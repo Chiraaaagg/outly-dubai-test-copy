@@ -1,0 +1,126 @@
+# Repository CI definitions (doc 22 §23 B6, files only).
+#
+# Nothing here is enabled by this commit: the workflow runs only once the
+# branch is pushed to GitHub (A7a), and nothing hosted is configured by it.
+#
+# Rules this file keeps:
+#  - read-only token (`permissions: contents: read`), no repository secrets,
+#    no deployment, no provider or Supabase call;
+#  - every action pinned to a full commit SHA (the tag is a comment only);
+#  - the database job uses a Postgres 17 service container that lives and dies
+#    with the job, reached on 127.0.0.1 only through the target guard; never a
+#    hosted database;
+#  - skips count as failures in the database job (OUTLY_REQUIRE_DB=1).
+#
+# Before enabling: re-check each pinned SHA against its tag
+# (`git ls-remote https://github.com/actions/<name> refs/tags/<tag>`).
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "24"
+  NEXT_TELEMETRY_DISABLED: "1"
+  # Tests and builds must never reach a provider: every adapter stays on its fake.
+  SUPPLIER_ADAPTER_RATHIN: mock
+  SUPPLIER_ADAPTER_TRAVELDESK: mock
+  TRAVELDESK_BOOKINGS_ENABLED: "false"
+  INSTANT_RELEASE_ENABLED: "false"
+
+jobs:
+  static:
+    name: typecheck and lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+
+  unit:
+    name: unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  db:
+    name: guarded database tests (Postgres 17 service container)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          # A throwaway credential for a container that exists only for this job.
+          POSTGRES_USER: outly_test
+          POSTGRES_PASSWORD: outly_ci_disposable_only
+          POSTGRES_DB: outly_test_main
+        ports:
+          - 127.0.0.1:55434:5432
+        options: >-
+          --health-cmd "pg_isready -U outly_test -d outly_test_main"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: Prepare the disposable database (marker, API roles, migrations, seed)
+        env:
+          PGPASSWORD: outly_ci_disposable_only
+        run: sh scripts/test-db/ci-prepare.sh
+      - name: Database tests (guard on, skips fail)
+        run: npm run test:db
+
+  build:
+    name: production build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: next build (no deployment)
+        env:
+          APP_ENV: development
+          NEXT_PUBLIC_SITE_URL: http://localhost:3000
+        run: npm run build
