@@ -26,6 +26,7 @@ import {
 import { track } from "@/lib/analytics";
 import { useCatalog } from "@/lib/catalog/client";
 import type { OtpAttempt } from "@/lib/otp-flow";
+import { maskEmail, startCheckoutCode, type CodeChannel } from "@/lib/checkout-code-channel";
 import { maskPhone, normalisePhone, SUPPORTED_COUNTRY_CODES } from "@/lib/phone";
 import {
   DEPOSIT_THRESHOLD_INR,
@@ -576,18 +577,23 @@ export default function CheckoutPage() {
     });
   };
 
-  /** A code to the WhatsApp number for this quote; `onVerified` keeps the verification for it. */
-  const checkoutAttempt = async (q: ServerQuote, e164: string): Promise<OtpAttempt> => {
-    const { challengeId } = await startCheckoutVerification({ quoteId: q.quoteId, channel: "phone", contact: e164 });
-    track("otp_sent", { context: "checkout" });
+  /**
+   * A code for this quote: to the phone, or to the email on the form when the
+   * deployment cannot send phone codes. `onVerified` keeps the verification for it.
+   */
+  const checkoutAttempt = async (q: ServerQuote, e164: string, email: string, channel: CodeChannel = "phone"): Promise<OtpAttempt> => {
+    const sent = await startCheckoutCode(startCheckoutVerification, { quoteId: q.quoteId, channel, phoneE164: e164, email });
+    track("otp_sent", { context: "checkout", channel: sent.channel });
     return {
-      phoneMasked: maskPhone(e164),
+      channel: sent.channel,
+      phoneMasked: sent.channel === "email" ? maskEmail(email) : maskPhone(e164),
       expiresInSeconds: 0,
       verify: async (code) => {
-        const v = await verifyCheckoutCode({ challengeId, code });
+        const v = await verifyCheckoutCode({ challengeId: sent.challengeId, code });
         verification.current = { quoteId: q.quoteId, verificationId: v.verificationId };
       },
-      resend: () => checkoutAttempt(q, e164),
+      // A resend stays on the channel the first code used.
+      resend: () => checkoutAttempt(q, e164, email, sent.channel),
     };
   };
 
@@ -685,7 +691,7 @@ export default function CheckoutPage() {
     const phone = normalisePhone(traveller.phone, traveller.countryCode);
     try {
       setPayment("processing");
-      const attempt = await checkoutAttempt(fresh, phone.e164);
+      const attempt = await checkoutAttempt(fresh, phone.e164, traveller.email);
       otpToken.current += 1;
       setOtp({ attempt, quote: fresh, token: otpToken.current });
       setPayment("verifying");

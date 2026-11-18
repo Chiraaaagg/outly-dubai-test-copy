@@ -49,7 +49,9 @@ export class CaptchaPendingError extends Error {
 }
 
 export interface OtpAttempt {
-  /** Safe to display: "+91 ••••• •3210". */
+  /** Where the code went. Absent means the phone (sign-in always uses it). */
+  channel?: "phone" | "email";
+  /** Safe to display: "+91 ••••• •3210", or a masked email when `channel` is "email". */
   phoneMasked: string;
   /** Seconds until the code expires, or 0 when the provider owns the clock. */
   expiresInSeconds: number;

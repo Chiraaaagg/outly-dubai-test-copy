@@ -229,6 +229,8 @@ describe("CO-07: the reason a trip goes to the inquiry form", () => {
   it("maps refusals to a plain reason", () => {
     expect(inquiryReasonForQuote(["past_cutoff"])).toBe("cutoff");
     expect(inquiryReasonForQuote(["same_day_inquiry_only"])).toBe("cutoff");
+    expect(inquiryReasonForQuote(["invalid_slot"])).toBe("time_slot");
+    expect(inquiryReasonForQuote(["invalid_slot", "past_cutoff"])).toBe("cutoff");
     expect(inquiryReasonForQuote(["pickup_unavailable", "sold_out"])).toBe("pickup");
     expect(inquiryReasonForQuote(["sold_out"])).toBe("sold_out");
     expect(inquiryReasonForQuote(["multi_instant_inquiry"])).toBe("over_limit");
@@ -237,7 +239,7 @@ describe("CO-07: the reason a trip goes to the inquiry form", () => {
   });
 
   it("only known reasons come back from the URL", () => {
-    for (const r of ["mixed", "over_limit", "cutoff", "sold_out", "pickup", "unavailable"] as const) {
+    for (const r of ["mixed", "over_limit", "cutoff", "time_slot", "sold_out", "pickup", "unavailable"] as const) {
       expect(parseInquiryReason(new URL(inquiryHref(r), "https://outlyy.test").searchParams.get("reason"))).toBe(r);
     }
     for (const bad of ["<script>", "toString", "constructor", "", null, undefined]) expect(parseInquiryReason(bad)).toBeNull();

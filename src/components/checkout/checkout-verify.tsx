@@ -6,6 +6,7 @@ import { ApiError } from "@/lib/api";
 import { track } from "@/lib/analytics";
 import type { OtpAttempt } from "@/lib/otp-flow";
 import { serverErrorCode } from "@/lib/server-error";
+import { codeCopy } from "@/lib/checkout-code-channel";
 
 export const CODE_LENGTH = 6;
 export const RESEND_AFTER_SECONDS = 30;
@@ -232,9 +233,8 @@ export function CheckoutVerify({
     }
   };
 
-  const description = state.resentAt
-    ? `We sent a new code at ${state.resentAt} to ${attempt.phoneMasked}. The previous code no longer works.`
-    : `Enter the ${CODE_LENGTH}-digit code we sent by SMS to ${attempt.phoneMasked}.`;
+  const copy = codeCopy(attempt.channel, attempt.phoneMasked, CODE_LENGTH, state.resentAt);
+  const description = copy.description;
 
   return (
     <div className="space-y-2" data-testid="checkout-verify">
@@ -242,7 +242,7 @@ export function CheckoutVerify({
         id={INPUT_ID}
         autoFocus
         disabled={locked}
-        title="Confirm your mobile number"
+        title={copy.title}
         description={description}
         label={`${CODE_LENGTH}-digit code`}
         value={state.code}
@@ -258,7 +258,7 @@ export function CheckoutVerify({
         onResend={() => void resend()}
         verifyLabel="Verify and continue"
         onVerify={(v) => void verify(cleanCode(v))}
-        helpText="Wrong number?"
+        helpText={copy.helpText}
         helpLinkLabel="Change it"
         onHelp={() => {
           if (!locked) onChangeNumber();
