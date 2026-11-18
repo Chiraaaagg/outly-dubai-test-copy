@@ -37,7 +37,7 @@ describe("OtpVerificationCard", () => {
 
   it("shows one error line, tied to the input, only when there is a message", () => {
     expect(render()).not.toContain('role="alert"');
-    const html = render({ invalid: true, message: "That code doesn't match. Check the latest SMS and try again." });
+    const html = render({ invalid: true, message: "That code doesn't match. Check the latest code we sent and try again." });
     expect(html).toMatch(/<div role="alert"[^>]*id="checkout-code-message"[^>]*>That code doesn&#x27;t match/);
     expect(html).toMatch(/<input[^>]*aria-invalid="true"/);
     expect(html).toMatch(/<input[^>]*aria-describedby="checkout-code-message"/);
@@ -57,7 +57,7 @@ describe("OtpVerificationCard", () => {
 describe("verifyErrorMessage (the existing /api/checkout/verify answers)", () => {
   it("a wrong code keeps the field and says so", () => {
     const err = new ApiError("Check the details.", "error", "Check the code.", false, { code: "That code isn't right. Check it and try again." }, "VALIDATION_FAILED", 400);
-    expect(verifyErrorMessage(err)).toEqual({ message: "That code doesn't match. Check the latest SMS and try again.", expired: false });
+    expect(verifyErrorMessage(err)).toEqual({ message: "That code doesn't match. Check the latest code we sent and try again.", expired: false });
   });
 
   it("an expired code (404) offers a new one", () => {

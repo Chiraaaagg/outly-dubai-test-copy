@@ -620,7 +620,7 @@ export default function CheckoutPage() {
         } else if (r.refused === "verification_required") {
           verification.current = null;
           setPayment("idle");
-          setNotice("We need to confirm your number again for this booking. Press pay to get a new code.");
+          setNotice("We need to confirm your contact details again for this booking. Press pay to get a new code.");
           focusPayWhenReady.current = true;
         } else if (r.refused === "try_again") {
           setPayment("failed");
@@ -1307,7 +1307,7 @@ export default function CheckoutPage() {
                           setOtp(null);
                           setPayment("idle");
                           if (stepRef.current === 2) {
-                            setNotice("Your booking details changed, so we need to confirm your number again. Press pay to get a new code.");
+                            setNotice("Your booking details changed, so we need to confirm your contact details again. Press pay to get a new code.");
                           }
                         }
                         return;

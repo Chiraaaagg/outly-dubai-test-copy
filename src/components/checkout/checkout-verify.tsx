@@ -22,7 +22,7 @@ export function verifyErrorMessage(err: unknown): { message: string; expired: bo
   if (code === "RATE_LIMITED") return { message: "Too many attempts. Wait a few minutes, then send a new code.", expired: false };
   // A wrong code is a validation error on the `code` field.
   if (err instanceof ApiError && err.fields?.code) {
-    return { message: "That code doesn't match. Check the latest SMS and try again.", expired: false };
+    return { message: "That code doesn't match. Check the latest code we sent and try again.", expired: false };
   }
   if (err instanceof ApiError) return { message: err.recovery, expired: false };
   return { message: "We couldn't check that code. Try again.", expired: false };
