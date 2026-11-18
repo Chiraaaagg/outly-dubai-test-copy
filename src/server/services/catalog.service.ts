@@ -343,7 +343,9 @@ export const catalogService = {
         // allowed (travelDeskMutationRefusal); elsewhere its mappings keep a
         // product in inquiry mode, whatever the supplier row says.
         for (const m of before.mappings) {
-          if (!m.isActive || m.supplier.source !== "api" || m.supplier.deletedAt) continue;
+          // An editorial supplier record (adapter "manual", made from the content's supplier block) never
+          // books: the instant path reads only the booking supplier's own mappings (readiness/quote).
+          if (!m.isActive || m.supplier.source !== "api" || m.supplier.deletedAt || m.supplier.adapter === "manual") continue;
           let confirms = false;
           try {
             confirms = supplierFor(m.supplier, env()).capabilities().instantConfirmation;

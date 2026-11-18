@@ -58,7 +58,8 @@ vi.mock("../readiness.service", () => ({
   },
 }));
 vi.mock("../../suppliers/registry", () => ({
-  supplierFor: () => ({ capabilities: () => ({ instantConfirmation: state.confirms }) }),
+  // The manual adapter never confirms (as in the real registry); every other adapter follows `state.confirms`.
+  supplierFor: (s: { adapter: string }) => ({ capabilities: () => ({ instantConfirmation: s.adapter === "manual" ? false : state.confirms }) }),
 }));
 
 const { catalogService, approvalEnvironmentFor } = await import("../catalog.service");
@@ -145,6 +146,29 @@ describe("setFulfilmentMode: instant release switch", () => {
     expect(state.updates).toHaveLength(0);
     // Checks run before the step-up, so a product that cannot qualify burns no code.
     expect(state.approvalCalls).toHaveLength(0);
+  });
+
+  it("an editorial supplier record (adapter manual) beside a confirming mapping does not block instant", async () => {
+    state.instantReleased = true;
+    state.product = {
+      id: "product-1",
+      fulfilmentMode: "inquiry",
+      mappings: [
+        { isActive: true, supplier: { source: "api", adapter: "traveldesk", status: "active", deletedAt: null } },
+        // Made by the editor from the content's supplier block ("API aggregator"); it never books.
+        { isActive: true, supplier: { source: "api", adapter: "manual", status: "active", deletedAt: null } },
+      ],
+    };
+    const after = await catalogService.setFulfilmentMode(admin, { kind: "product", id: "product-1" }, "instant", "go live", code);
+    expect(after).toMatchObject({ status: "applied", fulfilmentMode: "instant" });
+  });
+
+  it("an editorial supplier record alone is still refused: it is not an API mapping that can book", async () => {
+    state.instantReleased = true;
+    state.product = { id: "product-1", fulfilmentMode: "inquiry", mappings: [{ isActive: true, supplier: { source: "api", adapter: "manual", status: "active", deletedAt: null } }] };
+    const e = await refusal(catalogService.setFulfilmentMode(admin, { kind: "product", id: "product-1" }, "instant", "go live", code));
+    expect(isAppError(e) && e.code).toBe("CONFLICT");
+    expect(state.updates).toHaveLength(0);
   });
 
   it("with the switch on, a product without an API mapping is still refused", async () => {
