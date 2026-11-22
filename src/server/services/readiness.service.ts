@@ -46,6 +46,12 @@ import type { ProductMappingReadiness, VariantMappingState } from "./supplier-ca
  *    variant), the mapping is approved and current, its adapter can book,
  *    its slot rules are known and every unit names a supplier unit the offer
  *    accepts;
+ *  - page start times equal the supplier's (doc 29 Batch 0): the times the
+ *    activity page offers (`timeSlots`, "HH:mm") are exactly the mapped
+ *    offer's stored slot starts, as a set (`slot_times_mismatch`); a page
+ *    time that does not parse, a page without times or an offer whose starts
+ *    are unknown does not pass. An offer with an "any time" slot is
+ *    `slot_any_time_unsupported`: a guest-chosen time is not supported yet;
  *  - page price equals quote price: every unit is one of the page's pax
  *    types and its authored price equals the price the activity page shows
  *    for that type (`unit_price_mismatch`);
@@ -72,8 +78,12 @@ import type { ProductMappingReadiness, VariantMappingState } from "./supplier-ca
  * Combos never reach this function: they are inquiry by rule (doc 22 §22.2).
  */
 
-/** Version of the rule set above; stored with every verdict so a rules change can be re-run. */
-export const READINESS_RULES_VERSION = 4;
+/**
+ * Version of the rule set above; stored with every verdict so a rules change can be re-run.
+ * 6 (doc 29 Batch 1a): `capability_not_ready` also when the capability gate refuses the offer's
+ * exact class key (supplier-catalog.service.ts `mappingReadinessFor`, suppliers/capability-gate.ts).
+ */
+export const READINESS_RULES_VERSION = 6;
 
 /**
  * Per-mapping facts the readiness rules need, adapted from the supplier
@@ -105,6 +115,10 @@ export interface MappingReadiness {
   pickupOffered?: boolean | null;
   /** The supplier account a quote in this environment checks against; absent or null when not reported. */
   accountId?: string | null;
+  /** The offer's stored slot starts, minutes after midnight; absent or null = unknown, which never passes. */
+  slotStartMinutes?: number[] | null;
+  /** Whether the offer has an "any time" slot; absent or null = unknown, which never passes. */
+  anyTimeSlots?: boolean | null;
 }
 
 export interface MappingReadinessSource {
@@ -139,7 +153,11 @@ export type ReadinessTrigger =
   /** A fresh supplier check found a refund policy the page no longer fits (quote N1). */
   | "supplier_policy_changed"
   /** A margin policy, FX input or cost-input setting was written (CR-B2-8). */
-  | "pricing_settings_changed";
+  | "pricing_settings_changed"
+  /** A capability class flag was switched on or off (doc 29 §3.3). */
+  | "capability_flag"
+  /** Per-offer enablement evidence was recorded or revoked (doc 29 §3.3). */
+  | "offer_evidence";
 
 /** Settings whose values the margin rule reads; writing one re-runs readiness (`reevaluateAfterSetting`). */
 export const PRICING_SETTING_KEYS: readonly string[] = [MARGIN_POLICY_SETTING_KEY, FX_INR_PER_AED_SETTING_KEY, MARGIN_COST_INPUTS_SETTING_KEY];
@@ -235,6 +253,31 @@ export function policyTextAgrees(text: string, hours: number): boolean {
   return stated.length > 0 && stated.every((h) => h === hours);
 }
 
+/** A page start time, "HH:mm" on the 24-hour clock, as minutes after midnight; null for anything else ("Flexible", "9 pm"). */
+export function pageStartMinutes(time: string): number | null {
+  const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(time.trim());
+  return m ? Number(m[1]) * 60 + Number(m[2]) : null;
+}
+
+/**
+ * Whether the page's start times are the mapped offer's (doc 29 Batch 0).
+ * Exact set equality with the stored slot starts; never more permissive:
+ * an unparseable page time, no page time, unknown supplier starts or an
+ * "any time" slot (unknown counts as one) all refuse.
+ */
+export function slotTimesAgree(pageTimes: readonly string[], m: Pick<MappingReadiness, "slotStartMinutes" | "anyTimeSlots">): "ok" | "slot_times_mismatch" | "slot_any_time_unsupported" {
+  if (m.anyTimeSlots !== false) return m.anyTimeSlots === true ? "slot_any_time_unsupported" : "slot_times_mismatch";
+  const supplier = m.slotStartMinutes;
+  if (!supplier || supplier.length === 0) return "slot_times_mismatch";
+  const page = pageTimes.map(pageStartMinutes);
+  if (page.length === 0 || page.some((p) => p === null)) return "slot_times_mismatch";
+  const pageSet = new Set(page as number[]);
+  const supplierSet = new Set(supplier);
+  if (pageSet.size !== supplierSet.size) return "slot_times_mismatch";
+  for (const p of pageSet) if (!supplierSet.has(p)) return "slot_times_mismatch";
+  return "ok";
+}
+
 /** The one refund word a 0-hour text may carry, and only as its opening. */
 const NON_REFUNDABLE_LEAD = /^\s*non[-\s]?refundable\b/i;
 
@@ -318,6 +361,8 @@ export async function assessReadiness(input: ReadinessInput): Promise<ReadinessA
     else if (m.state === "missing_upstream") reasons.add("mapping_missing_upstream");
     if (!m.capabilityReady) reasons.add("capability_not_ready");
     if (!m.slotRulesKnown) reasons.add("slot_rules_unknown");
+    const times = slotTimesAgree(activity.timeSlots, m);
+    if (times !== "ok") reasons.add(times);
     if (!policyWithinSupplier(activity.freeCancellationHours, m)) reasons.add("policy_exceeds_supplier");
     if (!pickupAgrees(activity.pickupIncluded, m.pickupOffered ?? null)) reasons.add("safety_fact_unknown");
     if (!units.every((u) => unitPriceShown(activity, v, u))) reasons.add("unit_price_mismatch");
@@ -533,6 +578,12 @@ function netsOf(raw: unknown): Record<string, bigint> | null {
   return Object.keys(out).length ? out : null;
 }
 
+/** Stored slot starts: whole minutes within a day; anything else reads as unknown. */
+function startsOf(raw: unknown): number[] | null {
+  if (!Array.isArray(raw)) return null;
+  return raw.every((x) => typeof x === "number" && Number.isInteger(x) && x >= 0 && x < 24 * 60) ? (raw as number[]) : null;
+}
+
 function hoursOf(raw: unknown): number | null {
   return typeof raw === "number" && Number.isFinite(raw) && raw >= 0 ? raw : null;
 }
@@ -573,6 +624,8 @@ export function fromCatalogReadiness(r: ProductMappingReadiness): MappingReadine
       environment: facts.environment,
       pickupOffered: typeof extra.isDirectReporting === "boolean" ? !extra.isDirectReporting : null,
       accountId: typeof extra.accountId === "string" && extra.accountId.length > 0 ? extra.accountId : null,
+      slotStartMinutes: startsOf(extra.slotStartMinutes),
+      anyTimeSlots: typeof extra.anyTimeSlots === "boolean" ? extra.anyTimeSlots : null,
     });
   }
   return [...out.values()];

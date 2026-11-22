@@ -175,10 +175,16 @@ const activityShape = {
     seo: seoSchema,
 };
 
-function refineActivity(v: { fulfilmentMode: string; confirmation: string; variants: { id: string; units?: { unitId: string }[] }[]; addOns: { id: string }[]; relatedSlugs: string[]; slug: string }, ctx: z.RefinementCtx) {
-    if (v.fulfilmentMode === "instant" && v.confirmation !== "instant") {
-      ctx.addIssue({ code: "custom", path: ["fulfilmentMode"], message: "Instant fulfilment requires instant supplier confirmation" });
-    }
+/**
+ * Rules for the stored document and the input alike. Instant fulfilment with
+ * manual confirmation is NOT one of them: the document's `fulfilmentMode` is
+ * the requested mode mirrored from the column (activity.service.ts rules),
+ * and readiness drops such a product to inquiry
+ * (`editorial_confirmation_not_instant`). Refusing it here threw a raw
+ * validation error inside the editor's transaction when an instant product's
+ * confirmation was set to manual (doc 29 §7.3, D3).
+ */
+function refineActivity(v: { variants: { id: string; units?: { unitId: string }[] }[]; addOns: { id: string }[]; relatedSlugs: string[]; slug: string }, ctx: z.RefinementCtx) {
     const ids = new Set<string>();
     for (const [i, x] of v.variants.entries()) {
       if (ids.has(x.id)) ctx.addIssue({ code: "custom", path: ["variants", i, "id"], message: "Duplicate variant id" });
@@ -197,7 +203,15 @@ function refineActivity(v: { fulfilmentMode: string; confirmation: string; varia
     if (v.relatedSlugs.includes(v.slug)) ctx.addIssue({ code: "custom", path: ["relatedSlugs"], message: "An activity cannot relate to itself" });
 }
 
-export const activityInputSchema = z.object(activityShape).strict().superRefine(refineActivity);
+/** An input that itself asks for instant with manual confirmation is refused at the parse, before any transaction. */
+function refineActivityInput(v: Parameters<typeof refineActivity>[0] & { fulfilmentMode: string; confirmation: string }, ctx: z.RefinementCtx) {
+    if (v.fulfilmentMode === "instant" && v.confirmation !== "instant") {
+      ctx.addIssue({ code: "custom", path: ["fulfilmentMode"], message: "Instant fulfilment requires instant supplier confirmation" });
+    }
+    refineActivity(v, ctx);
+}
+
+export const activityInputSchema = z.object(activityShape).strict().superRefine(refineActivityInput);
 export type ActivityInput = z.infer<typeof activityInputSchema>;
 
 /** Full stored document = input + derived fields. */

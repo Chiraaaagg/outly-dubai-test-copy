@@ -228,6 +228,15 @@ describe("tour details", () => {
     expect(detail.offers[2].timeSlots[0]).toMatchObject({ isAnyTime: true, endMinutes: null, minimumAdvancedBookingHours: null, isExternal: false });
   });
 
+  it("keeps the undocumented slot unit count when sent, and leaves the slot shape unchanged when not (doc 29 Batch 1a)", () => {
+    const d = tourDetailFrom(
+      tourDetailsWire.parse({ ...tourDetailsFixture, offers: [offer({ timeSlots: [timeSlot({ numberOfUnits: 10 }), timeSlot({ id: 72, numberOfUnits: null })] })] }),
+    );
+    expect(d.offers[0].timeSlots[0].numberOfUnits).toBe(10);
+    expect("numberOfUnits" in d.offers[0].timeSlots[1]).toBe(false);
+    expect(tourDetailsWire.safeParse({ ...tourDetailsFixture, offers: [offer({ timeSlots: [timeSlot({ numberOfUnits: "10" })] })] }).success).toBe(false);
+  });
+
   it("AED pricing periods are priced; a null-currency period has price null and a warning", () => {
     const periods = detail.offers[2].pricingPeriods;
     expect(periods[0]).toMatchObject({ periodId: 9100, dateStart: "2026-10-01", dateEnd: "2027-03-31" });
@@ -288,6 +297,18 @@ describe("availability", () => {
     expect(() => availabilityFrom(availabilityWire.parse([availabilityRow({}, { currency: null })]))).toThrow(/missing/);
     const { currency: _c, ...noCurrency } = offerPrice();
     expect(() => availabilityFrom(availabilityWire.parse([{ availability: availabilityRow().availability, price: noCurrency }]))).toThrow(TravelDeskCurrencyError);
+  });
+
+  it("a not-bookable row with no currency is a date with no price in force: dropped and reported, never priced (doc 29 Batch 1a)", () => {
+    const { rows, warnings } = availabilityFrom(
+      availabilityWire.parse([availabilityRow({ timeSlotId: 0, startTime: 0, endTime: 0, left: 0 }, { currency: null, isBookable: false }), availabilityRow({ id: 2 })]),
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].timeSlotId).toBe(71);
+    expect(warnings).toEqual(["availability row for slot 0 on 2026-11-03: no price in force (not on sale)"]);
+    // Only that exact shape is tolerated: a bookable row without a currency, or a non-AED unbookable row, still refuses the read.
+    expect(() => availabilityFrom(availabilityWire.parse([availabilityRow({}, { currency: null, isBookable: true })]))).toThrow(TravelDeskCurrencyError);
+    expect(() => availabilityFrom(availabilityWire.parse([availabilityRow({}, { currency: "USD", isBookable: false })]))).toThrow(TravelDeskCurrencyError);
   });
 
   it("lower-case aed is accepted", () => {

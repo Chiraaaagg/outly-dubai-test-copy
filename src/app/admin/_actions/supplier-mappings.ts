@@ -9,10 +9,10 @@ import { parseWith } from "@/server/lib/http";
 import { approvalService, OPERATION_PERMISSION } from "@/server/services/approval.service";
 import { authService } from "@/server/services/auth.service";
 import {
-  bookingAccountId,
   bookingControl,
   type ControlChange,
   controlApprovalPayload,
+  pinnedControlAccount,
   supplierBookingService,
   TRAVELDESK_SUPPLIER_CODE,
 } from "@/server/services/supplier-booking.service";
@@ -107,7 +107,7 @@ export type BookingControlResult = ActionResult<{ paused: boolean; status: "appl
 /** The supplier account whose controls an environment uses, or a refusal when production has none pinned here. */
 function controlAccount(environment: "test" | "production"): string {
   const config = traveldeskConfigFrom(env());
-  const account = bookingAccountId(environment, config?.environment === environment ? config.agencyId : null);
+  const account = pinnedControlAccount(environment, config);
   if (!account) throw Errors.conflict("No TravelDesk account is pinned for this environment on this deployment (TRAVELDESK_AGENCY_ID)");
   return account;
 }

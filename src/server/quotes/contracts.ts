@@ -100,6 +100,10 @@ export type ReadinessReason =
   | "units_missing"
   | "unit_not_mapped"
   | "slot_rules_unknown"
+  /** The page's start times are not exactly the mapped offer's stored slot starts (doc 29 Batch 0). */
+  | "slot_times_mismatch"
+  /** The mapped offer has an "any time" slot: a guest-chosen time is not supported yet (doc 29 Batch 0, Batch 2). */
+  | "slot_any_time_unsupported"
   | "safety_fact_unknown"
   | "unit_price_mismatch"
   | "margin_below_floor"

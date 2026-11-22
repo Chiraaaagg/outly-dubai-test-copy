@@ -72,7 +72,10 @@ describe("OrderStatusView: download access", () => {
     const html = render(status({ canDownload: false, items: [item({ tickets: { fulfilment: "issued", documents: [] } })] }));
     expect(html).not.toContain('data-testid="voucher-actions"');
     expect(html).not.toContain("/api/tickets/documents/");
-    expect(html).toContain("Text me a code");
+    expect(html).toContain("Send me a code");
+    // Channel-neutral while codes may go by email (doc 29 §8.4 row 10).
+    expect(html).not.toContain("Text me a code");
+    expect(html).toContain("mobile number or email you booked with");
   });
 });
 

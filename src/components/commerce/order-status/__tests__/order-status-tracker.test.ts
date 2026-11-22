@@ -56,7 +56,7 @@ describe("OrderStatus (tracker)", () => {
     const html = render();
     expect(html.match(/<img[^>]*alt=""/g)).toHaveLength(2);
     expect(html).not.toContain("<button");
-    expect(render({ actionLabel: "Text me a code" })).toMatch(/<button[^>]*>Text me a code<\/button>/);
+    expect(render({ actionLabel: "Send me a code" })).toMatch(/<button[^>]*>Send me a code<\/button>/);
   });
 
   it("uses the lagoon-700 tracking line and OUTLYY surfaces", () => {

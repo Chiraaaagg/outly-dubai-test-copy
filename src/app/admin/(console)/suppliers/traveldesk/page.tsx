@@ -2,7 +2,7 @@ import Link from "next/link";
 import { Alert } from "@/components/ui/primitives";
 import { hasPermission } from "@/server/lib/actor";
 import { env as appEnv } from "@/server/lib/env";
-import { supplierBookingService } from "@/server/services/supplier-booking.service";
+import { pinnedControlAccount, supplierBookingService } from "@/server/services/supplier-booking.service";
 import { supplierCatalogService, type CandidateRow } from "@/server/services/supplier-catalog.service";
 import { traveldeskConfigFrom } from "@/server/suppliers/traveldesk/traveldesk.config";
 import { requirePage } from "../../../_lib/guard";
@@ -63,11 +63,13 @@ export default async function TravelDeskMappingPage({ searchParams }: { searchPa
   const sp = await searchParams;
   const state = (STATES as readonly string[]).includes(sp.state ?? "") ? (sp.state as (typeof STATES)[number]) : "suggested";
   const env = (ENVS as readonly string[]).includes(sp.env ?? "") ? (sp.env as (typeof ENVS)[number]) : "production";
+  const config = traveldeskConfigFrom(appEnv());
 
   const [summary, rows, bookings] = await Promise.all([
     supplierCatalogService.summary(actor),
     supplierCatalogService.listCandidates(actor, { state, environment: env }),
-    supplierBookingService.overview(actor),
+    // The rows the write action changes (D2): the pinned account per environment, not the default key.
+    supplierBookingService.overview(actor, { accounts: { test: pinnedControlAccount("test", config), production: pinnedControlAccount("production", config) } }),
   ]);
   const bookingCounts = bookings.counts.filter((c) => c.environment === env);
   // The controls shown and posted are the selected environment's (CR-11).
@@ -77,7 +79,7 @@ export default async function TravelDeskMappingPage({ searchParams }: { searchPa
   // Ticket answers change refundability: administrators only (Q6).
   const canSetEvidence = hasPermission(actor, "products.activate_instant");
   // The environment this deployment's key belongs to: the only one the sync can pull.
-  const syncEnvironment = traveldeskConfigFrom(appEnv())?.environment ?? null;
+  const syncEnvironment = config?.environment ?? null;
 
   const count = (s: string) => (summary.configured ? summary.candidates.filter((c) => c.environment === env && c.state === s).reduce((n, c) => n + c.count, 0) : 0);
   const offers = summary.configured ? summary.items.filter((i) => i.environment === env && i.kind === "offer").reduce((n, i) => n + i.count, 0) : 0;
@@ -163,6 +165,9 @@ export default async function TravelDeskMappingPage({ searchParams }: { searchPa
             {s}
           </Link>
         ))}
+        <Link href={`/admin/suppliers/traveldesk/capabilities?env=${env}`} className="ml-auto self-center underline underline-offset-2">
+          Capability classes
+        </Link>
       </nav>
 
       {!summary.configured && <Alert tone="warning">No TravelDesk catalogue yet. Use the catalogue sync above first.</Alert>}

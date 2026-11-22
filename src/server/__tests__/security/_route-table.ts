@@ -105,6 +105,7 @@ export const NON_BROWSER = new Set([
   "POST jobs/payments-tick",
   "POST jobs/documents-tick",
   "POST jobs/fx-refresh",
+  "POST jobs/crm-worker",
   "POST webhooks/payments/[provider]",
   "POST events",
 ]);

@@ -71,6 +71,9 @@ export function mapping(over: Partial<MappingReadiness> = {}): MappingReadiness 
     supplierFreeCancellationHours: null,
     environment: "test",
     pickupOffered: false,
+    // The page's "09:00" (instantDoc) is the offer's one stored start (doc 29 Batch 0 time-slot rule).
+    slotStartMinutes: [540],
+    anyTimeSlots: false,
     ...over,
   };
 }

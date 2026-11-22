@@ -7,6 +7,7 @@ import { Errors } from "../lib/errors";
 import type { EngineSagaApi, SagaNotifier } from "../payments/contracts";
 import { dbPaymentEvidence } from "../payments/evidence";
 import { GUARD_RELEASING_STATES, type PaymentEvidencePort } from "../suppliers/booking-port";
+import { checkOfferCapability } from "../suppliers/capability-gate";
 import { travelDeskExternalRefSchema } from "../suppliers/traveldesk/traveldesk.adapter";
 import { traveldeskConfigFrom } from "../suppliers/traveldesk/traveldesk.config";
 import { parseStoredOffer } from "../suppliers/traveldesk/traveldesk.offer-terms";
@@ -141,7 +142,7 @@ export function createEngineSagaApi(deps: EngineSagaDeps): EngineSagaApi {
       }
       if (line.serviceDate !== item.serviceDate.toISOString().slice(0, 10)) refuse("service_date_mismatch", "The order item and its quote line name different dates");
 
-      const mapping = await db.productSupplierMapping.findUnique({ where: { id: line.mappingId }, include: { supplier: { select: { code: true } } } });
+      const mapping = await db.productSupplierMapping.findUnique({ where: { id: line.mappingId }, include: { supplier: { select: { code: true, adapter: true } } } });
       if (!mapping || !mapping.isActive || mapping.supplier.code !== code) refuse("mapping_inactive", "The supplier mapping is not active");
       if (mapping.environment !== line.supplierEnvironment) refuse("mapping_environment_changed", "The mapping's environment changed since the quote");
       if (mapping.approvedOfferHash !== line.approvedOfferHash) refuse("mapping_changed", "The approved offer terms changed since the quote");
@@ -165,6 +166,16 @@ export function createEngineSagaApi(deps: EngineSagaDeps): EngineSagaApi {
         : null;
       const stored = offerRow && !offerRow.removedAt ? parseStoredOffer(offerRow.payload) : null;
       if (!stored || stored.offerId !== ref.data.offerId) refuse("offer_unreadable", "The approved offer cannot be read");
+      // The same capability lookup readiness used (doc 29 §3.3): a class switched off since the quote is refused here, before any supplier call.
+      const capability = await checkOfferCapability(db, {
+        adapter: mapping.supplier.adapter,
+        supplierId: mapping.supplierId,
+        environment: config.environment,
+        offerExternalId: mapping.supplierOfferId!,
+        payload: offerRow!.payload,
+        termsHash: mapping.approvedOfferHash,
+      });
+      if (!capability.verdict.instant) refuse("capability_not_enabled", `This offer's booking class (${capability.verdict.classKey}) is not enabled for instant sale: ${capability.verdict.reason}`);
       const rules = slotRulesFor(stored.timeSlots, slot.timeSlotId, slot.startMinutes);
       const endMinutes = stored.timeSlots.find((s) => s.timeSlotId === slot.timeSlotId && s.startMinutes === slot.startMinutes)?.endMinutes ?? null;
       if (!rules || endMinutes === null) refuse("slot_rules_unknown", "The slot's stored rules or end time are unknown");

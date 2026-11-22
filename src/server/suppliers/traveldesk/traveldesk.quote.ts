@@ -249,6 +249,10 @@ export interface OfferReadinessFacts {
   supplierFreeCancellationHours: number | null;
   /** True: the guest makes their own way, no pickup. False: the offer collects from hotels. Null: offer unknown. */
   isDirectReporting: boolean | null;
+  /** The stored slots' start times, minutes after midnight, unique and ascending; null when the offer is unknown (doc 29 Batch 0). */
+  slotStartMinutes: number[] | null;
+  /** Whether any stored slot is an "any time" slot; null when the offer is unknown. */
+  anyTimeSlots: boolean | null;
 }
 
 /** One pax type's age band as the page gives it: inclusive whole years, null for no limit. */
@@ -300,7 +304,7 @@ export function offerReadinessFacts(offer: StoredOffer | null, policy: TravelDes
     const full = policy.filter((r) => r.refundPercent >= 100 && r.moreThanHours >= 0).map((r) => r.moreThanHours);
     supplierFreeCancellationHours = full.length ? Math.min(...full) : 0;
   }
-  if (!offer) return { supplierUnits: [], netAedMinorByUnit: null, supplierFreeCancellationHours, isDirectReporting: null };
+  if (!offer) return { supplierUnits: [], netAedMinorByUnit: null, supplierFreeCancellationHours, isDirectReporting: null, slotStartMinutes: null, anyTimeSlots: null };
 
   const periods = offer.pricingPeriods.filter((p) => p.dateEnd === null || p.dateEnd.slice(0, 10) >= today);
   const prices = periods.flatMap((p) => (p.price ? [p.price] : []));
@@ -324,7 +328,9 @@ export function offerReadinessFacts(offer: StoredOffer | null, policy: TravelDes
         trip: max(prices.map((p) => p.perTripMinor)),
       }
     : null;
-  return { supplierUnits, netAedMinorByUnit, supplierFreeCancellationHours, isDirectReporting: offer.isDirectReporting };
+  const slotStartMinutes = [...new Set(offer.timeSlots.map((s) => s.startMinutes))].sort((a, b) => a - b);
+  const anyTimeSlots = offer.timeSlots.some((s) => s.isAnyTime);
+  return { supplierUnits, netAedMinorByUnit, supplierFreeCancellationHours, isDirectReporting: offer.isDirectReporting, slotStartMinutes, anyTimeSlots };
 }
 
 /**

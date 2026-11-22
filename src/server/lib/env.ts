@@ -2,6 +2,7 @@ import "server-only";
 import { z } from "zod";
 import { stripeConfigProblems } from "../payments/stripe/stripe.config";
 import { traveldeskConfigProblems } from "../suppliers/traveldesk/traveldesk.config";
+import { crmConfigProblems, crmScopeProblems } from "../crm/crm.config";
 import { keyRingProblems } from "./crypto";
 import { log } from "./logger";
 
@@ -310,6 +311,30 @@ const schema = z.object({
   /** Comma list of rails served by the one Stripe account: `aed_card`, `inr_pacb`. Default `aed_card`. */
   STRIPE_RAILS: optionalStr,
 
+  // CRM — Bitrix24 one-way push (doc 29 §5, §6.4; CRM batch C1). Validated in
+  // src/server/crm/crm.config.ts. No portal host ⇒ nothing is enqueued; a
+  // portal host without CRM_SYNC_ENABLED=true ⇒ rows wait, nothing is sent.
+  // Keep production CRM values in Vercel's Production scope only.
+  /**
+   * Release switch for CRM delivery (`/api/jobs/crm-worker`). While false the
+   * worker answers `skipped` and calls nothing. Only "true" enables it;
+   * default off everywhere. Not an emergency stop for anything else: checkout
+   * never depends on the CRM.
+   */
+  CRM_SYNC_ENABLED: strictBool("CRM_SYNC_ENABLED"),
+  /** `test` or `production`; production only with APP_ENV=production on Vercel's production deployment. */
+  CRM_BITRIX_ENV: z.preprocess((v) => (v === "" ? undefined : v), z.enum(["test", "production"]).optional()),
+  /** Pinned portal host, e.g. `<portal>.bitrix24.com` (no scheme, path or port). */
+  CRM_BITRIX_PORTAL_HOST: optionalStr,
+  /** Inbound webhook of the dedicated non-admin service user (owner decision 15): its numeric user id and secret. */
+  CRM_BITRIX_WEBHOOK_USER_ID: optionalStr,
+  CRM_BITRIX_WEBHOOK_SECRET: optionalStr,
+  /** The OUTLYY deal funnel id (never 0, the other business's funnel). */
+  CRM_BITRIX_DEAL_CATEGORY_ID: optionalStr,
+  /** `stage_key=C<category>:<STATUS_ID>` pairs for every OUTLYY stage (crm.config.ts CRM_STAGE_KEYS). */
+  CRM_BITRIX_STAGE_IDS: optionalStr,
+  CRM_BITRIX_TIMEOUT_MS: int(5_000),
+
   // Photography — Pexels search for any catalogue image without a curated id (src/lib/images/manifest.ts).
   PEXELS_API_KEY: optionalStr,
 
@@ -388,6 +413,14 @@ export function assertBootEnv(): string[] {
     for (const p of traveldeskConfigProblems(e)) problems.push(`TravelDesk live but unusable: ${p}`);
   }
   for (const p of stripeConfigProblems(e)) problems.push(`Stripe refused: ${p}`);
+  if (e.CRM_SYNC_ENABLED) {
+    for (const p of crmConfigProblems(e)) problems.push(`CRM sync on but unusable: ${p}`);
+  } else if (e.CRM_BITRIX_PORTAL_HOST) {
+    for (const p of crmScopeProblems(e)) problems.push(`CRM portal refused, nothing is enqueued: ${p}`);
+  }
+  if (Object.keys(process.env).some((k) => k.startsWith("NEXT_PUBLIC_") && (k.includes("BITRIX") || k.includes("CRM_")))) {
+    problems.push("A NEXT_PUBLIC_*BITRIX* or NEXT_PUBLIC_*CRM_* variable exists — CRM settings must never reach the browser");
+  }
   if (Object.keys(process.env).some((k) => k.startsWith("NEXT_PUBLIC_") && k.includes("TRAVELDESK"))) {
     problems.push("A NEXT_PUBLIC_*TRAVELDESK* variable exists — TravelDesk settings must never reach the browser");
   }

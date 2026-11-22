@@ -253,6 +253,14 @@ describe.skipIf(!enabled)("activityService: readiness on every product version w
     await expectDemoted(row.id, "editor_save");
   });
 
+  it("editor save of an instant product whose confirmation turns manual saves and drops to inquiry, never a raw validation error (doc 29 D3)", async () => {
+    const row = await instantOnRecord("manual");
+    const saved = await activityService.update(admin, row.id, { ...fixtureInput(3), slug: row.slug, confirmation: "manual" });
+    expect(saved.version).toBe(row.version + 1);
+    await expectDemoted(row.id, "editor_save");
+    expect((await prisma.productEligibility.findUniqueOrThrow({ where: { productId: row.id } })).reasons).toContain("editorial_confirmation_not_instant");
+  });
+
   it("restore-version", async () => {
     const row = await instantOnRecord("restore");
     await activityService.update(admin, row.id, { ...fixtureInput(3), slug: row.slug, title: "Second" });

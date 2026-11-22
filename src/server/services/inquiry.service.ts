@@ -28,6 +28,7 @@ import { notificationService } from "./notification.service";
 import { opsAlertService } from "./ops-alert.service";
 import { analyticsService } from "./analytics.service";
 import { orderService } from "./order.service";
+import { enqueueCrmSync } from "../crm/crm.outbox";
 import type {
   AgentPublic,
   CreateInquiryInput,
@@ -413,6 +414,8 @@ export const inquiryService = {
         },
         tx,
       );
+      // CRM outbox (doc 29 §6.2): last, in the same transaction. A spam inquiry never becomes a deal (crm.mapping.ts).
+      await enqueueCrmSync(tx, [{ type: "inquiry", id }]);
       return ref;
     }, TX_OPTIONS);
 
@@ -597,6 +600,7 @@ export const inquiryService = {
       await tx.inquiry.update({ where: { id }, data: { assignedAgentId: agentId, assignedAt: now, status: to, escalatedAt: null } });
       await addEvent(tx, id, { kind: "assignment", from, to, actor, note: reason, meta: { agentId, agentName: target.fullName, previousAgentId: d.assignedAgent?.id, previousAgentName: d.assignedAgent?.name } });
       await audit(actor, "inquiry.assign", { type: "inquiry", id }, { before: { agentId: d.assignedAgent?.id, status: from }, after: { agentId, status: to }, reason }, tx);
+      await enqueueCrmSync(tx, [{ type: "inquiry", id }]);
     }, TX_OPTIONS);
 
     const [sla, agent, detail] = await Promise.all([settingsService.sla(), agentPublicById(agentId), inquiryRepo.findById(id)]);
@@ -683,6 +687,7 @@ export const inquiryService = {
           userAgent: actor.userAgent,
         })),
       });
+      await enqueueCrmSync(tx, moving.map((r) => ({ type: "inquiry" as const, id: r.id })));
 
       return { assigned: moving.length, skipped, alreadyTheirs: open.length - moving.length, agentName: target.fullName };
     }, TX_OPTIONS);
@@ -705,6 +710,7 @@ export const inquiryService = {
       await tx.inquiry.update({ where: { id }, data: { assignedAgentId: null, assignedAt: null, status: to } });
       await addEvent(tx, id, { kind: "assignment", from, to, actor, note: reason ?? "Released to queue", meta: { agentId: null, previousAgentId: d.assignedAgent?.id, previousAgentName: d.assignedAgent?.name } });
       await audit(actor, "inquiry.unassign", { type: "inquiry", id }, { before: { agentId: d.assignedAgent?.id, status: from }, after: { agentId: null, status: to }, reason }, tx);
+      await enqueueCrmSync(tx, [{ type: "inquiry", id }]);
     }, TX_OPTIONS);
     return (await inquiryRepo.findById(id))!;
   },
@@ -756,6 +762,7 @@ export const inquiryService = {
       await tx.inquiry.update({ where: { id }, data });
       await addEvent(tx, id, { kind: "status", from, to, actor, note: opts.note ?? (to === "lost" ? opts.reason : undefined) });
       await audit(actor, "inquiry.transition", { type: "inquiry", id }, { before: { status: from }, after: { status: to }, reason: opts.reason }, tx);
+      await enqueueCrmSync(tx, [{ type: "inquiry", id }]);
     }, TX_OPTIONS);
 
     const eventName =
@@ -866,6 +873,7 @@ export const inquiryService = {
         await suppressContact(tx, "phone", d.leadPhone, "spam");
       }
       await audit(actor, "inquiry.mark_spam", { type: "inquiry", id }, { before: { status: d.status }, after: { status: "spam", suppressed: opts.suppress }, reason: opts.reason }, tx);
+      await enqueueCrmSync(tx, [{ type: "inquiry", id }]);
     }, TX_OPTIONS);
     return (await inquiryRepo.findById(id))!;
   },
@@ -1038,6 +1046,8 @@ export const inquiryService = {
       await tx.inquiry.update({ where: { id }, data: { status: "won", convertedOrderId: order.id, nextFollowupAt: null, lastContactAt: new Date() } });
       await addEvent(tx, id, { kind: "status", from: d.status, to: "won", actor, note: input.note, meta: { orderId: order.id, orderReference: order.reference } });
       await audit(actor, "inquiry.convert", { type: "inquiry", id }, { before: { status: d.status }, after: { status: "won", orderReference: order.reference, totalInr: totalInr.toString() } }, tx);
+      // One deal per sale (owner decision 16): the inquiry's deal is reused for its order.
+      await enqueueCrmSync(tx, [{ type: "inquiry", id }]);
       return order;
     }, TX_OPTIONS);
 

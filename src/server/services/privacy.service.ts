@@ -7,6 +7,7 @@ import { Errors } from "../lib/errors";
 import { uuidv7 } from "../lib/ids";
 import { emitEvent } from "../lib/structured-events";
 import { getDocumentStore } from "../documents/store";
+import { enqueueCrmErasure } from "../crm/crm.outbox";
 import { LATE_MONEY_WINDOW_MS } from "../payments/saga";
 import {
   eraseSubjectRows,
@@ -181,6 +182,10 @@ export const privacyService = {
       };
       // The hashed entry now covers the number: its plaintext copy in the legacy list goes (R-B4-6).
       const legacySuppressionRemoved = subject.phoneE164 ? await forgetLegacySuppression(tx, subject.phoneE164) : 0;
+      // CRM copies (doc 29 §6.5): a delete for every linked deal of the erased inquiries and orders. Delivery is the
+      // CRM worker's, under CRM_SYNC_ENABLED; nothing is enqueued while no CRM portal is configured.
+      const deferredIds = new Set(deferredOrders.map((d) => d.orderId));
+      await enqueueCrmErasure(tx, { inquiryIds: records.inquiryIds, orderIds: records.orderIds.filter((id) => !deferredIds.has(id)) });
       const obligations = [...new Set(deferredOrders.flatMap((d) => d.obligations))].sort();
       const c = write.counts;
       const erasedSomething =

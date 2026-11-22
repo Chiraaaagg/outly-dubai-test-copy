@@ -24,6 +24,7 @@ import {
 import { appendOnce, lockPayment } from "./ledger";
 import { closeRelease, closeWaitingRemedies, createRefundDriver, isDisputeType, openPendingRefund, openRefund, openRelease, refundableMinor, refundedOutsideOutlyMinor, RefundRefused, type RefundDriver } from "./refunds";
 import { paymentGateways, type GatewayRegistry } from "./registry";
+import { enqueueCrmSyncForOrders } from "../crm/crm.outbox";
 
 /**
  * Payment saga (doc 22 §22.1 item 6, §23 B3; PAY-1 to PAY-6, PAY-13; F1–F5,
@@ -360,6 +361,8 @@ export function createPaymentSaga(deps: SagaDeps) {
         await capabilityService.revokeAllForOrders(tx, [saga.orderId], "order_cancelled", now, { issuedFor: ["checkout"] });
       }
       if (to === "released" || to === "failed") await orderService.applyPaymentOutcome(tx, saga.orderId, "payment_failed", now);
+      // CRM outbox (doc 29 §6.2), last in the move: authorisation, capture, fulfilment, release and refund.
+      await enqueueCrmSyncForOrders(tx, [saga.orderId]);
     }, TX_OPTIONS);
     log.info("payments.saga_moved", { sagaId: saga.id, from: saga.state, to });
     await recordVerifiedEvents(saga, to);
@@ -446,6 +449,8 @@ export function createPaymentSaga(deps: SagaDeps) {
         });
         if (primary) await orderService.applyPaymentOutcome(tx, cur.orderId, "paid", at);
       }
+      // CRM outbox: the verified captured or refunded amount changed (opportunity), or an authorisation was first seen.
+      if (captured > cur.capturedMinor || refunded > cur.refundedMinor || (s.authorizedAt && !cur.authorizedAt)) await enqueueCrmSyncForOrders(tx, [cur.orderId]);
     }, TX_OPTIONS);
   }
 

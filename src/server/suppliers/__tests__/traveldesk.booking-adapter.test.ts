@@ -306,12 +306,23 @@ describe("status reads (SUP-4, SUP-12)", () => {
 });
 
 describe("account and funds (SUP-10)", () => {
-  it("funds are the lower of payable balance and balance plus credit, with the agency id", async () => {
+  it("funds are the lower of payable balance and credit minus balance, with the raw figures and the agency id (doc 29 §4.5)", async () => {
     const { t } = transport();
-    expect(await adapterFor(t).funds()).toEqual({ spendableMinor: 120_000n, currency: "AED", accountId: "42" });
-    const low = transport({ getBalance: async () => ({ agencyId: 42, currencyRequested: "AED" as const, balanceMinor: 10_000n, creditFacilityMinor: 0n, payableBalanceMinor: 90_000n }) });
-    expect((await adapterFor(low.t).funds()).spendableMinor).toBe(10_000n);
+    // Credit 1 000.00, 500.00 used: 500.00 left; the payable figure (1 200.00) disagrees and the engine refuses it, the adapter reports the lower.
+    expect(await adapterFor(t).funds()).toEqual({ spendableMinor: 50_000n, currency: "AED", accountId: "42", wallet: { balanceMinor: 50_000n, creditFacilityMinor: 100_000n, payableMinor: 120_000n } });
+    const credit = transport({ getBalance: async () => ({ agencyId: 42, currencyRequested: "AED" as const, balanceMinor: 10_000n, creditFacilityMinor: 100_000n, payableBalanceMinor: 90_000n }) });
+    expect((await adapterFor(credit.t).funds()).spendableMinor).toBe(90_000n);
     expect(await adapterFor(t).account()).toEqual({ accountId: "42" });
+  });
+
+  it("a prepaid wallet with a negative balance can book what was paid in (the production shape of 22 November)", async () => {
+    const prepaid = transport({ getBalance: async () => ({ agencyId: 42, currencyRequested: "AED" as const, balanceMinor: -24_406n, creditFacilityMinor: 0n, payableBalanceMinor: 24_406n }) });
+    expect((await adapterFor(prepaid.t).funds()).spendableMinor).toBe(24_406n);
+  });
+
+  it("a balance read that does not parse is never a figure", async () => {
+    const broken = transport({ getBalance: async () => ({ agencyId: 42, currencyRequested: "AED" as const, balanceMinor: 0n, creditFacilityMinor: 0n }) as never });
+    await expect(adapterFor(broken.t).funds()).rejects.toThrow();
   });
 
   it("records the status and Date header of the last call (SUP-21)", () => {

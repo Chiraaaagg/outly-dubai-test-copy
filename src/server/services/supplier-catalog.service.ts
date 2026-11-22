@@ -18,6 +18,8 @@ import { offerTermsHash, parseStoredOffer, parseStoredPolicy } from "../supplier
 import { ageBandMismatches, offerReadinessFacts } from "../suppliers/traveldesk/traveldesk.quote";
 import { readinessService } from "./readiness.service";
 import { verifyStepUp } from "./approval.service";
+import { gateVerdict, loadCapabilityGate } from "../suppliers/capability-gate";
+import { CAPABILITY_DERIVATION_VERSION, deriveCapabilities } from "../suppliers/traveldesk/traveldesk.capability";
 import type { ReadLimits } from "../suppliers/read-budget";
 import { TravelDeskApiError } from "../suppliers/traveldesk/traveldesk.http";
 import { bookingAccountId, DEFAULT_BOOKING_ACCOUNT_ID, mutationInFlight, takeReadToken } from "./supplier-booking.service";
@@ -134,6 +136,42 @@ function toJson(value: unknown): Prisma.InputJsonValue {
 
 function hashOf(value: unknown): string {
   return createHash("sha256").update(stableJson(value)).digest("hex");
+}
+
+/**
+ * Derive and store the offer's capability (doc 29 §3.1, Batch 1a) from the
+ * payload exactly as stored, so the stored row and the gate's own derivation
+ * read the same input. Provenance only: the gate never reads this row.
+ */
+async function storeCapability(
+  supplierId: string,
+  environment: SupplierEnvironment,
+  catalogueItemId: string,
+  offerExternalId: string,
+  offerPayload: Prisma.InputJsonValue,
+  tourPayload: Prisma.InputJsonValue,
+  at: Date,
+) {
+  const cap = deriveCapabilities(offerPayload);
+  const data = {
+    catalogueItemId,
+    fulfilment: cap.dimensions.fulfilment,
+    timeShape: cap.dimensions.timeShape,
+    arrival: cap.dimensions.arrival,
+    route: cap.dimensions.route,
+    pricingUnit: cap.dimensions.pricingUnit,
+    classKey: cap.classKey,
+    reviewReasons: cap.reviewReasons,
+    rawValues: toJson(cap.raw),
+    derivationVersion: CAPABILITY_DERIVATION_VERSION,
+    offerTermsHash: offerTermsHash(offerPayload, tourPayload),
+    derivedAt: at,
+  };
+  await prisma.supplierOfferCapability.upsert({
+    where: { supplierId_environment_offerExternalId: { supplierId, environment, offerExternalId } },
+    create: { id: uuidv7(), supplierId, environment, offerExternalId, ...data },
+    update: data,
+  });
 }
 
 /** `code` exists so integration tests can isolate themselves on their own supplier row. */
@@ -330,8 +368,16 @@ export interface VariantMappingState {
     supplierFreeCancellationHours: number | null;
     /** True: no pickup. False: the offer collects from hotels. Null: the stored offer cannot be read. */
     isDirectReporting: boolean | null;
+    /** The stored slots' start times (minutes after midnight); null when the stored offer cannot be read. */
+    slotStartMinutes: number[] | null;
+    /** Whether a stored slot is an "any time" slot; null when the stored offer cannot be read. */
+    anyTimeSlots: boolean | null;
     /** The supplier account a quote in this environment checks against; null when TravelDesk is not configured for it. */
     accountId: string | null;
+    /** The offer's composed capability class (doc 29 §3.1); `unknown` when the stored offer cannot be read. */
+    capabilityClassKey?: string;
+    /** Why the capability gate refuses instant sale; null when it allows it. */
+    capabilityRefusal?: string | null;
   } | null;
   /** Empty when the mapping side is ready; readiness adds its own reasons. */
   blockers: MappingBlocker[];
@@ -367,7 +413,11 @@ export const supplierCatalogService = {
    *  - `slot_rules_unknown`: the stored offer cannot be read, or a slot-based
    *    offer has no slots;
    *  - `capability_not_ready`: not a live-book offer (on request, TicketOnly or
-   *    unknown), or the supplier row is not the TravelDesk adapter;
+   *    unknown), the supplier row is not the TravelDesk adapter, or the
+   *    capability gate refuses the offer (doc 29 §3.3, Batch 1a): its class is
+   *    unknown or never sellable, needs review, its exact class key is not
+   *    switched on for this environment, or it lacks the per-offer evidence
+   *    the flag asks for (`capabilityRefusal` says which);
    *  - `unit_not_mapped`: the offer's child or infant age band does not reach
    *    the top of the page's band for that unit (`PAGE_PAX_AGES`,
    *    `ageBandMismatches`, N3). That unit is also left out of
@@ -399,6 +449,12 @@ export const supplierCatalogService = {
     });
     const byKey = new Map(items.map((i) => [`${i.kind}:${i.externalId}`, i]));
     const accountId = supplierCheckAccountId(environment);
+    const gate = await loadCapabilityGate(prisma, {
+      adapter: supplier.adapter,
+      supplierId: supplier.id,
+      environment,
+      offerExternalIds: mappings.flatMap((m) => (m.supplierOfferId ? [m.supplierOfferId] : [])),
+    });
 
     const states = variants.map((variantCode): VariantMappingState => {
       const m = mappings.find((x) => x.variantCode === variantCode) ?? mappings.find((x) => x.variantCode === null);
@@ -418,7 +474,16 @@ export const supplierCatalogService = {
       if (!present || m.syncStatus === "missing_upstream") blockers.push("mapping_missing_upstream");
       else if (m.syncStatus !== "ok" || !m.approvedOfferHash || currentOfferHash !== m.approvedOfferHash) blockers.push("mapping_changed_upstream");
       if (!stored || (stored.bookingKind === "live_book" && stored.timeSlots.length === 0)) blockers.push("slot_rules_unknown");
-      if (supplier.adapter !== "traveldesk" || !ref.success || ref.data.bookingKind !== "live_book" || m.bookingKind !== "live_book") blockers.push("capability_not_ready");
+      // The capability lookup is added beside the old live-book test, which stays, so the verdict is never more permissive (Batch 1a parity).
+      const capability = gateVerdict(gate, m.supplierOfferId ?? "", offer && !offer.removedAt ? offer.payload : null, currentOfferHash);
+      if (
+        supplier.adapter !== "traveldesk" ||
+        !ref.success ||
+        ref.data.bookingKind !== "live_book" ||
+        m.bookingKind !== "live_book" ||
+        !capability.verdict.instant
+      )
+        blockers.push("capability_not_ready");
       if (bandMismatch.length) blockers.push("unit_not_mapped");
 
       return {
@@ -438,6 +503,8 @@ export const supplierCatalogService = {
           issuesTicketsAtConfirm: ref.success ? (ref.data.ticketEvidence?.issuesTicketsAtConfirm ?? "unknown") : "unknown",
           ...facts,
           accountId,
+          capabilityClassKey: capability.verdict.classKey,
+          capabilityRefusal: capability.verdict.instant ? null : capability.verdict.reason,
         },
         blockers,
       };
@@ -494,12 +561,13 @@ export const supplierCatalogService = {
       result.tours += 1;
       const items = [tourItem(detail), ...detail.offers.map(offerItem)];
       result.offers += detail.offers.length;
+      const tourPayload = toJson(tourItem(detail).payload);
       for (const item of items) {
         const payloadHash = hashOf(item.payload);
         const key = { supplierId_environment_kind_externalId: { supplierId: supplier.id, environment, kind: item.kind, externalId: item.externalId } };
         const existing = await prisma.supplierCatalogueItem.findUnique({ where: key });
         if (!existing) {
-          await prisma.supplierCatalogueItem.create({
+          const created = await prisma.supplierCatalogueItem.create({
             data: {
               id: uuidv7(),
               supplierId: supplier.id,
@@ -516,11 +584,13 @@ export const supplierCatalogService = {
               lastSeenAt: runStarted,
             },
           });
+          if (item.kind === "offer") await storeCapability(supplier.id, environment, created.id, item.externalId, toJson(item.payload), tourPayload, runStarted);
           result.added += 1;
           continue;
         }
         if (existing.removedAt) result.revived += 1;
         if (existing.payloadHash !== payloadHash) result.changed += 1;
+        if (item.kind === "offer") await storeCapability(supplier.id, environment, existing.id, item.externalId, toJson(item.payload), tourPayload, runStarted);
         await prisma.supplierCatalogueItem.update({
           where: { id: existing.id },
           data: {

@@ -52,7 +52,7 @@ type Connection = "ok" | "offline" | "rate_limited" | "lost_access";
  * Renders the server projection it is given, and nothing it was not given:
  * headline and next step as text, then the one action that state needs
  * (checkout redesign batch 1): "Download voucher" when the voucher is ready
- * and this viewer may download it; "Text me a code" (the existing order-bound
+ * and this viewer may download it; "Send me a code" (the existing order-bound
  * recovery, in place) when it is ready but hidden from this browser (CO-02);
  * "Return to payment" while Stripe has not confirmed a payment and this tab
  * made it (CO-06, the same `POST /api/checkout`). Then a payment → booking →
@@ -217,7 +217,7 @@ export function OrderStatusView({ initial, returnHint = null }: { initial: Custo
   const ticketItem = !multi && BOOKED_STATES.includes(status.state) && firstItem?.timeslot && /^\d{2}:\d{2}$/.test(firstItem.timeslot) ? firstItem : null;
   const ticketDate = ticketItem ? new Date(`${ticketItem.serviceDate}T${ticketItem.timeslot}:00+04:00`) : null;
 
-  // After an unlock the "Text me a code" form is gone: focus moves to the download that replaced it.
+  // After an unlock the "Send me a code" form is gone: focus moves to the download that replaced it.
   const focusDownloads = useRef(false);
   const downloadsRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -499,11 +499,11 @@ function VoucherUnlock({ reference, onUnlocked }: { reference: string; onUnlocke
               setOpen(true);
             }}
           >
-            Text me a code
+            Send me a code
           </Button>
           <p className="mt-2 flex gap-2 text-sm text-ink-700">
             <Lock className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
-            We send a 6-digit code to the mobile number you booked with. No account or password needed.
+            We send a 6-digit code to the mobile number or email you booked with. No account or password needed.
           </p>
         </>
       )}

@@ -37,6 +37,9 @@ import { READ_BUDGET, type ReadClass, type ReadLimits } from "../suppliers/read-
 import { mutationHealth, READ_BUDGET_REASON, type ReadGate } from "../suppliers/traveldesk/traveldesk.booking-adapter";
 import { isConfirmedSnapshot, withinChargeTolerance } from "../suppliers/traveldesk/traveldesk.confirmation";
 import { SUPPLIER_WALLET_BOOK, type SupplierRefundFigure, walletEntriesFor, walletPhaseOf } from "../suppliers/wallet-ledger";
+import { bookingAccountId, DEFAULT_BOOKING_ACCOUNT_ID } from "../suppliers/control-account";
+import { checkOfferCapability } from "../suppliers/capability-gate";
+import { candidateSpendable, DIRECTION_PAUSES, type DirectionVerdict, type FundsRefusal, type FundsWithWallet, orderSpendable, walletDirection, walletSpendable, type WalletFigures } from "../suppliers/wallet-funds";
 import { APPROVAL_TTL_MS, canonicalPayload, OPERATION_PERMISSION, privilegedPayloadHash } from "./approval.service";
 
 /**
@@ -119,14 +122,8 @@ export const bookingControlSchema = z.object({
 });
 export type BookingControl = z.infer<typeof bookingControlSchema>;
 
-/** The account segment in test while no agency id is pinned (SUP-10). Never used in production. */
-export const DEFAULT_BOOKING_ACCOUNT_ID = "default";
-
-/** The account a worker or intake acts for: the pinned id, else `default` in test, else none (mutations refused). */
-export function bookingAccountId(environment: SupplierEnvironment, pinned: string | null | undefined): string | null {
-  if (pinned) return pinned;
-  return environment === "test" ? DEFAULT_BOOKING_ACCOUNT_ID : null;
-}
+// The account helpers live in a pure module so the admin page and action share them (doc 29 D2); re-exported for existing callers.
+export { bookingAccountId, DEFAULT_BOOKING_ACCOUNT_ID, pinnedControlAccount } from "../suppliers/control-account";
 
 export function bookingControlKey(supplierCode: string, environment: SupplierEnvironment, accountId: string = DEFAULT_BOOKING_ACCOUNT_ID) {
   return bookingControlKeyFor(supplierCode, environment, accountId);
@@ -417,6 +414,12 @@ const DETAIL_KEYS = new Set([
   "code",
   "account",
   "approvalId",
+  // Wallet funds (doc 29 §4.5): AED minor units of the agency wallet, never a per-booking supplier price beyond the expected net already stored on the row.
+  "fundsMinor",
+  "runningMinor",
+  "expectedMinor",
+  "deltaMinor",
+  "verdict",
 ]);
 const DETAIL_CODE = /^[A-Za-z0-9_.:-]{1,80}$/;
 
@@ -1295,6 +1298,62 @@ async function resetOutageCounter(tx: Tx, supplierCode: string, environment: Sup
   await tx.$executeRaw`UPDATE settings SET value = jsonb_build_object('fails', jsonb_build_array()), updated_at = now() WHERE key = ${outageCounterKey(supplierCode, environment, accountId)}`;
 }
 
+/* ---------------------------------------------------------------------------
+ * Wallet funds (doc 29 §4.5, defect D1)
+ * ------------------------------------------------------------------------ */
+
+/** The control's `reason` when the wallet direction guard stopped all writes. */
+export const WALLET_DIRECTION_PAUSE_REASON = "wallet_direction_auto";
+
+/** States in which Outly's own reservation holds wallet money not yet confirmed (the explanation allowed for a payable figure below the derived one). */
+const OPEN_HOLD_STATES: SupplierBookingState[] = ["reserving", "reserved", "awaiting_payment", "confirming"];
+
+/** Outly's own open holds on the booking's supplier account, other than the booking itself. */
+async function openHoldsMinor(b: Pick<SupplierBooking, "id" | "supplierId" | "environment" | "accountId">): Promise<bigint> {
+  const rows = await prisma.supplierBooking.findMany({
+    where: { supplierId: b.supplierId, environment: b.environment, accountId: b.accountId, state: { in: OPEN_HOLD_STATES }, id: { not: b.id } },
+    select: { expectedNetMinor: true, chargedNetMinor: true },
+  });
+  return rows.reduce((sum, x) => sum + (x.chargedNetMinor !== null && x.chargedNetMinor > x.expectedNetMinor ? x.chargedNetMinor : x.expectedNetMinor), 0n);
+}
+
+/**
+ * The direction guard's stop (doc 29 §4.5 rule 4): the control row is set to
+ * an emergency stop (`all_writes`, reason `wallet_direction_auto`, no
+ * operator name), with an audit row, an `alert` event on the booking and an
+ * error event; the ops sweep emails it (`supplier_wallet_paused`). Never
+ * loosens: a row already at `all_writes`, an invalid row (already an
+ * emergency stop) and a missing row (already paused in production) are left
+ * as they are. A `new_sales` pause is tightened to `all_writes`. Nothing
+ * resumes automatically: resume is the privileged `setControl` path.
+ */
+export async function pauseForWalletDirection(
+  scope: { supplierCode: string; supplierId: string; environment: SupplierEnvironment; accountId: string },
+  bookingId: string,
+  verdict: DirectionVerdict,
+): Promise<boolean> {
+  const controlKey = bookingControlKey(scope.supplierCode, scope.environment, scope.accountId);
+  const paused = await prisma.$transaction(async (tx) => {
+    const [control] = await tx.$queryRaw<{ value: unknown }[]>`SELECT value FROM settings WHERE key = ${controlKey} FOR UPDATE`;
+    await writeEvent(tx, bookingId, "alert", { detail: { reason: WALLET_DIRECTION_PAUSE_REASON, verdict } });
+    if (!control) return false;
+    const parsed = bookingControlSchema.safeParse(control.value);
+    if (!parsed.success || (parsed.data.paused && parsed.data.scope === "all_writes")) return false;
+    const next = bookingControlSchema.parse({ ...parsed.data, paused: true, scope: "all_writes", reason: WALLET_DIRECTION_PAUSE_REASON });
+    await tx.setting.update({ where: { key: controlKey }, data: { value: next, updatedBy: null } });
+    await audit(
+      SYSTEM_ACTOR,
+      "supplier_bookings.pause",
+      { type: "supplier", id: scope.supplierId },
+      { before: { key: controlKey, ...parsed.data }, after: { key: controlKey, ...next, trigger: { verdict, bookingId } }, reason: WALLET_DIRECTION_PAUSE_REASON },
+      tx,
+    );
+    return true;
+  }, TX_OPTIONS);
+  emitEvent("supplier.wallet_paused", { supplierCode: scope.supplierCode, environment: scope.environment, account: scope.accountId, reason: WALLET_DIRECTION_PAUSE_REASON, verdict }, "error");
+  return paused;
+}
+
 /* ===========================================================================
  * Service
  * ======================================================================== */
@@ -1481,15 +1540,24 @@ export const supplierBookingService = {
   /**
    * Controls of both environments plus booking counts per environment and
    * state, for the admin page. `control` is the one of `opts.environment`
-   * (default test).
+   * (default test). `accounts` names the account per environment, as the
+   * write action resolves it (`pinnedControlAccount`, doc 29 D2): the page
+   * then shows the row a change would write. An environment whose account is
+   * null (production with no pin on this deployment) shows as paused, which
+   * is what the engine does with it. `accountId` alone applies to both.
    */
-  async overview(actor: Actor, opts: { supplierCode?: string; environment?: SupplierEnvironment; accountId?: string } = {}) {
+  async overview(actor: Actor, opts: { supplierCode?: string; environment?: SupplierEnvironment; accountId?: string; accounts?: Record<SupplierEnvironment, string | null> } = {}) {
     requirePermission(actor, "suppliers.manage");
     const code = opts.supplierCode ?? TRAVELDESK_SUPPLIER_CODE;
     const supplier = await prisma.supplier.findUnique({ where: { code } });
+    const controlOf = async (environment: SupplierEnvironment): Promise<BookingControl> => {
+      const account = opts.accounts ? opts.accounts[environment] : (opts.accountId ?? DEFAULT_BOOKING_ACCOUNT_ID);
+      if (account === null) return { ...bookingControlSchema.parse({}), paused: true, reason: "No TravelDesk account is pinned for this environment on this deployment (TRAVELDESK_AGENCY_ID)" };
+      return bookingControl(code, environment, account);
+    };
     const controls: Record<SupplierEnvironment, BookingControl> = {
-      test: await bookingControl(code, "test", opts.accountId),
-      production: await bookingControl(code, "production", opts.accountId),
+      test: await controlOf("test"),
+      production: await controlOf("production"),
     };
     const control = controls[opts.environment ?? "test"];
     const none = { test: null, production: null } as Record<SupplierEnvironment, ReconcileSummary | null>;
@@ -1676,6 +1744,23 @@ export const supplierBookingService = {
         if (input.orderId && item.orderId !== input.orderId) throw Errors.validation({ orderItemId: "The order item belongs to another order" });
         // PRD-3: an assisted conversion never creates a supplier attempt, whatever the caller says.
         if (item.fulfilmentOrigin !== "instant_checkout") throw Errors.conflict("This order item was not sold through instant checkout", { orderItemId: input.orderItemId });
+        // The same capability lookup readiness and the saga use (doc 29 §3.3): no stored offer, or a class not switched on, refuses.
+        const offerRow = await db.supplierCatalogueItem.findUnique({
+          where: { supplierId_environment_kind_externalId: { supplierId: supplier.id, environment: input.environment, kind: "offer", externalId: String(input.offerId) } },
+          select: { payload: true, removedAt: true },
+        });
+        const mapping = input.mappingId ? await db.productSupplierMapping.findUnique({ where: { id: input.mappingId }, select: { approvedOfferHash: true } }) : null;
+        const capability = await checkOfferCapability(db, {
+          adapter: supplier.adapter,
+          supplierId: supplier.id,
+          environment: input.environment,
+          offerExternalId: String(input.offerId),
+          payload: offerRow && !offerRow.removedAt ? offerRow.payload : null,
+          termsHash: mapping?.approvedOfferHash ?? null,
+        });
+        if (!capability.verdict.instant) {
+          throw Errors.conflict("This offer's booking class is not enabled for instant sale", { classKey: capability.verdict.classKey, reason: capability.verdict.reason });
+        }
       }
       const { control } = await readControl(code, input.environment, accountId);
       if (control.paused) throw Errors.conflict("Supplier bookings are paused", { reason: control.reason ?? null, scope: control.scope });
@@ -2116,7 +2201,10 @@ export const supplierBookingService = {
       return "balance_unavailable";
     }
     if (accountMismatch(b, funds.accountId)) return this.refuseForAccount(b, kind, deps);
-    const after = funds.spendableMinor - b.expectedNetMinor;
+    // Doc 29 §4.5 (D1): fail closed on figures that do not add up, and check a further item of an order against its running total.
+    const checked = await this.fundsCheck(b, funds as FundsWithWallet);
+    if (!checked.ok) return this.refuseForFunds(b, kind, checked.reason, deps);
+    const after = checked.spendableMinor - b.expectedNetMinor;
     if (after < BigInt(control.minFundsAfterMinor)) {
       await transitionWithEvent(b, "not_created", { errorCode: "balance_floor", errorMessage: `Funds after booking ${after} below floor ${control.minFundsAfterMinor}` }, { saga: deps.saga });
       return "not_created:balance_floor";
@@ -2157,7 +2245,110 @@ export const supplierBookingService = {
     }
     // Keep the supplier id first, so a failure further down still leaves the booking findable by id.
     await prisma.supplierBooking.updateMany({ where: { id: b.id }, data: { supplierBookingId: o.snapshot.ref } });
-    return this.applySupplierState(sending, o.snapshot, deps, kind === "reserve" ? "reserved_at" : "created", undefined, kind === "create" ? o.tickets : undefined);
+    try {
+      return await this.applySupplierState(sending, o.snapshot, deps, kind === "reserve" ? "reserved_at" : "created", undefined, kind === "create" ? o.tickets : undefined);
+    } finally {
+      // After the state is kept: the wallet must have moved the right way (doc 29 §4.5 rule 4). Never throws.
+      await this.walletDirectionGuard(b, { spendableMinor: checked.currentMinor, wallet: (funds as FundsWithWallet).wallet }, o.snapshot, deps);
+    }
+  },
+
+  /**
+   * The funds a reserve is checked against (doc 29 §4.5 rules 1–3). With the
+   * raw wallet figures (TravelDesk): the lower of `payableBalance` and
+   * `creditFacility − balance`, refused when a figure is missing, the payable
+   * figure is negative, or the two differ by more than a cent beyond Outly's
+   * own open holds on the account. An adapter that reports one figure only is
+   * taken at its word. For an order, a further item is checked against the
+   * lower of that figure and the order's running total: the order's first
+   * read (its earliest `funds_check` event) minus the expected cost of each
+   * of its items whose reserve was sent since. Every check that passes is
+   * recorded as a `funds_check` event with the current read.
+   */
+  async fundsCheck(b: SupplierBooking, funds: FundsWithWallet): Promise<{ ok: true; spendableMinor: bigint; currentMinor: bigint } | { ok: false; reason: FundsRefusal | "funds_record_invalid" }> {
+    let current = funds.spendableMinor;
+    if (funds.wallet) {
+      const v = walletSpendable(funds.wallet, await openHoldsMinor(b));
+      if (!v.ok) return v;
+      current = v.spendableMinor;
+    }
+    let running: bigint | null = null;
+    let spendable = current;
+    if (b.orderId) {
+      const scope = { orderId: b.orderId, supplierId: b.supplierId, environment: b.environment, accountId: b.accountId };
+      const first = await prisma.supplierBookingEvent.findFirst({ where: { kind: "funds_check", booking: scope }, orderBy: [{ at: "asc" }, { id: "asc" }], select: { at: true, detail: true } });
+      if (first) {
+        const firstRead = (first.detail as { fundsMinor?: unknown } | null)?.fundsMinor;
+        if (typeof firstRead !== "number" || !Number.isSafeInteger(firstRead)) return { ok: false, reason: "funds_record_invalid" };
+        const since = await prisma.supplierBooking.findMany({
+          where: {
+            ...scope,
+            id: { not: b.id },
+            state: { notIn: [...GUARD_RELEASING_STATES, "queued"] },
+            events: { some: { kind: "request_sent", operation: { in: [OPERATION.reserve, OPERATION.create] }, at: { gte: first.at } } },
+          },
+          select: { expectedNetMinor: true, chargedNetMinor: true },
+        });
+        const reserved = since.reduce((sum, x) => sum + (x.chargedNetMinor !== null && x.chargedNetMinor > x.expectedNetMinor ? x.chargedNetMinor : x.expectedNetMinor), 0n);
+        ({ spendableMinor: spendable, runningMinor: running } = orderSpendable(current, BigInt(firstRead), reserved));
+      }
+    }
+    await writeEvent(prisma, b.id, "funds_check", { detail: { fundsMinor: Number(current), runningMinor: running === null ? null : Number(running) } });
+    return { ok: true, spendableMinor: spendable, currentMinor: current };
+  },
+
+  /**
+   * Fail closed on wallet figures that do not add up (doc 29 §4.5 rule 2):
+   * nothing is sent, the job waits, and a human is told once per booking
+   * (attention, `funds_unverified`, an alert event; the ops sweep emails it).
+   */
+  async refuseForFunds(b: SupplierBooking, kind: string, reason: FundsRefusal | "funds_record_invalid", deps: Deps) {
+    const t = deps.now();
+    const told = await prisma.supplierBookingEvent.count({ where: { supplierBookingId: b.id, kind: "alert", detail: { path: ["reason"], equals: "funds_unverified" } } });
+    if (told === 0) {
+      await prisma.supplierBooking.updateMany({ where: { id: b.id, state: b.state }, data: { attentionRequiredAt: b.attentionRequiredAt ?? t, errorCode: "funds_unverified", errorMessage: "The supplier wallet figures failed the funds check; nothing was sent" } });
+      await writeEvent(prisma, b.id, "alert", { detail: { reason: "funds_unverified", code: reason, jobKind: kind } });
+      emitEvent("supplier.funds_unverified", { environment: b.environment, account: b.accountId, reason }, "error");
+    }
+    await enqueue(prisma, kind, b.id, new Date(t.getTime() + 60_000), deps.holder);
+    return `funds_unverified:${reason}`;
+  },
+
+  /**
+   * Direction guard (doc 29 §4.5 rule 4), production only: right after an
+   * accepted reserve or create, read the wallet again. Funds that did not
+   * move, or rose by about the booking's cost, are clear evidence that the
+   * sign convention or the debit-at-reserve assumption is wrong: all supplier
+   * writes are paused (`all_writes`, `pauseForWalletDirection`). A larger
+   * drop is other bookings on the same agency (staff also book through the
+   * TravelDesk portal, doc 29 §8.4 decision 3) and passes. A smaller drop, a
+   * rise of another size or an unreadable wallet may be another movement
+   * (a portal cancellation, a top-up): an alert, never a pause. Every verdict
+   * is recorded as a `wallet_direction` event. A fault here is reported and
+   * never changes the booking.
+   */
+  async walletDirectionGuard(b: SupplierBooking, before: { spendableMinor: bigint; wallet?: WalletFigures }, snapshot: Pick<SupplierSnapshot, "chargedNetMinor">, deps: Pick<EngineDeps, "adapter" | "supplierCode">) {
+    if (b.environment !== "production" || !before.wallet) return;
+    try {
+      const cost = snapshot.chargedNetMinor !== null && snapshot.chargedNetMinor > 0n ? snapshot.chargedNetMinor : b.expectedNetMinor;
+      const read = (await deps.adapter.funds().catch(() => null)) as (FundsWithWallet & { accountId: string }) | null;
+      const afterMinor = read?.wallet && !accountMismatch(b, read.accountId) ? candidateSpendable(read.wallet) : null;
+      let verdict: DirectionVerdict | "unverified" = "unverified";
+      if (afterMinor !== null) {
+        verdict = walletDirection({ beforeMinor: before.spendableMinor, afterMinor, costMinor: cost });
+        await writeEvent(prisma, b.id, "wallet_direction", { detail: { verdict, fundsMinor: Number(afterMinor), deltaMinor: Number(afterMinor - before.spendableMinor), expectedMinor: Number(cost) } });
+      } else {
+        await writeEvent(prisma, b.id, "wallet_direction", { detail: { verdict } });
+      }
+      if (verdict !== "unverified" && DIRECTION_PAUSES.includes(verdict)) {
+        await pauseForWalletDirection({ supplierCode: deps.supplierCode ?? TRAVELDESK_SUPPLIER_CODE, supplierId: b.supplierId, environment: b.environment, accountId: b.accountId }, b.id, verdict);
+      } else if (verdict === "partial" || verdict === "rose_unexplained" || verdict === "unverified") {
+        await writeEvent(prisma, b.id, "alert", { detail: { reason: "wallet_direction_unclear", verdict } });
+        emitEvent("supplier.wallet_direction", { environment: b.environment, account: b.accountId, verdict }, "warn");
+      }
+    } catch (e) {
+      emitEvent("supplier.wallet_guard_failed", { reason: e instanceof Error ? e.name : "error" }, "error");
+    }
   },
 
   /** Re-read the controls immediately before a money-taking call; when this kind is held, put the job back for later. */
@@ -2891,8 +3082,9 @@ export const supplierBookingService = {
  * Check and burn an applied approval for a control change, inside the
  * control's transaction. The approval must be for this exact change, applied
  * within the approval TTL, and the actor must be its requester or approver.
+ * Also used by the capability flags (supplier-capability.service.ts).
  */
-async function useApproval(tx: Tx, actor: Actor, approvalId: string, operation: PrivilegedOperation, payload: Record<string, unknown>, environment: SupplierEnvironment, now: Date) {
+export async function useApproval(tx: Tx, actor: Actor, approvalId: string, operation: PrivilegedOperation, payload: Record<string, unknown>, environment: SupplierEnvironment, now: Date) {
   const row = await tx.privilegedApproval.findUnique({ where: { id: approvalId } });
   const permission = OPERATION_PERMISSION[operation];
   const fail = (why: string) => Errors.conflict(`The approval cannot be used: ${why}`, { approvalId });

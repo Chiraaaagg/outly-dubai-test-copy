@@ -34,6 +34,16 @@ describe("activity schema", () => {
     expect(activityInputSchema.safeParse({ ...input, confirmation: "manual", fulfilmentMode: "instant" }).success).toBe(false);
   });
 
+  it("a stored instant document whose confirmation turned manual still parses; readiness, not the schema, drops it to inquiry (D3)", () => {
+    const a = { ...activities[0], fulfilmentMode: "instant" as const, confirmation: "manual" as const };
+    expect(activitySchema.safeParse(a).success).toBe(true);
+    // The editor sends the input without the mode (it defaults to inquiry) and the service mirrors the column's mode.
+    const { id: _id, rating: _r, reviewCount: _rc, bookedThisMonth: _b, fulfilmentMode: _m, ...input } = a;
+    const parsed = activityInputSchema.safeParse(input);
+    expect(parsed.success).toBe(true);
+    expect(activitySchema.safeParse({ ...activities[0], ...parsed.data, fulfilmentMode: "instant" }).success).toBe(true);
+  });
+
   it("projects the scalar columns in minor units", () => {
     const p = projectActivity(activities[0]);
     expect(p.priceFromInr).toBe(BigInt(activities[0].price.adult.inr * 100));

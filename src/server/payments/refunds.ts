@@ -6,6 +6,7 @@ import { log } from "../lib/logger";
 import { appendOnce, lockPayment } from "./ledger";
 import type { RemedyRequest } from "./contracts";
 import type { GatewayRegistry } from "./registry";
+import { enqueueCrmSyncForOrders } from "../crm/crm.outbox";
 
 /**
  * Refunds and customer remedies (F5, F16, F45, F46, F56; SUP-20, TKT-8).
@@ -284,6 +285,8 @@ export function createRefundDriver(deps: { gateways: GatewayRegistry; now: () =>
         evidenceRef: `refund:${r.payment.environment ?? "unknown"}:${r.provider}:${r.providerRefundId ?? r.idempotencyKey}`,
         occurredAt: at.toISOString(),
       });
+      // CRM outbox: a verified refund lowers the deal's opportunity (doc 29 §5.4).
+      await enqueueCrmSyncForOrders(tx, [r.payment.orderId]);
     }, TX_OPTIONS);
   }
 

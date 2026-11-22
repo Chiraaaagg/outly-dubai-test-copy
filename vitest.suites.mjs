@@ -35,7 +35,10 @@ export const DB_SUITES = [
   "src/server/services/__tests__/quote.store.test.ts",
   "src/server/services/__tests__/supplier-booking.service.test.ts",
   "src/server/services/__tests__/supplier-catalog.service.test.ts",
+  "src/server/services/__tests__/supplier-capability.service.test.ts",
   "src/server/services/__tests__/traveldesk-catalogue-sync.service.test.ts",
+  // CRM batch C1: outbox, links, Postgres store, worker on the fake portal, erasure and retention.
+  "src/server/crm/__tests__/crm.db.test.ts",
 ];
 
 /**

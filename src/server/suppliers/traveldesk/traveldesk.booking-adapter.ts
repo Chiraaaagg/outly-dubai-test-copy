@@ -15,6 +15,7 @@ import type { TicketEvidence } from "../../documents/contracts";
 import { type TravelDeskBooking, type TravelDeskBookingAnswer, TravelDeskBookingClient } from "./traveldesk.booking";
 import type { TravelDeskConfig } from "./traveldesk.config";
 import type { SupplierRefundFigure } from "../wallet-ledger";
+import { candidateSpendable, type WalletFigures } from "../wallet-funds";
 import { confirmationSnapshotFrom } from "./traveldesk.confirmation";
 import { isTravelDeskApiError, type TravelDeskCallEvent, type TravelDeskErrorKind, type TravelDeskHttpOptions } from "./traveldesk.http";
 
@@ -307,12 +308,19 @@ export class TravelDeskBookingAdapter implements SupplierBookingAdapter, CallObs
     return { accountId: String(b.agencyId) };
   }
 
-  /** `min(payableBalance, balance + creditFacility)` until Q-C1 says which one TravelDesk enforces (SUP-10). */
-  async funds() {
+  /**
+   * Spendable funds (doc 29 §4.5, D1): the lower of `payableBalance` and
+   * `creditFacility − balance`. A negative balance is prepaid money in the
+   * agency's favour, so a prepaid wallet with balance −244.06 and no credit
+   * can book 244.06. The raw figures go along as `wallet`: the engine applies
+   * the fail-closed cross-check (`walletSpendable`) before any reserve.
+   */
+  async funds(): Promise<{ spendableMinor: bigint; currency: "AED"; accountId: string; wallet: WalletFigures }> {
     const b = await this.balance();
-    const total = b.balanceMinor + b.creditFacilityMinor;
-    const spendable = b.payableBalanceMinor < total ? b.payableBalanceMinor : total;
-    return { spendableMinor: spendable, currency: "AED" as const, accountId: String(b.agencyId) };
+    const wallet: WalletFigures = { balanceMinor: b.balanceMinor, creditFacilityMinor: b.creditFacilityMinor, payableMinor: b.payableBalanceMinor };
+    const spendable = candidateSpendable(wallet);
+    if (spendable === null) throw new Error("TravelDesk balance figures are missing");
+    return { spendableMinor: spendable, currency: "AED" as const, accountId: String(b.agencyId), wallet };
   }
 
   async hold(a: AttemptRequest): Promise<MutationOutcome> {

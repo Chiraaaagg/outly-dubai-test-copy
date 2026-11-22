@@ -327,7 +327,13 @@ describe("readiness facts from the stored offer", () => {
       netAedMinorByUnit: { adult: 11_000n, child: 6_000n, infant: 0n, trip: 0n }, // the expired period is ignored
       supplierFreeCancellationHours: 72,
       isDirectReporting: true,
+      slotStartMinutes: [1260],
+      anyTimeSlots: false,
     });
+    // Starts are unique and ascending; an "any time" slot is reported; an unknown offer has no starts.
+    const many = offerOf({ timeSlots: [storedSlot({ startMinutes: 1260 }), storedSlot({ timeSlotId: 12, startMinutes: 600, isAnyTime: true }), storedSlot({ timeSlotId: 13, startMinutes: 600 })] });
+    expect(offerReadinessFacts(many, policy, TODAY)).toMatchObject({ slotStartMinutes: [600, 1260], anyTimeSlots: true });
+    expect(offerReadinessFacts(null, policy, TODAY)).toMatchObject({ slotStartMinutes: null, anyTimeSlots: null });
     expect(offerReadinessFacts(offerOf({ isDirectReporting: false }), policy, TODAY).isDirectReporting).toBe(false);
   });
 
@@ -349,7 +355,7 @@ describe("readiness facts from the stored offer", () => {
     expect(offerReadinessFacts(offerOf(), [{ moreThanHours: 24, refundPercent: 50 }], TODAY).supplierFreeCancellationHours).toBe(0);
     expect(offerReadinessFacts(offerOf(), [{ moreThanHours: 0, refundPercent: 100 }], TODAY).supplierFreeCancellationHours).toBe(0);
     expect(offerReadinessFacts(offerOf(), null, TODAY).supplierFreeCancellationHours).toBeNull();
-    expect(offerReadinessFacts(null, policy, TODAY)).toEqual({ supplierUnits: [], netAedMinorByUnit: null, supplierFreeCancellationHours: 72, isDirectReporting: null });
+    expect(offerReadinessFacts(null, policy, TODAY)).toEqual({ supplierUnits: [], netAedMinorByUnit: null, supplierFreeCancellationHours: 72, isDirectReporting: null, slotStartMinutes: null, anyTimeSlots: null });
   });
 });
 

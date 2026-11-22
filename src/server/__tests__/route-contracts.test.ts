@@ -37,6 +37,7 @@ const JOB_GETS = new Map([
   ["GET jobs/supplier-reconcile", "reads TravelDesk bookings and balance; records the reconcile summary"],
   ["GET jobs/documents-tick", "ticket documents: missing-codes sweep, F12 attention, evidenced document reads and PDF downloads into private storage"],
   ["GET jobs/fx-refresh", "fetches the ECB USD/INR rate and, when every guard passes, writes a new pricing.fx_inr_per_aed version"],
+  ["GET jobs/crm-worker", "CRM outbox delivery to Bitrix24 deals and its retention purge; skipped unless CRM_SYNC_ENABLED=true (not scheduled in C1)"],
 ]);
 
 interface RouteFile {

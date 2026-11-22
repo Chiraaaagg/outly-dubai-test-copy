@@ -248,6 +248,22 @@ describe.skipIf(!enabled)("engine ticket hook (local DB, fake adapter)", () => {
     logger = (await import("../../lib/logger")).log;
     supplierId = uuidv7();
     await prisma.supplier.create({ data: { id: supplierId, code: CODE, name: "Tickets (engine test)", source: "api", adapter: "traveldesk" } });
+    // Customer intents pass the capability gate (doc 29 Batch 1a): the stored offer is in a seeded class.
+    const { storedOffer, storedSlot } = await import("../../suppliers/__tests__/fixtures/traveldesk-terms");
+    await prisma.supplierCatalogueItem.create({
+      data: {
+        id: uuidv7(),
+        supplierId,
+        environment: "test",
+        kind: "offer",
+        externalId: String(OFFER),
+        parentExternalId: "1",
+        name: "engine test offer",
+        bookingKind: "live_book",
+        payload: storedOffer({ offerId: OFFER, tourId: 1, timeSlots: [storedSlot({ timeSlotId: 9, startMinutes: 1260, endMinutes: 1365 })] }) as never,
+        payloadHash: "x",
+      },
+    });
   });
 
   beforeEach(() => {

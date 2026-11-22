@@ -22,6 +22,10 @@ const TRAVELDESK_TABLES = [
   "supplier_booking_events",
   "supplier_jobs",
   "supplier_account_leases",
+  // Doc 29 Batch 1a.
+  "supplier_offer_capabilities",
+  "supplier_capability_flags",
+  "supplier_offer_enablement",
 ];
 
 describe.skipIf(!dbEnabled)("schema lint: RLS and API-role grants in public", () => {

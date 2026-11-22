@@ -51,7 +51,22 @@ function line(over: Record<string, unknown> = {}) {
   };
 }
 
-function fakeTx(over: { item?: Record<string, unknown>; quote?: Record<string, unknown> | null; lines?: unknown[]; mapping?: Record<string, unknown> | null; offer?: unknown } = {}) {
+/** The flags migration 20261122120000 seeds: the two proven fixed-start keys, on, no per-offer evidence. */
+const SEEDED_FLAGS = [
+  { classKey: "live.fixed_slot_single.self.internal.per_person", enabled: true, requiresOfferEvidence: false },
+  { classKey: "live.fixed_slot_choice.self.internal.per_person", enabled: true, requiresOfferEvidence: false },
+];
+
+function fakeTx(
+  over: {
+    item?: Record<string, unknown>;
+    quote?: Record<string, unknown> | null;
+    lines?: unknown[];
+    mapping?: Record<string, unknown> | null;
+    offer?: unknown;
+    flags?: { classKey: string; enabled: boolean; requiresOfferEvidence: boolean }[];
+  } = {},
+) {
   return {
     orderItem: {
       findUnique: async () => ({
@@ -77,11 +92,13 @@ function fakeTx(over: { item?: Record<string, unknown>; quote?: Record<string, u
               supplierId: "sup-1",
               supplierOfferId: "501",
               externalRef: { tourId: 3001, offerId: 501, bookingKind: "live_book", isExternal: false },
-              supplier: { code: "traveldesk" },
+              supplier: { code: "traveldesk", adapter: "traveldesk" },
               ...over.mapping,
             },
     },
     supplierCatalogueItem: { findUnique: async () => ({ payload: over.offer ?? storedOffer({ timeSlots: [storedSlot()] }), removedAt: null }) },
+    supplierCapabilityFlag: { findMany: async () => over.flags ?? SEEDED_FLAGS },
+    supplierOfferEnablement: { findMany: async () => [] },
   };
 }
 
@@ -150,6 +167,10 @@ describe("engineSagaApi (B3)", () => {
       [fakeTx({ lines: [line({ slotRef: "12@21:00" })] }), "slot_rules_unknown"],
       [fakeTx({ offer: storedOffer({ timeSlots: [storedSlot({ endMinutes: null })] }) }), "slot_rules_unknown"],
       [fakeTx({ offer: { not: "an offer" } }), "offer_unreadable"],
+      // The capability gate (doc 29 Batch 1a): a class switched off since the quote, or a class never switched on.
+      [fakeTx({ flags: [] }), "capability_not_enabled"],
+      [fakeTx({ offer: storedOffer({ isDirectReporting: false, timeSlots: [storedSlot()] }) }), "capability_not_enabled"],
+      [fakeTx({ mapping: { supplier: { code: "traveldesk", adapter: "manual" } } }), "capability_not_enabled"],
       [fakeTx({ lines: [line({ units: { trip: 2 }, unitDefinitions: [{ unitId: "trip", supplierUnit: "trip" }] })] }), "unit_rule_failed"],
       [fakeTx({ lines: [line({ pickup: { hotelRef: "Example Hotel" } })] }), "pickup_unreadable"],
       [fakeTx({ lines: [line({ supplierNetUsdMinor: null })] }), "supplier_usd_net_missing"],

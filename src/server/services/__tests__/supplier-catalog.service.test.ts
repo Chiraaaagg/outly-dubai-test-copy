@@ -175,8 +175,22 @@ describe.skipIf(!enabled)("supplierCatalogService (local DB)", () => {
     const first = await svc.syncTravelDeskCatalogue(source([t]), "test", { supplierCode: CODE });
     expect(first).toMatchObject({ tours: 1, offers: 2, added: 3, removed: 0, removalsApplied: true });
 
+    // Each offer's capability is derived and stored with its provenance (doc 29 Batch 1a).
+    const sup = await prisma.supplier.findUniqueOrThrow({ where: { code: CODE } });
+    const caps = await prisma.supplierOfferCapability.findMany({ where: { supplierId: sup.id, environment: "test" }, orderBy: { offerExternalId: "asc" } });
+    expect(caps.map((c) => [c.offerExternalId, c.classKey, c.reviewReasons])).toEqual([
+      [String(OFFER_A), "live.fixed_slot_single.self.internal.per_person", []],
+      // No AED price period: the price basis is unknown, so the class is too.
+      [String(OFFER_B), "unknown", ["no_aed_price"]],
+    ]);
+    expect(caps[0]).toMatchObject({ fulfilment: "live", timeShape: "fixed_slot_single", arrival: "self", route: "internal", pricingUnit: "per_person", derivationVersion: 1 });
+    expect(caps[0].rawValues).toMatchObject({ bookingTypeRaw: 1, isDirectReporting: true, slotCount: 1, distinctStarts: 1, perPersonPriced: true, perUnitPriced: false });
+    expect(caps[0].offerTermsHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(JSON.stringify(caps[0].rawValues)).not.toMatch(/12000|8000/);
+
     const again = await svc.syncTravelDeskCatalogue(source([t]), "test", { supplierCode: CODE });
     expect(again).toMatchObject({ added: 0, changed: 0, removed: 0 });
+    expect(await prisma.supplierOfferCapability.count({ where: { supplierId: sup.id, environment: "test" } })).toBe(2);
 
     const changed = tour(TOUR, t.name!, [offer(OFFER_A, TOUR, { maxPax: 40 }), t.offers[1]]);
     expect((await svc.syncTravelDeskCatalogue(source([changed]), "test", { supplierCode: CODE })).changed).toBe(1);
@@ -427,6 +441,8 @@ describe.skipIf(!enabled)("supplierCatalogService (local DB)", () => {
     expect((await mapping()).syncStatus).toBe("ok");
     const ready = await readiness("deluxe");
     expect(ready.blockers).toEqual([]);
+    // The capability gate passes on a seeded class (doc 29 Batch 1a parity).
+    expect(ready.mapping).toMatchObject({ capabilityClassKey: "live.fixed_slot_single.self.internal.per_person", capabilityRefusal: null });
     expect(ready.mapping).toMatchObject({ offerExternalId: String(OFFER_A), bookingKind: "live_book", issuesTicketsAtConfirm: "unknown" });
     expect(ready.mapping!.currentOfferHash).toBe(ready.mapping!.approvedOfferHash);
     // The facts readiness needs, from the stored offer and tour policy (synthetic nets), and the account a quote would check.
@@ -441,7 +457,9 @@ describe.skipIf(!enabled)("supplierCatalogService (local DB)", () => {
     expect(fromCatalogReadiness(await svc.mappingReadinessFor(productId, "test", { supplierCode: CODE })).find((x) => x.variantId === "deluxe")?.pickupOffered).toBe(false);
     // A fully mapped variant with synthetic instant content passes every readiness rule.
     const facts = fromCatalogReadiness(await svc.mappingReadinessFor(productId, "test", { supplierCode: CODE })).filter((x) => x.variantId === "deluxe");
-    const doc = instantDoc({ variants: [{ ...instantDoc().variants[0], id: "deluxe" }] });
+    // The stored offer starts at 21:00 only, so the page offers 21:00 (doc 29 Batch 0 time-slot rule).
+    const doc = instantDoc({ timeSlots: ["21:00"], variants: [{ ...instantDoc().variants[0], id: "deluxe" }] });
+    expect(ready.mapping).toMatchObject({ slotStartMinutes: [1260], anyTimeSlots: false });
     expect(await assessReadiness({ product: product({ id: productId }, doc), mappings: facts, releaseEnabled: true, margin: fakeMargin() })).toMatchObject({ effective: "instant", reasons: [] });
     expect((await readiness("wooden")).blockers).toEqual(["variant_without_mapping"]);
     expect((await svc.mappingReadinessFor(productId, "production", { supplierCode: CODE })).variants.every((v) => v.blockers.includes("variant_without_mapping"))).toBe(true);

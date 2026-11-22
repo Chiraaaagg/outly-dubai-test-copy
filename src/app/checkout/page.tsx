@@ -113,7 +113,7 @@ import { inquiryHref, inquiryReasonForQuote, inquiryReasonText, type InquiryReas
  * the details step with the Phone Input (UAE first, then India), blur
  * validation, and Review & pay with read-only details, the one cancellation
  * statement from the quote, the promo behind "Have a promo code?" and one
- * action, "Verify number and pay …", which turns into the inline OTP card.
+ * action, "Confirm and pay …" (owner decision, doc 29 §8.4 row 9), which turns into the inline code card.
  * Dietary needs and notes are no longer asked on this instant path: they were
  * collected and then dropped (CO-10). The calls, the quote, the price
  * re-consent, the hand-off and every rule below are unchanged.
@@ -209,7 +209,7 @@ function detailErrors(t: Traveller, selfServe: boolean): Record<string, string> 
   else if (selfServe && supplierGuestName(t.fullName) === null) next.fullName = GUEST_NAME_LATIN_MESSAGE;
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(t.email)) next.email = "Enter an email we can send the voucher to.";
   if (!/^\d{7,12}$/.test(t.phone.replace(/\s/g, "")))
-    next.phone = "We need a working mobile number. We text a code to it to confirm your booking.";
+    next.phone = "We need a working mobile number to reach you about your booking.";
   else if (!normalisePhone(t.phone, t.countryCode).valid)
     next.phone = normalisePhone(t.phone, t.countryCode).reason ?? "Check the number.";
   return next;
@@ -1001,7 +1001,7 @@ export default function CheckoutPage() {
                     Mobile number
                   </label>
                   <p id="phone-hint" className="mt-0.5 text-sm text-ink-600">
-                    We text a code to this number to confirm your booking.
+                    We send a code to confirm your booking, to this number or to your email.
                   </p>
                   <PhoneInput
                     id="phone"
@@ -1030,7 +1030,7 @@ export default function CheckoutPage() {
                     id="hotel"
                     value={traveller.hotel ?? ""}
                     onChange={(v) => setTraveller((t) => ({ ...t, hotel: v }))}
-                    hint="Not sure yet? Leave it and tell us later."
+                    hint="Needed for pickup: the hotel the operator collects you from."
                     autoComplete="off"
                   />
                 )}
@@ -1331,7 +1331,7 @@ export default function CheckoutPage() {
                     loadingLabel={quoteState === "loading" ? "Checking the price with the operator…" : "Opening the secure payment page…"}
                     onClick={() => void pay()}
                   >
-                    {payDeposit ? `Verify number and pay ${charge} deposit` : `Verify number and pay ${charge}`}
+                    {payDeposit ? `Confirm and pay ${charge} deposit` : `Confirm and pay ${charge}`}
                   </Button>
                 )}
 
@@ -1345,7 +1345,7 @@ export default function CheckoutPage() {
                 <p className="flex gap-1.5 px-1 text-sm text-ink-600">
                   <Lock aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0" />
                   <span>
-                    First we text a 6-digit code to {phoneShown}. Then you pay by card on Stripe&apos;s secure page, charged in{" "}
+                    First we send a 6-digit code to {phoneShown} or to your email. Then you pay by card on Stripe&apos;s secure page, charged in{" "}
                     {payCurrency}, and come straight back here.
                   </span>
                 </p>

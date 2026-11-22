@@ -94,6 +94,11 @@ export const STRUCTURED_EVENTS = {
   // Supplier outage circuit breaker (doc 22 §32.22): a new-sales pause set automatically, and a breaker fault
   "supplier.outage_paused": ["supplierCode", "environment", "account", "failures", "reason", "lastReason"],
   "supplier.outage_breaker_failed": ["reason"],
+  // Supplier wallet funds (doc 29 §4.5, D1): a reserve held back by the fail-closed check, the direction guard's verdict, its pause and its faults. Codes only, never an amount.
+  "supplier.funds_unverified": ["environment", "account", "reason"],
+  "supplier.wallet_direction": ["environment", "account", "verdict"],
+  "supplier.wallet_paused": ["supplierCode", "environment", "account", "reason", "verdict"],
+  "supplier.wallet_guard_failed": ["reason"],
   // Ops alert emails for instant-path incidents (doc 22 §32.24). Codes and counts only.
   "alerts.claimed": ["alertId", "entityKind", "reason"],
   "alerts.suppressed": ["alertId", "entityKind", "reason"],
@@ -106,6 +111,18 @@ export const STRUCTURED_EVENTS = {
   "payments.tick_starved": ["pass", "consecutive"],
   // Documents right after a supplier confirm (checkout redesign batch 4, CO-40): best effort, the documents tick is the net.
   "document.after_confirm": ["supplierBookingId", "outcome", "reason", "claimed"],
+  // Bitrix24 CRM push (doc 29 §6.4, §6.5; CRM batch C1). Method names, codes, counts and local ids only:
+  // never a CRM URL, credential, record content or provider message.
+  "crm.call": ["method", "status", "durationMs", "outcome"],
+  "crm.enqueue_failed": ["entityType", "entityId", "count", "reason"],
+  "crm.run": ["outcome", "reason", "processed", "pushed", "failed", "dead", "throttled", "breakerOpen", "foreignDue", "durationMs"],
+  "crm.row_done": ["outboxId", "entityType", "entityId", "op", "outcome"],
+  "crm.row_failed": ["outboxId", "entityType", "entityId", "op", "reason", "attempts"],
+  "crm.dead_letter": ["outboxId", "entityType", "entityId", "op", "reason", "attempts"],
+  "crm.twin_detected": ["entityType", "entityId", "count"],
+  "crm.circuit_open": ["reason", "pausedUntil", "failures"],
+  "crm.refused": ["reason"],
+  "crm.retention": ["scheduled", "purgedOutbox", "purgedLinks"],
 } as const satisfies Record<string, readonly string[]>;
 
 export type StructuredEventName = keyof typeof STRUCTURED_EVENTS;

@@ -187,9 +187,9 @@ async function fillDetails(page: Page): Promise<void> {
   await page.getByRole("button", { name: "Continue to review" }).click();
 }
 
-/** The one pay action on Review & pay (batch 2): "Verify number and pay AED …". */
+/** The one pay action on Review & pay (batch 2; label per doc 29 §8.4 row 9): "Confirm and pay AED …". */
 function payButton(page: Page) {
-  return page.getByRole("button", { name: /^Verify number and pay / });
+  return page.getByRole("button", { name: /^Confirm and pay / });
 }
 
 /** Walks a planted all-instant cart to Review & pay with the quote in, or reports /inquiry when the cart went there. */
@@ -304,7 +304,7 @@ test.describe("/checkout with several instant items", () => {
     await expect(main).not.toContainText(/Apple Pay|Google Pay|Amex/);
 
     await page.getByRole("checkbox", { name: /cancellation policy/ }).check();
-    await expect(pay).toHaveAccessibleName(`Verify number and pay ${aed2(totalMajor)}`);
+    await expect(pay).toHaveAccessibleName(`Confirm and pay ${aed2(totalMajor)}`);
     await pay.click();
 
     // The number on the order is verified for this quote (inline OTP card), then one checkout request opens the hosted page.
@@ -420,7 +420,7 @@ standardChecks({
   ready: async (page) => {
     await toPaymentStep(page);
   },
-  primary: (page) => page.locator("#main").getByRole("button", { name: /^(Verify number and pay|Send inquiry)/ }).filter({ visible: true }).first(),
+  primary: (page) => page.locator("#main").getByRole("button", { name: /^(Confirm and pay|Send inquiry)/ }).filter({ visible: true }).first(),
 });
 
 /* ---------------------------------------------------------------- status */

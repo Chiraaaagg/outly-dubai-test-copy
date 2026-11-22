@@ -77,7 +77,7 @@ const SLOT = "h-12 w-9 text-xl sm:w-11";
 export default function OtpVerificationCard({
   id = "otp-verification",
   title = "Confirm your mobile number",
-  description = "Enter the 6-digit code we sent by SMS.",
+  description = "Enter the 6-digit code we sent you.",
   label = "6-digit code",
   resendLabel = "Send a new code",
   resendDisabled = false,

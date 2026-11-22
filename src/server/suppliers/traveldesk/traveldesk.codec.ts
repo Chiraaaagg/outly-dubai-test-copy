@@ -73,6 +73,8 @@ const timeSlotWire = z.object({
   isOnRequest: z.boolean(),
   minimumAdvancedBooking: nint,
   isExternal: z.boolean().optional(),
+  // Not in the spec; sent on a few offers only (1 or 10, 22 Nov 2026). Meaning unknown (doc 29 §8.2 Q7).
+  numberOfUnits: nint,
 });
 
 /** Offer (L3504). */
@@ -327,6 +329,12 @@ export interface TravelDeskTimeSlot {
   isOnRequest: boolean;
   minimumAdvancedBookingHours: number | null;
   isExternal: boolean;
+  /**
+   * Undocumented slot unit count, kept as received. Absent when TravelDesk does
+   * not send it, so payloads of offers without it hash as before. Never used
+   * as a capacity: the capability derivation flags any value but 1 for review.
+   */
+  numberOfUnits?: number;
 }
 
 export interface TravelDeskPricingPeriod {
@@ -445,6 +453,7 @@ export function offerFrom(tourId: number, o: z.infer<typeof offerWire>, warnings
       isOnRequest: t.isOnRequest,
       minimumAdvancedBookingHours: t.minimumAdvancedBooking ?? null,
       isExternal: t.isExternal ?? false,
+      ...(typeof t.numberOfUnits === "number" ? { numberOfUnits: t.numberOfUnits } : {}),
     })),
     pricingPeriods: (o.pricingPeriods ?? []).map((p) => periodFrom(p, warnings)),
   };
@@ -502,7 +511,16 @@ export interface TravelDeskAvailabilityRow {
   price: TravelDeskNetPrice;
 }
 
-/** Throws TravelDeskCurrencyError if any row is not priced in AED. Rows with an unparseable date are dropped and reported. */
+/**
+ * Throws TravelDeskCurrencyError if any row is not priced in AED. Rows with an
+ * unparseable date are dropped and reported.
+ *
+ * One tolerance (doc 29 §7.3 Batch 1a): a row that is not bookable and carries
+ * no currency at all is a date with no price in force (observed on date-only
+ * offers, 22 Nov 2026). It is dropped and reported, so the date reads as not
+ * on sale instead of failing the whole read. A bookable row without a
+ * currency, and any row in another currency, still throws.
+ */
 export function availabilityFrom(wire: z.infer<typeof availabilityWire>): { rows: TravelDeskAvailabilityRow[]; warnings: string[] } {
   const warnings: string[] = [];
   const rows: TravelDeskAvailabilityRow[] = [];
@@ -510,6 +528,10 @@ export function availabilityFrom(wire: z.infer<typeof availabilityWire>): { rows
     const date = datePart(r.availability.date);
     if (!date) {
       warnings.push(`availability row for slot ${r.availability.timeSlotId}: unparseable date`);
+      continue;
+    }
+    if ((r.price.currency === null || r.price.currency === undefined) && r.price.isBookable === false) {
+      warnings.push(`availability row for slot ${r.availability.timeSlotId} on ${date}: no price in force (not on sale)`);
       continue;
     }
     rows.push({

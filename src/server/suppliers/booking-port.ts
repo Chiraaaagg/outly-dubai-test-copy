@@ -253,7 +253,9 @@ export type PrivilegedOperation =
   | "instant.activate"
   | "supplier.resume"
   | "supplier.limits.raise"
-  | "booking.privileged_resolution";
+  | "booking.privileged_resolution"
+  /** Switch a capability class flag on, or record per-offer enablement evidence (doc 29 §3.3, Batch 1a). */
+  | "supplier.capability.enable";
 
 /** Approval outcome: `pending` until a different staff member with the same permission approves. */
 export type PrivilegedApproval =

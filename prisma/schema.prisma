@@ -540,6 +540,8 @@ model Supplier {
   priceSnapshots    SupplierPriceSnapshot[]
   mappingCandidates SupplierMappingCandidate[]
   bookings          SupplierBooking[]
+  offerCapabilities SupplierOfferCapability[]
+  offerEnablements  SupplierOfferEnablement[]
 
   @@map("suppliers")
 }
@@ -612,10 +614,97 @@ model SupplierCatalogueItem {
   /// Set when a sync no longer sees the item; cleared if it comes back.
   removedAt        DateTime?           @map("removed_at") @db.Timestamptz(6)
   supplier         Supplier            @relation(fields: [supplierId], references: [id])
+  capability       SupplierOfferCapability?
 
   @@unique([supplierId, environment, kind, externalId], map: "sci_identity_key")
   @@index([supplierId, environment, kind, removedAt], map: "sci_live_idx")
   @@map("supplier_catalogue_items")
+}
+
+/// Derived booking capability of one supplier offer in one environment (doc 29
+/// §3.1, §3.4; migration 20261122120000). Written by the catalogue sync from the
+/// stored offer (`traveldesk.capability.ts`). The gate re-derives from the
+/// stored offer on every check, so this row is provenance and the admin view;
+/// it never enables anything by itself.
+model SupplierOfferCapability {
+  id                String                @id @db.Uuid
+  supplierId        String                @map("supplier_id") @db.Uuid
+  environment       SupplierEnvironment
+  offerExternalId   String                @map("offer_external_id")
+  catalogueItemId   String                @unique @map("catalogue_item_id") @db.Uuid
+  fulfilment        String
+  timeShape         String                @map("time_shape")
+  arrival           String
+  route             String
+  pricingUnit       String                @map("pricing_unit")
+  /// Composed key, e.g. live.fixed_slot_single.self.internal.per_person; `unknown` or `inquiry_only` otherwise.
+  classKey          String                @map("class_key")
+  reviewReasons     String[]              @default([]) @map("review_reasons")
+  /// The raw supplier values the dimensions came from. Never a price.
+  rawValues         Json                  @default("{}") @map("raw_values")
+  derivationVersion Int                   @map("derivation_version")
+  /// Offer terms hash (traveldesk.offer-terms.ts) of the payload derived from; null when unreadable.
+  offerTermsHash    String?               @map("offer_terms_hash")
+  derivedAt         DateTime              @default(now()) @map("derived_at") @db.Timestamptz(6)
+  supplier          Supplier              @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  catalogueItem     SupplierCatalogueItem @relation(fields: [catalogueItemId], references: [id], onDelete: Cascade)
+
+  @@unique([supplierId, environment, offerExternalId], map: "soc_identity_key")
+  @@index([environment, classKey], map: "soc_class_idx")
+  @@map("supplier_offer_capabilities")
+}
+
+/// One switch per adapter, environment and exact composed class key (doc 29
+/// §3.3). Default off; a missing row is off. Turning one on goes through
+/// approval.service (step-up; a second person in production); turning one
+/// off needs no approval. The database refuses an enabled per-unit key.
+/// Two keys are seeded on by migration 20261122120000 (the named exception).
+model SupplierCapabilityFlag {
+  id                    String              @id @db.Uuid
+  /// Supplier adapter whose class vocabulary the key uses ('traveldesk').
+  adapter               String
+  environment           SupplierEnvironment
+  classKey              String              @map("class_key")
+  enabled               Boolean             @default(false)
+  /// False only on the seeded keys: their offers need no per-offer evidence (§3.3 exception).
+  requiresOfferEvidence Boolean             @default(true) @map("requires_offer_evidence")
+  /// Why it was last changed (also in the audit log).
+  reason                String
+  /// The privileged approval that allowed the last loosening; null for tightening and for the seed.
+  approvalId            String?             @map("approval_id") @db.Uuid
+  /// Staff member who last changed it; null for the migration seed.
+  changedBy             String?             @map("changed_by") @db.Uuid
+  changedAt             DateTime            @default(now()) @map("changed_at") @db.Timestamptz(6)
+  createdAt             DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([adapter, environment, classKey], map: "scf_identity_key")
+  @@map("supplier_capability_flags")
+}
+
+/// Per-offer evidence that an offer may be sold instantly under one class key
+/// (doc 29 §3.3). Rows are never deleted: a withdrawn one is revoked. Evidence
+/// lapses when the offer terms hash changes.
+model SupplierOfferEnablement {
+  id              String              @id @db.Uuid
+  supplierId      String              @map("supplier_id") @db.Uuid
+  environment     SupplierEnvironment
+  offerExternalId String              @map("offer_external_id")
+  classKey        String              @map("class_key")
+  /// contract_test | sandbox_drill | production_booking | neighbour_proof
+  evidenceKind    String              @map("evidence_kind")
+  /// Test name, drill reference or booking reference. Never a price or personal data.
+  reference       String
+  offerTermsHash  String              @map("offer_terms_hash")
+  approvalId      String?             @map("approval_id") @db.Uuid
+  recordedBy      String?             @map("recorded_by") @db.Uuid
+  recordedAt      DateTime            @default(now()) @map("recorded_at") @db.Timestamptz(6)
+  revokedAt       DateTime?           @map("revoked_at") @db.Timestamptz(6)
+  revokedBy       String?             @map("revoked_by") @db.Uuid
+  revokeReason    String?             @map("revoke_reason")
+  supplier        Supplier            @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+
+  @@index([supplierId, environment, offerExternalId, classKey], map: "soe_offer_idx")
+  @@map("supplier_offer_enablement")
 }
 
 /// Supplier net price (and seats, when known) for one offer, date and slot, in
@@ -2064,4 +2153,121 @@ model OpsAlert {
   @@index([lastSuppressedAt], map: "ops_alerts_last_suppressed_idx")
   @@index([dispatchPending], map: "ops_alerts_dispatch_pending_idx")
   @@map("ops_alerts")
+}
+
+/**
+ * ---------------------------------------------------------------------------
+ * Bitrix24 CRM push (doc 29 §6.4, CRM batch C1). Switched off and run only
+ * against a fake portal in C1. None of these tables holds personal data,
+ * payloads, CRM credentials or URLs: ids, versions, codes and timestamps only.
+ * ------------------------------------------------------------------------
+ */
+
+/// CRM outbox: one row per local change of a deal subject (an inquiry, or a
+/// direct-checkout order), written in the domain transaction. No payload: the
+/// worker re-reads current state and pushes a full snapshot, so a row at or
+/// below the link's pushed version is a no-op. Claimed like `supplier_jobs`.
+/// Checks in migration 20261122120000.
+model CrmOutbox {
+  id             String    @id @db.Uuid
+  /// APP_ENV of the writer: development | staging | production
+  environment    String
+  /// The pinned portal host the row is for (CRM_BITRIX_PORTAL_HOST at enqueue).
+  portal         String
+  /// inquiry | order
+  entityType     String    @map("entity_type")
+  entityId       String    @map("entity_id") @db.Uuid
+  /// sync | delete
+  kind           String
+  /// The entity's crm_links.local_version this row was written with.
+  version        BigInt
+  /// Snapshot contract version the writer expected (CRM_PAYLOAD_VERSION).
+  payloadVersion Int       @default(1) @map("payload_version")
+  dedupeKey      String    @unique(map: "crm_outbox_dedupe_key_key") @map("dedupe_key")
+  /// queued | running | done | dead
+  status         String    @default("queued")
+  attempts       Int       @default(0)
+  maxAttempts    Int       @default(8) @map("max_attempts")
+  nextAttemptAt  DateTime  @default(now()) @map("next_attempt_at") @db.Timestamptz(6)
+  lockedBy       String?   @map("locked_by")
+  lockedUntil    DateTime? @map("locked_until") @db.Timestamptz(6)
+  /// A short code (at most 64 characters), never a provider message.
+  lastErrorCode  String?   @map("last_error_code")
+  /// Why a done row is done (pushed, unchanged, stale, not_visible, deleted, ...).
+  outcome        String?
+  /// Delete rows only: erasure | retention.
+  reason         String?
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([environment, portal, status, nextAttemptAt, createdAt], map: "crm_outbox_claim_idx")
+  @@index([entityType, entityId], map: "crm_outbox_entity_idx")
+  @@index([status, updatedAt], map: "crm_outbox_status_updated_idx")
+  @@map("crm_outbox")
+}
+
+/// One local deal subject in one portal and environment, and its CRM deal.
+/// Unique per (environment, portal, entity): the row is also the per-entity
+/// lock a worker must hold to create, update or delete (doc 29 §6.4), and its
+/// `local_version` is the per-entity counter the outbox enqueue bumps under
+/// the row lock, so versions follow commit order.
+model CrmLink {
+  id              String    @id @db.Uuid
+  environment     String
+  portal          String
+  /// inquiry | order
+  entityType      String    @map("entity_type")
+  entityId        String    @map("entity_id") @db.Uuid
+  /// Bitrix24 entityTypeId; 2 = deal.
+  crmEntityTypeId Int       @default(2) @map("crm_entity_type_id")
+  /// The Bitrix24 record id, once created or adopted.
+  crmId           BigInt?   @map("crm_id")
+  /// `outlyy-<environment>`: Bitrix24 originatorId (external source).
+  originatorId    String    @map("originator_id")
+  /// `inq:<id>` or `ord:<id>`: Bitrix24 originId (ORIGIN_ID), the search key before every create.
+  originId        String    @map("origin_id")
+  /// pending | creating | active | deleted
+  state           String    @default("pending")
+  /// Written before a create call: a lost answer is resolved by searching originId first.
+  creatingSince   DateTime? @map("creating_since") @db.Timestamptz(6)
+  localVersion    BigInt    @default(0) @map("local_version")
+  pushedVersion   BigInt    @default(0) @map("pushed_version")
+  /// sha256 hex of the last pushed snapshot (echo and no-change detection).
+  pushedHash      String?   @map("pushed_hash")
+  pushedAt        DateTime? @map("pushed_at") @db.Timestamptz(6)
+  lockedBy        String?   @map("locked_by")
+  lockedUntil     DateTime? @map("locked_until") @db.Timestamptz(6)
+  /// Two or more CRM records carry this originId: the oldest is kept, a human removes the rest.
+  twinFlaggedAt   DateTime? @map("twin_flagged_at") @db.Timestamptz(6)
+  deletedAt       DateTime? @map("deleted_at") @db.Timestamptz(6)
+  /// erasure | retention | crm_deleted
+  deleteReason    String?   @map("delete_reason")
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([environment, portal, entityType, entityId], map: "crm_links_entity_key")
+  @@index([environment, portal, state, pushedAt], map: "crm_links_state_pushed_idx")
+  @@map("crm_links")
+}
+
+/// Per portal and environment: the stored portal identity the worker checks
+/// its configuration against, the circuit breaker and throttle pause, and the
+/// single-flight run lease.
+model CrmPortalState {
+  environment         String
+  portal              String
+  /// The deal funnel the links were written into; a different configured funnel refuses the run.
+  categoryId          Int       @map("category_id")
+  originatorId        String    @map("originator_id")
+  pausedUntil         DateTime? @map("paused_until") @db.Timestamptz(6)
+  /// throttled | breaker | auth
+  pauseReason         String?   @map("pause_reason")
+  consecutiveFailures Int       @default(0) @map("consecutive_failures")
+  leaseHolder         String?   @map("lease_holder")
+  leaseUntil          DateTime? @map("lease_until") @db.Timestamptz(6)
+  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@id([environment, portal])
+  @@map("crm_portal_state")
 }

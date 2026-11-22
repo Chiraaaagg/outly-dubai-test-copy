@@ -4,10 +4,12 @@ import {
   createReadinessService,
   demotedForTrigger,
   fromCatalogReadiness,
+  pageStartMinutes,
   policyTextAgrees,
   policyWithinSupplier,
   PRICING_SETTING_KEYS,
   READINESS_RULES_VERSION,
+  slotTimesAgree,
   statedPolicyHours,
   unitRestricted,
   type EligibilityRow,
@@ -73,6 +75,13 @@ describe("assessReadiness: the rules", () => {
     ["upstream gone", () => reasonsFor(product(), [mapping({ state: "missing_upstream" })]), "mapping_missing_upstream"],
     ["adapter cannot book", () => reasonsFor(product(), [mapping({ capabilityReady: false })]), "capability_not_ready"],
     ["slot rules unknown", () => reasonsFor(product(), [mapping({ slotRulesKnown: false })]), "slot_rules_unknown"],
+    ["page start time not the supplier's", () => reasonsFor(product({}, instantDoc({ timeSlots: ["10:00"] }))), "slot_times_mismatch"],
+    ["page lists a start the supplier lacks", () => reasonsFor(product({}, instantDoc({ timeSlots: ["09:00", "21:00"] }))), "slot_times_mismatch"],
+    ["supplier has a start the page lacks", () => reasonsFor(product(), [mapping({ slotStartMinutes: [540, 1260] })]), "slot_times_mismatch"],
+    ["page without start times", () => reasonsFor(product({}, instantDoc({ timeSlots: [] }))), "slot_times_mismatch"],
+    ["page time that is not HH:mm", () => reasonsFor(product({}, instantDoc({ timeSlots: ["9 am"] }))), "slot_times_mismatch"],
+    ["supplier starts unknown", () => reasonsFor(product(), [mapping({ slotStartMinutes: undefined, anyTimeSlots: undefined })]), "slot_times_mismatch"],
+    ["any-time offer (guest-chosen time not supported yet)", () => reasonsFor(product(), [mapping({ anyTimeSlots: true })]), "slot_any_time_unsupported"],
     ["unit not offered by the supplier", () => reasonsFor(product(), [mapping({ supplierUnits: ["adult"] })]), "unit_not_mapped"],
     ["price lowered below the margin floor", () => reasonsFor(product({}, instantDoc({ variants: [{ ...instantDoc().variants[0], units: [{ ...ADULT, price: { inr: 2600, aed: 104 } }] }] }))), "margin_below_floor"],
     ["supplier net unknown", () => reasonsFor(product(), [mapping({ netAedMinorByUnit: null })]), "margin_below_floor"],
@@ -95,6 +104,17 @@ describe("assessReadiness: the rules", () => {
   it("pickup agrees: content with pickup and an offer that collects is instant; unknown pickup facts pass only without pickup", async () => {
     expect((await reasonsFor(product({}, instantDoc({ pickupIncluded: true })), [mapping({ pickupOffered: true })])).effective).toBe("instant");
     expect((await reasonsFor(product(), [mapping({ pickupOffered: undefined })])).effective).toBe("instant");
+  });
+
+  it("page start times equal to the supplier's stored starts pass, in any order (doc 29 Batch 0)", async () => {
+    const two = await reasonsFor(product({}, instantDoc({ timeSlots: ["21:00", "09:00"] })), [mapping({ slotStartMinutes: [540, 1260] })]);
+    expect(two).toMatchObject({ effective: "instant", reasons: [] });
+    expect(slotTimesAgree(["09:00", "09:00"], { slotStartMinutes: [540], anyTimeSlots: false })).toBe("ok");
+    expect(slotTimesAgree(["09:00"], { slotStartMinutes: [540], anyTimeSlots: true })).toBe("slot_any_time_unsupported");
+    expect(slotTimesAgree(["09:00"], { slotStartMinutes: [], anyTimeSlots: false })).toBe("slot_times_mismatch");
+    expect(pageStartMinutes("21:30")).toBe(1290);
+    expect(pageStartMinutes("24:00")).toBeNull();
+    expect(pageStartMinutes("Flexible")).toBeNull();
   });
 
   it("the assessment carries the product version it read", async () => {
@@ -428,7 +448,11 @@ describe("fromCatalogReadiness: the supplier catalogue's states as readiness fac
 
   it("uses supplier units, nets and refund hours when the catalogue reports them", async () => {
     const [out] = wrap([
-      { variantCode: "shared", mapping: m({ supplierUnits: ["adult", "child"], netAedMinorByUnit: { adult: 10_000n, child: 8_000n }, supplierFreeCancellationHours: 24 }), blockers: [] },
+      {
+        variantCode: "shared",
+        mapping: m({ supplierUnits: ["adult", "child"], netAedMinorByUnit: { adult: 10_000n, child: 8_000n }, supplierFreeCancellationHours: 24, slotStartMinutes: [540], anyTimeSlots: false }),
+        blockers: [],
+      },
     ]);
     expect(out).toMatchObject({ supplierUnits: ["adult", "child"], netAedMinorByUnit: { adult: 10_000n, child: 8_000n }, supplierFreeCancellationHours: 24 });
     const r = await assessReadiness({ product: product(), mappings: [{ ...out, issuesTicketsAtConfirm: "yes" }], releaseEnabled: true, margin: fakeMargin() });

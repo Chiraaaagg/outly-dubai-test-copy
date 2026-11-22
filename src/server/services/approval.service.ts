@@ -38,6 +38,8 @@ export const OPERATION_PERMISSION: Readonly<Record<PrivilegedOperation, Permissi
   "supplier.resume": "suppliers.resume",
   "supplier.limits.raise": "suppliers.limits.raise",
   "booking.privileged_resolution": "bookings.privileged_resolution",
+  // Turning a class flag on makes every offer of that class instant-eligible: the instant-activation permission.
+  "supplier.capability.enable": "products.activate_instant",
 });
 
 export type ApprovalEnvironment = "test" | "production";

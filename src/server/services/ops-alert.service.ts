@@ -27,6 +27,9 @@ import { urgentAt } from "./document.service";
  * Incidents (`collectOpsIncidents`), each raised within `OPS_ALERT_LOOKBACK_MS`:
  *  - `supplier_outage_paused`: the outage breaker paused new sales (control
  *    row paused with reason `supplier_outage_auto`);
+ *  - `supplier_wallet_paused`: the wallet direction guard stopped all
+ *    supplier writes (control row paused with reason `wallet_direction_auto`,
+ *    doc 29 §4.5);
  *  - `saga_attention`: a payment saga flagged for a human;
  *  - `item_refund_problem`: a multi-item order's item refund refused or
  *    short (`item_*` failed remedy);
@@ -35,7 +38,8 @@ import { urgentAt } from "./document.service";
  *  - `booking_attention`: a supplier booking needing staff:
  *    `outcome_unknown` past its first recovery search (or
  *    `not_found_unresolved`), `manual_review`, `charged_amount_mismatch`,
- *    `cancel_refused`, a late acceptance;
+ *    `cancel_refused`, a late acceptance, a reserve held back because the
+ *    wallet figures failed the funds check (`funds_unverified`);
  *  - `document_attention`: a ticket document flagged for staff past the
  *    existing F12 thresholds (urgent is its own reason).
  *
@@ -71,7 +75,7 @@ const DISPATCH_LIMIT = 60;
 const DIGEST = { entityKind: "digest", entityId: "hourly", reason: "suppressed" } as const;
 const EPOCH = new Date(0);
 
-export type OpsIncidentKind = "supplier_outage_paused" | "saga_attention" | "item_refund_problem" | "refund_failed" | "booking_attention" | "document_attention";
+export type OpsIncidentKind = "supplier_outage_paused" | "supplier_wallet_paused" | "saga_attention" | "item_refund_problem" | "refund_failed" | "booking_attention" | "document_attention";
 export type OpsEntityKind = "supplier_account" | "payment_saga" | "order_item" | "supplier_booking" | "supplier_document";
 
 export interface OpsIncident {
@@ -93,6 +97,7 @@ export interface OpsIncident {
 
 export const OPS_INCIDENT_TITLES: Record<OpsIncidentKind, string> = {
   supplier_outage_paused: "Supplier outage: new instant sales paused",
+  supplier_wallet_paused: "Supplier wallet check failed: all supplier bookings paused",
   saga_attention: "Payment needs attention",
   item_refund_problem: "Item refund failed or short",
   refund_failed: "Refund failed",
@@ -163,6 +168,7 @@ const date = (v: unknown): Date => (v instanceof Date ? v : new Date(String(v)))
 export function bookingReason(b: { state: string; errorCode: string | null; attention: boolean; recoverySearches: number }): string | null {
   if ((b.errorCode === "late_acceptance" || b.errorCode === "late_acceptance_duplicate") && b.attention) return "late_acceptance";
   if (b.errorCode === "charged_amount_mismatch" && b.attention) return "charged_amount_mismatch";
+  if (b.errorCode === "funds_unverified" && b.attention) return "funds_unverified";
   if (b.state === "manual_review") return "manual_review";
   if (b.state === "cancel_refused") return "cancel_refused";
   // Past its first recovery search: still unknown (or proven not found yet), a human must look.
@@ -173,20 +179,22 @@ export function bookingReason(b: { state: string; errorCode: string | null; atte
 export async function collectOpsIncidents(since: Date, now: Date, limit = COLLECT_LIMIT): Promise<OpsIncident[]> {
   const out: OpsIncident[] = [];
 
-  // The outage breaker's automatic pause, on the control row it wrote (supplier-booking.service.ts noteMutationHealth).
+  // The automatic pauses, on the control row they wrote (supplier-booking.service.ts): the outage breaker
+  // (noteMutationHealth) and the wallet direction guard (pauseForWalletDirection).
   const outages = await prisma.$queryRaw<Row[]>`
-    SELECT key, updated_at FROM settings
-    WHERE key LIKE 'supplier_bookings.%' AND value->>'reason' = 'supplier_outage_auto' AND value->>'paused' = 'true'
+    SELECT key, updated_at, value->>'reason' AS reason FROM settings
+    WHERE key LIKE 'supplier_bookings.%' AND value->>'reason' IN ('supplier_outage_auto', 'wallet_direction_auto') AND value->>'paused' = 'true'
       AND updated_at >= ${since} AND updated_at <= ${now}
     ORDER BY updated_at DESC LIMIT ${limit}`;
   for (const r of outages) {
     const key = String(r.key);
     const code = key.split(".")[1] ?? "";
+    const wallet = r.reason === "wallet_direction_auto";
     out.push({
-      kind: "supplier_outage_paused",
+      kind: wallet ? "supplier_wallet_paused" : "supplier_outage_paused",
       entityKind: "supplier_account",
       entityId: key,
-      reason: "supplier_outage_paused",
+      reason: wallet ? "supplier_wallet_paused" : "supplier_outage_paused",
       raisedAt: date(r.updated_at),
       orderId: null,
       orderReference: null,
@@ -270,7 +278,7 @@ export async function collectOpsIncidents(since: Date, now: Date, limit = COLLEC
       b.order_id, o.reference, COALESCE(b.attention_required_at, b.updated_at) AS raised_at
     FROM supplier_bookings b LEFT JOIN orders o ON o.id = b.order_id
     WHERE (
-        (b.error_code IN ('late_acceptance', 'late_acceptance_duplicate', 'charged_amount_mismatch') AND b.attention_required_at IS NOT NULL)
+        (b.error_code IN ('late_acceptance', 'late_acceptance_duplicate', 'charged_amount_mismatch', 'funds_unverified') AND b.attention_required_at IS NOT NULL)
         OR b.state IN ('manual_review', 'cancel_refused', 'not_found_unresolved')
         OR (b.state = 'outcome_unknown' AND b.recovery_searches >= 1)
       )

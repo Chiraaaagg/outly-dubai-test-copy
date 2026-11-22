@@ -262,7 +262,7 @@ export function RecoveryForm({ unlock }: { unlock?: RecoveryUnlock } = {}) {
 
           <Button type="submit" block size="lg" loading={busy} loadingLabel="Sending…">
             {!unlock && <Search className="h-[1.15rem] w-[1.15rem]" aria-hidden="true" />}
-            {unlock ? "Text me a code" : "Send me a code"}
+            Send me a code
           </Button>
         </form>
       ) : (
