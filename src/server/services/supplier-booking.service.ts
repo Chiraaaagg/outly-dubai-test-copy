@@ -945,27 +945,48 @@ export async function takeQuoteReadToken(supplierCode: string, environment: Supp
 }
 
 /**
+ * Take one browse read (doc 29 §6.3, Batches 2 and 3): the one token for
+ * unauthenticated page reads, an offer's start times on a date
+ * (start-times route via supplier-quote.service.ts) and its pickup hotel list
+ * (pickup-hotels.service.ts). Browse has its own small share
+ * of the same per-account window (`browseCap`) and never takes a read the
+ * quote share could still need, so a browse flood cannot delay or refuse a
+ * quote, and the engine keeps its reserve (`admitRead`,
+ * suppliers/read-budget.ts). False when refused: the page then shows the
+ * stored times, or offers the inquiry for the hotel. `opts.limits` is for tests; the default is `READ_BUDGET` (N5).
+ */
+export async function takeBrowseReadToken(supplierCode: string, environment: SupplierEnvironment, accountId: string, opts: { limits?: ReadLimits } = {}) {
+  return takeClassReadToken(supplierCode, environment, accountId, "browse", opts.limits ?? READ_BUDGET);
+}
+
+/**
  * `admitRead` (suppliers/read-budget.ts) as one update, so concurrent takers
- * re-check the row they wait on. Rows written before the quote class count
- * no quote reads.
+ * re-check the row they wait on. Rows written before the quote or browse
+ * class count no reads of that class.
  */
 async function takeClassReadToken(supplierCode: string, environment: SupplierEnvironment, accountId: string, cls: ReadClass, limits: ReadLimits) {
   const key = requestBudgetKey(supplierCode, environment, accountId);
   const q = cls === "quote" ? 1 : 0;
+  const b = cls === "browse" ? 1 : 0;
+  const browseCap = limits.browseCap ?? 0;
   await prisma.$executeRaw`
-    INSERT INTO settings (key, value, updated_at) VALUES (${key}, jsonb_build_object('windowStart', now(), 'used', 0, 'quoteUsed', 0), now())
+    INSERT INTO settings (key, value, updated_at) VALUES (${key}, jsonb_build_object('windowStart', now(), 'used', 0, 'quoteUsed', 0, 'browseUsed', 0), now())
     ON CONFLICT (key) DO NOTHING`;
   const n = await prisma.$executeRaw`
     UPDATE settings SET
       value = CASE WHEN (value->>'windowStart')::timestamptz <= now() - interval '1 minute'
-                   THEN jsonb_build_object('windowStart', now(), 'used', 1, 'quoteUsed', ${q}::int)
-                   ELSE jsonb_set(jsonb_set(value, '{used}', to_jsonb((value->>'used')::int + 1)),
-                                  '{quoteUsed}', to_jsonb(COALESCE((value->>'quoteUsed')::int, 0) + ${q}::int)) END,
+                   THEN jsonb_build_object('windowStart', now(), 'used', 1, 'quoteUsed', ${q}::int, 'browseUsed', ${b}::int)
+                   ELSE jsonb_set(jsonb_set(jsonb_set(value, '{used}', to_jsonb((value->>'used')::int + 1)),
+                                  '{quoteUsed}', to_jsonb(COALESCE((value->>'quoteUsed')::int, 0) + ${q}::int)),
+                                  '{browseUsed}', to_jsonb(COALESCE((value->>'browseUsed')::int, 0) + ${b}::int)) END,
       updated_at = now()
     WHERE key = ${key} AND CASE WHEN (value->>'windowStart')::timestamptz <= now() - interval '1 minute'
                                 THEN 0 < ${limits.perMinute}::int AND (${q}::int = 0 OR 0 < ${limits.quoteCap}::int)
+                                     AND (${b}::int = 0 OR (0 < ${browseCap}::int AND 1 + ${limits.quoteCap}::int <= ${limits.perMinute}::int))
                                 ELSE (value->>'used')::int < ${limits.perMinute}::int
-                                     AND (${q}::int = 0 OR COALESCE((value->>'quoteUsed')::int, 0) < ${limits.quoteCap}::int) END`;
+                                     AND (${q}::int = 0 OR COALESCE((value->>'quoteUsed')::int, 0) < ${limits.quoteCap}::int)
+                                     AND (${b}::int = 0 OR (COALESCE((value->>'browseUsed')::int, 0) < ${browseCap}::int
+                                          AND (value->>'used')::int + 1 + GREATEST(0, ${limits.quoteCap}::int - COALESCE((value->>'quoteUsed')::int, 0)) <= ${limits.perMinute}::int)) END`;
   return n === 1;
 }
 

@@ -202,8 +202,12 @@ export interface QuoteLineSnapshot {
   /** The unit definitions priced, with their authored prices and restrictions. */
   unitDefinitions: UnitDefinition[];
   addonIds: string[];
-  /** The pickup the supplier check accepted, or null when the line has none. */
-  pickup: { hotelRef: string } | null;
+  /**
+   * The pickup the supplier check accepted, or null when the line has none.
+   * `hotelName` is the name on the supplier's list at quote time (Batch 3),
+   * kept as the order item's display snapshot; absent on older quotes.
+   */
+  pickup: { hotelRef: string; hotelName?: string | null } | null;
   chargedMinor: bigint;
   discountAllocMinor: bigint;
   taxAllocMinor: bigint;
@@ -290,6 +294,8 @@ export type SupplierQuoteResult =
       supplierFreeCancellationUntilUtc: string | null;
       /** TicketOnly: last day (Asia/Dubai, YYYY-MM-DD) the ticket can be used, when the supplier gives one; null otherwise. */
       ticketValidUntil: string | null;
+      /** With a pickup: the accepted hotel's name on the supplier's list, when it has one (Batch 3). */
+      pickupHotelName?: string | null;
     }
   | { ok: false; reason: "closed" | "sold_out" | "past_cutoff" | "invalid_slot" | "on_request" | "unit_rule_failed" | "pickup_unavailable" | "availability_unknown" | "supplier_unavailable" };
 

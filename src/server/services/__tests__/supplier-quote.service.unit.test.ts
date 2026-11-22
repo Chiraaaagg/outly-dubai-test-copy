@@ -135,12 +135,29 @@ describe("supplierQuoteService.quote (SUP-14)", () => {
   });
 
   it("checks the hotel against the offer's list (GET /hotels/foroffer); a hotel not on it is pickup_unavailable without a price read", async () => {
-    for (const hotelRef of ["asdf", "999", "042", "42.0", "Example Marina Hotel"]) {
+    for (const hotelRef of ["999", "44", "123456789"]) {
       const h = harness(collecting());
       expect(await h.svc.quote({ ...input, pickup: { hotelRef } })).toEqual({ ok: false, reason: "pickup_unavailable" });
       expect(h.calls).toEqual(["hotels:501"]);
       expect(h.tokens).toEqual(["traveldesk:test:acct-test"]);
     }
+  });
+
+  it("a malformed hotel ref (a typed name, padded, signed, decimal, too long) is refused before any read (Batch 3)", async () => {
+    for (const hotelRef of ["asdf", "042", "42.0", "-42", "+42", " 42", "4 2", "0", "1234567890", "Example Marina Hotel"]) {
+      const h = harness(collecting());
+      expect(await h.svc.quote({ ...input, pickup: { hotelRef } })).toEqual({ ok: false, reason: "pickup_unavailable" });
+      expect(h.calls).toEqual([]);
+      expect(h.tokens).toEqual([]);
+    }
+  });
+
+  it("a listed hotel comes back with its name on the supplier's list, for the order item snapshot (Batch 3)", async () => {
+    const h = harness(collecting());
+    expect(await h.svc.quote({ ...input, pickup: { hotelRef: "43" } })).toMatchObject({ ok: true, pickupHotelName: "Example Creek Hotel" });
+    // Without a pickup the field is not set at all.
+    const self = harness(context());
+    expect(await self.svc.quote(input)).not.toHaveProperty("pickupHotelName");
   });
 
   it("a listed hotel is quoted; the hotel list alone is reused for a short time, seats and price never", async () => {

@@ -2,6 +2,8 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import choiceFixture from "./fixtures/traveldesk/capability-fixed-slot-choice.json";
+import listedChoiceFixture from "./fixtures/traveldesk/capability-listed-starts-choice.json";
+import listedSingleFixture from "./fixtures/traveldesk/capability-listed-start-single.json";
 import tourFixture from "./fixtures/traveldesk/tour-5.json";
 import { storedOffer, storedSlot } from "./fixtures/traveldesk-terms";
 import { tourDetailFrom, tourDetailsWire, type TravelDeskOffer } from "../traveldesk/traveldesk.codec";
@@ -11,11 +13,14 @@ import {
   deriveCapabilities,
   INQUIRY_CLASS,
   legacyLiveBookGate,
+  LISTED_START_CLASS_KEYS,
+  listedStartsSellable,
   neverEnabledReason,
   parseClassKey,
   SEEDED_CLASS_KEYS,
   UNKNOWN_CLASS,
   type CapabilityFlagState,
+  type DerivedCapability,
 } from "../traveldesk/traveldesk.capability";
 
 /**
@@ -346,5 +351,117 @@ describe("contract fixtures per composed key present in Batch 0", () => {
     expect(variant({ isDirectReporting: false })).toBe("live.fixed_slot_choice.pickup_required.internal.per_person");
     const slots = (base.timeSlots as Json[]).map((s) => ({ ...s, isAnyTime: true }));
     expect(variant({ timeSlots: slots })).toBe("live.listed_starts_customer_selected.self.internal.per_person");
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * Batch 2: the two listed-start keys (doc 29 §3.3, §7.3)
+ * ------------------------------------------------------------------------ */
+
+const LISTED_SINGLE = "live.listed_start_single.self.internal.per_person";
+const LISTED_CHOICE = "live.listed_starts_customer_selected.self.internal.per_person";
+const B2_FLAGS = new Map<string, CapabilityFlagState>([...SEEDED_FLAGS, ...LISTED_START_CLASS_KEYS.map((k) => [k, { enabled: true, requiresOfferEvidence: true }] as const)]);
+/** Evidence for the offer's own listed-start key and current terms: what the approval path records per offer (non-seeded keys always need it). */
+const listedEvidence = (classKey: string) => (LISTED_START_CLASS_KEYS.includes(classKey) ? [{ classKey, offerTermsHash: HASH, revokedAt: null }] : []);
+
+describe("Batch 2 listed-start keys", () => {
+  it("are exactly the two keys of the plan, sellable in principle, and seeded off", () => {
+    expect([...LISTED_START_CLASS_KEYS].sort()).toEqual([LISTED_SINGLE, LISTED_CHOICE].sort());
+    for (const k of LISTED_START_CLASS_KEYS) {
+      expect(neverEnabledReason(k)).toBeNull();
+      expect(SEEDED_CLASS_KEYS).not.toContain(k);
+    }
+  });
+
+  it.each([
+    ["one listed start (synthetic)", listedSingleFixture, LISTED_SINGLE],
+    ["three listed starts on one repeated slot id (synthetic)", listedChoiceFixture, LISTED_CHOICE],
+  ])("contract fixture %s parses with the production schema, derives %s, and is instant only with its own flag on", (_name, wire, key) => {
+    const parsed = tourDetailsWire.safeParse(wire);
+    expect(parsed.success).toBe(true);
+    const detail = tourDetailFrom(parsed.data!);
+    expect(detail.warnings).toEqual([]);
+    const payload = asStored(detail.offers[0]);
+    const cap = deriveCapabilities(payload);
+    expect(cap.classKey).toBe(key);
+    expect(cap.reviewReasons).toEqual([]);
+    // Off by default: no flag row.
+    expect(capabilityVerdict(cap, null, [], HASH)).toEqual({ instant: false, classKey: key, reason: "flag_off" });
+    expect(capabilityVerdict(cap, SEEDED_FLAGS.get(key) ?? null, [], HASH).instant).toBe(false);
+    // On, with evidence asked for: only evidence for this key and these terms counts.
+    expect(capabilityVerdict(cap, { enabled: true, requiresOfferEvidence: true }, [], HASH).instant).toBe(false);
+    expect(capabilityVerdict(cap, { enabled: true, requiresOfferEvidence: true }, [{ classKey: SINGLE, offerTermsHash: HASH, revokedAt: null }], HASH).instant).toBe(false);
+    expect(capabilityVerdict(cap, { enabled: true, requiresOfferEvidence: true }, [{ classKey: key, offerTermsHash: HASH, revokedAt: null }], HASH)).toEqual({ instant: true, classKey: key });
+    // Its slots are all "any time" with a stored end, so the offer may sell as listed starts once the gate allows it.
+    const slots = (payload as { timeSlots: { isAnyTime: boolean; endMinutes: number | null }[] }).timeSlots;
+    expect(listedStartsSellable(true, cap.dimensions.timeShape, slots)).toBe(true);
+    expect(listedStartsSellable(false, cap.dimensions.timeShape, slots)).toBe(false);
+  });
+
+  it("need evidence for that exact key and current terms even if a flag row claims otherwise (the rule for every non-seeded key)", () => {
+    for (const k of LISTED_START_CLASS_KEYS) {
+      const cap: DerivedCapability = { version: 1, dimensions: parseClassKey(k)!, classKey: k, reviewReasons: [], raw: {} as DerivedCapability["raw"] };
+      expect(capabilityVerdict(cap, { enabled: true, requiresOfferEvidence: false }, [], HASH)).toMatchObject({ instant: false, reason: "offer_evidence_missing" });
+      expect(capabilityVerdict(cap, { enabled: true, requiresOfferEvidence: false }, [{ classKey: k, offerTermsHash: "d".repeat(64), revokedAt: null }], HASH)).toMatchObject({ instant: false });
+      expect(capabilityVerdict(cap, { enabled: true, requiresOfferEvidence: false }, [{ classKey: k, offerTermsHash: HASH, revokedAt: null }], HASH)).toEqual({ instant: true, classKey: k });
+    }
+  });
+
+  it("per-unit and mixed-price listed-start keys can never be switched on", () => {
+    for (const shape of ["listed_start_single", "listed_starts_customer_selected"]) {
+      for (const arrival of ["self", "pickup_required"]) {
+        expect(neverEnabledReason(`live.${shape}.${arrival}.internal.per_unit`)).toBe("private_units_inquiry");
+        expect(neverEnabledReason(`live.${shape}.${arrival}.internal.mixed_person_plus_unit`)).toBe("private_units_inquiry");
+      }
+    }
+  });
+
+  it("listed starts sell only when every slot is 'any time' with a stored end; fixed shapes and unknown slots never", () => {
+    const anyTime = (end: number | null) => ({ isAnyTime: true, endMinutes: end });
+    expect(listedStartsSellable(true, "listed_starts_customer_selected", [anyTime(660), anyTime(720)])).toBe(true);
+    expect(listedStartsSellable(true, "listed_starts_customer_selected", [anyTime(660), anyTime(null)])).toBe(false);
+    expect(listedStartsSellable(true, "listed_start_single", [{ isAnyTime: false, endMinutes: 660 }])).toBe(false);
+    expect(listedStartsSellable(true, "fixed_slot_choice", [anyTime(660)])).toBe(false);
+    expect(listedStartsSellable(true, "listed_start_single", [])).toBe(false);
+    expect(listedStartsSellable(true, "listed_start_single", null)).toBe(false);
+  });
+
+  it("a listed-start fixture with pickup, an external route or a per-trip price leaves the Batch 2 keys", () => {
+    const base = (listedChoiceFixture as { offers: Json[] }).offers[0];
+    const variant = (over: Json) => {
+      const wire = { ...listedChoiceFixture, offers: [{ ...base, ...over }] };
+      return deriveCapabilities(asStored(tourDetailFrom(tourDetailsWire.parse(wire)).offers[0])).classKey;
+    };
+    expect(variant({ isDirectReporting: false })).toBe("live.listed_starts_customer_selected.pickup_required.internal.per_person");
+    expect(LISTED_START_CLASS_KEYS).not.toContain(variant({ isDirectReporting: false }));
+    const slotsOff = (base.timeSlots as Json[]).map((t) => ({ ...t, isAnyTime: false }));
+    expect(variant({ timeSlots: slotsOff })).toBe(CHOICE);
+  });
+});
+
+describe.skipIf(!HAS_LEDGER)("Batch 2 coverage over the 22 November 2026 catalogue", () => {
+  it("with the Batch 2 flags on as well, exactly the 16 Batch 0 offers plus the 2 Batch 2 offers pass, and never more than the old gate", () => {
+    const passed: string[] = [];
+    for (const r of LEDGER) {
+      const payload = offerFromLedger(r);
+      const cap = deriveCapabilities(payload);
+      const v = capabilityVerdict(cap, B2_FLAGS.get(cap.classKey) ?? null, listedEvidence(cap.classKey), HASH);
+      if (v.instant) {
+        passed.push(r.offerId);
+        expect(legacyLiveBookGate(payload)).toBe(true);
+      }
+    }
+    const want = LEDGER.filter((r) => r.planBatch === "B0" || r.planBatch === "B2").map((r) => r.offerId);
+    expect(want).toHaveLength(18);
+    expect(passed.sort()).toEqual(want.sort());
+  });
+
+  it("no per-unit or mixed-price listed-start offer passes, even with every listed-start key on", () => {
+    for (const r of LEDGER) {
+      const cap = deriveCapabilities(offerFromLedger(r));
+      if (cap.dimensions.timeShape !== "listed_start_single" && cap.dimensions.timeShape !== "listed_starts_customer_selected") continue;
+      if (cap.dimensions.pricingUnit === "per_person") continue;
+      expect(capabilityVerdict(cap, { enabled: true, requiresOfferEvidence: false }, [], HASH).instant).toBe(false);
+    }
   });
 });

@@ -139,8 +139,23 @@ describe("handle(fn, { timing })", () => {
     },
   );
 
-  it("only the quote route sends the header", () => {
-    expect(SERVER_TIMING_ROUTES).toEqual(["quote"]);
+  it("only quote and the two public read routes send the header (doc 29 §6.6)", () => {
+    expect(SERVER_TIMING_ROUTES).toEqual(["quote", "catalog_start_times", "pickup_hotels"]);
+  });
+
+  it.each(["catalog_start_times", "pickup_hotels"] as const)("adds Server-Timing with durations only to the %s read route", async (route) => {
+    const GET = handle(
+      async () => {
+        recordPhase("supplier", 40);
+        return json({ ok: true });
+      },
+      { timing: route },
+    );
+    const res = await GET(req("/api/catalog/start-times"), undefined as never);
+    const header = res.headers.get("server-timing") ?? "";
+    expect(header).toMatch(SERVER_TIMING);
+    expect(header).toMatch(/^supplier;dur=40, total;dur=/);
+    expect(header).not.toMatch(/req-synthetic|\/api/);
   });
 
   it("times error responses too, with their status", async () => {

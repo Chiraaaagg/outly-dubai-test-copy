@@ -6,8 +6,9 @@
 -- `revoked_at`); without these every batch is a sequential scan. No column,
 -- constraint, row or function changes.
 --
--- Plain CREATE INDEX, not CONCURRENTLY: Prisma runs the file in one
--- transaction, where CONCURRENTLY is refused. It holds a SHARE lock on each
+-- Plain CREATE INDEX, not CONCURRENTLY: CONCURRENTLY would need one
+-- single-statement migration file per index, and the lock timeout and the
+-- migration-safety suite assume one transaction per file. It holds a SHARE lock on each
 -- table while its index builds, which blocks writes (new sessions, sign-in
 -- codes, grants) for that time only. These tables are small at pilot size,
 -- so the build takes well under a second. The lock timeout makes the

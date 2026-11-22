@@ -293,6 +293,17 @@ export interface CartItem {
   fulfilmentMode: FulfilmentMode;
   freeCancellationHours: number;
   durationMinutes: number;
+  /**
+   * Batch 3: the hotel the operator collects from, chosen at checkout from the
+   * offer's list (`hotelId`, the TravelDesk id the quote sends), or typed for
+   * our team when it was not on the list (`hotelId` null; never quoted).
+   */
+  pickupHotel?: PickupHotelChoice;
+}
+
+export interface PickupHotelChoice {
+  hotelId: string | null;
+  name: string;
 }
 
 export type OrderStatus =

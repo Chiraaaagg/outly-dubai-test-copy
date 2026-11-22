@@ -268,7 +268,7 @@ export async function createServerQuote(input: { lines: QuoteLineInput[]; curren
  * instant quote line (a combo, a fixture product without a database id, an
  * unknown variant), and then the whole cart goes to the inquiry path.
  */
-export function quoteLinesFor(items: CartItem[], activities: Activity[], hotel: string | undefined): QuoteLineInput[] | null {
+export function quoteLinesFor(items: CartItem[], activities: Activity[]): QuoteLineInput[] | null {
   const lines: QuoteLineInput[] = [];
   for (const item of items) {
     if (item.kind !== "activity") return null;
@@ -286,7 +286,8 @@ export function quoteLinesFor(items: CartItem[], activities: Activity[], hotel: 
       slotRef: /^([01]\d|2[0-3]):[0-5]\d$/.test(item.time) ? item.time : null,
       units,
       addonIds: item.addOnIds,
-      pickup: activity.pickupIncluded && hotel?.trim() ? { hotelRef: hotel.trim() } : null,
+      // Batch 3: the TravelDesk hotel id chosen from the offer's list; a typed name is never sent (the server refuses it).
+      pickup: activity.pickupIncluded && item.pickupHotel?.hotelId ? { hotelRef: item.pickupHotel.hotelId } : null,
     });
   }
   return lines.length ? lines : null;

@@ -51,7 +51,11 @@ import type { ProductMappingReadiness, VariantMappingState } from "./supplier-ca
  *    offer's stored slot starts, as a set (`slot_times_mismatch`); a page
  *    time that does not parse, a page without times or an offer whose starts
  *    are unknown does not pass. An offer with an "any time" slot is
- *    `slot_any_time_unsupported`: a guest-chosen time is not supported yet;
+ *    `slot_any_time_unsupported`, unless it sells as a choice among its
+ *    listed starts (doc 29 Batch 2, `listedStartsSellable`: its exact
+ *    listed-start class key is switched on and every slot has a stored end);
+ *    then the same set equality applies to its listed starts. Never an
+ *    arbitrary time;
  *  - page price equals quote price: every unit is one of the page's pax
  *    types and its authored price equals the price the activity page shows
  *    for that type (`unit_price_mismatch`);
@@ -91,8 +95,9 @@ import type { ProductMappingReadiness, VariantMappingState } from "./supplier-ca
  * 7 (doc 29 Batch 1b): `catalogue_stale` when the catalogue is older than 48 h or of unknown age.
  * 8 (doc 29 Batch 1b, review R2): the age is the mapped offer's own last successful read, no later
  * than the latest complete run (which must have read at least one tour).
+ * 9 (doc 29 Batch 2): an "any time" offer passes the time rule when it sells as listed starts.
  */
-export const READINESS_RULES_VERSION = 8;
+export const READINESS_RULES_VERSION = 9;
 
 /**
  * Per-mapping facts the readiness rules need, adapted from the supplier
@@ -130,6 +135,8 @@ export interface MappingReadiness {
   slotStartMinutes?: number[] | null;
   /** Whether the offer has an "any time" slot; absent or null = unknown, which never passes. */
   anyTimeSlots?: boolean | null;
+  /** Doc 29 Batch 2: the offer sells as a choice among its listed starts (flag on for its exact key). Absent or null = no. */
+  listedStartsSellable?: boolean | null;
 }
 
 export interface MappingReadinessSource {
@@ -275,11 +282,17 @@ export function pageStartMinutes(time: string): number | null {
 /**
  * Whether the page's start times are the mapped offer's (doc 29 Batch 0).
  * Exact set equality with the stored slot starts; never more permissive:
- * an unparseable page time, no page time, unknown supplier starts or an
- * "any time" slot (unknown counts as one) all refuse.
+ * an unparseable page time, no page time or unknown supplier starts refuse,
+ * and so does an "any time" slot unless the offer sells as listed starts
+ * (Batch 2), whose listed starts must then equal the page's times.
  */
-export function slotTimesAgree(pageTimes: readonly string[], m: Pick<MappingReadiness, "slotStartMinutes" | "anyTimeSlots">): "ok" | "slot_times_mismatch" | "slot_any_time_unsupported" {
-  if (m.anyTimeSlots !== false) return m.anyTimeSlots === true ? "slot_any_time_unsupported" : "slot_times_mismatch";
+export function slotTimesAgree(
+  pageTimes: readonly string[],
+  m: Pick<MappingReadiness, "slotStartMinutes" | "anyTimeSlots" | "listedStartsSellable">,
+): "ok" | "slot_times_mismatch" | "slot_any_time_unsupported" {
+  if (m.anyTimeSlots === null || m.anyTimeSlots === undefined) return "slot_times_mismatch";
+  // Batch 2: "any time" sells only as one of the listed starts, below, and only with its flag on.
+  if (m.anyTimeSlots === true && m.listedStartsSellable !== true) return "slot_any_time_unsupported";
   const supplier = m.slotStartMinutes;
   if (!supplier || supplier.length === 0) return "slot_times_mismatch";
   const page = pageTimes.map(pageStartMinutes);
@@ -652,6 +665,7 @@ export function fromCatalogReadiness(r: ProductMappingReadiness): MappingReadine
       accountId: typeof extra.accountId === "string" && extra.accountId.length > 0 ? extra.accountId : null,
       slotStartMinutes: startsOf(extra.slotStartMinutes),
       anyTimeSlots: typeof extra.anyTimeSlots === "boolean" ? extra.anyTimeSlots : null,
+      listedStartsSellable: extra.listedStartsSellable === true,
     });
   }
   return [...out.values()];

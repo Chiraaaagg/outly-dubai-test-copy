@@ -1,17 +1,21 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { CalendarDays, Check, Lock, ShieldCheck } from "lucide-react";
 import { useApp } from "@/components/providers/app-provider";
 import { Button } from "@/components/ui/button";
 import { DatePickerSheet, DateStrip, GuestSelector, TimeSlots } from "./pickers";
+import { TimeSlotPicker } from "./time-slot-picker";
 import { PaymentMethods } from "./trust";
 import { WhatsAppButton } from "./whatsapp";
 import { ConfirmFirstNote, IndicativePriceNote, ResponsePromise } from "./inquiry-ui";
 import { track } from "@/lib/analytics";
 import { ctaFor } from "@/lib/cta";
-import { computeBreakdown, toCartItem, variantById } from "@/lib/pricing";
+import { computeBreakdown, guestRowsFor, toCartItem, variantById } from "@/lib/pricing";
+import { fetchStartTimes, type StartTimesAnswer } from "@/lib/api/start-times";
+import { startMark } from "@/lib/perf-mark";
+import { useAbortableRead } from "@/lib/use-abortable-read";
 import type { Activity, PaxCount } from "@/lib/types";
 import { EMPTY_PAX, cancellationPolicyBeforeQuote, cn, dubaiToday, formatDateKey, paxBillable, priceIn } from "@/lib/utils";
 
@@ -34,20 +38,34 @@ import { EMPTY_PAX, cancellationPolicyBeforeQuote, cn, dubaiToday, formatDateKey
  *
  * The two objection-handling lines beside the CTA ("why can't I just book",
  * "how long will this take") come straight from §3.4.
+ *
+ * Start times (doc 29 Batch 2). An instant product asks
+ * `/api/catalog/start-times` for the chosen date (one abortable read per
+ * date, kept for a minute). When its offer sells as listed starts, the
+ * answer's times replace the stored chips in the Time Slot Picker, with
+ * their availability marks; any other answer, a failure or a busy budget
+ * keeps the stored chips, and the quote decides as before. Guest rows follow
+ * the offer: no Seniors row without a senior price (owner decision 5).
+ * `retimeItemId` (from checkout's "Choose another time") restores that cart
+ * line, says its time is gone and moves focus to the times; the new choice
+ * replaces the line.
  */
 export function BookingWidget({
   activity,
   className,
   compact,
   initialDate,
+  retimeItemId,
 }: {
   activity: Activity;
   className?: string;
   compact?: boolean;
   initialDate?: string;
+  /** A cart line whose start time the quote refused (`retimeHrefFor`, src/lib/start-time-retry.ts). */
+  retimeItemId?: string;
 }) {
   const router = useRouter();
-  const { currency, addToCart, toast } = useApp();
+  const { currency, addToCart, removeFromCart, cart, toast } = useApp();
   const inquiryMode = activity.fulfilmentMode !== "instant";
   const cta = ctaFor(activity.fulfilmentMode, { quoteOnly: activity.quoteOnly });
 
@@ -62,19 +80,82 @@ export function BookingWidget({
   const [dateOpen, setDateOpen] = useState(false);
 
   const [submitting, setSubmitting] = useState(false);
+  /** Why the times need the visitor's attention: the cart line's time is gone, or no time is chosen yet. */
+  const [timeNotice, setTimeNotice] = useState<string | null>(null);
+  const timesRef = useRef<HTMLDivElement>(null);
+  const [focusTimes, setFocusTimes] = useState(false);
 
-  const breakdown = computeBreakdown(activity, pax, variantId, addOnIds);
+  // Checkout sent the visitor back because the quote refused this line's start time: restore the line once.
+  const retimeItem = retimeItemId ? cart.find((i) => i.id === retimeItemId && i.slug === activity.slug && i.kind === "activity") : undefined;
+  const [restored, setRestored] = useState<string | null>(null);
+  if (retimeItem && restored !== retimeItem.id) {
+    setRestored(retimeItem.id);
+    setDate(retimeItem.date);
+    setPax(retimeItem.pax);
+    if (retimeItem.variantId) setVariantId(retimeItem.variantId);
+    setAddOnIds(retimeItem.addOnIds);
+    setTime(undefined);
+    setTimeNotice(`The ${retimeItem.time} start on ${formatDateKey(retimeItem.date)} is no longer available. Choose another time.`);
+    setFocusTimes(true);
+  }
+
+  // Guest rows follow the offer (owner decision 5): no Seniors row without a senior price.
+  const guestRows = guestRowsFor(activity, variantId);
+  const shownPax: PaxCount = guestRows.includes("senior") || pax.senior === 0 ? pax : { ...pax, senior: 0 };
+
+  // Listed start times for the date (Batch 2). Inquiry products never ask: their times are preferences.
+  const readKey = !inquiryMode && activity.productId && variantId ? `${activity.productId}|${variantId}|${date}` : null;
+  const startTimes = useAbortableRead<StartTimesAnswer>(readKey, async (signal) => {
+    const done = startMark("times_for_date");
+    try {
+      return await fetchStartTimes({ productId: activity.productId!, variantId: variantId!, date }, signal);
+    } finally {
+      done();
+    }
+  });
+  const listed = startTimes.status === "ready" && startTimes.data.source === "supplier" ? startTimes.data : null;
+  // Once this product answered with listed starts, later dates show the picker's own loading state.
+  const [listedProduct, setListedProduct] = useState(false);
+  if (listed && !listedProduct) setListedProduct(true);
+  const pickerTimes = listed
+    ? listed.times.map((t) => ({ time: t.time, status: t.status }))
+    : null;
+  const pickerLoading = listedProduct && startTimes.status === "loading";
+  const usableTime = (t: string | undefined) => !!t && !!pickerTimes?.some((x) => x.time === t && (x.status === "available" || x.status === "limited"));
+  // With listed times on screen, only a time they offer counts as chosen.
+  const chosenTime = pickerTimes ? (usableTime(time) ? time : undefined) : time;
+  const timesFellBack = listedProduct && !listed && startTimes.status !== "loading";
+
+  useEffect(() => {
+    // Wait for this date's answer, so focus lands on the times that will stay on screen.
+    if (!focusTimes || startTimes.status === "loading") return;
+    const el = timesRef.current;
+    if (!el) return;
+    el.scrollIntoView({ block: "center" });
+    el.focus({ preventScroll: true });
+    setFocusTimes(false);
+  }, [focusTimes, startTimes.status]);
+
+  const breakdown = computeBreakdown(activity, shownPax, variantId, addOnIds);
   const variant = variantById(activity, variantId);
 
   const proceed = async () => {
+    // Listed times on screen, or a line sent back for a new time: a time must be chosen, never assumed.
+    if (!chosenTime && (pickerTimes || retimeItem)) {
+      setTimeNotice("Choose a start time first.");
+      setFocusTimes(true);
+      return;
+    }
     setSubmitting(true);
     const item = toCartItem(activity, {
       date,
-      time: time ?? activity.timeSlots[0] ?? "Flexible",
-      pax,
+      time: chosenTime ?? activity.timeSlots[0] ?? "Flexible",
+      pax: shownPax,
       variantId,
       addOnIds,
     });
+    // A line sent back from checkout is replaced, not duplicated.
+    if (retimeItem && retimeItem.id !== item.id) removeFromCart(retimeItem.id);
     addToCart(item);
 
     if (inquiryMode) {
@@ -159,8 +240,8 @@ export function BookingWidget({
         <div className="flex items-end justify-between gap-3">
           <div>
             <p className="text-xs font-bold uppercase tracking-wide text-ink-500">
-              {inquiryMode ? "Indicative total" : paxBillable(pax) > 1 ? "Total for your group" : "Total"}
-              {paxBillable(pax) > 1 && inquiryMode ? ` · ${paxBillable(pax)} guests` : ""}
+              {inquiryMode ? "Indicative total" : paxBillable(shownPax) > 1 ? "Total for your group" : "Total"}
+              {paxBillable(shownPax) > 1 && inquiryMode ? ` · ${paxBillable(shownPax)} guests` : ""}
             </p>
             <p className="font-display text-3xl font-bold tnum text-ink-900">
               {priceIn(breakdown.total, currency)}
@@ -266,26 +347,75 @@ export function BookingWidget({
           )}
         </div>
 
-        {/* ---- Time: the listing's slots, no availability claims ---- */}
-        {activity.timeSlots.length > 1 && (
+        {/* ---- Time: the supplier's listed starts for the date when the offer sells that way
+            (Batch 2), otherwise the listing's slots with no availability claims ---- */}
+        {pickerTimes || pickerLoading ? (
           <div>
-            <p className="mb-2 text-sm font-bold text-ink-900">
-              {inquiryMode
-                ? activity.pickupIncluded ? "Preferred pickup time" : "Preferred start time"
-                : activity.pickupIncluded ? "Pickup time" : "Start time"}
+            <p id="start-time-label" className="mb-2 text-sm font-bold text-ink-900">
+              {activity.pickupIncluded ? "Pickup time" : "Start time"}
             </p>
-            <TimeSlots
-              slots={activity.timeSlots.map((t) => ({ time: t, status: "available" }))}
-              value={time}
-              onChange={setTime}
+            {timeNotice && (
+              <p role="status" className="mb-2 rounded-[var(--radius-control)] bg-sun-50 p-3 text-xs font-semibold leading-relaxed text-sun-800">
+                {timeNotice}
+              </p>
+            )}
+            <TimeSlotPicker
+              date={date}
+              slots={pickerTimes ?? []}
+              loading={pickerLoading}
+              value={chosenTime}
+              groupRef={timesRef}
+              label={activity.pickupIncluded ? "Pickup time" : "Start time"}
+              onValueChange={(t) => {
+                setTime(t);
+                setTimeNotice(null);
+                track("time_selected", { selected_time: t });
+              }}
+              note={
+                startTimes.slow ? (
+                  <p className="text-xs text-ink-600">This is taking longer than usual. You can still continue, or ask us on WhatsApp.</p>
+                ) : listed ? (
+                  <p className="text-xs text-ink-500">
+                    Checked with the operator at <span className="tnum">{asOfDubai(listed.checkedAt)}</span>. Your time is confirmed when you continue.
+                  </p>
+                ) : null
+              }
             />
           </div>
+        ) : (
+          activity.timeSlots.length > 1 && (
+            <div>
+              <p className="mb-2 text-sm font-bold text-ink-900">
+                {inquiryMode
+                  ? activity.pickupIncluded ? "Preferred pickup time" : "Preferred start time"
+                  : activity.pickupIncluded ? "Pickup time" : "Start time"}
+              </p>
+              {timeNotice && (
+                <p role="status" className="mb-2 rounded-[var(--radius-control)] bg-sun-50 p-3 text-xs font-semibold leading-relaxed text-sun-800">
+                  {timeNotice}
+                </p>
+              )}
+              <div ref={timesRef} tabIndex={-1} className="outline-none">
+                <TimeSlots
+                  slots={activity.timeSlots.map((t) => ({ time: t, status: "available" }))}
+                  value={time}
+                  onChange={(t) => {
+                    setTime(t);
+                    setTimeNotice(null);
+                  }}
+                />
+              </div>
+              {timesFellBack && (
+                <p className="mt-2 text-xs text-ink-500">Live times aren&apos;t available right now. We check your time with the operator when you continue.</p>
+              )}
+            </div>
+          )
         )}
 
-        {/* Guests */}
+        {/* Guests: rows follow the offer (owner decision 5) */}
         <div>
           <p className="mb-1 text-sm font-bold text-ink-900">Guests</p>
-          <GuestSelector value={pax} onChange={setPax} />
+          <GuestSelector value={shownPax} onChange={setPax} rows={guestRows} />
         </div>
 
         {/* Add-ons */}
@@ -376,12 +506,12 @@ export function BookingWidget({
             block
             size="lg"
             context={{
-              intent: paxBillable(pax) >= 5 ? "group" : "activity",
+              intent: paxBillable(shownPax) >= 5 ? "group" : "activity",
               activityTitle: `${activity.title}${variant ? `, ${variant.name}` : ""}`,
               activityUrl: `https://outlyy.com/activities/${activity.slug}`,
               date: formatDateKey(date),
-              time,
-              pax,
+              time: chosenTime,
+              pax: shownPax,
               priceLabel: priceIn(breakdown.total, currency),
               placement: "adp_widget",
             }}
@@ -428,6 +558,11 @@ export function BookingWidget({
       />
     </div>
   );
+}
+
+/** `HH:mm` in Dubai for an "as of" line; the visitor's own clock never decides it. */
+function asOfDubai(iso: string): string {
+  return new Date(iso).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "Asia/Dubai" });
 }
 
 /**

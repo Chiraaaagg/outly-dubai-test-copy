@@ -1488,6 +1488,10 @@ model OrderItem {
   /// reserve and confirm order). Null for assisted items and rows written before multi-item checkout. Unique per
   /// order when set (order_items_order_quote_line_key, SQL only; migration 20261103140000).
   quoteLineIndex     Int?      @map("quote_line_index")
+  /// Batch 3 (doc 29 §3.4): the TravelDesk hotel id the quote accepted for pickup (plain decimal), and the hotel's
+  /// name on the supplier's list at quote time. Null for items without pickup and rows written before Batch 3.
+  pickupHotelId           String? @map("pickup_hotel_id")
+  pickupHotelNameSnapshot String? @map("pickup_hotel_name_snapshot")
 
   order                Order                 @relation(fields: [orderId], references: [id])
   product              Product?              @relation(fields: [productId], references: [id])

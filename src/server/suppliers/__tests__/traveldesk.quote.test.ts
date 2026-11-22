@@ -9,6 +9,8 @@ import {
   HALF_DIRHAM_MARGIN_MINOR_PER_UNIT,
   freeCancellationUntilMs,
   hotelOnPickupList,
+  LIMITED_SEATS_AT,
+  listedStartsOn,
   netUsdMinorOf,
   offerReadinessFacts,
   paxAllowed,
@@ -158,7 +160,8 @@ describe("live-book slot quote (SUP-14)", () => {
     expect(slotRulesFor(offer.timeSlots, 11, 660)?.startMinutes).toBe(540);
     const disagree = offerOf({ timeSlots: [agree[0], storedSlot({ startMinutes: 600, isAnyTime: true, isOnRequest: true })] });
     expect(slotRulesFor(disagree.timeSlots, 11, 660)).toBeNull();
-    expect(slot([row({ startMinutes: 660 })], { offer: disagree, slotRef: "11@11:00" })).toEqual({ ok: false, reason: "availability_unknown" });
+    // 11:00 is not one of the listed starts (09:00, 10:00): since doc 29 Batch 2 it is refused as a start, before any rules join.
+    expect(slot([row({ startMinutes: 660 })], { offer: disagree, slotRef: "11@11:00" })).toEqual({ ok: false, reason: "invalid_slot" });
   });
 
   it("pax outside the offer's rules is unit_rule_failed", () => {
@@ -399,5 +402,76 @@ describe("pickup (CR-B2-4)", () => {
     expect(ageBandMismatches(terms({ childrenAllowed: false, childAge: 0, infantsAllowed: false, infantAge: 0 }), page)).toEqual([]);
     // A page band without an upper limit cannot be covered.
     expect(ageBandMismatches(terms({}), { ...page, child: { min: 3, max: null } })).toEqual(["child"]);
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * Doc 29 Batch 2: listed starts ("any time" offers)
+ * ------------------------------------------------------------------------ */
+
+/** Three listed starts on one repeated "any time" slot id (the shape of the 22 Nov catalogue), synthetic. */
+function listedOffer(over: Record<string, unknown> = {}, end: (start: number) => number | null = (start) => start + 60) {
+  return offerOf({
+    timeSlots: [600, 780, 960].map((startMinutes) => storedSlot({ timeSlotId: 31, startMinutes, endMinutes: end(startMinutes), isAnyTime: true, minimumAdvancedBookingHours: 8 })),
+    ...over,
+  });
+}
+const listedRow = (startMinutes: number, over: Parameters<typeof row>[0] = {}) => row({ timeSlotId: 31, startMinutes, endMinutes: startMinutes + 60, ...over });
+
+describe("listed starts: the quote (Batch 2)", () => {
+  it("sells a listed start from its fresh row", () => {
+    const q = slot([listedRow(780)], { offer: listedOffer(), slotRef: "13:00" });
+    expect(q).toMatchObject({ ok: true, slotRef: "31@13:00" });
+  });
+
+  it("refuses a start outside the supplier's listed starts, even when a fresh row names it", () => {
+    expect(slot([listedRow(840)], { offer: listedOffer(), slotRef: "14:00" })).toEqual({ ok: false, reason: "invalid_slot" });
+    expect(slot([listedRow(840)], { offer: listedOffer(), slotRef: "31@14:00" })).toEqual({ ok: false, reason: "invalid_slot" });
+    // An arbitrary minute between two listed starts is no start either.
+    expect(slot([listedRow(601)], { offer: listedOffer(), slotRef: "10:01" })).toEqual({ ok: false, reason: "invalid_slot" });
+  });
+
+  it("refuses a listed start with no stored end time: the booking would have no end to send", () => {
+    expect(slot([listedRow(780)], { offer: listedOffer({}, () => null), slotRef: "13:00" })).toEqual({ ok: false, reason: "availability_unknown" });
+  });
+
+  it("stale slot: a listed start that sold out since the page read it is sold_out at quote", () => {
+    expect(slot([listedRow(780, { seatsLeft: 0, price: { isBookable: false } })], { offer: listedOffer(), slotRef: "13:00" })).toEqual({ ok: false, reason: "sold_out" });
+    expect(slot([listedRow(780, { seatsLeft: 1 })], { offer: listedOffer(), slotRef: "13:00" })).toEqual({ ok: false, reason: "sold_out" });
+  });
+
+  it("several listed starts and no time chosen is invalid_slot, never a guess", () => {
+    expect(slot([listedRow(600), listedRow(780)], { offer: listedOffer(), slotRef: null })).toEqual({ ok: false, reason: "invalid_slot" });
+  });
+});
+
+describe("listed starts: the public start-times answer (Batch 2)", () => {
+  it("lists only the stored starts, in order, with marks and no price or count", () => {
+    const rows = [listedRow(600), listedRow(780, { seatsLeft: LIMITED_SEATS_AT }), listedRow(960, { seatsLeft: 0, price: { isBookable: false } }), listedRow(840)];
+    const times = listedStartsOn(listedOffer(), SERVICE_DATE, rows, NOW);
+    expect(times).toEqual([
+      { time: "10:00", status: "available" },
+      { time: "13:00", status: "limited" },
+      { time: "16:00", status: "sold_out" },
+    ]);
+    for (const t of times!) expect(Object.keys(t).sort()).toEqual(["status", "time"]);
+  });
+
+  it("a start with no row, past its cut-off, on request or on a closed day is unavailable; a sentinel count is available, not limited", () => {
+    const lateNow = new Date("2026-11-11T23:00:00Z"); // 03:00 in Dubai on the day: 10:00 is past its 8-hour cut-off, 16:00 is not
+    expect(listedStartsOn(listedOffer(), SERVICE_DATE, [listedRow(600), listedRow(960, { seatsLeft: 99_999 })], lateNow)).toEqual([
+      { time: "10:00", status: "unavailable" },
+      { time: "13:00", status: "unavailable" },
+      { time: "16:00", status: "available" },
+    ]);
+    expect(listedStartsOn(listedOffer(), SERVICE_DATE, [listedRow(600, { seatsLeft: 0 })], NOW)?.[0]).toEqual({ time: "10:00", status: "unavailable" });
+    expect(listedStartsOn(listedOffer({ daysOffered: 1 }), SERVICE_DATE, [listedRow(600)], NOW)?.[0]).toEqual({ time: "10:00", status: "unavailable" });
+    expect(listedStartsOn(listedOffer(), SERVICE_DATE, [listedRow(600, { date: "2026-11-13" })], NOW)?.[0]).toEqual({ time: "10:00", status: "unavailable" });
+  });
+
+  it("is null for an offer that is not wholly 'any time' with stored ends, so the page keeps its stored times", () => {
+    expect(listedStartsOn(offerOf(), SERVICE_DATE, [row()], NOW)).toBeNull();
+    expect(listedStartsOn(listedOffer({}, (s) => (s === 960 ? null : s + 60)), SERVICE_DATE, [], NOW)).toBeNull();
+    expect(listedStartsOn(offerOf({ timeSlots: [] }), SERVICE_DATE, [], NOW)).toBeNull();
   });
 });

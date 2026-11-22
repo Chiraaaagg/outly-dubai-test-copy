@@ -601,19 +601,89 @@ describe("quote: pickup (CR-B2-4)", () => {
       mappings: new Map([[PRODUCT_ID, [mapping({ pickupOffered: true, ...over })]]]),
     });
 
-  it("a product with pickup needs a hotel; the hotel goes to the supplier check and into the snapshot", async () => {
+  it("a product with pickup needs a hotel (missing: refused before any supplier call); a listed hotel goes to the supplier check and into the snapshot with its name", async () => {
     const w = withPickup();
     expect(await refusal(w, request())).toEqual([{ index: 0, reason: "pickup_unavailable" }]);
     expect(w.supplierCalls).toEqual([]);
-    const q = await w.svc.create(GUEST, request({ lines: [line({ pickup: { hotelRef: "hotel-42" } })] }));
-    expect(q.ok && q.lines[0].pickup).toEqual({ hotelRef: "hotel-42" });
-    expect(w.supplierCalls).toMatchObject([{ pickup: { hotelRef: "hotel-42" } }]);
+    w.supplier = () => okSupplier({ pickupHotelName: "Example Marina Hotel" });
+    const q = await w.svc.create(GUEST, request({ lines: [line({ pickup: { hotelRef: "42" } })] }));
+    expect(q.ok && q.lines[0].pickup).toEqual({ hotelRef: "42", hotelName: "Example Marina Hotel" });
+    expect(w.supplierCalls).toMatchObject([{ pickup: { hotelRef: "42" } }]);
+    // The stored line keeps both, as the order item snapshot reads them (checkout.service.ts).
+    expect(w.store.rows[0].snapshot.lines[0].pickup).toEqual({ hotelRef: "42", hotelName: "Example Marina Hotel" });
   });
 
   it("a hotel not on the supplier's list is pickup_unavailable (supplier check)", async () => {
     const w = withPickup();
     w.supplier = () => ({ ok: false, reason: "pickup_unavailable" });
-    expect(await refusal(w, request({ lines: [line({ pickup: { hotelRef: "asdf" } })] }))).toEqual([{ index: 0, reason: "pickup_unavailable" }]);
+    expect(await refusal(w, request({ lines: [line({ pickup: { hotelRef: "999" } })] }))).toEqual([{ index: 0, reason: "pickup_unavailable" }]);
+    expect(w.store.rows).toEqual([]);
+  });
+
+  it("a malformed hotel ref (a typed name, padded, signed, decimal or too long) is pickup_unavailable with no supplier call (Batch 3)", async () => {
+    for (const hotelRef of ["hotel-42", "Example Marina Hotel", "042", "-42", "42.0", "0", "1234567890"]) {
+      const w = withPickup();
+      expect(await refusal(w, request({ lines: [line({ pickup: { hotelRef } })] }))).toEqual([{ index: 0, reason: "pickup_unavailable" }]);
+      expect(w.supplierCalls).toEqual([]);
+      expect(w.store.rows).toEqual([]);
+    }
+  });
+
+  describe("two pickup activities in one cart (Batch 3, owner decision 11)", () => {
+    const OTHER_MAPPING = "0190a000-0000-7000-8000-0000000000a9";
+    const twoPickups = (lists: Record<string, string[]>) => {
+      const w = world({
+        products: new Map([
+          [PRODUCT_ID, product({}, instantDoc({ pickupIncluded: true }))],
+          [OTHER_ID, product({ id: OTHER_ID }, instantDoc({ pickupIncluded: true }))],
+        ]),
+        mappings: new Map([
+          [PRODUCT_ID, [mapping({ pickupOffered: true })]],
+          [OTHER_ID, [mapping({ pickupOffered: true, mappingId: OTHER_MAPPING })]],
+        ]),
+      });
+      // Each offer's own list, as the supplier check reads it.
+      w.supplier = (input) => {
+        const i = input as { mappingId: string; pickup: { hotelRef: string } | null };
+        return i.pickup && (lists[i.mappingId] ?? []).includes(i.pickup.hotelRef) ? okSupplier({ pickupHotelName: `Hotel ${i.pickup.hotelRef}` }) : { ok: false, reason: "pickup_unavailable" };
+      };
+      return w;
+    };
+
+    it("same list: the one cart hotel is quoted on both lines", async () => {
+      const w = twoPickups({ [MAPPING_ID]: ["42", "43"], [OTHER_MAPPING]: ["42", "43"] });
+      const q = await w.svc.create(GUEST, request({ lines: [line({ pickup: { hotelRef: "42" } }), line({ productId: OTHER_ID, pickup: { hotelRef: "42" } })] }));
+      expect(q.ok).toBe(true);
+      if (!q.ok) return;
+      expect(q.lines.map((l) => l.pickup)).toEqual([
+        { hotelRef: "42", hotelName: "Hotel 42" },
+        { hotelRef: "42", hotelName: "Hotel 42" },
+      ]);
+      expect(w.supplierCalls).toHaveLength(2);
+    });
+
+    it("different lists: the cart hotel missing from the second list refuses that line only; its own hotel is quoted", async () => {
+      const w = twoPickups({ [MAPPING_ID]: ["42"], [OTHER_MAPPING]: ["77"] });
+      expect(await refusal(w, request({ lines: [line({ pickup: { hotelRef: "42" } }), line({ productId: OTHER_ID, pickup: { hotelRef: "42" } })] }))).toEqual([
+        { index: 1, reason: "pickup_unavailable" },
+      ]);
+      expect(w.store.rows).toEqual([]);
+      const q = await w.svc.create(GUEST, request({ lines: [line({ pickup: { hotelRef: "42" } }), line({ productId: OTHER_ID, pickup: { hotelRef: "77" } })] }));
+      expect(q.ok && q.lines.map((l) => l.pickup?.hotelRef)).toEqual(["42", "77"]);
+    });
+  });
+
+  it("mixed cart: an instant pickup line plus an inquiry line stays a wholly unpaid inquiry; no supplier read, no quote (doc 29 §7.4)", async () => {
+    const w = world({
+      products: new Map([
+        [PRODUCT_ID, product({}, instantDoc({ pickupIncluded: true }))],
+        [OTHER_ID, product({ id: OTHER_ID, fulfilmentMode: "inquiry" })],
+      ]),
+      mappings: new Map([[PRODUCT_ID, [mapping({ pickupOffered: true })]]]),
+    });
+    expect(await refusal(w, request({ lines: [line({ pickup: { hotelRef: "42" } }), line({ productId: OTHER_ID })] }))).toEqual([{ index: 1, reason: "requires_inquiry" }]);
+    expect(w.supplierCalls).toEqual([]);
+    expect(w.store.rows).toEqual([]);
   });
 
   it("an offer that collects from hotels needs a hotel even when content forgot it; readiness already keeps that product inquiry", async () => {
@@ -855,5 +925,48 @@ describe("quote: per-order instant cap (doc 22 §32.24, owner: 500 AED per order
       const gate = instantOrderCapVerdict({ totalMinor: total, currency: c.currency, capAedMinor: c.cap, inrPerAed: c.fx });
       expect({ ...c, quoted: q.ok }).toEqual({ ...c, quoted: gate.ok });
     }
+  });
+});
+
+describe("doc 29 Batch 2: listed-start products at quote", () => {
+  const listedDoc = instantDoc({ timeSlots: ["10:00", "13:00", "16:00"] });
+  const listedMapping = (sellable: boolean) => mapping({ anyTimeSlots: true, slotStartMinutes: [600, 780, 960], listedStartsSellable: sellable });
+
+  it("with its flag on, a listed-start product quotes the chosen listed start through the supplier check", async () => {
+    const w = world({ products: new Map([[PRODUCT_ID, product({}, listedDoc)]]), mappings: new Map([[PRODUCT_ID, [listedMapping(true)]]]), supplier: () => okSupplier({ slotRef: "31@13:00" }) });
+    const q = await w.svc.create(GUEST, request({ lines: [line({ slotRef: "13:00" })] }));
+    expect(q.ok).toBe(true);
+    expect(w.supplierCalls).toMatchObject([{ slotRef: "13:00" }]);
+  });
+
+  it("with its flag off the same product is not instant: no supplier read, no quote", async () => {
+    const w = world({ products: new Map([[PRODUCT_ID, product({}, listedDoc)]]), mappings: new Map([[PRODUCT_ID, [listedMapping(false)]]]) });
+    expect(await refusal(w, request({ lines: [line({ slotRef: "13:00" })] }))).toEqual([{ index: 0, reason: "requires_inquiry" }]);
+    expect(w.supplierCalls).toEqual([]);
+    expect(w.store.rows).toEqual([]);
+  });
+
+  it("no time chosen on a listed-start product is invalid_slot before any supplier read", async () => {
+    const w = world({ products: new Map([[PRODUCT_ID, product({}, listedDoc)]]), mappings: new Map([[PRODUCT_ID, [listedMapping(true)]]]) });
+    expect(await refusal(w, request({ lines: [line({ slotRef: null })] }))).toEqual([{ index: 0, reason: "invalid_slot" }]);
+    expect(w.supplierCalls).toEqual([]);
+  });
+
+  it("the supplier's refusal of a stale or unlisted start reaches the customer as that line's reason", async () => {
+    for (const reason of ["sold_out", "invalid_slot"] as const) {
+      const w = world({ products: new Map([[PRODUCT_ID, product({}, listedDoc)]]), mappings: new Map([[PRODUCT_ID, [listedMapping(true)]]]), supplier: () => ({ ok: false, reason }) });
+      expect(await refusal(w, request({ lines: [line({ slotRef: "13:00" })] }))).toEqual([{ index: 0, reason }]);
+      expect(w.store.rows).toEqual([]);
+    }
+  });
+
+  it("mixed cart: a listed-start instant item plus an inquiry item stays a wholly unpaid inquiry; no supplier read, no quote", async () => {
+    const w = world({
+      products: new Map([[PRODUCT_ID, product({}, listedDoc)], [OTHER_ID, product({ id: OTHER_ID, fulfilmentMode: "inquiry" })]]),
+      mappings: new Map([[PRODUCT_ID, [listedMapping(true)]]]),
+    });
+    expect(await refusal(w, request({ lines: [line({ slotRef: "13:00" }), line({ productId: OTHER_ID })] }))).toEqual([{ index: 1, reason: "requires_inquiry" }]);
+    expect(w.supplierCalls).toEqual([]);
+    expect(w.store.rows).toEqual([]);
   });
 });

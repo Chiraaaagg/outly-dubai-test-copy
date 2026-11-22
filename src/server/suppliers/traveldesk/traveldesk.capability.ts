@@ -64,6 +64,58 @@ export const SEEDED_CLASS_KEYS: readonly string[] = Object.freeze([
   "live.fixed_slot_choice.self.internal.per_person",
 ]);
 
+/**
+ * The two Batch 2 keys (doc 29 §3.3, §7.3): the guest picks one of the
+ * supplier's listed start times ("any time" slots), self arrival, internal
+ * route, per-person price. No migration seeds them: they have no flag row,
+ * which reads as off, until an owner switches them on through the approval
+ * path. Like every key outside `SEEDED_CLASS_KEYS` (Batch 3's rule in
+ * `capabilityVerdict`), each offer then also needs evidence for that exact key
+ * and its current terms, whatever its flag row says. Owner decision 6
+ * (22 Nov 2026): listed starts only, never an arbitrary time.
+ */
+export const LISTED_START_CLASS_KEYS: readonly string[] = Object.freeze([
+  "live.listed_start_single.self.internal.per_person",
+  "live.listed_starts_customer_selected.self.internal.per_person",
+]);
+
+/** Whether a time shape is one of the two "any time" shapes, sold only as a choice among listed starts. */
+export function isListedStartShape(shape: CapTimeShape): boolean {
+  return shape === "listed_start_single" || shape === "listed_starts_customer_selected";
+}
+
+/**
+ * Whether an offer may sell as a choice among its listed starts (Batch 2):
+ * the capability gate allowed its exact class key (`gateAllows`), the class
+ * is a listed-start shape, and every stored slot is an "any time" slot whose
+ * end time is stored, because the booking sends the stored end
+ * (engine-saga.service.ts). Unknown slots never pass.
+ */
+export function listedStartsSellable(gateAllows: boolean, shape: CapTimeShape, slots: readonly { isAnyTime: boolean; endMinutes: number | null }[] | null | undefined): boolean {
+  if (!gateAllows || !isListedStartShape(shape) || !slots || slots.length === 0) return false;
+  return slots.every((s) => s.isAnyTime && s.endMinutes !== null);
+}
+
+/**
+ * The keys Batch 3 builds (doc 29 §3.3, §7.3 Batch 3): fixed start, hotel
+ * pickup, internal route, per person; 43 offers in the coverage ledger
+ * (42 single start, 1 choice). They are **not seeded**: no flag row means
+ * off, and switching one on goes through the approval path
+ * (supplier-capability.service.ts) with per-offer evidence for that exact
+ * key, which `capabilityVerdict` always asks of a key outside
+ * `SEEDED_CLASS_KEYS`. Before any of them goes on: a sandbox booking carrying
+ * a hotel id, then one supervised production pickup booking, each with its
+ * own approval. Per-unit pickup keys stay inquiry (owner decision 7). The
+ * listed-start pickup keys (Batch 2's time shape with pickup, e.g.
+ * `live.listed_starts_customer_selected.pickup_required.internal.per_person`)
+ * are not listed here: no internal per-person offer has that shape in the
+ * ledger. They stay off like any key without a flag row.
+ */
+export const PICKUP_CLASS_KEYS: readonly string[] = Object.freeze([
+  "live.fixed_slot_single.pickup_required.internal.per_person",
+  "live.fixed_slot_choice.pickup_required.internal.per_person",
+]);
+
 export interface CapabilityDimensions {
   fulfilment: CapFulfilment;
   timeShape: CapTimeShape;
@@ -295,7 +347,8 @@ export function capabilityVerdict(cap: DerivedCapability, flag: CapabilityFlagSt
   if (neverEnabledReason(classKey)) return { instant: false, classKey, reason: "class_not_sellable" };
   if (cap.reviewReasons.length > 0) return { instant: false, classKey, reason: "review_required" };
   if (!flag || !flag.enabled) return { instant: false, classKey, reason: "flag_off" };
-  if (flag.requiresOfferEvidence) {
+  // Only the two seeded keys may sell without per-offer evidence; a flag row that says otherwise for any other key is not believed.
+  if (flag.requiresOfferEvidence || !SEEDED_CLASS_KEYS.includes(classKey)) {
     const has = currentTermsHash !== null && evidence.some((e) => e.revokedAt === null && e.classKey === classKey && e.offerTermsHash === currentTermsHash);
     if (!has) return { instant: false, classKey, reason: "offer_evidence_missing" };
   }

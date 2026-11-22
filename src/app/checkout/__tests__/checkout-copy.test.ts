@@ -37,4 +37,11 @@ describe("checkout verification copy is channel-neutral", () => {
     expect(src).not.toContain("Leave it and tell us later");
     expect(src).toContain('label="Hotel for pickup"');
   });
+
+  it("the hotel is chosen from the operator's list, not typed (Batch 3)", () => {
+    const src = read("src/app/checkout/page.tsx");
+    expect(src).toContain("<PickupHotelFields");
+    expect(src).not.toMatch(/setTraveller\(\(t\) => \(\{ \.\.\.t, hotel: v \}\)\)/);
+    expect(src).not.toContain("traveller.hotel");
+  });
 });

@@ -383,6 +383,11 @@ export function quoteSlot(input: SlotQuoteInput): SupplierQuoteResult {
   const stored = offer.timeSlots.filter(matches);
   const group = rows.filter(matches);
   if (stored.length === 0 && group.length === 0) return refuse("invalid_slot");
+  // Doc 29 Batch 2: an "any time" offer sells only one of its listed starts, never a start the stored
+  // slots do not list (even when a fresh row names it), and only with a stored end, which the booking sends.
+  if (offer.timeSlots.some((s) => s.isAnyTime) && (stored.length === 0 || stored.some((s) => s.endMinutes === null))) {
+    return refuse(stored.length === 0 ? "invalid_slot" : "availability_unknown");
+  }
   if (group.length === 0) {
     // Silence is not sold out: closed when the stored rules say so, otherwise unknown.
     return refuse(stored.every((s) => !isOfferedOn(s.daysOffered, serviceDate)) ? "closed" : "availability_unknown");
@@ -438,6 +443,54 @@ export function quoteSlot(input: SlotQuoteInput): SupplierQuoteResult {
     });
   }
   return refuse(pickReason(reasons));
+}
+
+/** One start time as the public start-times read shows it (doc 29 Batch 2): a time and a mark, nothing else. */
+export interface ListedStart {
+  /** `HH:mm`, Asia/Dubai. */
+  time: string;
+  /** `available`; `limited` when few seats are left (no count is given); `sold_out`; `unavailable` (closed, past the cut-off, unknown). */
+  status: "available" | "limited" | "sold_out" | "unavailable";
+}
+
+/** At or below this many seats a start is marked `limited`. The count itself never leaves the server. */
+export const LIMITED_SEATS_AT = 5;
+
+/**
+ * The listed starts of an "any time" offer on one date, from fresh rows plus
+ * the stored rules (doc 29 Batch 2), for the public start-times read. Only
+ * the offer's own stored starts are listed: a row at any other start is
+ * ignored, so the page can never offer a time the quote would refuse
+ * (`quoteSlot`). A start with no row reads `unavailable` (silence is not
+ * availability). Prices in the rows are never returned. Null when the offer
+ * is not wholly "any time" with stored end times: the page then keeps its
+ * stored times. Indicative only; the quote stays the one promise.
+ */
+export function listedStartsOn(offer: StoredOffer, serviceDate: string, rows: TravelDeskAvailabilityRow[], now: Date): ListedStart[] | null {
+  if (offer.timeSlots.length === 0 || offer.timeSlots.some((s) => !s.isAnyTime || s.endMinutes === null)) return null;
+  const starts = [...new Set(offer.timeSlots.map((s) => s.startMinutes))].sort((a, b) => a - b);
+  const dated = rows.filter((r) => r.date === serviceDate);
+  return starts.map((start): ListedStart => {
+    const time = minutesToHhmm(start);
+    if (!isOfferedOn(offer.daysOffered, serviceDate)) return { time, status: "unavailable" };
+    // Several rows may share a start (quoteSlot uses the first with seats): the best mark wins.
+    const rank: ListedStart["status"][] = ["unavailable", "sold_out", "limited", "available"];
+    let best = 0;
+    for (const r of dated.filter((x) => x.startMinutes === start)) {
+      const rules = slotRulesFor(offer.timeSlots, r.timeSlotId, r.startMinutes);
+      if (!rules || rules.isOnRequest || !isOfferedOn(rules.daysOffered, serviceDate)) continue;
+      if (now.getTime() >= slotCutoffMs(serviceDate, start, rules.minimumAdvancedBookingHours)) continue;
+      if (r.seatsLeft === 0 && r.price.isBookable) continue; // a closed day (Q-A1)
+      let status: ListedStart["status"];
+      if (!r.price.isBookable || r.seatsLeft <= 0) status = "sold_out";
+      else {
+        const unknownCapacity = CAPACITY_SENTINELS.has(r.seatsLeft) || perTripPriced(offer, r.price);
+        status = !unknownCapacity && r.seatsLeft <= LIMITED_SEATS_AT ? "limited" : "available";
+      }
+      best = Math.max(best, rank.indexOf(status));
+    }
+    return { time, status: rank[best] };
+  });
 }
 
 /** One answer for a start time whose rows all failed: unknown wins (fail closed), then the most specific. */

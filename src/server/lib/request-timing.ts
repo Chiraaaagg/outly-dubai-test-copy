@@ -18,17 +18,19 @@ import { AsyncLocalStorage } from "node:async_hooks";
  * durations: calls that overlap count in full, so either may exceed `total`.
  */
 
-export const TIMING_ROUTES = ["quote", "checkout", "checkout_verify_start", "checkout_verify", "order_status"] as const;
+export const TIMING_ROUTES = ["quote", "checkout", "checkout_verify_start", "checkout_verify", "order_status", "catalog_start_times", "pickup_hotels"] as const;
 export type TimingRoute = (typeof TIMING_ROUTES)[number];
 
 /**
  * The routes whose responses carry the `Server-Timing` header (doc 29 §6.6:
- * quote, and the two new read routes once they exist). Every timed route
- * logs its `route.timing` line; only these show durations to the browser.
- * Kept off the private order-status route (review R6), where an exact `db`
- * duration on its 404 would say more about whether a reference exists.
+ * quote and the two public read routes, start times for a date and an
+ * offer's pickup hotel list; both take only public product and variant ids
+ * and answer the same to every visitor). Every timed route logs its
+ * `route.timing` line; only these show durations to the browser. Kept off
+ * the private order-status route (review R6), where an exact `db` duration
+ * on its 404 would say more about whether a reference exists.
  */
-export const SERVER_TIMING_ROUTES: readonly TimingRoute[] = ["quote"];
+export const SERVER_TIMING_ROUTES: readonly TimingRoute[] = ["quote", "catalog_start_times", "pickup_hotels"];
 export type TimingPhase = "supplier" | "db";
 
 interface PhaseTotal {

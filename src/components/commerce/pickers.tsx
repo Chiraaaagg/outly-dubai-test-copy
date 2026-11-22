@@ -232,11 +232,14 @@ export function GuestSelector({
   value,
   onChange,
   max = 20,
+  rows,
   className,
 }: {
   value: PaxCount;
   onChange: (pax: PaxCount) => void;
   max?: number;
+  /** Which rows to show (`guestRowsFor`, owner decision 5: no Seniors row without a senior price). Default: all four. */
+  rows?: readonly (keyof PaxCount)[];
   className?: string;
 }) {
   const total = paxTotal(value);
@@ -252,7 +255,7 @@ export function GuestSelector({
 
   return (
     <div className={cn("space-y-1", className)}>
-      {PAX_ROWS.map((row) => (
+      {PAX_ROWS.filter((row) => !rows || rows.includes(row.key)).map((row) => (
         <div key={row.key} className="flex items-center justify-between gap-4 py-2.5">
           <div>
             <p className="text-[0.95rem] font-bold text-ink-900">{row.label}</p>

@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { AlertTriangle, ChevronDown, Clock, Lock, Pencil, RefreshCw, ShieldCheck } from "lucide-react";
 import { useApp } from "@/components/providers/app-provider";
@@ -57,6 +57,10 @@ import {
 import { fetchOrderStatus } from "@/lib/api/order-status";
 import { resumePayment } from "@/lib/resume-payment";
 import { inquiryHref, inquiryReasonForQuote, inquiryReasonText, type InquiryReason } from "@/lib/inquiry-handoff";
+import { retimeHrefFor } from "@/lib/start-time-retry";
+import { PickupHotelFields, usePickupHotelLists } from "@/components/checkout/pickup-hotel-fields";
+import { CART_HOTEL_FIELD, initialCartHotel, pickupErrors, pickupItemsFor, pickupPlan, pickupUpdates } from "@/lib/pickup-selection";
+import type { PickupHotelChoice } from "@/lib/types";
 
 /**
  * CHECKOUT (PRD §5.6)
@@ -180,6 +184,7 @@ const FIELD_LABELS: Record<string, string> = {
   email: "Email",
   phone: "Mobile number",
   terms: "Cancellation policy and terms",
+  [CART_HOTEL_FIELD]: "Pickup hotel",
 };
 
 const STEP_TITLES = ["Activity", "Your details", "Review & pay", "Booked"] as const;
@@ -234,7 +239,7 @@ function chargeText(m: Money, currency: "INR" | "AED"): string {
 
 export default function CheckoutPage() {
   const router = useRouter();
-  const { cart, cartTotalINR, cartTotalAED, currency, clearCart, hydrated, toast } = useApp();
+  const { cart, cartTotalINR, cartTotalAED, currency, clearCart, hydrated, toast, updateCartItem } = useApp();
 
   const [step, setStep] = useState<Step>(1);
   // The details typed in this tab come back (CO-06): after Stripe, a reload, or the inquiry form and back.
@@ -265,6 +270,25 @@ export default function CheckoutPage() {
     null,
   );
   const { activities, settled: catalogSettled } = useCatalog();
+  // Hotel pickup (doc 29 Batch 3): one hotel for the cart, a per-activity choice only where that activity's list lacks it.
+  const pickupItems = useMemo(() => pickupItemsFor(cart, activities), [cart, activities]);
+  const { lists: pickupLists, retry: retryPickupLists } = usePickupHotelLists(pickupItems);
+  const [cartHotel, setCartHotel] = useState<PickupHotelChoice | null>(null);
+  const cartHotelStarted = useRef(false);
+  const leavingForInquiry = useRef(false);
+  const focusHotelField = useRef(false);
+  const plan = useMemo(() => pickupPlan(pickupItems, pickupLists, cartHotel), [pickupItems, pickupLists, cartHotel]);
+  // The kept choice comes back after a reload, Edit or the inquiry form and back.
+  useEffect(() => {
+    if (!hydrated || cartHotelStarted.current || !pickupItems.length) return;
+    cartHotelStarted.current = true;
+    setCartHotel(initialCartHotel(pickupItems));
+  }, [hydrated, pickupItems]);
+  // Each pickup line carries the hotel it is quoted with (the cart line, never the URL).
+  useEffect(() => {
+    if (!hydrated || leavingForInquiry.current) return;
+    for (const u of pickupUpdates(plan)) updateCartItem(u.itemId, { pickupHotel: u.pickupHotel });
+  }, [hydrated, plan, updateCartItem]);
   // The server quote for this cart (B3): set on the review step, required before payment.
   const [quote, setQuote] = useState<ServerQuote | null>(null);
   const [quoteState, setQuoteState] = useState<"idle" | "loading" | "ready" | "failed">("idle");
@@ -279,6 +303,8 @@ export default function CheckoutPage() {
   const [notice, setNotice] = useState<string | null>(null);
   // Why this cart cannot be paid online (CO-07): said on the page, with the inquiry as a choice.
   const [inquiryReason, setInquiryReason] = useState<InquiryReason | null>(null);
+  /** Doc 29 Batch 2: when only a line's start time was refused, the way back to choose another (`retimeHrefFor`). */
+  const [retimeHref, setRetimeHref] = useState<string | null>(null);
   // Back from Stripe (CO-06): the order this tab handed over for this cart. `moved_on`: it has a payment or has ended.
   const [leftPayment, setLeftPayment] = useState<{ reference: string; state: LeftPaymentState | "moved_on" } | null>(null);
   const leftPaymentRef = useRef<HTMLDivElement>(null);
@@ -449,8 +475,9 @@ export default function CheckoutPage() {
    */
   const requestQuote = async (): Promise<ServerQuote | null> => {
     const seq = ++quoteSeq.current;
-    const lines = quoteLinesFor(cart, activities, traveller.hotel);
+    const lines = quoteLinesFor(cart, activities);
     if (!lines) {
+      setRetimeHref(null);
       setInquiryReason("unavailable");
       return null;
     }
@@ -464,12 +491,15 @@ export default function CheckoutPage() {
           setQuoteState("idle");
           return null;
         }
-        // Nothing is charged and the cart is kept; the page says why and offers the inquiry (CO-07).
+        // Nothing is charged and the cart is kept; the page says why and offers the inquiry (CO-07),
+        // or, when only a start time was refused, another time first (Batch 2).
+        setRetimeHref(retimeHrefFor(r.lines, cart, activities));
         setInquiryReason(inquiryReasonForQuote(r.lines.map((l) => l.reason)));
         setQuoteState("idle");
         return null;
       }
       setInquiryReason(null);
+      setRetimeHref(null);
       setQuote(r);
       setQuoteState("ready");
       return r;
@@ -488,8 +518,8 @@ export default function CheckoutPage() {
   };
 
   // Quote on reaching the review step, and again whenever what it covers changes.
-  const quoteKey = `${payCurrency}|${appliedCoupon ?? ""}|${traveller.hotel ?? ""}|${cart
-    .map((i) => `${i.id}:${i.date}:${i.time}:${JSON.stringify(i.pax)}`)
+  const quoteKey = `${payCurrency}|${appliedCoupon ?? ""}|${cart
+    .map((i) => `${i.id}:${i.date}:${i.time}:${JSON.stringify(i.pax)}:${i.pickupHotel?.hotelId ?? ""}`)
     .join(",")}`;
   useEffect(() => {
     if (!hydrated || !selfServe || step < 2 || !catalogSettled || !cart.length) return;
@@ -502,6 +532,8 @@ export default function CheckoutPage() {
   /** Field errors for the traveller details, plus the terms checkbox when `scope` is "all" (the payment step). */
   const validate = (scope: "details" | "all" = "all"): Record<string, string> => {
     const next = detailErrors(traveller, selfServe);
+    // Pickup hotels are chosen on the details step; the quote re-checks them on the server.
+    if (scope === "details") Object.assign(next, pickupErrors(plan));
     if (scope === "all" && !terms) next.terms = "Please confirm you've read the cancellation policy.";
     setErrors(next);
     Object.keys(next).forEach((field) =>
@@ -546,6 +578,15 @@ export default function CheckoutPage() {
   useEffect(() => {
     if (!focusStepHeading.current) return;
     focusStepHeading.current = false;
+    // After a refused hotel, focus goes to the control that must change (doc 29 §3.5).
+    if (focusHotelField.current) {
+      focusHotelField.current = false;
+      const hotel = document.getElementById(CART_HOTEL_FIELD);
+      if (hotel) {
+        hotel.focus();
+        return;
+      }
+    }
     stepHeading.current?.focus();
   }, [step]);
 
@@ -627,6 +668,7 @@ export default function CheckoutPage() {
         } else {
           // Nothing was charged; the cart is kept, and the page says so before offering the inquiry (CO-07).
           setPayment("idle");
+          setRetimeHref(null);
           setInquiryReason("unavailable");
         }
         return;
@@ -636,6 +678,7 @@ export default function CheckoutPage() {
       const payPage = payPageUrl(r.redirectUrl, { production: !mocksAllowed() });
       if (!payPage) {
         setPayment("idle");
+        setRetimeHref(null);
         setInquiryReason("unavailable");
         return;
       }
@@ -728,7 +771,17 @@ export default function CheckoutPage() {
   const first = cart[0];
   // Endowment wording (checklist 4): the summary and the review card are "Your <activity>".
   const tripTitle = single ? `Your ${first.title}` : "Your trip";
-  const hasPickup = cart.some((i) => activities.find((a) => a.slug === i.slug)?.pickupIncluded);
+  const hasPickup = pickupItems.length > 0;
+  // One hotel for every pickup line, when they share one: said once in the details.
+  const firstPickup = pickupItems[0]?.chosen;
+  const sharedPickup = firstPickup?.hotelId && pickupItems.every((p) => p.chosen?.hotelId === firstPickup.hotelId) ? firstPickup.name : null;
+  /** Send the trip to our team (doc 29 §7.3): what was typed goes on the pickup lines for the inquiry form, never in the URL. */
+  const askTeamAboutPickup = (typed: string) => {
+    leavingForInquiry.current = true;
+    const name = typed.trim().slice(0, 120);
+    if (name) for (const p of pickupItems) updateCartItem(p.itemId, { pickupHotel: { hotelId: null, name } });
+    router.push(inquiryHref("pickup"));
+  };
   const charge = payDeposit ? chargeText(deposit.now, payCurrency) : chargeText(total, payCurrency);
   const phoneNow = normalisePhone(traveller.phone, traveller.countryCode);
   const phoneShown = phoneNow.valid ? maskPhone(phoneNow.e164) : `${traveller.countryCode} ${traveller.phone}`;
@@ -742,10 +795,10 @@ export default function CheckoutPage() {
       </dd>
       <dt className="text-ink-600">Guests</dt>
       <dd className="text-right font-semibold">{paxLabel(first.pax)}</dd>
-      {hasPickup && traveller.hotel?.trim() ? (
+      {hasPickup && first.pickupHotel?.hotelId ? (
         <>
           <dt className="text-ink-600">Pickup</dt>
-          <dd className="text-right font-semibold">{traveller.hotel}</dd>
+          <dd className="text-right font-semibold">{first.pickupHotel.name}</dd>
         </>
       ) : null}
     </dl>
@@ -870,7 +923,7 @@ export default function CheckoutPage() {
                         document.getElementById(field)?.focus();
                       }}
                     >
-                      {FIELD_LABELS[field] ?? field}: {message}
+                      {FIELD_LABELS[field] ?? (field.startsWith(`${CART_HOTEL_FIELD}-`) ? "Pickup hotel" : field)}: {message}
                     </a>
                   </li>
                 ))}
@@ -950,9 +1003,29 @@ export default function CheckoutPage() {
               testId="checkout-needs-inquiry"
               action={
                 <div className="flex flex-wrap gap-2">
-                  <ButtonLink href={inquiryHref(inquiryReason)} size="sm">
+                  {retimeHref && (
+                    <ButtonLink href={retimeHref} size="sm">
+                      Choose another time
+                    </ButtonLink>
+                  )}
+                  <ButtonLink href={inquiryHref(inquiryReason)} size="sm" variant={retimeHref ? "outline" : undefined}>
                     Send it to our team
                   </ButtonLink>
+                  {/* The operator refused the hotel (doc 29 §3.5 Pickup): back to the hotel choice, focus on it. */}
+                  {inquiryReason === "pickup" && hasPickup && !outstanding && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => {
+                        focusHotelField.current = true;
+                        setRetimeHref(null);
+                        setInquiryReason(null);
+                        editDetails();
+                      }}
+                    >
+                      Choose another hotel
+                    </Button>
+                  )}
                   <ButtonLink href="/cart" size="sm" variant="outline">
                     Back to my trip
                   </ButtonLink>
@@ -1023,15 +1096,24 @@ export default function CheckoutPage() {
                   {errors.phone ? <FieldMessage id="phone-error">{errors.phone}</FieldMessage> : null}
                 </div>
 
-                {/* Hotel only for products with pickup (CO-10). */}
+                {/* Hotel only for products with pickup (CO-10): from the operator's list (doc 29 Batch 3). */}
                 {hasPickup && (
-                  <Field
+                  <PickupHotelFields
                     label="Hotel for pickup"
-                    id="hotel"
-                    value={traveller.hotel ?? ""}
-                    onChange={(v) => setTraveller((t) => ({ ...t, hotel: v }))}
-                    hint="Needed for pickup: the hotel the operator collects you from."
-                    autoComplete="off"
+                    plan={plan}
+                    lists={pickupLists}
+                    cartHotel={cartHotel}
+                    onCartHotel={(h) => {
+                      setCartHotel(h);
+                      setErrors((prev) => ({ ...prev, [CART_HOTEL_FIELD]: "" }));
+                    }}
+                    onItemHotel={(itemId, h) => {
+                      updateCartItem(itemId, { pickupHotel: h });
+                      setErrors((prev) => Object.fromEntries(Object.entries(prev).filter(([k]) => !k.startsWith(`${CART_HOTEL_FIELD}-`))));
+                    }}
+                    errors={errors}
+                    onAskTeam={askTeamAboutPickup}
+                    onRetry={retryPickupLists}
                   />
                 )}
 
@@ -1068,6 +1150,8 @@ export default function CheckoutPage() {
                           <p className="tnum text-[0.95rem] text-ink-900">
                             {reviewDate(item.date)} · {item.time} Dubai time · {paxLabel(item.pax)}
                           </p>
+                          {/* Pickup lines that differ from one another each say their own hotel (doc 29 Batch 3). */}
+                          {!sharedPickup && item.pickupHotel?.hotelId ? <p className="text-[0.95rem] text-ink-700">Pickup from {item.pickupHotel.name}</p> : null}
                         </div>
                         {/* In the currency charged (PRD-8); with a quote, that line's own charged amount. */}
                         {!single && <p className="shrink-0 font-bold tnum">{chargeText(lineCharged(index, item.total), payCurrency)}</p>}
@@ -1132,7 +1216,7 @@ export default function CheckoutPage() {
                   <p className="font-semibold">{traveller.fullName}</p>
                   <p className="break-words">{traveller.email}</p>
                   <p className="tnum">{phoneShown}</p>
-                  {hasPickup && traveller.hotel?.trim() ? <p>Pickup: {traveller.hotel}</p> : null}
+                  {sharedPickup ? <p>Pickup: {sharedPickup}</p> : null}
                 </div>
               </Card>
 

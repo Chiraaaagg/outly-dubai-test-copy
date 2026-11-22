@@ -86,6 +86,17 @@ const NEW_TABLES_ONLY = [
   // supplier_sync_runs (doc 29 Batch 1b): a standalone table, no foreign key.
   "20261123120000_b1b_supplier_sync_runs",
 ];
+/**
+ * Migrations that only add nullable columns, with no default, to existing
+ * tables. They do lock the table they alter, so they stay in the fault and
+ * lock tests like any other; checked below: every statement after the lock
+ * timeout is `ALTER TABLE ... ADD COLUMN <name> <type>` with no NOT NULL,
+ * DEFAULT, constraint or reference.
+ */
+const NULLABLE_COLUMNS_ONLY = [
+  // order_items.pickup_hotel_id, pickup_hotel_name_snapshot (doc 29 Batch 3).
+  "20261123150000_b3_order_item_pickup_hotel",
+];
 /*
  * Every other faulted migration takes a lock on an existing table and has its
  * own `SET LOCAL lock_timeout`, so behind the held lock it must fail fast and
@@ -146,6 +157,16 @@ describe.skipIf(!dbEnabled || excludedHere)("migration safety (doc 27 §3)", () 
       const named = [...ddl.matchAll(/(?:ALTER\s+TABLE|\bON|REFERENCES)\s+"?(\w+)"?/gi)].map((m) => m[1]);
       expect(named.filter((t) => !created.includes(t)), n).toEqual([]);
       expect(ddl, n).not.toMatch(/\b(REFERENCES|LOCK|DROP|UPDATE|INSERT|DELETE|TRIGGER|FUNCTION)\b/i);
+    }
+    for (const n of NULLABLE_COLUMNS_ONLY) {
+      expect(FAULTED, n).toContain(n);
+      expect(LOCK_FREE.includes(n) || NEW_TABLES_ONLY.includes(n), n).toBe(false);
+      const statements = sqlOf(n).replace(/--.*$/gm, "").split(";").map((x) => x.replace(/\s+/g, " ").trim()).filter(Boolean);
+      expect(statements[0], n).toBe("SET LOCAL lock_timeout = '5s'");
+      expect(statements.length, n).toBeGreaterThan(1);
+      for (const st of statements.slice(1)) {
+        expect(st, n).toMatch(/^ALTER TABLE "?\w+"? ADD COLUMN "?\w+"? (TEXT|INTEGER|BIGINT|BOOLEAN|UUID|JSONB|TIMESTAMPTZ\(\d\))$/i);
+      }
     }
   });
 

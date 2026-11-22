@@ -134,6 +134,8 @@ const storedLineSchema = z.object({
   margin: z.record(z.string(), z.unknown()),
   freeCancellationUntilUtc: z.string().nullable(),
   nonRefundableAfterConfirm: z.boolean(),
+  // Batch 3: the accepted pickup hotel. Absent on lines quoted before pickup snapshots, and then read as none.
+  pickup: z.object({ hotelRef: z.string(), hotelName: z.string().nullable().optional() }).nullable().optional(),
 });
 type StoredLine = z.infer<typeof storedLineSchema>;
 
@@ -391,6 +393,9 @@ export function createCheckoutService(deps: CheckoutDeps): CheckoutService & { e
         marginSnapshot: line.margin,
         // The item's position: the saga reserves and confirms in this order, and the engine reads this line.
         quoteLineIndex: index,
+        // The hotel the supplier check accepted, as the order's own record of it (Batch 3).
+        pickupHotelId: line.pickup?.hotelRef ?? null,
+        pickupHotelNameSnapshot: line.pickup ? (line.pickup.hotelName ?? null) : null,
       });
     }
     // The payment is the quote total; each item's allocation is its own payable share, and they add up exactly.

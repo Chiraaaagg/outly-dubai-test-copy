@@ -114,6 +114,9 @@ export interface CreateOrderItemInput {
   marginSnapshot?: Record<string, unknown>;
   /** Instant items: the index of the quote line this item was sold from (its position in the order). */
   quoteLineIndex?: number;
+  /** Batch 3: the TravelDesk hotel id the quote accepted for pickup, and its name on the supplier's list then. */
+  pickupHotelId?: string | null;
+  pickupHotelNameSnapshot?: string | null;
 }
 
 export interface CreateOrderInput {
@@ -320,6 +323,8 @@ export const orderService = {
               quoteId: i.quoteId,
               marginSnapshot: i.marginSnapshot as Prisma.InputJsonValue | undefined,
               quoteLineIndex: i.quoteLineIndex,
+              pickupHotelId: i.pickupHotelId ?? undefined,
+              pickupHotelNameSnapshot: i.pickupHotelNameSnapshot ?? undefined,
               status: idx >= 0 ? "pending" : "pending",
             })),
           },

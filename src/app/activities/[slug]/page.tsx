@@ -16,6 +16,7 @@ import { ActivityCard } from "@/components/commerce/activity-card";
 import { toCard } from "@/lib/catalog/card";
 import { ComboCard } from "@/components/commerce/cards";
 import { BookingWidget, StickyBookingBar } from "@/components/commerce/booking-widget";
+import { parseRetimeId } from "@/lib/start-time-retry";
 import { Gallery } from "@/components/commerce/gallery";
 import { PriceBlock } from "@/components/commerce/price";
 import { IndicativePriceNote } from "@/components/commerce/inquiry-ui";
@@ -89,10 +90,10 @@ export default async function ActivityPage({
   searchParams,
 }: {
   params: Promise<{ slug: string }>;
-  searchParams: Promise<{ date?: string }>;
+  searchParams: Promise<{ date?: string; retime?: string }>;
 }) {
   const { slug } = await params;
-  const { date } = await searchParams;
+  const { date, retime } = await searchParams;
   const cached = await getActivityBySlug(slug);
   if (!cached) notFound();
   // The badge, the attributes and the booking widget all follow the mode read now, not the cached snapshot's (N6).
@@ -433,7 +434,7 @@ export default async function ActivityPage({
           <div className="hidden lg:block">
             <PriceBlock band={activity.price} size="xl" className="mb-4" />
           </div>
-          <BookingWidget activity={activity} initialDate={date} />
+          <BookingWidget activity={activity} initialDate={date} retimeItemId={parseRetimeId(retime) ?? undefined} />
           <Card className="mt-4 p-5">
             <h2 className="mb-3 text-[0.95rem]">Why book this with OUTLYY</h2>
             <TrustSummary />

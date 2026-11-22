@@ -401,6 +401,14 @@ export async function eraseSubjectRows(tx: Tx, plan: ErasurePlan): Promise<Erasu
       })
     : { count: 0 };
   if (orders.count) note("orders", "leadName", "leadPhone", "leadEmail", "hotel", "pickupZone", "dietary", "specialRequests");
+  // The pickup hotel on an item says where the person stays, like `orders.hotel` (Batch 3); money and status stay.
+  const pickupItems = erasedOrderIds.length
+    ? await tx.orderItem.updateMany({
+        where: { orderId: { in: erasedOrderIds }, OR: [{ pickupHotelId: { not: null } }, { pickupHotelNameSnapshot: { not: null } }] },
+        data: { pickupHotelId: null, pickupHotelNameSnapshot: null },
+      })
+    : { count: 0 };
+  if (pickupItems.count) note("order_items", "pickupHotelId", "pickupHotelNameSnapshot");
   // Click identifiers are never needed to fulfil or refund: cleared on every order of the subject. Source, medium and campaign stay (aggregate reporting).
   const attribution = records.orderIds.length
     ? await tx.orderAttribution.updateMany({ where: { orderId: { in: records.orderIds } }, data: { fbclid: null, fbc: null, fbp: null, gclid: null } })

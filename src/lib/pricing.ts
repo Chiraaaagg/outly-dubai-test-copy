@@ -32,7 +32,7 @@ export interface PriceBreakdown {
   savings?: Money;
 }
 
-export function variantById(activity: PricedActivity, id?: string): Variant | undefined {
+export function variantById(activity: Pick<PricedActivity, "variants">, id?: string): Variant | undefined {
   if (!id) return activity.variants.find((v) => v.recommended) ?? activity.variants[0];
   return activity.variants.find((v) => v.id === id);
 }
@@ -53,6 +53,28 @@ export const PAGE_PAX_AGES: Record<(typeof PAGE_PAX_TYPES)[number], { min: numbe
   infant: { min: null, max: 2 },
   senior: { min: 60, max: null },
 };
+
+/** The guest rows the picker can show, in display order. */
+export const GUEST_ROWS = ["adult", "child", "infant", "senior"] as const satisfies readonly (keyof PaxCount)[];
+
+/**
+ * Whether the offer has a senior price of its own (owner decision 5, 22 Nov
+ * 2026, doc 29 §8.4: hide the Seniors row where the offer has no senior
+ * price). A variant with typed units decides by its units: a senior unit, or
+ * none, which the quote would refuse. Without typed units (inquiry pricing)
+ * the page's price band decides.
+ */
+export function offersSeniorPrice(activity: Pick<PricedActivity, "price">, variant: Variant | undefined): boolean {
+  const units = variant?.units;
+  if (units && units.length > 0) return units.some((u) => u.unitId === "senior");
+  return activity.price.senior !== undefined;
+}
+
+/** The guest rows for this activity and variant: every row except Seniors when the offer has no senior price. */
+export function guestRowsFor(activity: Pick<PricedActivity, "price" | "variants">, variantId?: string): (keyof PaxCount)[] {
+  const variant = variantById(activity, variantId);
+  return GUEST_ROWS.filter((row) => row !== "senior" || offersSeniorPrice(activity, variant));
+}
 
 /**
  * The per-unit price the activity page shows for one pax type. Readiness

@@ -12,6 +12,7 @@ import { DateField, DatePickerSheet, GuestField, GuestSheet } from "./pickers";
 import { WhatsAppButton } from "./whatsapp";
 import { ConfirmFirstNote, ResponsePromise } from "./inquiry-ui";
 import { ApiError, submitInquiry } from "@/lib/api";
+import { hotelForInquiry } from "@/lib/pickup-selection";
 import { InquiryVerify } from "./inquiry-verify";
 import {
   CAPTCHA_ELEMENT_ID,
@@ -106,14 +107,15 @@ export function InquiryForm({
   const [flexible, setFlexible] = useState(!firstItem);
   const [pax, setPax] = useState<PaxCount>(firstItem?.pax ?? EMPTY_PAX);
   const [dietary, setDietary] = useState<Dietary | undefined>(undefined);
-  const [hotel, setHotel] = useState("");
+  // A pickup hotel chosen or typed at checkout comes with the trip (doc 29 Batch 3): in the form, never the URL.
+  const [hotel, setHotel] = useState(() => hotelForInquiry(items));
   const [budget, setBudget] = useState<BudgetBand | undefined>(undefined);
   const [notes, setNotes] = useState("");
   // Unticked by default: WhatsApp messaging is a separate, affirmative
   // choice, not something bundled into sending the form. A pre-ticked box is
   // not consent under the GDPR, the UAE PDPL or India's DPDP Act.
   const [consent, setConsent] = useState(false);
-  const [moreOpen, setMoreOpen] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(() => Boolean(hotelForInquiry(items)));
   const [dateOpen, setDateOpen] = useState(false);
   const [guestOpen, setGuestOpen] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});

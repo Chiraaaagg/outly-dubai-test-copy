@@ -44,7 +44,8 @@ export default async function CapabilityFlagsPage({ searchParams }: { searchPara
   const on = view.classes.filter((c) => c.flag?.enabled);
   const offersOn = on.reduce((n, c) => n + c.offers, 0);
   const offers = view.classes.reduce((n, c) => n + c.offers, 0);
-  const evidenceKeys = view.classes.filter((c) => !c.neverEnabled && c.flag?.requiresOfferEvidence !== false).map((c) => c.classKey);
+  // Only seeded keys may sell without per-offer evidence; for any other key a flag row saying so is not believed (capabilityVerdict).
+  const evidenceKeys = view.classes.filter((c) => !c.neverEnabled && (!c.seeded || c.flag?.requiresOfferEvidence !== false)).map((c) => c.classKey);
 
   const columns: DataColumn<CapabilityClassRow>[] = [
     {
@@ -55,7 +56,7 @@ export default async function CapabilityFlagsPage({ searchParams }: { searchPara
           <p className="break-all font-mono text-xs text-ink-900">{r.classKey}</p>
           <div className="mt-1 flex flex-wrap gap-1">
             {r.seeded && <StatusPill tone="info" title="Seeded on by migration (doc 29 §3.3 exception)">seeded</StatusPill>}
-            {r.flag && !r.flag.requiresOfferEvidence && <StatusPill title="Offers in this class need no per-offer evidence">no evidence needed</StatusPill>}
+            {r.seeded && r.flag && !r.flag.requiresOfferEvidence && <StatusPill title="Offers in this class need no per-offer evidence">no evidence needed</StatusPill>}
           </div>
         </div>
       ),

@@ -43,6 +43,8 @@ export const DB_SUITES = [
   "src/server/jobs/__tests__/retention-purge.db.test.ts",
   // Batch 1c: the Prisma timing extension counts queries of the request it runs in (doc 29 §6.6).
   "src/server/lib/__tests__/request-timing.db.test.ts",
+  // Batch 3: the browse read class in the shared budget row, and the order item pickup columns.
+  "src/server/services/__tests__/pickup-hotel.db.test.ts",
 ];
 
 /**

@@ -19,7 +19,7 @@ import { ageBandMismatches, offerReadinessFacts } from "../suppliers/traveldesk/
 import { readinessService } from "./readiness.service";
 import { verifyStepUp } from "./approval.service";
 import { gateVerdict, loadCapabilityGate } from "../suppliers/capability-gate";
-import { CAPABILITY_DERIVATION_VERSION, deriveCapabilities } from "../suppliers/traveldesk/traveldesk.capability";
+import { CAPABILITY_DERIVATION_VERSION, deriveCapabilities, listedStartsSellable } from "../suppliers/traveldesk/traveldesk.capability";
 import type { ReadLimits } from "../suppliers/read-budget";
 import { TravelDeskApiError } from "../suppliers/traveldesk/traveldesk.http";
 import { bookingAccountId, DEFAULT_BOOKING_ACCOUNT_ID, mutationInFlight, takeReadToken } from "./supplier-booking.service";
@@ -409,6 +409,14 @@ export interface VariantMappingState {
     capabilityRefusal?: string | null;
     /** When the catalogue this verdict reads was last synced (`catalogueSyncedAt`); null when unknown. */
     catalogueSyncedAt?: string | null;
+    /**
+     * Doc 29 Batch 2: the offer is sold as a choice among the supplier's
+     * listed starts. True only when the capability gate allows its exact
+     * listed-start class key (flag on, evidence where asked) and every stored
+     * slot is an "any time" slot with a stored end time (the booking sends the
+     * stored end, engine-saga.service.ts). Anything else is false.
+     */
+    listedStartsSellable?: boolean;
   } | null;
   /** Empty when the mapping side is ready; readiness adds its own reasons. */
   blockers: MappingBlocker[];
@@ -589,6 +597,7 @@ export const supplierCatalogService = {
           capabilityClassKey: capability.verdict.classKey,
           capabilityRefusal: capability.verdict.instant ? null : capability.verdict.reason,
           catalogueSyncedAt: syncedAt?.toISOString() ?? null,
+          listedStartsSellable: listedStartsSellable(capability.verdict.instant, capability.capability.dimensions.timeShape, stored?.timeSlots),
         },
         blockers,
       };

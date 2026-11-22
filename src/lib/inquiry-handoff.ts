@@ -5,7 +5,9 @@
  * the reason into words, so the customer is never moved without being told.
  *
  * The reason travels as a short code in the `/inquiry` URL (`?reason=`); it
- * names a rule, never a person, an item or an amount.
+ * names a rule, never a person, an item or an amount. A pickup hotel chosen
+ * or typed at checkout travels on the cart line and is filled into the
+ * inquiry form (`hotelForInquiry`, src/lib/pickup-selection.ts), never the URL.
  */
 
 export type InquiryReason = "mixed" | "over_limit" | "cutoff" | "time_slot" | "sold_out" | "pickup" | "unavailable";

@@ -1122,6 +1122,41 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
     await prisma.setting.deleteMany({ where: { key } });
   });
 
+  it("a browse flood leaves quote and engine reads unaffected (doc 29 §6.3, Batch 2)", async () => {
+    const account = `browse-share-${RUN}`;
+    const key = engine.requestBudgetKey(CODE, "test", account);
+    await prisma.setting.deleteMany({ where: { key } });
+    // 20 reads a window: 5 quote, 3 browse, 12 engine reserve.
+    const limits = readLimits(20, 0.25, 0.15);
+    expect(limits).toEqual({ perMinute: 20, quoteCap: 5, browseCap: 3, engineReserve: 12 });
+    const browse = () => engine.takeBrowseReadToken(CODE, "test", account, { limits });
+    const quote = () => engine.takeQuoteReadToken(CODE, "test", account, { limits });
+    const read = () => engine.takeReadToken(CODE, "test", account, limits);
+    // A concurrent flood takes only the browse share.
+    const flood = await Promise.all(Array.from({ length: 25 }, browse));
+    expect(flood.filter(Boolean)).toHaveLength(3);
+    // Quotes then get their whole share, and the engine its whole reserve.
+    for (let i = 0; i < 5; i++) expect(await quote()).toBe(true);
+    expect(await quote()).toBe(false);
+    for (let i = 0; i < 12; i++) expect(await read()).toBe(true);
+    expect(await read()).toBe(false);
+    expect((await prisma.setting.findUniqueOrThrow({ where: { key } })).value).toMatchObject({ used: 20, quoteUsed: 5, browseUsed: 3 });
+    // Browse never takes a read the quotes' unused share still needs: engine 14 used, 6 left, 5 for quotes.
+    await prisma.setting.deleteMany({ where: { key } });
+    for (let i = 0; i < 14; i++) expect(await read()).toBe(true);
+    expect(await browse()).toBe(true);
+    expect(await browse()).toBe(false);
+    for (let i = 0; i < 5; i++) expect(await quote()).toBe(true);
+    // A row from before the browse class counts no browse reads.
+    await prisma.setting.update({ where: { key }, data: { value: { windowStart: new Date().toISOString(), used: 2, quoteUsed: 0 } } });
+    expect(await browse()).toBe(true);
+    expect((await prisma.setting.findUniqueOrThrow({ where: { key } })).value).toMatchObject({ used: 3, browseUsed: 1 });
+    // Limits without a browse cap refuse browse.
+    await prisma.setting.deleteMany({ where: { key } });
+    expect(await engine.takeBrowseReadToken(CODE, "test", account, { limits: readLimits(20, 0.25) })).toBe(false);
+    await prisma.setting.deleteMany({ where: { key } });
+  });
+
   /* -------------------------------------------------------------------------
    * Ordering and admission (SUP-7), and what a run may send (SEC-8)
    * ---------------------------------------------------------------------- */

@@ -9,7 +9,7 @@ import { parseWith } from "../lib/http";
 import { quoteRequestSchema } from "../schemas/quote.schemas";
 import { marginService } from "./margin.service";
 import { instantOrderCapVerdict, readInstantOrderCapInputs, type InstantOrderCapInputs } from "../payments/exposure-limits";
-import { supplierQuoteService } from "./supplier-quote.service";
+import { PICKUP_HOTEL_REF, supplierQuoteService } from "./supplier-quote.service";
 import { activeVariants, mappingForVariant, READINESS_RULES_VERSION, readinessService, type MappingReadiness, type ReadinessServiceImpl } from "./readiness.service";
 import {
   MAX_INSTANT_ITEMS_PER_ORDER,
@@ -454,6 +454,8 @@ export function createQuoteService(deps: QuoteDeps): QuoteServiceImpl {
     // Readiness keeps content and offer in agreement; this is the per-line half.
     const pickupRequired = activity.pickupIncluded || mapping.pickupOffered === true;
     if (pickupRequired !== Boolean(line.pickup)) return "pickup_unavailable";
+    // Batch 3: a hotel is the numeric TravelDesk id from the offer's list, never a typed name.
+    if (line.pickup && !PICKUP_HOTEL_REF.test(line.pickup.hotelRef)) return "pickup_unavailable";
 
     return {
       index,
@@ -616,7 +618,7 @@ export function createQuoteService(deps: QuoteDeps): QuoteServiceImpl {
           units: c.line.units,
           unitDefinitions: c.units.filter((u) => qty(c.line.units, u.unitId) > 0),
           addonIds: [],
-          pickup: c.line.pickup,
+          pickup: c.line.pickup ? { hotelRef: c.line.pickup.hotelRef, hotelName: c.supplier.pickupHotelName ?? null } : null,
           chargedMinor: c.chargedMinor,
           discountAllocMinor: alloc.discountAllocMinor,
           taxAllocMinor: alloc.taxAllocMinor,

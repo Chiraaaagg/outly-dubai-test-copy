@@ -526,3 +526,50 @@ describe("fromCatalogReadiness: the supplier catalogue's states as readiness fac
     expect((await assessReadiness({ product: product({}, doc), mappings: out, releaseEnabled: true, margin: fakeMargin() })).reasons).toContain("variant_without_mapping");
   });
 });
+
+describe("doc 29 Batch 2: listed starts pass the time rule only with their flag on", () => {
+  const listed = (over: Partial<MappingReadiness> = {}) => mapping({ anyTimeSlots: true, slotStartMinutes: [600, 780, 960], listedStartsSellable: true, ...over });
+  const page = instantDoc({ timeSlots: ["10:00", "13:00", "16:00"] });
+
+  it("an 'any time' offer sold as listed starts is instant when the page lists exactly those starts", async () => {
+    expect(READINESS_RULES_VERSION).toBe(9);
+    expect(await reasonsFor(product({}, page), [listed()])).toMatchObject({ effective: "instant", reasons: [] });
+    expect(slotTimesAgree(["16:00", "10:00", "13:00"], listed())).toBe("ok");
+  });
+
+  it("without its flag (not sellable as listed starts) it stays slot_any_time_unsupported, as in Batch 0", async () => {
+    for (const flag of [false, null, undefined]) {
+      const r = await reasonsFor(product({}, page), [listed({ listedStartsSellable: flag })]);
+      expect(r.effective).toBe("inquiry");
+      expect(r.reasons).toContain("slot_any_time_unsupported");
+    }
+  });
+
+  it("never an arbitrary time: page times must still equal the listed starts", async () => {
+    expect(slotTimesAgree(["10:00", "13:00"], listed())).toBe("slot_times_mismatch");
+    expect(slotTimesAgree(["10:00", "13:00", "16:00", "17:30"], listed())).toBe("slot_times_mismatch");
+    expect(slotTimesAgree(["Any time"], listed())).toBe("slot_times_mismatch");
+    expect(slotTimesAgree([], listed())).toBe("slot_times_mismatch");
+    expect(slotTimesAgree(["10:00"], listed({ slotStartMinutes: null }))).toBe("slot_times_mismatch");
+    expect((await reasonsFor(product({}, instantDoc({ timeSlots: ["10:00"] })), [listed()])).reasons).toContain("slot_times_mismatch");
+  });
+
+  it("an unknown any-time fact never passes, whatever the listed-start flag says", () => {
+    expect(slotTimesAgree(["10:00"], { slotStartMinutes: [600], anyTimeSlots: null, listedStartsSellable: true })).toBe("slot_times_mismatch");
+  });
+
+  it("fromCatalogReadiness reads the catalogue's listedStartsSellable fact, and only an exact true counts", () => {
+    const base = { mappingId: "m-1", variantCode: "shared", environment: "test", isActive: true, syncStatus: "ok", approvedOfferHash: "h", currentOfferHash: "h", issuesTicketsAtConfirm: "no", anyTimeSlots: true };
+    const out = fromCatalogReadiness({
+      productId: PRODUCT_ID,
+      environment: "test",
+      evaluatedAt: "x",
+      variants: [
+        { variantCode: "a", mapping: { ...base, mappingId: "m-a", variantCode: "a", listedStartsSellable: true }, blockers: [] },
+        { variantCode: "b", mapping: { ...base, mappingId: "m-b", variantCode: "b", listedStartsSellable: "true" }, blockers: [] },
+        { variantCode: "c", mapping: { ...base, mappingId: "m-c", variantCode: "c" }, blockers: [] },
+      ],
+    } as never);
+    expect(out.map((o) => o.listedStartsSellable)).toEqual([true, false, false]);
+  });
+});
