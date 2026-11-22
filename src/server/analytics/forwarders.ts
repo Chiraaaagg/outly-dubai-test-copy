@@ -1,6 +1,7 @@
 import "server-only";
 import { env } from "../lib/env";
 import { log } from "../lib/logger";
+import { gaMeasurementId } from "@/lib/ga-config";
 
 /**
  * Downstream analytics destinations (§11.5) — a port with one adapter per
@@ -60,7 +61,7 @@ import { log } from "../lib/logger";
  *
  * TODO(ga4): Measurement Protocol
  *   POST https://www.google-analytics.com/mp/collect
- *        ?measurement_id={NEXT_PUBLIC_GA4_MEASUREMENT_ID}&api_secret={GA4_API_SECRET}
+ *        ?measurement_id={gaMeasurementId(): NEXT_PUBLIC_GA_MEASUREMENT_ID}&api_secret={GA4_API_SECRET}
  *   { client_id: anonId, timestamp_micros, non_personalized_ads: true,
  *     events: [{ name, params: { session_id, engagement_time_msec: 1, value, currency, ...scrubbed props } }] }
  *   Mapping: activity_viewed -> view_item, inquiry_item_added/add_to_cart -> add_to_cart,
@@ -150,7 +151,7 @@ const posthog: Forwarder = {
 
 const ga4: Forwarder = {
   name: "ga4",
-  enabled: () => Boolean(env().GA4_API_SECRET && env().NEXT_PUBLIC_GA4_MEASUREMENT_ID),
+  enabled: () => Boolean(env().GA4_API_SECRET && gaMeasurementId()),
   async forward() {
     // TODO(ga4): implement per the header note.
     warnOnce("ga4");

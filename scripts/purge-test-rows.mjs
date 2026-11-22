@@ -20,6 +20,8 @@ await prisma.supplierCatalogueItem.deleteMany({ where: { supplierId: { in: tdIds
 const tdBookings = await prisma.supplierBooking.findMany({ where: { supplierId: { in: tdIds } }, select: { id: true } });
 await prisma.supplierJob.deleteMany({ where: { supplierBookingId: { in: tdBookings.map((x) => x.id) } } });
 await prisma.supplierAccountLease.deleteMany({ where: { supplierId: { in: tdIds } } });
+// Catalogue sync run rows (doc 29 Batch 1b) are named by supplier code: zz-td-, zz-tds- and zz-tdr- test codes.
+await prisma.supplierSyncRun.deleteMany({ where: { supplierCode: { startsWith: "zz-td" } } });
 await prisma.supplier.deleteMany({ where: { id: { in: tdIds }, bookings: { none: {} } } });
 await prisma.productSupplierMapping.deleteMany({ where: { product: { slug: { startsWith: "zz-test-" } } } });
 const p = await prisma.product.deleteMany({ where: { slug: { startsWith: "zz-test-" } } });

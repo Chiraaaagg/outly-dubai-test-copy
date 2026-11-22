@@ -10,6 +10,7 @@ import { CookieBanner } from "@/components/layout/cookie-banner";
 import { StorefrontOnly } from "@/components/layout/storefront-only";
 import { CURRENCY_BOOTSTRAP_SCRIPT } from "@/lib/currency";
 import { googleTagBootstrap, googleTagSrc } from "@/lib/google-tag";
+import { gaMeasurementId } from "@/lib/ga-config";
 
 /**
  * Type pairing:
@@ -59,7 +60,8 @@ export const viewport: Viewport = {
   viewportFit: "cover",
 };
 
-const GA_ID = process.env.NEXT_PUBLIC_GA_MEASUREMENT_ID;
+/** One name for the GA4 id across the tag, the CSP and the forwarder (src/lib/ga-config.ts). */
+const GA_ID = gaMeasurementId();
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (

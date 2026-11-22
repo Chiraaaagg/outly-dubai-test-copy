@@ -83,6 +83,7 @@ describe("assessReadiness: the rules", () => {
     ["supplier starts unknown", () => reasonsFor(product(), [mapping({ slotStartMinutes: undefined, anyTimeSlots: undefined })]), "slot_times_mismatch"],
     ["any-time offer (guest-chosen time not supported yet)", () => reasonsFor(product(), [mapping({ anyTimeSlots: true })]), "slot_any_time_unsupported"],
     ["unit not offered by the supplier", () => reasonsFor(product(), [mapping({ supplierUnits: ["adult"] })]), "unit_not_mapped"],
+    ["supplier catalogue older than the staleness limit (doc 29 Batch 1b)", () => reasonsFor(product(), [mapping({ catalogueFresh: false })]), "catalogue_stale"],
     ["price lowered below the margin floor", () => reasonsFor(product({}, instantDoc({ variants: [{ ...instantDoc().variants[0], units: [{ ...ADULT, price: { inr: 2600, aed: 104 } }] }] }))), "margin_below_floor"],
     ["supplier net unknown", () => reasonsFor(product(), [mapping({ netAedMinorByUnit: null })]), "margin_below_floor"],
     ["per-trip supplier cost not sold through any unit", () => reasonsFor(product(), [mapping({ supplierUnits: ["adult", "child", "trip"], netAedMinorByUnit: { adult: 10_000n, child: 8_000n, trip: 50_000n } })]), "unit_not_mapped"],
@@ -392,6 +393,20 @@ describe("readiness service: pricing settings and rules versions (CR-B2-8)", () 
     expect(h.calls.audits).toMatchObject([{ trigger: "pricing_settings_changed", after: { effectiveMode: "inquiry" } }]);
   });
 
+  it("a stale catalogue demotes a stored instant verdict to inquiry under the catalogue-age trigger; a fresh one keeps it (doc 29 Batch 1b)", async () => {
+    const instantRow = () => new Map([[PRODUCT_ID, { effectiveMode: "instant" as const, reasons: [], readinessVersion: READINESS_RULES_VERSION }]]);
+    const fresh = harness({ candidates: [PRODUCT_ID], rows: instantRow(), mappings: [mapping({ catalogueFresh: true })] });
+    await fresh.svc.reevaluateInstantCandidates("catalogue_age");
+    expect(fresh.calls.writes).toEqual([]);
+    expect(fresh.rows.get(PRODUCT_ID)).toMatchObject({ effectiveMode: "instant" });
+
+    const stale = harness({ candidates: [PRODUCT_ID], rows: instantRow(), mappings: [mapping({ catalogueFresh: false })] });
+    await stale.svc.reevaluateInstantCandidates("catalogue_age");
+    expect(stale.rows.get(PRODUCT_ID)).toEqual({ effectiveMode: "inquiry", reasons: ["catalogue_stale"] });
+    expect(stale.calls.audits).toMatchObject([{ trigger: "catalogue_age", after: { effectiveMode: "inquiry", reasons: ["catalogue_stale"] } }]);
+    await expect(harness({ candidates: "fail" }).svc.reevaluateInstantCandidates("catalogue_age")).resolves.toBeUndefined();
+  });
+
   it("any other setting is a no-op; a failure to list candidates never throws", async () => {
     const h = harness();
     const spy = vi.spyOn(h.svc, "reevaluateMany");
@@ -457,6 +472,17 @@ describe("fromCatalogReadiness: the supplier catalogue's states as readiness fac
     expect(out).toMatchObject({ supplierUnits: ["adult", "child"], netAedMinorByUnit: { adult: 10_000n, child: 8_000n }, supplierFreeCancellationHours: 24 });
     const r = await assessReadiness({ product: product(), mappings: [{ ...out, issuesTicketsAtConfirm: "yes" }], releaseEnabled: true, margin: fakeMargin() });
     expect(r.reasons).toEqual([]);
+  });
+
+  it("a catalogue_stale blocker reads as a stale catalogue and keeps the product inquiry (doc 29 Batch 1b)", async () => {
+    const [fresh, stale] = wrap([
+      { variantCode: "a", mapping: m({ mappingId: "m-a", variantCode: "a" }), blockers: [] },
+      { variantCode: "b", mapping: m({ mappingId: "m-b", variantCode: "b" }), blockers: ["catalogue_stale"] },
+    ]);
+    expect([fresh.catalogueFresh, stale.catalogueFresh]).toEqual([true, false]);
+    expect(stale.state).toBe("ready");
+    const r = await assessReadiness({ product: product(), mappings: [mapping({ catalogueFresh: stale.catalogueFresh })], releaseEnabled: true, margin: fakeMargin() });
+    expect(r).toMatchObject({ effective: "inquiry", reasons: ["catalogue_stale"] });
   });
 
   it("reads the mapping environment and pickup from the offer's direct-reporting flag", () => {

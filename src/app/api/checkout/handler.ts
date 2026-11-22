@@ -133,5 +133,5 @@ export function createCheckoutHandler(checkout: () => CheckoutService, downloadG
       }
     }
     return res;
-  });
+  }, { timing: "checkout" });
 }

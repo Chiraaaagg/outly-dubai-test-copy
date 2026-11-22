@@ -38,6 +38,8 @@ const JOB_GETS = new Map([
   ["GET jobs/documents-tick", "ticket documents: missing-codes sweep, F12 attention, evidenced document reads and PDF downloads into private storage"],
   ["GET jobs/fx-refresh", "fetches the ECB USD/INR rate and, when every guard passes, writes a new pricing.fx_inr_per_aed version"],
   ["GET jobs/crm-worker", "CRM outbox delivery to Bitrix24 deals and its retention purge; skipped unless CRM_SYNC_ENABLED=true (not scheduled in C1)"],
+  ["GET jobs/catalogue-sync", "daily read-only TravelDesk catalogue sync (GET calls only): catalogue items, mapping sync status, suggestions, price snapshots, a supplier_sync_runs row, then readiness (doc 29 Batch 1b)"],
+  ["GET jobs/retention-purge", "deletes expired one-time-code rows, sessions and capability grants, unused expired quotes with their unbound verifications, and guest sessions no quote names (doc 26 §2)"],
 ]);
 
 interface RouteFile {

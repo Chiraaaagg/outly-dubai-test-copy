@@ -8,6 +8,8 @@ import { log } from "./logger";
 import { bigintReplacer } from "./money";
 import { env } from "./env";
 import { safeEqual } from "./crypto";
+import { serverTimingHeader, timingFields, withRequestTiming, type TimingRoute } from "./request-timing";
+import { emitEvent } from "./structured-events";
 
 /**
  * Transport helpers for `app/api/**` route handlers (§04.3.1: parse, authorise,
@@ -61,17 +63,38 @@ export function errorResponse(err: unknown, requestId?: string): NextResponse {
 
 type Handler<Ctx> = (req: NextRequest, ctx: Ctx) => Promise<NextResponse | Response>;
 
+export interface HandleOptions {
+  /**
+   * Measure this route (doc 29 §6.6): a `Server-Timing` header (`supplier`,
+   * `db`, `total` durations only) on every response, errors included, and one
+   * `route.timing` log line with the fixed route code, the status and the
+   * durations. See src/server/lib/request-timing.ts.
+   */
+  timing?: TimingRoute;
+}
+
 /** Wraps a route handler with the error envelope and an `x-request-id` for log correlation. */
-export function handle<Ctx = { params: Promise<Record<string, string>> }>(fn: Handler<Ctx>): Handler<Ctx> {
+export function handle<Ctx = { params: Promise<Record<string, string>> }>(fn: Handler<Ctx>, opts: HandleOptions = {}): Handler<Ctx> {
   return async (req, ctx) => {
     const requestId = req.headers.get("x-request-id")?.slice(0, 64) ?? randomUUID();
+    const run = async (): Promise<NextResponse | Response> => {
+      try {
+        const res = await fn(req, ctx);
+        if (!res.headers.has("x-request-id")) res.headers.set("x-request-id", requestId);
+        return res;
+      } catch (err) {
+        return errorResponse(err, requestId);
+      }
+    };
+    if (!opts.timing) return run();
+    const { result: res, timing } = await withRequestTiming(run);
     try {
-      const res = await fn(req, ctx);
-      if (!res.headers.has("x-request-id")) res.headers.set("x-request-id", requestId);
-      return res;
-    } catch (err) {
-      return errorResponse(err, requestId);
+      res.headers.set("server-timing", serverTimingHeader(timing));
+    } catch {
+      // An immutable-header response (none of the timed routes returns one) keeps its headers; the log line still goes out.
     }
+    emitEvent("route.timing", timingFields(opts.timing, res.status, timing));
+    return res;
   };
 }
 

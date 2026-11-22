@@ -69,7 +69,12 @@ import type { ProductMappingReadiness, VariantMappingState } from "./supplier-ca
  *    (`ISSUED_TICKET_REFUND_POLICY`, TKT-7);
  *  - the free-text `cancellationPolicy` the page shows states the same hours
  *    as `freeCancellationHours` (`policyTextAgrees`, CR-B2-7), otherwise
- *    `safety_fact_unknown`.
+ *    `safety_fact_unknown`;
+ *  - the supplier catalogue is fresh (doc 29 Batch 1b): the latest complete
+ *    catalogue sync for the mapping's supplier and environment finished
+ *    within `CATALOGUE_STALE_AFTER_MS` (48 h), else `catalogue_stale`. Before
+ *    any complete run is recorded, the mapped offer's own last-seen time
+ *    stands in (`catalogueSyncedAt` in supplier-catalog.service.ts).
  *
  * Writes of the pricing settings the margin rule reads (margin policy, FX
  * input, cost inputs) re-run readiness for every product that is or asks to
@@ -82,8 +87,9 @@ import type { ProductMappingReadiness, VariantMappingState } from "./supplier-ca
  * Version of the rule set above; stored with every verdict so a rules change can be re-run.
  * 6 (doc 29 Batch 1a): `capability_not_ready` also when the capability gate refuses the offer's
  * exact class key (supplier-catalog.service.ts `mappingReadinessFor`, suppliers/capability-gate.ts).
+ * 7 (doc 29 Batch 1b): `catalogue_stale` when the catalogue is older than 48 h or of unknown age.
  */
-export const READINESS_RULES_VERSION = 6;
+export const READINESS_RULES_VERSION = 7;
 
 /**
  * Per-mapping facts the readiness rules need, adapted from the supplier
@@ -102,6 +108,8 @@ export interface MappingReadiness {
   /** The adapter can hold and confirm this offer in this environment. */
   capabilityReady: boolean;
   slotRulesKnown: boolean;
+  /** The supplier catalogue behind this mapping is within the staleness limit (doc 29 Batch 1b). */
+  catalogueFresh: boolean;
   /** Supplier unit codes the offer accepts (TravelDesk: adult, child, infant, trip). */
   supplierUnits: string[];
   /** Approved supplier net per supplier unit, AED minor units; null when unknown. */
@@ -157,7 +165,9 @@ export type ReadinessTrigger =
   /** A capability class flag was switched on or off (doc 29 §3.3). */
   | "capability_flag"
   /** Per-offer enablement evidence was recorded or revoked (doc 29 §3.3). */
-  | "offer_evidence";
+  | "offer_evidence"
+  /** A scheduled catalogue sync did not complete: the catalogue's age is re-checked (doc 29 Batch 1b). */
+  | "catalogue_age";
 
 /** Settings whose values the margin rule reads; writing one re-runs readiness (`reevaluateAfterSetting`). */
 export const PRICING_SETTING_KEYS: readonly string[] = [MARGIN_POLICY_SETTING_KEY, FX_INR_PER_AED_SETTING_KEY, MARGIN_COST_INPUTS_SETTING_KEY];
@@ -361,6 +371,7 @@ export async function assessReadiness(input: ReadinessInput): Promise<ReadinessA
     else if (m.state === "missing_upstream") reasons.add("mapping_missing_upstream");
     if (!m.capabilityReady) reasons.add("capability_not_ready");
     if (!m.slotRulesKnown) reasons.add("slot_rules_unknown");
+    if (!m.catalogueFresh) reasons.add("catalogue_stale");
     const times = slotTimesAgree(activity.timeSlots, m);
     if (times !== "ok") reasons.add(times);
     if (!policyWithinSupplier(activity.freeCancellationHours, m)) reasons.add("policy_exceeds_supplier");
@@ -431,6 +442,13 @@ export interface ReadinessServiceImpl extends ReadinessService {
    * Never throws: a failure to list candidates is logged.
    */
   reevaluateAfterSetting(key: string): Promise<void>;
+  /**
+   * Re-run readiness for every product that is or asks to be instant. Never
+   * throws: a failure to list candidates is logged. Used when a scheduled
+   * catalogue sync did not complete, so an ageing catalogue reaches the
+   * storefront without waiting for the next sync (doc 29 Batch 1b).
+   */
+  reevaluateInstantCandidates(trigger: ReadinessTrigger): Promise<void>;
 }
 
 /**
@@ -534,14 +552,18 @@ export function createReadinessService(deps: ReadinessDeps): ReadinessServiceImp
 
     async reevaluateAfterSetting(key) {
       if (!PRICING_SETTING_KEYS.includes(key)) return;
+      await service.reevaluateInstantCandidates("pricing_settings_changed");
+    },
+
+    async reevaluateInstantCandidates(trigger) {
       let ids: string[];
       try {
         ids = await deps.listInstantCandidates();
       } catch (error) {
-        log.error("readiness.candidates_failed", { trigger: "pricing_settings_changed", key, error });
+        log.error("readiness.candidates_failed", { trigger, error });
         return;
       }
-      await service.reevaluateMany(ids, "pricing_settings_changed");
+      await service.reevaluateMany(ids, trigger);
     },
   };
   return service;
@@ -617,6 +639,7 @@ export function fromCatalogReadiness(r: ProductMappingReadiness): MappingReadine
       approvedOfferHash: facts.approvedOfferHash,
       capabilityReady: !v.blockers.includes("capability_not_ready"),
       slotRulesKnown: !v.blockers.includes("slot_rules_unknown"),
+      catalogueFresh: !v.blockers.includes("catalogue_stale"),
       supplierUnits: supplierUnitsOf(extra.supplierUnits),
       netAedMinorByUnit: netsOf(extra.netAedMinorByUnit),
       issuesTicketsAtConfirm: facts.issuesTicketsAtConfirm,

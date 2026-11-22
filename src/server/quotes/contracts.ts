@@ -108,7 +108,9 @@ export type ReadinessReason =
   | "unit_price_mismatch"
   | "margin_below_floor"
   | "policy_exceeds_supplier"
-  | "capability_not_ready";
+  | "capability_not_ready"
+  /** The supplier catalogue the verdict reads is older than the staleness limit, or of unknown age (doc 29 Batch 1b). */
+  | "catalogue_stale";
 
 export interface ReadinessResult {
   productId: string;

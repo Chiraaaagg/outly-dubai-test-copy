@@ -83,6 +83,8 @@ const NEW_TABLES_ONLY = [
   "20261104120000_ops_alerts",
   // crm_outbox, crm_links, crm_portal_state (doc 29 C1): standalone tables, no foreign key.
   "20261122130000_crm_c1_outbox_links",
+  // supplier_sync_runs (doc 29 Batch 1b): a standalone table, no foreign key.
+  "20261123120000_b1b_supplier_sync_runs",
 ];
 /** How long the injected lock is held. Longer than every `lock_timeout` (5 s). */
 const HOLD_MS = 12_000;

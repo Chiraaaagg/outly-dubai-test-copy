@@ -25,6 +25,14 @@
     {
       "path": "/api/jobs/supplier-reconcile",
       "schedule": "*/15 * * * *"
+    },
+    {
+      "path": "/api/jobs/catalogue-sync",
+      "schedule": "0 23 * * *"
+    },
+    {
+      "path": "/api/jobs/retention-purge",
+      "schedule": "45 2 * * *"
     }
   ]
 }

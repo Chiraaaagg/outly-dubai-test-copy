@@ -1,4 +1,5 @@
 import type { z } from "zod";
+import { recordPhase } from "../../lib/request-timing";
 import { assertTravelDeskMutationAllowed, expectedBaseUrl, type TravelDeskConfig } from "./traveldesk.config";
 
 /**
@@ -25,7 +26,9 @@ import { assertTravelDeskMutationAllowed, expectedBaseUrl, type TravelDeskConfig
  *  - No automatic retries. Callers decide (the cache serves stale data).
  *
  * Pure: no env, no logger. Observability goes through the `onEvent` hook,
- * which carries no body, no query values and no headers.
+ * which carries no body, no query values and no headers, and each call's
+ * duration is added to the current request's `supplier` timing
+ * (src/server/lib/request-timing.ts; a no-op outside a timed request).
  */
 
 export type TravelDeskErrorKind =
@@ -452,8 +455,11 @@ export class TravelDeskHttp {
     let status: number | null = null;
     let bytes: number | null = null;
     let serverDate: string | null = null;
-    const emit = (outcome: TravelDeskCallEvent["outcome"]) =>
-      this.onEvent?.({ operation, method: "GET", pathTemplate, environment: this.config.environment, status, durationMs: this.now() - started, outcome, bytes, serverDate });
+    const emit = (outcome: TravelDeskCallEvent["outcome"]) => {
+      const durationMs = this.now() - started;
+      recordPhase("supplier", durationMs);
+      this.onEvent?.({ operation, method: "GET", pathTemplate, environment: this.config.environment, status, durationMs, outcome, bytes, serverDate });
+    };
 
     let res: Response;
     try {
@@ -519,18 +525,21 @@ export class TravelDeskHttp {
     let status: number | null = null;
     let bytes: number | null = null;
     let serverDate: string | null = null;
-    const emit = (outcome: TravelDeskCallEvent["outcome"]) =>
+    const emit = (outcome: TravelDeskCallEvent["outcome"]) => {
+      const durationMs = this.now() - started;
+      recordPhase("supplier", durationMs);
       this.onEvent?.({
         operation,
         method,
         pathTemplate,
         environment: this.config.environment,
         status,
-        durationMs: this.now() - started,
+        durationMs,
         outcome,
         bytes,
         serverDate,
       });
+    };
 
     let res: Response;
     try {

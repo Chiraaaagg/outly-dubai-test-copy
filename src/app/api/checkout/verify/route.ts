@@ -37,4 +37,4 @@ export const POST = handle(async (req: NextRequest) => {
     throw Errors.validation({ code: "That code isn't right. Check it and try again." });
   }
   return json({ verificationId: result.verificationId, channel: result.channel, verifiedAt: result.verifiedAt });
-});
+}, { timing: "checkout_verify" });

@@ -2,6 +2,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { jwtVerify } from "jose";
 import { CURRENCY_COOKIE, currencyForCountry, isDisplayCurrency } from "@/lib/currency";
 import { isPrivateCustomerPath } from "@/lib/customer-status";
+import { gaMeasurementId } from "@/lib/ga-config";
 
 /**
  * Request proxy (Next 16 name for middleware) — the edge of the app (§04.2).
@@ -46,19 +47,34 @@ const SESSION_COOKIE = "outlyy_admin_session";
 const PENDING_COOKIE = "outlyy_admin_pending";
 
 /**
- * Google Analytics origins.
+ * Google Analytics 4 origins, exactly as Google documents them for a CSP
+ * ("Google Analytics 4 (Google Analytics)" in
+ * https://developers.google.com/tag-platform/security/guides/csp):
  *
- * gtag.js is served from googletagmanager.com and beacons to
- * google-analytics.com — plus a regional `region1.google-analytics.com` style
- * host, hence the wildcard. Without these the tag is blocked by the CSP and
- * fails silently, which is the hardest kind of analytics bug to notice.
+ *   script-src   https://*.googletagmanager.com
+ *   img-src      https://*.google-analytics.com https://*.googletagmanager.com
+ *   connect-src  https://*.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com
  *
- * Storefront only. The admin console keeps its nonce + 'strict-dynamic'
- * policy with nothing added, because no third-party script belongs on a
- * screen showing customer PII.
+ * gtag.js is served from www.googletagmanager.com and sends its hits to
+ * region hosts such as `region1.google-analytics.com` and, for GA4,
+ * `region1.analytics.google.com`. That last family was missing (D4, doc 29
+ * Batch 1c), so collection was blocked by the CSP and failed silently, which
+ * is the hardest kind of analytics bug to notice. Google's extra hosts for
+ * Google Signals and ads features (`*.g.doubleclick.net`, `*.google.com`,
+ * `*.google.<TLD>`) are deliberately NOT added: neither is enabled here,
+ * and they would open far more than collection needs. `img-src` already
+ * allows any https image; the GA hosts are named there too so the policy
+ * stays correct if that is ever narrowed.
+ *
+ * Storefront only, and only when a measurement id is configured
+ * (`gaMeasurementId()`, src/lib/ga-config.ts). Private customer pages and
+ * the admin console never get them: the admin console keeps its nonce +
+ * 'strict-dynamic' policy with nothing added, because no third-party script
+ * belongs on a screen showing customer PII.
  */
-const GA_SCRIPT_SRC = "https://www.googletagmanager.com";
-const GA_CONNECT_SRC = "https://www.google-analytics.com https://*.google-analytics.com https://www.googletagmanager.com";
+const GA_SCRIPT_SRC = "https://*.googletagmanager.com";
+const GA_IMG_SRC = "https://*.google-analytics.com https://*.googletagmanager.com";
+const GA_CONNECT_SRC = "https://*.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com";
 
 /**
  * MSG91 OTP widget origins (src/lib/msg91-widget.ts).
@@ -93,12 +109,13 @@ const OTP_CONNECT_SRC = `https://control.msg91.com https://verify.msg91.com http
 const OTP_FRAME_SRC = HCAPTCHA_SRC;
 const OTP_STYLE_SRC = HCAPTCHA_SRC;
 
-function buildCsp(scriptSrc: string, isProd: boolean, allowAnalytics: boolean, allowOtpWidget: boolean): string {
+/** The Content-Security-Policy value. Pure; exported for tests. */
+export function buildCsp(scriptSrc: string, isProd: boolean, allowAnalytics: boolean, allowOtpWidget: boolean): string {
   return [
     `default-src 'self'`,
     `script-src ${scriptSrc}${allowAnalytics ? ` ${GA_SCRIPT_SRC}` : ""}${allowOtpWidget ? ` ${OTP_SCRIPT_SRC}` : ""}`,
     `style-src 'self' 'unsafe-inline'${allowOtpWidget ? ` ${OTP_STYLE_SRC}` : ""}`,
-    `img-src 'self' data: blob: https:`,
+    `img-src 'self' data: blob: https:${allowAnalytics ? ` ${GA_IMG_SRC}` : ""}`,
     `font-src 'self' data:`,
     `connect-src 'self'${allowAnalytics ? ` ${GA_CONNECT_SRC}` : ""}${allowOtpWidget ? ` ${OTP_CONNECT_SRC}` : ""}${isProd ? "" : " ws: wss:"}`,
     ...(allowOtpWidget ? [`frame-src ${OTP_FRAME_SRC}`] : []),
@@ -178,7 +195,7 @@ export interface EdgePolicyInput {
   pathname: string;
   isProd: boolean;
   nonce: string;
-  /** NEXT_PUBLIC_GA_MEASUREMENT_ID is set. */
+  /** A GA4 measurement id is configured (`gaMeasurementId()`: NEXT_PUBLIC_GA_MEASUREMENT_ID, or the deprecated NEXT_PUBLIC_GA4_MEASUREMENT_ID). */
   analyticsConfigured: boolean;
   /** NEXT_PUBLIC_MSG91_WIDGET_ID is set. */
   otpWidgetConfigured: boolean;
@@ -232,7 +249,7 @@ export async function proxy(req: NextRequest) {
     pathname,
     isProd,
     nonce,
-    analyticsConfigured: Boolean(process.env.NEXT_PUBLIC_GA_MEASUREMENT_ID),
+    analyticsConfigured: Boolean(gaMeasurementId()),
     otpWidgetConfigured: Boolean(process.env.NEXT_PUBLIC_MSG91_WIDGET_ID),
   });
 

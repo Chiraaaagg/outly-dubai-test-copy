@@ -65,6 +65,7 @@ export function mapping(over: Partial<MappingReadiness> = {}): MappingReadiness 
     approvedOfferHash: "a".repeat(64),
     capabilityReady: true,
     slotRulesKnown: true,
+    catalogueFresh: true,
     supplierUnits: ["adult", "child", "infant"],
     netAedMinorByUnit: { adult: 10_000n, child: 8_000n },
     issuesTicketsAtConfirm: "yes",

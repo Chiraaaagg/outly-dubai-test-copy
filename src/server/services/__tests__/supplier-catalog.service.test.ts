@@ -167,6 +167,7 @@ describe.skipIf(!enabled)("supplierCatalogService (local DB)", () => {
     await prisma.productSupplierMapping.deleteMany({ where: { productId } });
     await prisma.supplierMappingCandidate.deleteMany({ where: { productId } });
     await prisma.product.deleteMany({ where: { slug: { startsWith: `zz-test-${RUN}` } } });
+    await prisma.supplierSyncRun.deleteMany({ where: { supplierCode: CODE } });
     await prisma.$disconnect();
   });
 
@@ -440,6 +441,7 @@ describe.skipIf(!enabled)("supplierCatalogService (local DB)", () => {
     expect(same.mappingsChanged).toBe(0);
     expect((await mapping()).syncStatus).toBe("ok");
     const ready = await readiness("deluxe");
+    // No supplier_sync_runs row exists for this supplier (a fresh deploy of Batch 1b): the offer's own last-seen time stands in, so nothing is demoted.
     expect(ready.blockers).toEqual([]);
     // The capability gate passes on a seeded class (doc 29 Batch 1a parity).
     expect(ready.mapping).toMatchObject({ capabilityClassKey: "live.fixed_slot_single.self.internal.per_person", capabilityRefusal: null });
@@ -487,6 +489,54 @@ describe.skipIf(!enabled)("supplierCatalogService (local DB)", () => {
     expect(backfill.hashesBackfilled).toBe(1);
     expect(await mapping()).toMatchObject({ approvedOfferHash: m.approvedOfferHash, syncStatus: "ok" });
     expect((await svc.syncTravelDeskCatalogue(source([dearer, ...filler]), "test", { supplierCode: CODE })).hashesBackfilled).toBe(0);
+  });
+
+  it("a stale catalogue blocks readiness with catalogue_stale; a fresh complete run clears it (doc 29 Batch 1b)", async () => {
+    const supplier = await prisma.supplier.findUniqueOrThrow({ where: { code: CODE } });
+    const readiness = async () => (await svc.mappingReadinessFor(productId, "test", { supplierCode: CODE })).variants.find((v) => v.variantCode === "deluxe")!;
+    const { CATALOGUE_STALE_AFTER_MS } = await import("../supplier-catalog.service");
+    const hoursAgo = (h: number) => new Date(Date.now() - h * 3_600_000);
+    const runRow = (finishedAt: Date, status = "complete") => ({
+      id: uuidv7(),
+      supplierCode: CODE,
+      environment: "test",
+      accountId: "zz-account",
+      triggeredBy: "cron",
+      status,
+      startedAt: new Date(finishedAt.getTime() - 60_000),
+      passStartedAt: new Date(finishedAt.getTime() - 60_000),
+      finishedAt,
+    });
+    await prisma.supplierSyncRun.deleteMany({ where: { supplierCode: CODE } });
+    expect((await readiness()).blockers).not.toContain("catalogue_stale");
+
+    // No complete run yet: the offer's own last-seen time decides; an old one is stale.
+    const offerRow = await prisma.supplierCatalogueItem.findUniqueOrThrow({
+      where: { supplierId_environment_kind_externalId: { supplierId: supplier.id, environment: "test", kind: "offer", externalId: String(OFFER_A) } },
+    });
+    await prisma.supplierCatalogueItem.update({ where: { id: offerRow.id }, data: { lastSeenAt: hoursAgo(49) } });
+    expect((await readiness()).blockers).toContain("catalogue_stale");
+    // An incomplete run does not count as a complete sync.
+    await prisma.supplierSyncRun.create({ data: { ...runRow(hoursAgo(1), "incomplete") } });
+    expect((await readiness()).blockers).toContain("catalogue_stale");
+
+    // The last complete run decides once one exists: older than the limit is stale, whatever the offer says.
+    await prisma.supplierCatalogueItem.update({ where: { id: offerRow.id }, data: { lastSeenAt: offerRow.lastSeenAt } });
+    await prisma.supplierSyncRun.create({ data: runRow(new Date(Date.now() - CATALOGUE_STALE_AFTER_MS - 60_000)) });
+    const stale = await readiness();
+    expect(stale.blockers).toContain("catalogue_stale");
+    const facts = fromCatalogReadiness(await svc.mappingReadinessFor(productId, "test", { supplierCode: CODE })).filter((x) => x.variantId === "deluxe");
+    const doc = instantDoc({ timeSlots: ["21:00"], variants: [{ ...instantDoc().variants[0], id: "deluxe" }] });
+    const verdict = await assessReadiness({ product: product({ id: productId }, doc), mappings: facts, releaseEnabled: true, margin: fakeMargin() });
+    expect(verdict.effective).toBe("inquiry");
+    expect(verdict.reasons).toContain("catalogue_stale");
+
+    // A fresh complete run clears it.
+    await prisma.supplierSyncRun.create({ data: runRow(hoursAgo(2)) });
+    const fresh = await readiness();
+    expect(fresh.blockers).not.toContain("catalogue_stale");
+    expect(fresh.mapping!.catalogueSyncedAt).not.toBeNull();
+    await prisma.supplierSyncRun.deleteMany({ where: { supplierCode: CODE } });
   });
 
   it("one failing tour no longer hides withdrawals in other tours (SUP-15)", async () => {

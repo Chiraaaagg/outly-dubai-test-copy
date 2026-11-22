@@ -39,6 +39,10 @@ export const DB_SUITES = [
   "src/server/services/__tests__/traveldesk-catalogue-sync.service.test.ts",
   // CRM batch C1: outbox, links, Postgres store, worker on the fake portal, erasure and retention.
   "src/server/crm/__tests__/crm.db.test.ts",
+  // Batch 1c: the retention purge leaves live rows alone (doc 26 §2).
+  "src/server/jobs/__tests__/retention-purge.db.test.ts",
+  // Batch 1c: the Prisma timing extension counts queries of the request it runs in (doc 29 §6.6).
+  "src/server/lib/__tests__/request-timing.db.test.ts",
 ];
 
 /**

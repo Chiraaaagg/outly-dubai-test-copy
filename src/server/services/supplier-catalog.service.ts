@@ -80,7 +80,26 @@ async function quietLane(supplierId: string, code: string, environment: Supplier
 }
 
 /** Above this share of live items disappearing in one pull, removals are skipped and reported. */
-const MAX_REMOVAL_SHARE = 0.2;
+export const MAX_REMOVAL_SHARE = 0.2;
+
+/**
+ * A catalogue older than this makes mapped instant offers fall back to
+ * inquiry (`catalogue_stale`, doc 29 §6.3 and Batch 1b). Two daily scheduled
+ * runs, so one failed or incomplete night does not demote anything.
+ */
+export const CATALOGUE_STALE_AFTER_MS = 48 * 3_600_000;
+
+/**
+ * Continue an incomplete pass (doc 29 Batch 1b): skip the tours up to and
+ * including `afterTourId` (tours run in id order), keep the earlier runs'
+ * failed tours, and judge removals against everything seen since the pass
+ * started.
+ */
+export interface SyncResume {
+  afterTourId: number;
+  passStartedAt: Date;
+  failedTours: number[];
+}
 
 /** The read calls the sync needs; `TravelDeskReadClient` satisfies it. */
 export interface TravelDeskCatalogueSource {
@@ -112,6 +131,14 @@ export interface SyncResult {
   removalsSkipped?: "empty_tour_list" | "too_many_removals" | "incomplete";
   /** True when the run stopped at its deadline before every tour was read; removals are then skipped. */
   incomplete?: boolean;
+  /**
+   * The last tour this pass attempted (read or failed), in tour id order; null
+   * when none was. An incomplete run's cursor: the next run resumes after it
+   * (doc 29 Batch 1b).
+   */
+  lastTourId: number | null;
+  /** Start of the pass this run belongs to (its own start, or the resumed pass's). Removals count items unseen since then. */
+  passStartedAt: Date;
   mappingsChecked: number;
   /** Mappings whose offer terms differ from the approved ones this run. */
   mappingsChanged: number;
@@ -340,7 +367,7 @@ export interface TicketEvidenceInput {
 /** The readiness reasons a variant's mapping can produce (quotes/contracts.ts). */
 export type MappingBlocker = Extract<
   ReadinessReason,
-  "variant_without_mapping" | "mapping_inactive" | "mapping_changed_upstream" | "mapping_missing_upstream" | "slot_rules_unknown" | "capability_not_ready" | "unit_not_mapped"
+  "variant_without_mapping" | "mapping_inactive" | "mapping_changed_upstream" | "mapping_missing_upstream" | "slot_rules_unknown" | "capability_not_ready" | "unit_not_mapped" | "catalogue_stale"
 >;
 
 /** One storefront variant and the supplier mapping that would fulfil it. */
@@ -378,6 +405,8 @@ export interface VariantMappingState {
     capabilityClassKey?: string;
     /** Why the capability gate refuses instant sale; null when it allows it. */
     capabilityRefusal?: string | null;
+    /** When the catalogue this verdict reads was last synced (`catalogueSyncedAt`); null when unknown. */
+    catalogueSyncedAt?: string | null;
   } | null;
   /** Empty when the mapping side is ready; readiness adds its own reasons. */
   blockers: MappingBlocker[];
@@ -388,6 +417,42 @@ export interface ProductMappingReadiness {
   environment: SupplierEnvironment;
   variants: VariantMappingState[];
   evaluatedAt: string;
+}
+
+/**
+ * A run that counts as a complete sync for staleness: it read every listed
+ * tour. A run that got an empty tour list read nothing, so it does not count
+ * (its removals were skipped too); `too_many_removals` still read every tour.
+ */
+function completeRunWhere(supplierCode: string, environment: SupplierEnvironment): Prisma.SupplierSyncRunWhereInput {
+  return { supplierCode, environment, status: "complete", OR: [{ removalsSkipped: null }, { removalsSkipped: { not: "empty_tour_list" } }] };
+}
+
+/** Finish time of the latest complete catalogue sync run for this supplier and environment, or null. */
+export async function lastCompleteSync(supplierCode: string, environment: SupplierEnvironment): Promise<Date | null> {
+  const run = await prisma.supplierSyncRun.findFirst({
+    where: completeRunWhere(supplierCode, environment),
+    orderBy: { finishedAt: "desc" },
+    select: { finishedAt: true },
+  });
+  return run?.finishedAt ?? null;
+}
+
+/**
+ * When the catalogue behind a mapping was last synced (doc 29 Batch 1b): the
+ * latest complete run's finish. Before any complete run is recorded (a fresh
+ * deploy of this batch, or only incomplete runs since), the mapped offer's own
+ * `last_seen_at`, which every sync that read the offer already stores. Never
+ * more permissive than before this rule, which had no age check at all, and a
+ * deploy does not demote an offer a sync read recently.
+ */
+export function catalogueSyncedAt(lastCompleteRun: Date | null, offerLastSeenAt: Date | null): Date | null {
+  return lastCompleteRun ?? offerLastSeenAt;
+}
+
+/** Unknown age is stale; so is an age above `CATALOGUE_STALE_AFTER_MS`. */
+export function catalogueStale(syncedAt: Date | null, at: Date): boolean {
+  return !syncedAt || at.getTime() - syncedAt.getTime() > CATALOGUE_STALE_AFTER_MS;
 }
 
 /** Variant ids as the storefront and the matcher see them (`matchProductFrom`). */
@@ -421,7 +486,10 @@ export const supplierCatalogService = {
    *  - `unit_not_mapped`: the offer's child or infant age band does not reach
    *    the top of the page's band for that unit (`PAGE_PAX_AGES`,
    *    `ageBandMismatches`, N3). That unit is also left out of
-   *    `supplierUnits`, so readiness refuses any content unit sold through it.
+   *    `supplierUnits`, so readiness refuses any content unit sold through it;
+   *  - `catalogue_stale` (doc 29 Batch 1b): the catalogue this verdict reads
+   *    is older than `CATALOGUE_STALE_AFTER_MS`, or its age is unknown
+   *    (`catalogueSyncedAt`).
    */
   async mappingReadinessFor(productId: string, environment: SupplierEnvironment, opts: { supplierCode?: string; now?: () => Date } = {}): Promise<ProductMappingReadiness> {
     const product = await prisma.product.findUnique({ where: { id: productId }, select: { id: true, content: true } });
@@ -445,9 +513,10 @@ export const supplierCatalogService = {
           { kind: "tour", externalId: { in: mappings.flatMap((m) => (m.supplierProductId ? [m.supplierProductId] : [])) } },
         ],
       },
-      select: { kind: true, externalId: true, payload: true, removedAt: true },
+      select: { kind: true, externalId: true, payload: true, removedAt: true, lastSeenAt: true },
     });
     const byKey = new Map(items.map((i) => [`${i.kind}:${i.externalId}`, i]));
+    const lastComplete = await lastCompleteSync(code, environment);
     const accountId = supplierCheckAccountId(environment);
     const gate = await loadCapabilityGate(prisma, {
       adapter: supplier.adapter,
@@ -485,6 +554,8 @@ export const supplierCatalogService = {
       )
         blockers.push("capability_not_ready");
       if (bandMismatch.length) blockers.push("unit_not_mapped");
+      const syncedAt = catalogueSyncedAt(lastComplete, offer?.lastSeenAt ?? null);
+      if (catalogueStale(syncedAt, at)) blockers.push("catalogue_stale");
 
       return {
         variantCode,
@@ -505,6 +576,7 @@ export const supplierCatalogService = {
           accountId,
           capabilityClassKey: capability.verdict.classKey,
           capabilityRefusal: capability.verdict.instant ? null : capability.verdict.reason,
+          catalogueSyncedAt: syncedAt?.toISOString() ?? null,
         },
         blockers,
       };
@@ -520,15 +592,21 @@ export const supplierCatalogService = {
   async syncTravelDeskCatalogue(
     source: TravelDeskCatalogueSource,
     environment: SupplierEnvironment,
-    opts: { now?: () => Date; supplierCode?: string; lane?: SyncLaneOptions } = {},
+    opts: { now?: () => Date; supplierCode?: string; lane?: SyncLaneOptions; resume?: SyncResume | null } = {},
   ): Promise<SyncResult> {
     const now = opts.now ?? (() => new Date());
     const supplier = await ensureTravelDeskSupplier(opts.supplierCode);
     const code = opts.supplierCode ?? TRAVELDESK_SUPPLIER_CODE;
     const lane = opts.lane ?? {};
+    const resume = opts.resume ?? null;
     const runStarted = now();
+    // A resumed pass judges removals against everything seen since its first run started.
+    const passStarted = resume && resume.passStartedAt < runStarted ? resume.passStartedAt : runStarted;
     if ((await quietLane(supplier.id, code, environment, lane)) === "deadline") throw Errors.unavailable(60);
-    const tours = await source.listTours();
+    const listed = await source.listTours();
+    // Tour id order, so a run stopped at its deadline leaves a cursor the next run can continue after (Batch 1b).
+    const ordered = [...listed].sort((a, b) => a.tourId - b.tourId);
+    const tours = resume ? ordered.filter((t) => t.tourId > resume.afterTourId) : ordered;
     const result: SyncResult = {
       environment,
       tours: 0,
@@ -537,11 +615,13 @@ export const supplierCatalogService = {
       changed: 0,
       removed: 0,
       revived: 0,
-      failedTours: [],
+      failedTours: resume ? [...new Set(resume.failedTours)] : [],
       removalsApplied: false,
       mappingsChecked: 0,
       mappingsChanged: 0,
       hashesBackfilled: 0,
+      lastTourId: resume ? resume.afterTourId : null,
+      passStartedAt: passStarted,
     };
 
     for (const t of tours) {
@@ -556,6 +636,7 @@ export const supplierCatalogService = {
         // A rejected key fails every tour the same way: stop instead of reporting an empty catalogue.
         if (error instanceof TravelDeskApiError && error.kind === "auth") throw error;
         result.failedTours.push(t.tourId);
+        result.lastTourId = t.tourId;
         continue;
       }
       result.tours += 1;
@@ -605,6 +686,7 @@ export const supplierCatalogService = {
           },
         });
       }
+      result.lastTourId = t.tourId;
     }
 
     // Only a plausible pull may mark inventory as gone: a non-empty tour list,
@@ -618,7 +700,8 @@ export const supplierCatalogService = {
       supplierId: supplier.id,
       environment,
       removedAt: null,
-      lastSeenAt: { not: runStarted },
+      // Not seen in this pass: a resumed pass read its earlier tours in earlier runs.
+      lastSeenAt: { lt: passStarted },
       ...(failedIds.length
         ? { OR: [{ kind: "tour", externalId: { notIn: failedIds } }, { kind: "offer", parentExternalId: { notIn: failedIds } }] }
         : {}),
@@ -626,7 +709,7 @@ export const supplierCatalogService = {
     const live = await prisma.supplierCatalogueItem.count({ where: { supplierId: supplier.id, environment, removedAt: null } });
     const wouldRemove = await prisma.supplierCatalogueItem.count({ where: unseen });
     if (result.incomplete) result.removalsSkipped = "incomplete";
-    else if (tours.length === 0) result.removalsSkipped = "empty_tour_list";
+    else if (listed.length === 0) result.removalsSkipped = "empty_tour_list";
     else if (live > 0 && wouldRemove / live > MAX_REMOVAL_SHARE) result.removalsSkipped = "too_many_removals";
     else {
       result.removed = (await prisma.supplierCatalogueItem.updateMany({ where: unseen, data: { removedAt: runStarted } })).count;
@@ -820,6 +903,46 @@ export const supplierCatalogService = {
       items: items.map((i) => ({ environment: i.environment, kind: i.kind, bookingKind: i.bookingKind, count: i._count._all })),
       candidates: candidates.map((c) => ({ environment: c.environment, state: c.state, count: c._count._all })),
       lastSyncAt: Object.fromEntries(lastSeen.map((l) => [l.environment, l._max.lastSeenAt?.toISOString() ?? null])) as Partial<Record<SupplierEnvironment, string | null>>,
+    };
+  },
+
+  /**
+   * The latest catalogue sync run and the latest complete one for an
+   * environment (doc 29 Batch 1b), for the admin page. Counts, codes and
+   * times only.
+   */
+  async lastSyncRuns(actor: Actor, environment: SupplierEnvironment, opts: { supplierCode?: string; now?: Date } = {}) {
+    requirePermission(actor, "suppliers.manage");
+    const code = opts.supplierCode ?? TRAVELDESK_SUPPLIER_CODE;
+    const select = {
+      id: true,
+      triggeredBy: true,
+      status: true,
+      startedAt: true,
+      finishedAt: true,
+      resumedFromRunId: true,
+      resumeAfterTourId: true,
+      tours: true,
+      offers: true,
+      added: true,
+      changed: true,
+      removed: true,
+      failedTours: true,
+      removalsSkipped: true,
+      deadlineHit: true,
+      errorCode: true,
+    } as const;
+    const [latest, complete] = await Promise.all([
+      prisma.supplierSyncRun.findFirst({ where: { supplierCode: code, environment }, orderBy: { createdAt: "desc" }, select }),
+      prisma.supplierSyncRun.findFirst({ where: completeRunWhere(code, environment), orderBy: { finishedAt: "desc" }, select }),
+    ]);
+    const at = opts.now ?? new Date();
+    return {
+      latest,
+      lastComplete: complete,
+      /** Whether readiness treats the catalogue as stale for mapped offers, judged by the last complete run; null when no complete run exists (the per-offer fallback applies). */
+      stale: complete?.finishedAt ? catalogueStale(complete.finishedAt, at) : null,
+      staleAfterHours: CATALOGUE_STALE_AFTER_MS / 3_600_000,
     };
   },
 

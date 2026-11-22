@@ -153,6 +153,9 @@ const schema = z.object({
   NEXT_PUBLIC_POSTHOG_KEY: optionalStr,
   NEXT_PUBLIC_POSTHOG_HOST: optionalStr,
   GA4_API_SECRET: optionalStr,
+  /** Canonical GA4 id; read through gaMeasurementId() (src/lib/ga-config.ts). */
+  NEXT_PUBLIC_GA_MEASUREMENT_ID: optionalStr,
+  /** Deprecated name for the same id: read only as gaMeasurementId()'s fallback. */
   NEXT_PUBLIC_GA4_MEASUREMENT_ID: optionalStr,
 
   // Supplier — Rathin NOT READY (§16). Adapter selection only.

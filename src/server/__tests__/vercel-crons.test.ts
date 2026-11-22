@@ -10,6 +10,8 @@ import { describe, expect, it } from "vitest";
  *    A10 asks for: payments-tick and supplier-worker every minute (as the one
  *    ordered booking-tick, CO-38), documents-tick every 2 minutes,
  *    supplier-reconcile every 15 minutes; the three older crons unchanged;
+ *    the catalogue sync once a day at 03:00 Dubai time (doc 29 Batch 1b);
+ *    the retention purge once a day at 02:45 UTC (doc 26 §2, Batch 1c);
  *  - payments-tick and supplier-worker are not also scheduled on their own
  *    (they would fire beside the booking tick, undoing its order);
  *  - every cron path is a job route that exists, exports GET and checks
@@ -36,6 +38,9 @@ const REQUIRED: Record<string, string> = {
   "/api/jobs/inquiry-sweep": "*/5 * * * *",
   "/api/jobs/offline-conversions": "30 3 * * *",
   "/api/jobs/fx-refresh": "30 4,16 * * *",
+  // Doc 29 Batch 1b: the daily read-only catalogue sync, 23:00 UTC = 03:00 in Dubai.
+  "/api/jobs/catalogue-sync": "0 23 * * *",
+  "/api/jobs/retention-purge": "45 2 * * *",
 };
 
 describe("vercel.json crons", () => {

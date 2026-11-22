@@ -91,7 +91,7 @@ export const POST = handle(async (req: NextRequest) => {
   }
   setGuestCookie(res, created.token, created.expiresAt);
   return res;
-});
+}, { timing: "quote" });
 
 /** The global limit, logged when it refuses: a full window means instant quotes are refused for everyone (N4 alert). */
 async function enforceGlobal(): Promise<void> {

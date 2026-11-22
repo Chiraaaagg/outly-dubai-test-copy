@@ -31,4 +31,4 @@ export const POST = handle(async (req: NextRequest) => {
   if (!owner) throw checkoutSessionEnded();
   const { challengeId } = await contactVerificationService.start({ ...body, owner, ip: ip ?? null });
   return json({ challengeId });
-});
+}, { timing: "checkout_verify_start" });

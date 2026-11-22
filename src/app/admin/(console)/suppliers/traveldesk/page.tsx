@@ -37,6 +37,15 @@ const KIND_LABEL: Record<string, { label: string; tone: PillTone }> = {
   unknown: { label: "Unknown type", tone: "danger" },
 };
 
+const RUN_STATUS: Record<string, { label: string; tone: PillTone }> = {
+  complete: { label: "Last sync complete", tone: "success" },
+  incomplete: { label: "Last sync incomplete", tone: "warning" },
+  running: { label: "Sync running", tone: "info" },
+  failed: { label: "Last sync failed", tone: "danger" },
+};
+
+const utc = (d: Date | null | undefined) => (d ? `${d.toISOString().slice(0, 16).replace("T", " ")} UTC` : "—");
+
 function aed(minor: string | null): string {
   if (minor === null) return "—";
   const n = Number(minor) / 100;
@@ -65,12 +74,15 @@ export default async function TravelDeskMappingPage({ searchParams }: { searchPa
   const env = (ENVS as readonly string[]).includes(sp.env ?? "") ? (sp.env as (typeof ENVS)[number]) : "production";
   const config = traveldeskConfigFrom(appEnv());
 
-  const [summary, rows, bookings] = await Promise.all([
+  const [summary, rows, bookings, syncRuns] = await Promise.all([
     supplierCatalogService.summary(actor),
     supplierCatalogService.listCandidates(actor, { state, environment: env }),
     // The rows the write action changes (D2): the pinned account per environment, not the default key.
     supplierBookingService.overview(actor, { accounts: { test: pinnedControlAccount("test", config), production: pinnedControlAccount("production", config) } }),
+    supplierCatalogService.lastSyncRuns(actor, env),
   ]);
+  const lastRun = syncRuns.latest;
+  const runPill = lastRun ? (RUN_STATUS[lastRun.status] ?? RUN_STATUS.failed) : null;
   const bookingCounts = bookings.counts.filter((c) => c.environment === env);
   // The controls shown and posted are the selected environment's (CR-11).
   const control = bookings.controls[env];
@@ -106,7 +118,36 @@ export default async function TravelDeskMappingPage({ searchParams }: { searchPa
         <StatCard label="Rejected" value={String(count("rejected"))} href={link({ state: "rejected" })} />
       </div>
 
-      <Panel className="mb-5" title="Catalogue" sub="Load TravelDesk's tours and offers into this database. Read only; nothing is booked.">
+      <Panel
+        className="mb-5"
+        title="Catalogue"
+        sub="Load TravelDesk's tours and offers into this database. Read only; nothing is booked. It also runs by itself once a day at 03:00 Dubai time."
+        actions={runPill && <StatusPill tone={runPill.tone}>{runPill.label}</StatusPill>}
+      >
+        <div className="mb-4 text-xs text-ink-600">
+          {!lastRun ? (
+            <p>No sync run recorded for {env} yet.</p>
+          ) : (
+            <>
+              <p>
+                Last run ({env}, {lastRun.triggeredBy === "cron" ? "scheduled" : "button"}): started {utc(lastRun.startedAt)}
+                {lastRun.finishedAt && `, finished ${utc(lastRun.finishedAt)}`}. {lastRun.tours} tours and {lastRun.offers} offers read; added {lastRun.added}, changed{" "}
+                {lastRun.changed}, removed {lastRun.removed}.
+                {lastRun.resumedFromRunId && " It continued an earlier incomplete run."}
+                {lastRun.status === "incomplete" && ` Stopped at the time limit; the next run continues after tour ${lastRun.resumeAfterTourId ?? "—"}.`}
+                {lastRun.status === "failed" && ` Failed (${lastRun.errorCode ?? "error"}).`}
+                {lastRun.failedTours.length > 0 && ` ${lastRun.failedTours.length} tour(s) failed to load.`}
+                {lastRun.removalsSkipped && ` Removals skipped (${lastRun.removalsSkipped.replace(/_/g, " ")}).`}
+              </p>
+              <p className={syncRuns.stale ? "mt-1 font-semibold text-[var(--color-danger)]" : "mt-1"}>
+                Last complete sync: {utc(syncRuns.lastComplete?.finishedAt)}.{" "}
+                {syncRuns.stale
+                  ? `Older than ${syncRuns.staleAfterHours} hours: mapped instant products show as inquiry until a sync completes.`
+                  : `Mapped instant products fall back to inquiry when it is older than ${syncRuns.staleAfterHours} hours.`}
+              </p>
+            </>
+          )}
+        </div>
         <CatalogueSync environment={syncEnvironment} />
       </Panel>
 

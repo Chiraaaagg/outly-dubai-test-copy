@@ -76,7 +76,8 @@ export function CatalogueSync({ environment }: { environment: "test" | "producti
               <p className="font-semibold text-[var(--color-danger)]">No tours loaded. Check the TravelDesk key and the failed tours below, then sync again.</p>
             ) : data.sync.incomplete ? (
               <p className="font-semibold text-[var(--color-warning)]">
-                Stopped at the time limit after {data.sync.tours} tours and {data.sync.offers} offers. Sync again to continue; suggestions refresh after a complete run.
+                Stopped at the time limit after {data.sync.tours} tours and {data.sync.offers} offers. Sync again to continue from where it stopped; suggestions refresh after a
+                complete run.
               </p>
             ) : (
               <p className="font-semibold text-[var(--color-success)]">

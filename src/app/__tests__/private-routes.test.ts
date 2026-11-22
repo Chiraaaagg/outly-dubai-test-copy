@@ -65,9 +65,10 @@ describe("proxy headers on private customer routes", () => {
     expect(headers["Cache-Control"]).toBeUndefined();
     expect(headers["Referrer-Policy"]).toBe("strict-origin-when-cross-origin");
     expect(headers["X-Robots-Tag"]).toBeUndefined();
-    // GA is allowed on the storefront when a measurement id is configured.
-    expect(csp).toMatch(/script-src [^;]*https:\/\/www\.googletagmanager\.com/);
+    // GA is allowed on the storefront when a measurement id is configured (Google's documented GA4 hosts; csp-analytics.test.ts).
+    expect(csp).toMatch(/script-src [^;]*https:\/\/\*\.googletagmanager\.com/);
     expect(csp).toMatch(/connect-src [^;]*google-analytics\.com/);
+    expect(csp).toMatch(/connect-src [^;]*https:\/\/\*\.analytics\.google\.com/);
   });
 
   it("no analytics origins anywhere when no measurement id is configured", () => {
@@ -101,7 +102,7 @@ describe("proxy headers on private customer routes", () => {
         expect(res.headers.get("cache-control"), pathname).toBe("private, no-store");
         expect(res.headers.get("referrer-policy"), pathname).toBe("no-referrer");
         expect(res.headers.get("x-robots-tag"), pathname).toBe("noindex, nofollow");
-        expect(res.headers.get("content-security-policy"), pathname).not.toMatch(/googletagmanager|google-analytics/);
+        expect(res.headers.get("content-security-policy"), pathname).not.toMatch(/googletagmanager|google-analytics|analytics\.google/);
       }
       const home = await proxy(new NextRequest("http://localhost:3000/terms"));
       expect(home.headers.get("referrer-policy")).toBe("strict-origin-when-cross-origin");

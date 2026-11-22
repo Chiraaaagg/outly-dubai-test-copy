@@ -927,6 +927,55 @@ model SupplierAccountLease {
   @@map("supplier_account_leases")
 }
 
+/// One catalogue sync run (doc 29 §6.3, Batch 1b; migration 20261123120000).
+/// Written by `traveldesk-catalogue-sync.service.ts` for the admin button and
+/// the daily scheduled run. A run that stops at its deadline leaves
+/// `resume_after_tour_id`, and the next run continues the same pass after it
+/// (`pass_started_at`); removals are judged only when a pass completes.
+/// Readiness reads the latest `complete` run for staleness. Counts, ids and
+/// short codes only: no prices, payloads or credentials. No foreign key: the
+/// supplier is named by its code, like the sync lease in `settings`.
+model SupplierSyncRun {
+  id                String    @id @db.Uuid
+  supplierCode      String    @map("supplier_code")
+  /// "test" | "production"
+  environment       String
+  /// The read-budget account the run drew on (`bookingAccountId`).
+  accountId         String    @map("account_id")
+  /// "cron" | "admin"
+  triggeredBy       String    @map("triggered_by")
+  /// "running" | "complete" | "incomplete" | "failed"
+  status            String    @default("running")
+  startedAt         DateTime  @default(now()) @map("started_at") @db.Timestamptz(6)
+  finishedAt        DateTime? @map("finished_at") @db.Timestamptz(6)
+  /// Start of the pass this run belongs to: its own start, or the first run's when it resumed one.
+  passStartedAt     DateTime  @map("pass_started_at") @db.Timestamptz(6)
+  /// The incomplete run this one continued; null for a fresh pass.
+  resumedFromRunId  String?   @map("resumed_from_run_id") @db.Uuid
+  /// Incomplete runs only: the last tour id this pass attempted (tours run in id order).
+  resumeAfterTourId Int?      @map("resume_after_tour_id")
+  tours             Int       @default(0)
+  offers            Int       @default(0)
+  added             Int       @default(0)
+  changed           Int       @default(0)
+  removed           Int       @default(0)
+  revived           Int       @default(0)
+  mappingsChanged   Int       @default(0) @map("mappings_changed")
+  /// Tours of this pass whose detail failed to load; they keep their stored items.
+  failedTours       Int[]     @default([]) @map("failed_tours")
+  /// empty_tour_list | too_many_removals | incomplete
+  removalsSkipped   String?   @map("removals_skipped")
+  /// The run stopped at its deadline (catalogue pull or price snapshots).
+  deadlineHit       Boolean   @default(false) @map("deadline_hit")
+  /// Failed runs: a short code (error class or kind), never a message.
+  errorCode         String?   @map("error_code")
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([supplierCode, environment, createdAt(sort: Desc)], map: "ssr_latest_idx")
+  @@index([supplierCode, environment, status, finishedAt(sort: Desc)], map: "ssr_complete_idx")
+  @@map("supplier_sync_runs")
+}
+
 /// Effective eligibility per product, written by the readiness evaluation (B2).
 /// No row means inquiry-only: absence is the safe default, so there is no backfill.
 model ProductEligibility {

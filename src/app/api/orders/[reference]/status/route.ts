@@ -30,4 +30,4 @@ export const GET = handle<Ctx>(async (req: NextRequest, ctx) => {
   const status = await loadCustomerOrderStatusForRequest(req, reference);
   if (!status) return json({ error: { code: "NOT_FOUND", message: "Not found" } }, { status: 404, headers: { ...TICKET_HEADERS } });
   return json(status, { headers: { ...TICKET_HEADERS } });
-});
+}, { timing: "order_status" });

@@ -124,6 +124,23 @@ export const STRUCTURED_EVENTS = {
   "crm.circuit_open": ["reason", "pausedUntil", "failures"],
   "crm.refused": ["reason"],
   "crm.retention": ["scheduled", "purgedOutbox", "purgedLinks"],
+  // Retention purge (doc 26 §2; doc 29 Batch 1c). Counts, a table name and a reason code only.
+  "retention.purged": [
+    "otpChallenges",
+    "customerSessions",
+    "adminSessions",
+    "grants",
+    "contactVerifications",
+    "quotes",
+    "guestSessions",
+    "failed",
+    "incomplete",
+    "outOfTime",
+    "durationMs",
+  ],
+  "retention.purge_failed": ["table", "reason", "batches"],
+  // Request timing (doc 29 §6.6; Batch 1c). A fixed route code, the status and durations only.
+  "route.timing": ["route", "status", "totalMs", "supplierMs", "supplierCalls", "dbMs", "dbQueries"],
 } as const satisfies Record<string, readonly string[]>;
 
 export type StructuredEventName = keyof typeof STRUCTURED_EVENTS;
