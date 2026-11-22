@@ -140,6 +140,8 @@ export interface SyncResult {
   /** Start of the pass this run belongs to (its own start, or the resumed pass's). Removals count items unseen since then. */
   passStartedAt: Date;
   mappingsChecked: number;
+  /** Products whose mappings this run checked; readiness was re-run for them (and is again once the run is recorded). */
+  checkedProductIds: string[];
   /** Mappings whose offer terms differ from the approved ones this run. */
   mappingsChanged: number;
   /** Approved mappings from before B2 that got their `approved_offer_hash` from this run's terms. */
@@ -420,12 +422,14 @@ export interface ProductMappingReadiness {
 }
 
 /**
- * A run that counts as a complete sync for staleness: it read every listed
- * tour. A run that got an empty tour list read nothing, so it does not count
- * (its removals were skipped too); `too_many_removals` still read every tour.
+ * A run that counts as a complete sync for staleness: it went through every
+ * listed tour and read at least one. A run that got an empty tour list read
+ * nothing, so it does not count (its removals were skipped too); nor does a
+ * run in which every tour failed to load (review R2). `too_many_removals`
+ * still read every tour.
  */
 function completeRunWhere(supplierCode: string, environment: SupplierEnvironment): Prisma.SupplierSyncRunWhereInput {
-  return { supplierCode, environment, status: "complete", OR: [{ removalsSkipped: null }, { removalsSkipped: { not: "empty_tour_list" } }] };
+  return { supplierCode, environment, status: "complete", tours: { gt: 0 }, OR: [{ removalsSkipped: null }, { removalsSkipped: { not: "empty_tour_list" } }] };
 }
 
 /** Finish time of the latest complete catalogue sync run for this supplier and environment, or null. */
@@ -439,15 +443,23 @@ export async function lastCompleteSync(supplierCode: string, environment: Suppli
 }
 
 /**
- * When the catalogue behind a mapping was last synced (doc 29 Batch 1b): the
- * latest complete run's finish. Before any complete run is recorded (a fresh
- * deploy of this batch, or only incomplete runs since), the mapped offer's own
- * `last_seen_at`, which every sync that read the offer already stores. Never
- * more permissive than before this rule, which had no age check at all, and a
- * deploy does not demote an offer a sync read recently.
+ * When the catalogue behind a mapping was last synced (doc 29 Batch 1b; review
+ * R2): the mapped offer's own `last_seen_at`, which a sync writes only when it
+ * read the offer's tour successfully (a resumed pass writes each run's own
+ * start), and no later than the latest complete run's finish. So:
+ *  - a run in which the offer's tour failed, or every tour failed, does not
+ *    make the offer fresh;
+ *  - in a long resumed pass, an offer read early keeps its early time;
+ *  - before any complete run is recorded (a fresh deploy of this batch, or
+ *    only incomplete runs since), the offer's own time decides, so a deploy
+ *    does not demote an offer a sync read recently (doc 29 §9.4 step 5).
+ * The result is never later than the rule it replaces (the latest complete
+ * run, else the offer's time), so it is never more permissive. No offer: unknown.
  */
 export function catalogueSyncedAt(lastCompleteRun: Date | null, offerLastSeenAt: Date | null): Date | null {
-  return lastCompleteRun ?? offerLastSeenAt;
+  if (!offerLastSeenAt) return null;
+  if (!lastCompleteRun) return offerLastSeenAt;
+  return lastCompleteRun.getTime() < offerLastSeenAt.getTime() ? lastCompleteRun : offerLastSeenAt;
 }
 
 /** Unknown age is stale; so is an age above `CATALOGUE_STALE_AFTER_MS`. */
@@ -620,6 +632,7 @@ export const supplierCatalogService = {
       mappingsChecked: 0,
       mappingsChanged: 0,
       hashesBackfilled: 0,
+      checkedProductIds: [],
       lastTourId: resume ? resume.afterTourId : null,
       passStartedAt: passStarted,
     };
@@ -763,7 +776,8 @@ export const supplierCatalogService = {
       if (syncStatus === "changed") result.mappingsChanged += 1;
     }
     // Removals and price moves can change readiness even when the status stays the same.
-    await readinessService.reevaluateMany([...checkedProducts], "sync");
+    result.checkedProductIds = [...checkedProducts];
+    await readinessService.reevaluateMany(result.checkedProductIds, "sync");
     return result;
   },
 
@@ -933,7 +947,7 @@ export const supplierCatalogService = {
       errorCode: true,
     } as const;
     const [latest, complete] = await Promise.all([
-      prisma.supplierSyncRun.findFirst({ where: { supplierCode: code, environment }, orderBy: { createdAt: "desc" }, select }),
+      prisma.supplierSyncRun.findFirst({ where: { supplierCode: code, environment }, orderBy: [{ createdAt: "desc" }, { id: "desc" }], select }),
       prisma.supplierSyncRun.findFirst({ where: completeRunWhere(code, environment), orderBy: { finishedAt: "desc" }, select }),
     ]);
     const at = opts.now ?? new Date();

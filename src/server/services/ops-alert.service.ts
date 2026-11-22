@@ -1,6 +1,9 @@
 import "server-only";
+import type { SupplierEnvironment } from "@prisma/client";
 import { prisma, TX_OPTIONS } from "../lib/db";
 import { env } from "../lib/env";
+import { traveldeskConfigFrom } from "../suppliers/traveldesk/traveldesk.config";
+import { CATALOGUE_STALE_AFTER_MS, TRAVELDESK_SUPPLIER_CODE } from "./supplier-catalog.service";
 import { uuidv7 } from "../lib/ids";
 import { emitEvent } from "../lib/structured-events";
 import type { OpsAlertContext, OpsAlertDigestContext, TemplateContext } from "../notifications/templates";
@@ -45,7 +48,13 @@ import { urgentAt } from "./document.service";
  *  - `crm_delete_failed`: a CRM copy that could not be deleted (a
  *    dead-lettered `delete` row in `crm_outbox`, reason `erasure` or
  *    `retention`; doc 29 §6.5, review R13). Ids only. Read only when the CRM
- *    tables exist: a missing table yields no incident, never a failed sweep.
+ *    tables exist: a missing table yields no incident, never a failed sweep;
+ *  - `catalogue_stale`: the TravelDesk catalogue of this deployment's
+ *    environment has had no complete sync for `CATALOGUE_STALE_AFTER_MS`
+ *    (48 h; doc 29 Batch 1b, review 81 R7). Raised at the moment it turned
+ *    stale. If the scheduled sync stopped (no `CRON_SECRET`, or the schedule
+ *    line removed as the rollback), stored instant verdicts no longer age
+ *    while live quotes refuse them, so staff must sync or look.
  *
  * Dedup and throttle (`ops_alerts`, one row per entity and reason, under one
  * row lock so concurrent sweeps decide one at a time):
@@ -87,7 +96,8 @@ export type OpsIncidentKind =
   | "refund_failed"
   | "booking_attention"
   | "document_attention"
-  | "crm_delete_failed";
+  | "crm_delete_failed"
+  | "catalogue_stale";
 /** `crm_subject` needs migration 20261122140000 (ops_alerts_entity_kind_check). */
 export type OpsEntityKind = "supplier_account" | "payment_saga" | "order_item" | "supplier_booking" | "supplier_document" | "crm_subject";
 
@@ -117,6 +127,7 @@ export const OPS_INCIDENT_TITLES: Record<OpsIncidentKind, string> = {
   booking_attention: "Booking needs staff",
   document_attention: "Tickets need staff",
   crm_delete_failed: "CRM copy could not be deleted",
+  catalogue_stale: "Supplier catalogue not synced for 48 hours",
 };
 
 /** The stored row payload: what the email says plus its idempotency scope. */
@@ -341,7 +352,55 @@ export async function collectOpsIncidents(since: Date, now: Date, limit = COLLEC
   }
 
   out.push(...(await crmDeleteIncidents(since, now, limit)));
+  const tdEnvironment = traveldeskConfigFrom(env())?.environment;
+  if (tdEnvironment) out.push(...(await catalogueStaleIncidents(tdEnvironment, since, now)));
   return out;
+}
+
+/**
+ * The stale-catalogue incident for one environment, from the finish of its
+ * latest complete sync run: raised when that finish is more than
+ * `CATALOGUE_STALE_AFTER_MS` old, at the moment it turned stale, and only
+ * inside the sweep window. Pure, for tests. No complete run at all: nothing
+ * (the per-offer rule in readiness already keeps those offers on inquiry).
+ */
+export function catalogueStaleIncident(environment: SupplierEnvironment, lastCompleteFinishedAt: Date | null, since: Date, now: Date): OpsIncident | null {
+  if (!lastCompleteFinishedAt) return null;
+  const staleAt = new Date(lastCompleteFinishedAt.getTime() + CATALOGUE_STALE_AFTER_MS);
+  if (staleAt.getTime() > now.getTime() || staleAt.getTime() < since.getTime()) return null;
+  return {
+    kind: "catalogue_stale",
+    entityKind: "supplier_account",
+    entityId: `${TRAVELDESK_SUPPLIER_CODE}.catalogue.${environment}`,
+    reason: "catalogue_stale",
+    raisedAt: staleAt,
+    orderId: null,
+    orderReference: null,
+    bookingId: null,
+    supplierBookingRef: null,
+    adminPath: `/admin/suppliers/${TRAVELDESK_SUPPLIER_CODE}`,
+  };
+}
+
+/**
+ * Reads the latest complete run as readiness counts it (`completeRunWhere` in
+ * supplier-catalog.service.ts: complete, read at least one tour, not an empty
+ * list). Guarded like the CRM read: before the Batch 1b migration the table
+ * is absent and this yields nothing rather than failing the sweep.
+ */
+export async function catalogueStaleIncidents(environment: SupplierEnvironment, since: Date, now: Date, supplierCode: string = TRAVELDESK_SUPPLIER_CODE): Promise<OpsIncident[]> {
+  const rows = await prisma
+    .$queryRaw<Row[]>`
+    SELECT finished_at FROM supplier_sync_runs
+    WHERE supplier_code = ${supplierCode} AND environment = ${environment} AND status = 'complete' AND tours > 0
+      AND (removals_skipped IS NULL OR removals_skipped <> 'empty_tour_list')
+    ORDER BY finished_at DESC LIMIT 1`
+    .catch((e: unknown) => {
+      if (/42P01|supplier_sync_runs.*does not exist/.test(String((e as { message?: unknown })?.message ?? "")) || (e as { meta?: { code?: unknown } })?.meta?.code === "42P01") return [] as Row[];
+      throw e;
+    });
+  const incident = catalogueStaleIncident(environment, rows[0]?.finished_at ? date(rows[0].finished_at) : null, since, now);
+  return incident ? [incident] : [];
 }
 
 /**

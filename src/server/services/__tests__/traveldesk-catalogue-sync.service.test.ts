@@ -321,17 +321,99 @@ describe.skipIf(!enabled)("scheduled catalogue sync and run rows (local DB, doc 
     expect(calls).toContain(`getTour:${b}`);
 
     // A row left running (the platform stopped the function) is closed as abandoned, and the pass it continued is not picked up again.
+    // Explicit insertion times: two rows written in the same millisecond would otherwise tie on created_at.
     const recent = new Date(Date.now() - 600_000);
+    const t = Date.now();
     await prisma.supplierSyncRun.create({
-      data: { id: uuidv7(), supplierCode: code, environment: "test", accountId: "zz", triggeredBy: "cron", status: "incomplete", startedAt: recent, passStartedAt: recent, finishedAt: recent, resumeAfterTourId: b },
+      data: { id: uuidv7(), supplierCode: code, environment: "test", accountId: "zz", triggeredBy: "cron", status: "incomplete", startedAt: recent, passStartedAt: recent, finishedAt: recent, resumeAfterTourId: b, createdAt: new Date(t - 2) },
     });
     const stuck = await prisma.supplierSyncRun.create({
-      data: { id: uuidv7(), supplierCode: code, environment: "test", accountId: "zz", triggeredBy: "cron", status: "running", startedAt: recent, passStartedAt: recent },
+      data: { id: uuidv7(), supplierCode: code, environment: "test", accountId: "zz", triggeredBy: "cron", status: "running", startedAt: recent, passStartedAt: recent, createdAt: new Date(t - 1) },
     });
     const again: string[] = [];
     await svc.runScheduledCatalogueSync({ config, source: fakeSource(again, { tours }), supplierCode: code, readLimits: LIMITS });
     expect(again).toContain(`getTour:${b}`);
     expect(await prisma.supplierSyncRun.findUniqueOrThrow({ where: { id: stuck.id } })).toMatchObject({ status: "failed", errorCode: "abandoned" });
+  });
+
+  it("a failed run between an incomplete run and the next one keeps the cursor (review R3)", async () => {
+    const code = newCode();
+    const b = base();
+    const tours = [b, b + 1, b + 2];
+    const recent = new Date(Date.now() - 600_000);
+    const t = Date.now();
+    const incomplete = await prisma.supplierSyncRun.create({
+      data: { id: uuidv7(), supplierCode: code, environment: "test", accountId: "zz", triggeredBy: "cron", status: "incomplete", startedAt: recent, passStartedAt: recent, finishedAt: recent, resumeAfterTourId: b, failedTours: [b], createdAt: new Date(t - 2) },
+    });
+    // A run that failed before it read a tour (a balance error, say): it must not drop the pass.
+    await prisma.supplierSyncRun.create({
+      data: { id: uuidv7(), supplierCode: code, environment: "test", accountId: "zz", triggeredBy: "admin", status: "failed", startedAt: recent, passStartedAt: recent, finishedAt: recent, errorCode: "traveldesk_timeout", createdAt: new Date(t - 1) },
+    });
+    const calls: string[] = [];
+    const out = await svc.runScheduledCatalogueSync({ config, source: fakeSource(calls, { tours }), supplierCode: code, readLimits: LIMITS });
+    expect(calls).toEqual(["balance", "listTours", `getTour:${b + 1}`, `getTour:${b + 2}`]);
+    if (out.status !== "complete") throw new Error(`expected complete, got ${out.status}`);
+    expect(out.result.run).toMatchObject({ resumedFromRunId: incomplete.id });
+    // The failed tour of the earlier run is carried, and the pass start is kept.
+    expect(out.result.sync.failedTours).toEqual([b]);
+    const row = await prisma.supplierSyncRun.findUniqueOrThrow({ where: { id: out.result.run.id } });
+    expect(row.passStartedAt.getTime()).toBe(recent.getTime());
+  });
+
+  it("a complete run re-runs readiness once it is recorded complete, for both triggers (review R1)", async () => {
+    const code = newCode();
+    const b = base();
+    const seen: { ids: string[]; status: string | undefined }[] = [];
+    const spy = vi.spyOn(readiness, "reevaluateMany").mockImplementation(async (ids) => {
+      const row = await prisma.supplierSyncRun.findFirst({ where: { supplierCode: code }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] });
+      seen.push({ ids, status: row?.status });
+    });
+    try {
+      const out = await svc.runScheduledCatalogueSync({ config, source: fakeSource([], { tours: [b] }), supplierCode: code, readLimits: LIMITS });
+      expect(out.status).toBe("complete");
+      // Once inside the sync (the run still running), then again after the run row says complete.
+      expect(seen.map((s) => s.status)).toEqual(["running", "complete"]);
+      seen.length = 0;
+      await svc.runTravelDeskCatalogueSync(admin, "123456", { config, source: fakeSource([], { tours: [b] }), stepUp: accept, supplierCode: code, readLimits: LIMITS });
+      expect(seen.map((s) => s.status)).toEqual(["running", "complete"]);
+      // An incomplete run does not re-run it after the close (the scheduled path re-checks the candidates instead).
+      seen.length = 0;
+      const start = Date.now() - svc.RUN_DEADLINE_MS + 1_500;
+      await svc.runTravelDeskCatalogueSync(admin, "123456", { config, source: fakeSource([], { tours: [b, b + 1], tourDelayMs: 2_000 }), stepUp: accept, supplierCode: code, readLimits: LIMITS, now: () => start });
+      expect(seen.map((s) => s.status)).toEqual(["running"]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("the stale-catalogue alert reads the latest complete run that read a tour (review R7)", async () => {
+    const { catalogueStaleIncidents } = await import("../ops-alert.service");
+    const code = newCode();
+    const H = 3_600_000;
+    const now = new Date();
+    const since = new Date(now.getTime() - 72 * H);
+    const row = (finishedAt: Date, tours: number) => ({
+      id: uuidv7(),
+      supplierCode: code,
+      environment: "test",
+      accountId: "zz",
+      triggeredBy: "cron",
+      status: "complete",
+      startedAt: new Date(finishedAt.getTime() - 60_000),
+      passStartedAt: new Date(finishedAt.getTime() - 60_000),
+      finishedAt,
+      tours,
+    });
+    expect(await catalogueStaleIncidents("test", since, now, code)).toEqual([]);
+    await prisma.supplierSyncRun.create({ data: row(new Date(now.getTime() - 50 * H), 3) });
+    // A later complete run in which every tour failed does not count as a sync.
+    await prisma.supplierSyncRun.create({ data: row(new Date(now.getTime() - 1 * H), 0) });
+    const found = await catalogueStaleIncidents("test", since, now, code);
+    expect(found).toHaveLength(1);
+    expect(found[0]).toMatchObject({ kind: "catalogue_stale", reason: "catalogue_stale", raisedAt: new Date(now.getTime() - 2 * H) });
+    // A fresh complete run clears it.
+    await prisma.supplierSyncRun.create({ data: row(new Date(now.getTime() - 1 * H), 3) });
+    expect(await catalogueStaleIncidents("test", since, now, code)).toEqual([]);
   });
 
   it("removal cap: a pull that would remove more than 20% removes nothing, and a plausible one removes", async () => {

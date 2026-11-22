@@ -382,6 +382,7 @@ model AdminSession {
 
   @@index([adminUserId, revokedAt], map: "admin_sessions_user_idx")
   @@index([refreshHash], map: "admin_sessions_refresh_idx")
+  @@index([expiresAt], map: "admin_sessions_expires_idx")
   @@map("admin_sessions")
 }
 
@@ -433,6 +434,7 @@ model CustomerSession {
   customer   Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
 
   @@index([customerId, revokedAt], map: "customer_sessions_customer_idx")
+  @@index([expiresAt], map: "customer_sessions_expires_idx")
   @@map("customer_sessions")
 }
 
@@ -448,6 +450,7 @@ model OtpChallenge {
   createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
 
   @@index([phoneE164, createdAt(sort: Desc)], map: "otp_challenges_phone_idx")
+  @@index([expiresAt], map: "otp_challenges_expires_idx")
   @@map("otp_challenges")
 }
 
@@ -2042,6 +2045,8 @@ model GuestCapabilityGrant {
   order           Order     @relation(fields: [orderId], references: [id], onDelete: Restrict)
 
   @@index([orderId, purpose], map: "guest_capability_grants_order_purpose_idx")
+  @@index([expiresAt], map: "guest_capability_grants_expires_idx")
+  @@index([revokedAt], map: "guest_capability_grants_revoked_idx")
   @@map("guest_capability_grants")
 }
 

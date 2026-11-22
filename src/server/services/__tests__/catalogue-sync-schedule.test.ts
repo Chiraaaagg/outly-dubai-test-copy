@@ -29,12 +29,19 @@ describe("catalogue staleness (doc 29 Batch 1b)", () => {
     expect(catalogueStale(null, at)).toBe(true);
   });
 
-  it("reads the last complete run first; the offer's own last-seen time only before any complete run exists", () => {
+  it("reads the offer's own last read, no later than the last complete run (review R2)", () => {
     // A fresh deploy with no run row: the offer the last sync read stays fresh.
     expect(catalogueSyncedAt(null, ago(2 * H))).toEqual(ago(2 * H));
-    // Once a complete run exists it decides, even when an incomplete run saw the offer since: never more permissive.
+    // A complete run older than the offer's read still caps it, even when an incomplete run saw the offer since: never more permissive.
     expect(catalogueSyncedAt(ago(60 * H), ago(1 * H))).toEqual(ago(60 * H));
     expect(catalogueStale(catalogueSyncedAt(ago(60 * H), ago(1 * H)), at)).toBe(true);
+    // A recent complete run does not refresh an offer it did not read (its tour failed, or every tour failed,
+    // or a long resumed pass read it early).
+    expect(catalogueSyncedAt(ago(1 * H), ago(60 * H))).toEqual(ago(60 * H));
+    expect(catalogueStale(catalogueSyncedAt(ago(1 * H), ago(60 * H)), at)).toBe(true);
+    expect(catalogueStale(catalogueSyncedAt(ago(1 * H), ago(3 * H)), at)).toBe(false);
+    // No offer row: unknown, so stale.
+    expect(catalogueSyncedAt(ago(1 * H), null)).toBeNull();
     expect(catalogueSyncedAt(null, null)).toBeNull();
   });
 });

@@ -20,6 +20,15 @@ import { AsyncLocalStorage } from "node:async_hooks";
 
 export const TIMING_ROUTES = ["quote", "checkout", "checkout_verify_start", "checkout_verify", "order_status"] as const;
 export type TimingRoute = (typeof TIMING_ROUTES)[number];
+
+/**
+ * The routes whose responses carry the `Server-Timing` header (doc 29 §6.6:
+ * quote, and the two new read routes once they exist). Every timed route
+ * logs its `route.timing` line; only these show durations to the browser.
+ * Kept off the private order-status route (review R6), where an exact `db`
+ * duration on its 404 would say more about whether a reference exists.
+ */
+export const SERVER_TIMING_ROUTES: readonly TimingRoute[] = ["quote"];
 export type TimingPhase = "supplier" | "db";
 
 interface PhaseTotal {

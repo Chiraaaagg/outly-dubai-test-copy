@@ -70,11 +70,12 @@ import type { ProductMappingReadiness, VariantMappingState } from "./supplier-ca
  *  - the free-text `cancellationPolicy` the page shows states the same hours
  *    as `freeCancellationHours` (`policyTextAgrees`, CR-B2-7), otherwise
  *    `safety_fact_unknown`;
- *  - the supplier catalogue is fresh (doc 29 Batch 1b): the latest complete
- *    catalogue sync for the mapping's supplier and environment finished
- *    within `CATALOGUE_STALE_AFTER_MS` (48 h), else `catalogue_stale`. Before
- *    any complete run is recorded, the mapped offer's own last-seen time
- *    stands in (`catalogueSyncedAt` in supplier-catalog.service.ts).
+ *  - the supplier catalogue is fresh (doc 29 Batch 1b): the mapped offer was
+ *    last read by a sync within `CATALOGUE_STALE_AFTER_MS` (48 h), and the
+ *    latest complete catalogue sync for the mapping's supplier and
+ *    environment finished within it too, else `catalogue_stale`. Before any
+ *    complete run is recorded, the offer's own last-seen time alone decides
+ *    (`catalogueSyncedAt` in supplier-catalog.service.ts).
  *
  * Writes of the pricing settings the margin rule reads (margin policy, FX
  * input, cost inputs) re-run readiness for every product that is or asks to
@@ -88,8 +89,10 @@ import type { ProductMappingReadiness, VariantMappingState } from "./supplier-ca
  * 6 (doc 29 Batch 1a): `capability_not_ready` also when the capability gate refuses the offer's
  * exact class key (supplier-catalog.service.ts `mappingReadinessFor`, suppliers/capability-gate.ts).
  * 7 (doc 29 Batch 1b): `catalogue_stale` when the catalogue is older than 48 h or of unknown age.
+ * 8 (doc 29 Batch 1b, review R2): the age is the mapped offer's own last successful read, no later
+ * than the latest complete run (which must have read at least one tour).
  */
-export const READINESS_RULES_VERSION = 7;
+export const READINESS_RULES_VERSION = 8;
 
 /**
  * Per-mapping facts the readiness rules need, adapted from the supplier

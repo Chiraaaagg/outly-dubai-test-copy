@@ -32,6 +32,9 @@ import { emitEvent } from "../lib/structured-events";
  * already past their window, so a repeat run is a no-op and a live row is
  * never matched. One class failing does not stop the others.
  *
+ * Each per-table predicate is served by an index on `expires_at` (and
+ * `revoked_at` for grants), migration 20261123130000.
+ *
  * Logs counts, durations and reason codes only (`retention.purged`,
  * `retention.purge_failed`): never an id, a hash or a subject.
  *

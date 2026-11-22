@@ -506,6 +506,7 @@ describe.skipIf(!enabled)("supplierCatalogService (local DB)", () => {
       startedAt: new Date(finishedAt.getTime() - 60_000),
       passStartedAt: new Date(finishedAt.getTime() - 60_000),
       finishedAt,
+      tours: 1,
     });
     await prisma.supplierSyncRun.deleteMany({ where: { supplierCode: CODE } });
     expect((await readiness()).blockers).not.toContain("catalogue_stale");
@@ -536,6 +537,16 @@ describe.skipIf(!enabled)("supplierCatalogService (local DB)", () => {
     const fresh = await readiness();
     expect(fresh.blockers).not.toContain("catalogue_stale");
     expect(fresh.mapping!.catalogueSyncedAt).not.toBeNull();
+
+    // Review R2: a recent complete run does not refresh an offer it did not read (its tour failed): the offer's own read decides.
+    await prisma.supplierCatalogueItem.update({ where: { id: offerRow.id }, data: { lastSeenAt: hoursAgo(49) } });
+    expect((await readiness()).blockers).toContain("catalogue_stale");
+    // A complete run that read no tour at all (every tour failed) is not a complete sync either.
+    await prisma.supplierCatalogueItem.update({ where: { id: offerRow.id }, data: { lastSeenAt: offerRow.lastSeenAt } });
+    await prisma.supplierSyncRun.deleteMany({ where: { supplierCode: CODE } });
+    await prisma.supplierSyncRun.create({ data: runRow(new Date(Date.now() - CATALOGUE_STALE_AFTER_MS - 60_000)) });
+    await prisma.supplierSyncRun.create({ data: { ...runRow(hoursAgo(1)), tours: 0, failedTours: [TOUR] } });
+    expect((await readiness()).blockers).toContain("catalogue_stale");
     await prisma.supplierSyncRun.deleteMany({ where: { supplierCode: CODE } });
   });
 

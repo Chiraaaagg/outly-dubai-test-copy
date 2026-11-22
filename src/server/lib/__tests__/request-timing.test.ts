@@ -4,8 +4,8 @@ import { z } from "zod";
 
 /**
  * Request timing (doc 29 §6.6, Batch 1c): `Server-Timing` carries three fixed
- * names with durations and nothing else, on success and error responses of a
- * timed route only; the `route.timing` line carries the route code, the
+ * names with durations and nothing else, on success and error responses of
+ * the quote route only (review R6); the `route.timing` line carries the route code, the
  * status and durations; concurrent requests never share a context; and the
  * supplier HTTP client reports each call's duration into the request it ran
  * in. No database: the `db` phase is fed directly here (its Prisma extension
@@ -18,7 +18,7 @@ vi.mock("../structured-events", async (orig) => {
   return { ...real, emitEvent: (name: string, fields: Record<string, unknown>) => emitted.push({ name, fields: real.structuredFields(name, fields) ?? {} }) };
 });
 
-import { recordPhase, serverTimingHeader, timingFields, withRequestTiming, TIMING_ROUTES } from "../request-timing";
+import { recordPhase, serverTimingHeader, SERVER_TIMING_ROUTES, timingFields, withRequestTiming, TIMING_ROUTES } from "../request-timing";
 import { handle, json } from "../http";
 import { Errors } from "../errors";
 import { traveldeskConfigFrom, type TravelDeskConfig } from "../../suppliers/traveldesk/traveldesk.config";
@@ -97,16 +97,16 @@ describe("handle(fn, { timing })", () => {
   const ORDER_REF = ["OUT", "10000017"].join("-");
   const req = (path: string) => new NextRequest(`http://localhost${path}`, { headers: { "x-request-id": "req-synthetic-1" } });
 
-  it("adds Server-Timing and one log line of durations to a timed route's response", async () => {
-    const GET = handle(
+  it("adds Server-Timing and one log line of durations to the quote route's response", async () => {
+    const POST = handle(
       async () => {
         recordPhase("supplier", 80);
         recordPhase("db", 3);
         return json({ ok: true, reference: ORDER_REF });
       },
-      { timing: "order_status" },
+      { timing: "quote" },
     );
-    const res = await GET(req(`/api/orders/${ORDER_REF}/status`), undefined as never);
+    const res = await POST(req("/api/quotes"), undefined as never);
     const header = res.headers.get("server-timing") ?? "";
     expect(header).toMatch(SERVER_TIMING);
     expect(header).toMatch(/^supplier;dur=80, db;dur=3, total;dur=/);
@@ -115,8 +115,32 @@ describe("handle(fn, { timing })", () => {
     const lines = emitted.filter((e) => e.name === "route.timing");
     expect(lines).toHaveLength(1);
     expect(Object.keys(lines[0].fields).sort()).toEqual(["dbMs", "dbQueries", "route", "status", "supplierCalls", "supplierMs", "totalMs"]);
-    expect(lines[0].fields).toMatchObject({ route: "order_status", status: 200, supplierMs: 80, supplierCalls: 1, dbMs: 3, dbQueries: 1 });
+    expect(lines[0].fields).toMatchObject({ route: "quote", status: 200, supplierMs: 80, supplierCalls: 1, dbMs: 3, dbQueries: 1 });
     expect(JSON.stringify(lines)).not.toMatch(/OUT-|req-synthetic|\/api/);
+  });
+
+  it.each(["checkout", "checkout_verify_start", "checkout_verify", "order_status"] as const)(
+    "logs %s's durations but sends no Server-Timing header (review R6)",
+    async (route) => {
+      const GET = handle(
+        async () => {
+          recordPhase("db", 3);
+          throw Errors.notFound("Order");
+        },
+        { timing: route },
+      );
+      const res = await GET(req(`/api/orders/${ORDER_REF}/status`), undefined as never);
+      expect(res.status).toBe(404);
+      expect(res.headers.get("server-timing")).toBeNull();
+      const lines = emitted.filter((e) => e.name === "route.timing");
+      expect(lines).toHaveLength(1);
+      expect(lines[0].fields).toMatchObject({ route, status: 404, dbQueries: 1 });
+      expect(JSON.stringify(lines)).not.toMatch(/OUT-|req-synthetic|\/api/);
+    },
+  );
+
+  it("only the quote route sends the header", () => {
+    expect(SERVER_TIMING_ROUTES).toEqual(["quote"]);
   });
 
   it("times error responses too, with their status", async () => {

@@ -8,7 +8,7 @@ import { log } from "./logger";
 import { bigintReplacer } from "./money";
 import { env } from "./env";
 import { safeEqual } from "./crypto";
-import { serverTimingHeader, timingFields, withRequestTiming, type TimingRoute } from "./request-timing";
+import { SERVER_TIMING_ROUTES, serverTimingHeader, timingFields, withRequestTiming, type TimingRoute } from "./request-timing";
 import { emitEvent } from "./structured-events";
 
 /**
@@ -65,10 +65,11 @@ type Handler<Ctx> = (req: NextRequest, ctx: Ctx) => Promise<NextResponse | Respo
 
 export interface HandleOptions {
   /**
-   * Measure this route (doc 29 §6.6): a `Server-Timing` header (`supplier`,
-   * `db`, `total` durations only) on every response, errors included, and one
-   * `route.timing` log line with the fixed route code, the status and the
-   * durations. See src/server/lib/request-timing.ts.
+   * Measure this route (doc 29 §6.6): one `route.timing` log line with the
+   * fixed route code, the status and the durations, and, for the routes in
+   * `SERVER_TIMING_ROUTES` only, a `Server-Timing` header (`supplier`, `db`,
+   * `total` durations only) on every response, errors included. See
+   * src/server/lib/request-timing.ts.
    */
   timing?: TimingRoute;
 }
@@ -88,10 +89,12 @@ export function handle<Ctx = { params: Promise<Record<string, string>> }>(fn: Ha
     };
     if (!opts.timing) return run();
     const { result: res, timing } = await withRequestTiming(run);
-    try {
-      res.headers.set("server-timing", serverTimingHeader(timing));
-    } catch {
-      // An immutable-header response (none of the timed routes returns one) keeps its headers; the log line still goes out.
+    if (SERVER_TIMING_ROUTES.includes(opts.timing)) {
+      try {
+        res.headers.set("server-timing", serverTimingHeader(timing));
+      } catch {
+        // An immutable-header response (none of the timed routes returns one) keeps its headers; the log line still goes out.
+      }
     }
     emitEvent("route.timing", timingFields(opts.timing, res.status, timing));
     return res;

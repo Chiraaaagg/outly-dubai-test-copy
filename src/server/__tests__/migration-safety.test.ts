@@ -86,6 +86,13 @@ const NEW_TABLES_ONLY = [
   // supplier_sync_runs (doc 29 Batch 1b): a standalone table, no foreign key.
   "20261123120000_b1b_supplier_sync_runs",
 ];
+/*
+ * Every other faulted migration takes a lock on an existing table and has its
+ * own `SET LOCAL lock_timeout`, so behind the held lock it must fail fast and
+ * roll back (the default branch of the lock test). That includes index-only
+ * migrations on existing tables, e.g. 20261123130000_retention_purge_expiry_indexes
+ * (plain CREATE INDEX takes a SHARE lock on its table).
+ */
 /** How long the injected lock is held. Longer than every `lock_timeout` (5 s). */
 const HOLD_MS = 12_000;
 const ROLLBACK = new Error("ROLLBACK");

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { bookingReason, incidentContext, latestPerKey, OPS_INCIDENT_TITLES, reasonCode, type OpsIncident } from "../ops-alert.service";
+import { bookingReason, catalogueStaleIncident, incidentContext, latestPerKey, OPS_INCIDENT_TITLES, reasonCode, type OpsIncident } from "../ops-alert.service";
 import { renderTemplate } from "@/server/notifications/templates";
 
 /** Ops alert emails (doc 22 §32.24): the pure parts. Synthetic ids only. */
@@ -106,5 +106,31 @@ describe("the alert email", () => {
     const r = renderTemplate("OPS_ALERT_DIGEST", "email", { suppressedCount: 7, sinceIso: T.toISOString(), untilIso: T.toISOString(), adminUrl: "https://outlyy.com/admin/bookings" } as never);
     expect(r.subject).toBe("[OUTLY ALERT] 7 more alerts suppressed");
     expect(r.text).toContain("7 more ops alerts were suppressed");
+  });
+});
+
+describe("stale catalogue alert (doc 29 Batch 1b, review 81 R7)", () => {
+  const H = 3_600_000;
+  const now = new Date("2026-11-23T10:00:00.000Z");
+  const since = new Date(now.getTime() - 72 * H);
+  const ago = (ms: number) => new Date(now.getTime() - ms);
+
+  it("is raised at the moment the last complete run turned 48 hours old, inside the sweep window only", () => {
+    expect(catalogueStaleIncident("production", ago(47 * H), since, now)).toBeNull();
+    const i = catalogueStaleIncident("production", ago(50 * H), since, now);
+    expect(i).toMatchObject({ kind: "catalogue_stale", entityKind: "supplier_account", entityId: "traveldesk.catalogue.production", reason: "catalogue_stale", orderReference: null, adminPath: "/admin/suppliers/traveldesk" });
+    expect(i!.raisedAt).toEqual(ago(2 * H));
+    // Stale for longer than the lookback: already alerted (or a first deploy), not again.
+    expect(catalogueStaleIncident("production", ago(121 * H), since, now)).toBeNull();
+    // No complete run at all: nothing to measure from.
+    expect(catalogueStaleIncident("production", null, since, now)).toBeNull();
+  });
+
+  it("the email carries codes and ids only", () => {
+    const r = renderTemplate("OPS_INCIDENT_ALERT", "email", incidentContext(catalogueStaleIncident("test", ago(50 * H), since, now)!, "https://outlyy.com") as never);
+    expect(r.subject).toBe(`[OUTLY ALERT] ${OPS_INCIDENT_TITLES.catalogue_stale}`);
+    expect(r.text).toContain("Reason: catalogue_stale");
+    expect(r.text).toContain("Entity: supplier_account:traveldesk.catalogue.test");
+    expect(r.text).toContain("Admin: https://outlyy.com/admin/suppliers/traveldesk");
   });
 });

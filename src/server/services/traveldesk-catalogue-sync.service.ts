@@ -49,7 +49,9 @@ import { supplierCatalogService, TRAVELDESK_SUPPLIER_CODE, type SyncResult, type
  *   1b): running, then complete, incomplete or failed, with its counts. An
  *   incomplete run leaves a cursor (the last tour attempted, tours in id
  *   order) and the next run, of either trigger, continues the same pass after
- *   it, unless the pass started more than `RESUME_MAX_PASS_AGE_MS` ago.
+ *   it, unless the pass started more than `RESUME_MAX_PASS_AGE_MS` ago or a
+ *   run the platform stopped came after it. Failed runs in between do not
+ *   drop the cursor (`pickResumeBase`).
  *   Removals are judged only when a pass completes, against everything seen
  *   since the pass started, and keep the 20% cap.
  * - The two entry points: `runTravelDeskCatalogueSync` for staff (permission
@@ -72,6 +74,9 @@ const SNAPSHOT_OFFER_LIMIT = 40;
 
 /** An incomplete pass older than this is not continued: the next run starts a fresh pass. */
 export const RESUME_MAX_PASS_AGE_MS = 72 * 3_600_000;
+
+/** The run row's `failed_tours` holds at most this many (its check constraint). */
+export const MAX_STORED_FAILED_TOURS = 1000;
 
 export type CatalogueSyncTrigger = "cron" | "admin";
 
@@ -163,19 +168,46 @@ function errorCodeOf(error: unknown): string {
   return raw.replace(/[^A-Za-z0-9_.:-]/g, "_").slice(0, 64) || "error";
 }
 
+/** How many earlier rows `openRun` looks back through for an incomplete pass to continue. */
+const RESUME_LOOKBACK_RUNS = 10;
+
+/**
+ * The row that decides whether a new run continues a pass: the latest one,
+ * looking past runs that failed on their own (a `getBalance` error, a busy
+ * supplier before the tour list, a rejected key, a failed button click).
+ * Such a run changed no cursor, and every tour it did read is stored with a
+ * fresh `last_seen_at`, so continuing the earlier cursor is safe: those tours
+ * are read again. A run the platform stopped (`abandoned`) ends the look
+ * back: how far it got is unknown, so the next run starts a fresh pass.
+ * Rows come newest first.
+ */
+export function pickResumeBase<T extends { status: string; errorCode: string | null }>(rows: T[]): T | null {
+  for (const r of rows) {
+    if (r.status === "failed" && r.errorCode !== "abandoned") continue;
+    return r;
+  }
+  return null;
+}
+
 /**
  * Open this run's row. Called while holding the lease, so any row still
  * `running` belongs to a run the platform stopped: it is closed as failed
- * (`abandoned`). The latest earlier row then decides whether this run
- * continues an incomplete pass.
+ * (`abandoned`). The latest earlier row that is not a failed run
+ * (`pickResumeBase`) then decides whether this run continues an incomplete
+ * pass.
  */
 async function openRun(code: string, environment: SupplierEnvironment, accountId: string, trigger: CatalogueSyncTrigger, startedAt: Date) {
   await prisma.supplierSyncRun.updateMany({
     where: { supplierCode: code, environment, status: "running" },
     data: { status: "failed", finishedAt: startedAt, errorCode: "abandoned", resumeAfterTourId: null },
   });
-  // Insertion order (database clock), not the run's own start time.
-  const previous = await prisma.supplierSyncRun.findFirst({ where: { supplierCode: code, environment }, orderBy: { createdAt: "desc" } });
+  // Insertion order (database clock), not the run's own start time; the id (time-ordered) breaks a tie.
+  const recent = await prisma.supplierSyncRun.findMany({
+    where: { supplierCode: code, environment },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+    take: RESUME_LOOKBACK_RUNS,
+  });
+  const previous = pickResumeBase(recent);
   const resumable =
     previous &&
     previous.status === "incomplete" &&
@@ -197,6 +229,15 @@ async function openRun(code: string, environment: SupplierEnvironment, accountId
     },
   });
   return { id: row.id, resume, resumedFromRunId: row.resumedFromRunId };
+}
+
+/** Never throws: the run is already recorded, and a failure here must not turn it into a failed run. */
+async function reevaluateAfterRun(productIds: string[]): Promise<void> {
+  try {
+    await readinessService.reevaluateMany(productIds, "sync");
+  } catch (error) {
+    log.warn("supplier.catalogue_sync_readiness_failed", { products: productIds.length, error });
+  }
 }
 
 /** Never throws: a failed write must not hide the run's own result or error. */
@@ -232,7 +273,8 @@ export type ScheduledCatalogueSyncOutcome =
  * The route's own auth (the cron secret) is the only gate. Never throws:
  * outcomes the route reports. When the run did not complete, readiness is
  * re-run for the instant candidates so an ageing catalogue reaches the
- * storefront (`catalogue_stale`) without waiting for the next sync.
+ * storefront (`catalogue_stale`) without waiting for the next sync. A
+ * complete run re-runs it itself, once the run is recorded (`runSync`).
  */
 export async function runScheduledCatalogueSync(deps: Omit<CatalogueSyncDeps, "stepUp"> = {}): Promise<ScheduledCatalogueSyncOutcome> {
   const config = deps.config !== undefined ? deps.config : traveldeskConfigFrom(env());
@@ -279,7 +321,8 @@ async function runSync(actor: Actor, trigger: CatalogueSyncTrigger, config: Trav
     progress.agencyId = String(balance.agencyId);
     progress.pinnedAgencyId = config.agencyId ?? null;
 
-    const sync = await supplierCatalogService.syncTravelDeskCatalogue(source, environment, { supplierCode: code, lane, resume: opened.resume });
+    // One clock for the run row and the items' `last_seen_at`, which removals compare with the pass start (review R4).
+    const sync = await supplierCatalogService.syncTravelDeskCatalogue(source, environment, { supplierCode: code, lane, resume: opened.resume, now: () => new Date(now()) });
     progress.sync = {
       tours: sync.tours,
       offers: sync.offers,
@@ -325,8 +368,13 @@ async function runSync(actor: Actor, trigger: CatalogueSyncTrigger, config: Trav
     }
 
     const status = sync.incomplete ? "incomplete" : "complete";
+    // More failed tours than the row can hold (review R5): store the first ones and drop the cursor, so the
+    // next run starts a fresh pass instead of continuing one whose failed tours it could not all carry
+    // (a carried list that lost tours would let a resumed pass remove their items).
+    const failedOverflow = sync.failedTours.length > MAX_STORED_FAILED_TOURS;
+    if (failedOverflow) log.warn("supplier.catalogue_sync_failed_tours_capped", { runId, failedTours: sync.failedTours.length });
     // An incomplete run leaves its cursor; with no tour attempted at all there is nothing to continue after.
-    const resumeAfterTourId = sync.incomplete ? sync.lastTourId : null;
+    const resumeAfterTourId = sync.incomplete && !failedOverflow ? sync.lastTourId : null;
     progress.run = { id: runId, status, resumedFromRunId: opened.resumedFromRunId, resumeAfterTourId };
     await closeRun(runId, {
       status,
@@ -339,10 +387,14 @@ async function runSync(actor: Actor, trigger: CatalogueSyncTrigger, config: Trav
       removed: sync.removed,
       revived: sync.revived,
       mappingsChanged: sync.mappingsChanged,
-      failedTours: sync.failedTours,
+      failedTours: sync.failedTours.slice(0, MAX_STORED_FAILED_TOURS),
       removalsSkipped: sync.removalsSkipped ?? null,
       deadlineHit: Boolean(sync.incomplete) || ("incomplete" in progress.snapshots && progress.snapshots.incomplete),
     });
+    // Readiness ran inside the sync, before this run was recorded complete, so it still read the previous
+    // complete run. Run it again now, so a run that brings an aged catalogue up to date lifts
+    // `catalogue_stale` at once instead of a day later (review R1).
+    if (status === "complete") await reevaluateAfterRun(sync.checkedProductIds);
     const result = { ...progress, durationMs: now() - started } as CatalogueSyncResult;
     await audit(actor, "supplier.catalogue_synced", { type: "supplier", id: code }, { after: { ...result, trigger } });
     return result;
