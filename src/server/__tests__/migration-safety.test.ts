@@ -81,6 +81,8 @@ const LOCK_FREE = [
 const NEW_TABLES_ONLY = [
   // ops_alerts (doc 22 §32.24): a standalone table, no foreign key.
   "20261104120000_ops_alerts",
+  // crm_outbox, crm_links, crm_portal_state (doc 29 C1): standalone tables, no foreign key.
+  "20261122130000_crm_c1_outbox_links",
 ];
 /** How long the injected lock is held. Longer than every `lock_timeout` (5 s). */
 const HOLD_MS = 12_000;
@@ -124,7 +126,8 @@ describe.skipIf(!dbEnabled || excludedHere)("migration safety (doc 27 §3)", () 
     expect(FAULTED.filter((n) => !/SET LOCAL lock_timeout/.test(sqlOf(n)))).toEqual(NO_LOCK_TIMEOUT);
     // The lock-free list holds only function replacements.
     for (const n of LOCK_FREE) {
-      const ddl = sqlOf(n).replace(/--.*$/gm, "").replace(/\$\$[^]*?\$\$/g, "");
+      // String literals (CHECK value lists such as 'delete') are not statements.
+      const ddl = sqlOf(n).replace(/--.*$/gm, "").replace(/\$\$[^]*?\$\$/g, "").replace(/'[^']*'/g, "''");
       expect(ddl, n).not.toMatch(/\b(ALTER|LOCK|CREATE\s+(TABLE|INDEX|UNIQUE|TRIGGER|POLICY)|DROP|UPDATE|INSERT|DELETE)\b/i);
     }
     for (const n of NEW_TABLES_ONLY) {
