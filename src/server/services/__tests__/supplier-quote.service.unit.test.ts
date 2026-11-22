@@ -40,7 +40,7 @@ function context(over: Partial<Context["mapping"]> = {}, rest: Partial<Omit<Cont
   };
 }
 
-function harness(ctx: Context | null, opts: { configured?: boolean; token?: boolean; fail?: boolean; hotelsFail?: boolean } = {}) {
+function harness(ctx: Context | null, opts: { configured?: boolean; token?: boolean; fail?: boolean; hotelsFail?: boolean; hotels?: () => ReturnType<typeof pickupHotels> } = {}) {
   const calls: string[] = [];
   const clock = { now: NOW };
   const source = {
@@ -56,7 +56,7 @@ function harness(ctx: Context | null, opts: { configured?: boolean; token?: bool
     async listPickupHotels(offerId: number) {
       calls.push(`hotels:${offerId}`);
       if (opts.hotelsFail) throw new Error("timeout");
-      return pickupHotels();
+      return (opts.hotels ?? pickupHotels)();
     },
   };
   const tokens: string[] = [];
@@ -158,6 +158,14 @@ describe("supplierQuoteService.quote (SUP-14)", () => {
     // Without a pickup the field is not set at all.
     const self = harness(context());
     expect(await self.svc.quote(input)).not.toHaveProperty("pickupHotelName");
+  });
+
+  it("the snapshot name gets the list's collapse and 120-character cap, so it matches what the customer saw (B3-L10)", async () => {
+    const messy = () => pickupHotels().map((x) => (x.hotelId === 43 ? { ...x, name: `  Example \n  Creek   ${"Hotel ".repeat(40)}` } : x));
+    const h = harness(collecting(), { hotels: messy });
+    const r = await h.svc.quote({ ...input, pickup: { hotelRef: "43" } });
+    expect(r.ok && r.pickupHotelName).toMatch(/^Example Creek Hotel Hotel/);
+    expect(r.ok && r.pickupHotelName && r.pickupHotelName.length).toBe(120);
   });
 
   it("a listed hotel is quoted; the hotel list alone is reused for a short time, seats and price never", async () => {

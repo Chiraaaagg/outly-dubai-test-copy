@@ -949,7 +949,8 @@ export async function takeQuoteReadToken(supplierCode: string, environment: Supp
  * unauthenticated page reads, an offer's start times on a date
  * (start-times route via supplier-quote.service.ts) and its pickup hotel list
  * (pickup-hotels.service.ts). Browse has its own small share
- * of the same per-account window (`browseCap`) and never takes a read the
+ * of the same per-account window (`browseCap`), carved out of the customer
+ * share beside `quoteCap` and never out of the engine reserve, and never takes a read the
  * quote share could still need, so a browse flood cannot delay or refuse a
  * quote, and the engine keeps its reserve (`admitRead`,
  * suppliers/read-budget.ts). False when refused: the page then shows the

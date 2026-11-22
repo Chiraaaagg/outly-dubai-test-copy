@@ -394,8 +394,8 @@ describe("Batch 2 listed-start keys", () => {
     expect(capabilityVerdict(cap, { enabled: true, requiresOfferEvidence: true }, [{ classKey: key, offerTermsHash: HASH, revokedAt: null }], HASH)).toEqual({ instant: true, classKey: key });
     // Its slots are all "any time" with a stored end, so the offer may sell as listed starts once the gate allows it.
     const slots = (payload as { timeSlots: { isAnyTime: boolean; endMinutes: number | null }[] }).timeSlots;
-    expect(listedStartsSellable(true, cap.dimensions.timeShape, slots)).toBe(true);
-    expect(listedStartsSellable(false, cap.dimensions.timeShape, slots)).toBe(false);
+    expect(listedStartsSellable(true, cap.classKey, slots)).toBe(true);
+    expect(listedStartsSellable(false, cap.classKey, slots)).toBe(false);
   });
 
   it("need evidence for that exact key and current terms even if a flag row claims otherwise (the rule for every non-seeded key)", () => {
@@ -418,12 +418,24 @@ describe("Batch 2 listed-start keys", () => {
 
   it("listed starts sell only when every slot is 'any time' with a stored end; fixed shapes and unknown slots never", () => {
     const anyTime = (end: number | null) => ({ isAnyTime: true, endMinutes: end });
-    expect(listedStartsSellable(true, "listed_starts_customer_selected", [anyTime(660), anyTime(720)])).toBe(true);
-    expect(listedStartsSellable(true, "listed_starts_customer_selected", [anyTime(660), anyTime(null)])).toBe(false);
-    expect(listedStartsSellable(true, "listed_start_single", [{ isAnyTime: false, endMinutes: 660 }])).toBe(false);
-    expect(listedStartsSellable(true, "fixed_slot_choice", [anyTime(660)])).toBe(false);
-    expect(listedStartsSellable(true, "listed_start_single", [])).toBe(false);
-    expect(listedStartsSellable(true, "listed_start_single", null)).toBe(false);
+    const [single, choice] = LISTED_START_CLASS_KEYS;
+    expect(listedStartsSellable(true, choice, [anyTime(660), anyTime(720)])).toBe(true);
+    expect(listedStartsSellable(true, choice, [anyTime(660), anyTime(null)])).toBe(false);
+    expect(listedStartsSellable(true, single, [{ isAnyTime: false, endMinutes: 660 }])).toBe(false);
+    expect(listedStartsSellable(true, "live.fixed_slot_choice.self.internal.per_person", [anyTime(660)])).toBe(false);
+    expect(listedStartsSellable(true, single, [])).toBe(false);
+    expect(listedStartsSellable(true, single, null)).toBe(false);
+  });
+
+  it("only the two Batch 2 keys lift the listed-start refusal: a flagged pickup or external listed-start key never does", () => {
+    const anyTime = (end: number | null) => ({ isAnyTime: true, endMinutes: end });
+    for (const shape of ["listed_start_single", "listed_starts_customer_selected"]) {
+      for (const key of [`live.${shape}.pickup_required.internal.per_person`, `live.${shape}.self.external.per_person`, `live.${shape}.pickup_required.external.per_person`]) {
+        expect(LISTED_START_CLASS_KEYS).not.toContain(key);
+        // Even when the gate allowed the key (its flag on and evidence recorded), the start-time path stays shut.
+        expect(listedStartsSellable(true, key, [anyTime(660), anyTime(720)])).toBe(false);
+      }
+    }
   });
 
   it("a listed-start fixture with pickup, an external route or a per-trip price leaves the Batch 2 keys", () => {

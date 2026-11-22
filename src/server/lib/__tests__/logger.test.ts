@@ -73,6 +73,9 @@ describe("logger redaction of supplier, ticket and payment keys", () => {
     "guestPhone",
     "bookingCode",
     "confirmationCode",
+    "pickupHotelNameSnapshot",
+    "pickup_hotel_name_snapshot",
+    "hotelName",
   ])("redacts %s", (key) => {
     const out = redact({ [key]: SECRET });
     expect(out[key]).toBe("[redacted]");

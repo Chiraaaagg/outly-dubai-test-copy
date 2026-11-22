@@ -59,7 +59,7 @@ import { resumePayment } from "@/lib/resume-payment";
 import { inquiryHref, inquiryReasonForQuote, inquiryReasonText, type InquiryReason } from "@/lib/inquiry-handoff";
 import { retimeHrefFor } from "@/lib/start-time-retry";
 import { PickupHotelFields, usePickupHotelLists } from "@/components/checkout/pickup-hotel-fields";
-import { CART_HOTEL_FIELD, initialCartHotel, pickupErrors, pickupItemsFor, pickupPlan, pickupUpdates } from "@/lib/pickup-selection";
+import { CART_HOTEL_FIELD, initialCartHotel, itemHotelField, pickupErrors, pickupItemsFor, pickupPlan, pickupUpdates } from "@/lib/pickup-selection";
 import type { PickupHotelChoice } from "@/lib/types";
 
 /**
@@ -272,7 +272,9 @@ export default function CheckoutPage() {
   const { activities, settled: catalogSettled } = useCatalog();
   // Hotel pickup (doc 29 Batch 3): one hotel for the cart, a per-activity choice only where that activity's list lacks it.
   const pickupItems = useMemo(() => pickupItemsFor(cart, activities), [cart, activities]);
-  const { lists: pickupLists, retry: retryPickupLists } = usePickupHotelLists(pickupItems);
+  // A cart that goes to inquiry anyway (mixed or over the item cap) reads no lists: no browse reads, no rate limit spent.
+  const pickupListItems = useMemo(() => (cartGoesToInquiry(cart) ? [] : pickupItems), [cart, pickupItems]);
+  const { lists: pickupLists, retry: retryPickupLists } = usePickupHotelLists(pickupListItems);
   const [cartHotel, setCartHotel] = useState<PickupHotelChoice | null>(null);
   const cartHotelStarted = useRef(false);
   const leavingForInquiry = useRef(false);
@@ -350,7 +352,11 @@ export default function CheckoutPage() {
     return line ? quotedMoney(line.chargedMinor, payCurrency, fallback) : fallback;
   };
   // Fields listed in the error summary: only ones on screen (the terms box is on step 3).
-  const summaryItems = Object.entries(errors).filter(([field, message]) => Boolean(message) && (field !== "terms" || step >= 2));
+  // A per-activity hotel error counts only while that activity's own field is on screen (the cart hotel may have changed since).
+  const ownHotelFields = new Set(plan.filter((r) => r.status.kind === "own").map((r) => itemHotelField(r.item.itemId)));
+  const summaryItems = Object.entries(errors).filter(
+    ([field, message]) => Boolean(message) && (field !== "terms" || step >= 2) && (!field.startsWith(`${CART_HOTEL_FIELD}-`) || ownHotelFields.has(field)),
+  );
 
   // Mixed-cart rule and the per-order item cap (the server quote sends a larger cart to inquiry
   // anyway; going there now keeps the visitor from typing details first). Whether a cart may be
@@ -1109,7 +1115,7 @@ export default function CheckoutPage() {
                     }}
                     onItemHotel={(itemId, h) => {
                       updateCartItem(itemId, { pickupHotel: h });
-                      setErrors((prev) => Object.fromEntries(Object.entries(prev).filter(([k]) => !k.startsWith(`${CART_HOTEL_FIELD}-`))));
+                      setErrors((prev) => ({ ...prev, [itemHotelField(itemId)]: "" }));
                     }}
                     errors={errors}
                     onAskTeam={askTeamAboutPickup}

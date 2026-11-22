@@ -1126,8 +1126,8 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
     const account = `browse-share-${RUN}`;
     const key = engine.requestBudgetKey(CODE, "test", account);
     await prisma.setting.deleteMany({ where: { key } });
-    // 20 reads a window: 5 quote, 3 browse, 12 engine reserve.
-    const limits = readLimits(20, 0.25, 0.15);
+    // 20 reads a window, a customer share of 8: 5 quote, 3 browse carved out of it, 12 engine reserve.
+    const limits = readLimits(20, 0.4, 0.15);
     expect(limits).toEqual({ perMinute: 20, quoteCap: 5, browseCap: 3, engineReserve: 12 });
     const browse = () => engine.takeBrowseReadToken(CODE, "test", account, { limits });
     const quote = () => engine.takeQuoteReadToken(CODE, "test", account, { limits });

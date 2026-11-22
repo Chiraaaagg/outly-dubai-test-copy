@@ -83,3 +83,27 @@ export function resultAnnouncement(total: number, shown: number, noun: { one: st
   if (total > shown) return `${total} ${noun.many} match, first ${shown} shown. Keep typing to narrow the list`;
   return total === 1 ? `1 ${noun.one} matches` : `${total} ${noun.many} match`;
 }
+
+/**
+ * The rows to render with the chosen one always among them: when `value` names
+ * an option that the display cap left out, it is put first (the last row
+ * shown drops out). Used for an empty query, so opening the list starts on
+ * the chosen hotel wherever it sits in a long list.
+ */
+export function pinSelected(result: FilterResult, options: readonly ComboboxOption[], value: string | null): FilterResult {
+  if (value === null || result.shown.some((o) => o.value === value)) return result;
+  const chosen = options.find((o) => o.value === value);
+  if (!chosen || result.shown.length === 0) return result;
+  return { shown: [chosen, ...result.shown.slice(0, result.shown.length - 1)], total: result.total };
+}
+
+/**
+ * Whether a blur leaves the combobox: focus moves to an element outside
+ * `root`, or nowhere (the window lost focus or a non-focusable spot was
+ * pressed). The panel then closes; Tab inside the field (the filter to the
+ * empty state's action, the action back to the trigger) keeps it open.
+ */
+export function focusLeaves(root: { contains(node: Node | null): boolean } | null, next: EventTarget | null): boolean {
+  if (!root) return true;
+  return !(next && root.contains(next as Node));
+}

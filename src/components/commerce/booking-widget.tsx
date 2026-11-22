@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { CalendarDays, Check, Lock, ShieldCheck } from "lucide-react";
 import { useApp } from "@/components/providers/app-provider";
 import { Button } from "@/components/ui/button";
@@ -84,6 +84,9 @@ export function BookingWidget({
   const [timeNotice, setTimeNotice] = useState<string | null>(null);
   const timesRef = useRef<HTMLDivElement>(null);
   const [focusTimes, setFocusTimes] = useState(false);
+  const timesUid = useId();
+  const timeLabelId = `${timesUid}-label`;
+  const timeNoticeId = `${timesUid}-notice`;
 
   // Checkout sent the visitor back because the quote refused this line's start time: restore the line once.
   const retimeItem = retimeItemId ? cart.find((i) => i.id === retimeItemId && i.slug === activity.slug && i.kind === "activity") : undefined;
@@ -95,7 +98,8 @@ export function BookingWidget({
     if (retimeItem.variantId) setVariantId(retimeItem.variantId);
     setAddOnIds(retimeItem.addOnIds);
     setTime(undefined);
-    setTimeNotice(`The ${retimeItem.time} start on ${formatDateKey(retimeItem.date)} is no longer available. Choose another time.`);
+    // Neutral: the quote also refuses a start with fewer seats than the party, not only a sold-out one.
+    setTimeNotice(`The ${retimeItem.time} start can't be booked for your group on ${formatDateKey(retimeItem.date)}. Choose another time.`);
     setFocusTimes(true);
   }
 
@@ -114,25 +118,39 @@ export function BookingWidget({
     }
   });
   const listed = startTimes.status === "ready" && startTimes.data.source === "supplier" ? startTimes.data : null;
-  // Once this product answered with listed starts, later dates show the picker's own loading state.
-  const [listedProduct, setListedProduct] = useState(false);
-  if (listed && !listedProduct) setListedProduct(true);
+  // Once this variant answered with listed starts, later dates show the picker's own loading state.
+  // Keyed by variant: another variant that is simply not listed shows its stored times with no "live times" line.
+  const [listedVariant, setListedVariant] = useState<string | null>(null);
+  if (listed && variantId && listedVariant !== variantId) setListedVariant(variantId);
+  const listedProduct = !!variantId && listedVariant === variantId;
   const pickerTimes = listed
     ? listed.times.map((t) => ({ time: t.time, status: t.status }))
     : null;
   const pickerLoading = listedProduct && startTimes.status === "loading";
   const usableTime = (t: string | undefined) => !!t && !!pickerTimes?.some((x) => x.time === t && (x.status === "available" || x.status === "limited"));
-  // With listed times on screen, only a time they offer counts as chosen.
-  const chosenTime = pickerTimes ? (usableTime(time) ? time : undefined) : time;
-  const timesFellBack = listedProduct && !listed && startTimes.status !== "loading";
+  // With listed times on screen, only a time they offer counts as chosen; while a date's times load, none does.
+  const chosenTime = pickerLoading ? undefined : pickerTimes ? (usableTime(time) ? time : undefined) : time;
+  // The live times could not be read (busy, unavailable, an error); a variant that is not listed is not a fallback.
+  const timesFellBack =
+    listedProduct && (startTimes.status === "error" || (startTimes.status === "ready" && startTimes.data.source === "stored" && startTimes.data.reason !== "not_listed"));
 
   useEffect(() => {
     // Wait for this date's answer, so focus lands on the times that will stay on screen.
     if (!focusTimes || startTimes.status === "loading") return;
     const el = timesRef.current;
-    if (!el) return;
+    // No times on screen (every one unusable): drop the request, so a later date does not pull focus.
+    if (!el) {
+      setFocusTimes(false);
+      return;
+    }
     el.scrollIntoView({ block: "center" });
-    el.focus({ preventScroll: true });
+    // Onto the time to choose (the checked one, else the first usable), not the group around it.
+    const target =
+      el.querySelector<HTMLElement>('[role="radio"][tabindex="0"]') ??
+      el.querySelector<HTMLElement>('button[aria-pressed="true"]') ??
+      el.querySelector<HTMLElement>("button:not([disabled])") ??
+      el;
+    target.focus({ preventScroll: true });
     setFocusTimes(false);
   }, [focusTimes, startTimes.status]);
 
@@ -141,7 +159,7 @@ export function BookingWidget({
 
   const proceed = async () => {
     // Listed times on screen, or a line sent back for a new time: a time must be chosen, never assumed.
-    if (!chosenTime && (pickerTimes || retimeItem)) {
+    if (!chosenTime && (pickerTimes || pickerLoading || retimeItem)) {
       setTimeNotice("Choose a start time first.");
       setFocusTimes(true);
       return;
@@ -351,21 +369,18 @@ export function BookingWidget({
             (Batch 2), otherwise the listing's slots with no availability claims ---- */}
         {pickerTimes || pickerLoading ? (
           <div>
-            <p id="start-time-label" className="mb-2 text-sm font-bold text-ink-900">
+            <p id={timeLabelId} className="mb-2 text-sm font-bold text-ink-900">
               {activity.pickupIncluded ? "Pickup time" : "Start time"}
             </p>
-            {timeNotice && (
-              <p role="status" className="mb-2 rounded-[var(--radius-control)] bg-sun-50 p-3 text-xs font-semibold leading-relaxed text-sun-800">
-                {timeNotice}
-              </p>
-            )}
+            <TimeNotice id={timeNoticeId} text={timeNotice} />
             <TimeSlotPicker
               date={date}
               slots={pickerTimes ?? []}
               loading={pickerLoading}
               value={chosenTime}
               groupRef={timesRef}
-              label={activity.pickupIncluded ? "Pickup time" : "Start time"}
+              labelledBy={timeLabelId}
+              describedBy={timeNotice ? timeNoticeId : undefined}
               onValueChange={(t) => {
                 setTime(t);
                 setTimeNotice(null);
@@ -376,7 +391,7 @@ export function BookingWidget({
                   <p className="text-xs text-ink-600">This is taking longer than usual. You can still continue, or ask us on WhatsApp.</p>
                 ) : listed ? (
                   <p className="text-xs text-ink-500">
-                    Checked with the operator at <span className="tnum">{asOfDubai(listed.checkedAt)}</span>. Your time is confirmed when you continue.
+                    Checked with the operator at <span className="tnum">{asOfDubai(listed.checkedAt)}</span>. We check this time again before you pay.
                   </p>
                 ) : null
               }
@@ -385,17 +400,20 @@ export function BookingWidget({
         ) : (
           activity.timeSlots.length > 1 && (
             <div>
-              <p className="mb-2 text-sm font-bold text-ink-900">
+              <p id={timeLabelId} className="mb-2 text-sm font-bold text-ink-900">
                 {inquiryMode
                   ? activity.pickupIncluded ? "Preferred pickup time" : "Preferred start time"
                   : activity.pickupIncluded ? "Pickup time" : "Start time"}
               </p>
-              {timeNotice && (
-                <p role="status" className="mb-2 rounded-[var(--radius-control)] bg-sun-50 p-3 text-xs font-semibold leading-relaxed text-sun-800">
-                  {timeNotice}
-                </p>
-              )}
-              <div ref={timesRef} tabIndex={-1} className="outline-none">
+              <TimeNotice id={timeNoticeId} text={timeNotice} />
+              <div
+                ref={timesRef}
+                role="group"
+                aria-labelledby={timeLabelId}
+                aria-describedby={timeNotice ? timeNoticeId : undefined}
+                tabIndex={-1}
+                className="outline-none"
+              >
                 <TimeSlots
                   slots={activity.timeSlots.map((t) => ({ time: t, status: "available" }))}
                   value={time}
@@ -561,6 +579,23 @@ export function BookingWidget({
 }
 
 /** `HH:mm` in Dubai for an "as of" line; the visitor's own clock never decides it. */
+/**
+ * Why the times need attention. The live region stays mounted (empty when
+ * there is nothing to say), so a notice is announced when its text arrives;
+ * the radio group also points at it with `aria-describedby`.
+ */
+function TimeNotice({ id, text }: { id: string; text: string | null }) {
+  return (
+    <div role="status" aria-live="polite">
+      {text ? (
+        <p id={id} className="mb-2 rounded-[var(--radius-control)] bg-sun-50 p-3 text-xs font-semibold leading-relaxed text-sun-800">
+          {text}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
 function asOfDubai(iso: string): string {
   return new Date(iso).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "Asia/Dubai" });
 }

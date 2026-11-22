@@ -7,6 +7,7 @@ import {
   hotelForInquiry,
   initialCartHotel,
   itemHotelField,
+  listsForItems,
   pickupErrors,
   pickupItemsFor,
   pickupPlan,
@@ -99,6 +100,13 @@ describe("one hotel for the cart; per activity only when its list lacks it", () 
 
   it("the cart field offers every hotel any pickup line collects from, once, by name", () => {
     expect(cartHotelOptions([ready(MARINA, CREEK), ready(MARINA, PALM), { status: "loading" }]).map((h) => h.id)).toEqual(["43", "42", "77"]);
+  });
+
+  it("the cart field reads only the lists of the lines in the cart now, never a removed line's list", () => {
+    const lists = new Map<string, ListState>([["a:1", ready(MARINA)], ["b:1", ready(CREEK)], ["gone:1", ready(PALM)]]);
+    const current = [{ listKey: "a:1" }, { listKey: "b:1" }, { listKey: "a:1" }, { listKey: "missing:1" }];
+    expect(cartHotelOptions(listsForItems(current, lists)).map((h) => h.id)).toEqual(["43", "42"]);
+    expect(listsForItems([], lists)).toEqual([]);
   });
 
   it("no hotel yet, a list still loading, or a list that cannot be read stops the details step with a reason", () => {

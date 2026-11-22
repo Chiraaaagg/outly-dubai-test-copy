@@ -16,10 +16,16 @@
 //   - keyboard: the vendor's roving radio group kept (arrows skip unavailable times), Home and End added,
 //     the arrow logic moved to the pure `nextUsableIndex` so it can be unit-tested without a DOM;
 //   - motion: colour transitions only, under `motion-safe`, and nothing animates on a keyboard move;
-//   - the vendor's sync-on-value effect is gone with the day strip (it only served the strip).
+//   - the vendor's sync-on-value effect is gone with the day strip (it only served the strip);
+//   - narrow columns: two columns when the picker is under 18rem wide (320 px phone, 200% zoom), three
+//     otherwise, by container query; the arrow keys read the columns actually laid out;
+//   - the radio group can take `aria-labelledby` (the visible heading) and `aria-describedby` (a notice);
+//     the live line is mounted empty and filled after, and says "Checking times with the operator"
+//     while loading.
+// Licence text: THIRD-PARTY-NOTICES.md at the repository root (MIT, copyright Klyv contributors).
 "use client";
 
-import { useId, useRef, type KeyboardEvent } from "react";
+import { useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
 import { cn } from "@/lib/utils";
 
 export interface TimeSlotPickerSlot {
@@ -36,8 +42,12 @@ export interface TimeSlotPickerProps {
   /** Controlled choice, `HH:mm`, or undefined. */
   value?: string;
   onValueChange?: (time: string) => void;
-  /** Accessible name of the radio group; also the visible heading's id target. */
+  /** Accessible name of the radio group, when no visible heading names it (`labelledBy`). */
   label?: string;
+  /** Id of the visible heading that names the radio group. */
+  labelledBy?: string;
+  /** Id of a notice about the times (e.g. why a time was refused), read with the group. */
+  describedBy?: string;
   /** Skeleton chips while the times for `date` load. */
   loading?: boolean;
   /** Printed under the grid. Fixed by default to the activity's zone, never the browser's. */
@@ -79,7 +89,7 @@ export function nextUsableIndex(key: string, index: number, slots: readonly Time
 /** "5 start times available", for the polite live line. */
 export function availableTimesLine(slots: readonly TimeSlotPickerSlot[]): string {
   const n = slots.filter(usable).length;
-  if (n === 0) return "No start times available on this date";
+  if (n === 0) return "No start times can be booked on this date";
   return `${n} start ${n === 1 ? "time" : "times"} available`;
 }
 
@@ -96,6 +106,8 @@ export function TimeSlotPicker({
   value,
   onValueChange,
   label = "Choose a start time",
+  labelledBy,
+  describedBy,
   loading,
   timeZoneLabel = DUBAI_TIME_LABEL,
   groupRef,
@@ -104,13 +116,23 @@ export function TimeSlotPicker({
 }: TimeSlotPickerProps) {
   const uid = useId();
   const slotRefs = useRef<(HTMLButtonElement | null)[]>([]);
-  // Three columns fit five-character times at 320 px; the arrow-key rows follow the narrowest layout.
-  const columns = 3;
+  // Mounted empty, then filled, so the first line after the times arrive is announced (a live region that
+  // mounts holding its text is often not read).
+  const [liveLine, setLiveLine] = useState("");
+  const liveText = loading ? "Checking times with the operator" : availableTimesLine(slots);
+  useEffect(() => {
+    // A tick later, after the region is in the page.
+    const t = setTimeout(() => setLiveLine(liveText), 0);
+    return () => clearTimeout(t);
+  }, [liveText]);
 
   const checkedSlot = slots.findIndex((slot) => slot.time === value && usable(slot));
   const slotStop = checkedSlot >= 0 ? checkedSlot : slots.findIndex(usable);
 
-  const onKey = (event: KeyboardEvent, index: number) => {
+  const onKey = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
+    // Up and down move by a laid-out row: two or three columns, by the picker's width.
+    const grid = event.currentTarget.parentElement;
+    const columns = (grid && getComputedStyle(grid).gridTemplateColumns.split(" ").filter(Boolean).length) || 3;
     const next = nextUsableIndex(event.key, index, slots, columns);
     if (next === null) return;
     event.preventDefault();
@@ -119,25 +141,26 @@ export function TimeSlotPicker({
   };
 
   return (
-    <div className={cn("flex w-full flex-col gap-2", className)} data-date={date}>
+    <div className={cn("@container flex w-full flex-col gap-2", className)} data-date={date}>
       {loading ? (
-        <div className="grid grid-cols-3 gap-2" aria-busy="true" aria-label="Checking times with the operator">
+        <div className="grid grid-cols-2 gap-2 @[18rem]:grid-cols-3" aria-hidden="true">
           {Array.from({ length: 6 }, (_, i) => (
             <span key={i} className="skeleton h-11 rounded-full" aria-hidden="true" />
           ))}
         </div>
       ) : slots.length === 0 || !slots.some(usable) ? (
         <p className="rounded-[var(--radius-control)] border border-dashed border-ink-300 px-4 py-5 text-center text-sm font-medium text-ink-600">
-          No start times left on this date. Pick another date, or ask our team on WhatsApp.
+          No start times can be booked on this date. Pick another date, or ask our team on WhatsApp.
         </p>
       ) : (
         <div
           ref={groupRef}
           role="radiogroup"
-          aria-label={label}
-          aria-describedby={`${uid}-zone`}
+          aria-label={labelledBy ? undefined : label}
+          aria-labelledby={labelledBy}
+          aria-describedby={[describedBy, `${uid}-zone`].filter(Boolean).join(" ")}
           tabIndex={-1}
-          className="grid grid-cols-3 gap-2 outline-none"
+          className="grid grid-cols-2 gap-2 outline-none @[18rem]:grid-cols-3"
         >
           {slots.map((slot, index) => {
             const open = usable(slot);
@@ -180,8 +203,8 @@ export function TimeSlotPicker({
         {timeZoneLabel}
       </p>
       {note}
-      <p className="sr-only" aria-live="polite">
-        {loading ? "" : availableTimesLine(slots)}
+      <p className="sr-only" role="status" aria-live="polite">
+        {liveLine}
       </p>
     </div>
   );

@@ -63,6 +63,18 @@ export function cartHotelOptions(lists: readonly ListState[]): PickupHotelOption
   return [...byId.values()].sort((a, b) => a.name.localeCompare(b.name, "en", { sensitivity: "base" }) || a.id.localeCompare(b.id));
 }
 
+/**
+ * The loaded lists of the cart's current pickup lines only, once per list. A
+ * list loaded for a line since removed, or for a variant no longer chosen,
+ * stays in the page's map but never feeds the cart field's options.
+ */
+export function listsForItems(items: readonly Pick<PickupItem, "listKey">[], lists: ReadonlyMap<string, ListState>): ListState[] {
+  return [...new Set(items.map((i) => i.listKey))].flatMap((k) => {
+    const l = lists.get(k);
+    return l ? [l] : [];
+  });
+}
+
 /** The plan for every pickup line, given the lists loaded so far and the cart hotel. */
 export function pickupPlan(items: readonly PickupItem[], lists: ReadonlyMap<string, ListState>, cartHotel: PickupHotelChoice | null): PickupPlanRow[] {
   return items.map((item) => {

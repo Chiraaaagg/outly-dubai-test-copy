@@ -21,6 +21,9 @@ const REDACT_KEYS = [
   "leadname",
   "lead_name",
   "hotel",
+  // The pickup hotel name an order item keeps (Batch 3): `pickupHotelNameSnapshot`, `pickup_hotel_name_snapshot`.
+  "hotelnamesnapshot",
+  "hotel_name_snapshot",
   "specialrequests",
   "special_requests",
   "dietary",

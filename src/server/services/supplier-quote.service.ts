@@ -12,6 +12,7 @@ import { traveldeskConfigFrom, type TravelDeskConfig } from "../suppliers/travel
 import { offerTermsHash, parseStoredOffer, parseStoredPolicy } from "../suppliers/traveldesk/traveldesk.offer-terms";
 import { hotelOnPickupList, listedStartsOn, pickupShapeFits, quoteSlot, quoteTickets, unitsFrom, type ListedStart } from "../suppliers/traveldesk/traveldesk.quote";
 import { TtlCache } from "../suppliers/cache";
+import { cleanHotelText } from "./pickup-hotels.service";
 import { bookingAccountId, DEFAULT_BOOKING_ACCOUNT_ID, takeBrowseReadToken, takeQuoteReadToken } from "./supplier-booking.service";
 
 /**
@@ -196,7 +197,8 @@ export function createSupplierQuoteService(deps: SupplierQuoteDeps): SupplierQuo
           const hotels = await hotelsFor(live, mapping.supplierCode, mapping.environment, ref.data.offerId);
           if (!hotels) return refuse("supplier_unavailable");
           if (!hotelOnPickupList(input.pickup.hotelRef, hotels)) return refuse("pickup_unavailable");
-          pickupHotelName = hotels.find((h) => String(h.hotelId) === input.pickup!.hotelRef)?.name?.trim() || null;
+          // The same collapse and cap as the list the customer saw (pickup-hotels.service.ts).
+          pickupHotelName = cleanHotelText(hotels.find((h) => String(h.hotelId) === input.pickup!.hotelRef)?.name);
         }
         if (!(await deps.takeQuoteReadToken(mapping.supplierCode, mapping.environment, live.accountId))) return refuse("supplier_unavailable");
         const withHotel = (r: SupplierQuoteResult): SupplierQuoteResult => (r.ok && input.pickup ? { ...r, pickupHotelName } : r);

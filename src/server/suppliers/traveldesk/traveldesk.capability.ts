@@ -79,20 +79,18 @@ export const LISTED_START_CLASS_KEYS: readonly string[] = Object.freeze([
   "live.listed_starts_customer_selected.self.internal.per_person",
 ]);
 
-/** Whether a time shape is one of the two "any time" shapes, sold only as a choice among listed starts. */
-export function isListedStartShape(shape: CapTimeShape): boolean {
-  return shape === "listed_start_single" || shape === "listed_starts_customer_selected";
-}
-
 /**
  * Whether an offer may sell as a choice among its listed starts (Batch 2):
- * the capability gate allowed its exact class key (`gateAllows`), the class
- * is a listed-start shape, and every stored slot is an "any time" slot whose
- * end time is stored, because the booking sends the stored end
- * (engine-saga.service.ts). Unknown slots never pass.
+ * the capability gate allowed its exact class key (`gateAllows`), that key is
+ * one of the two `LISTED_START_CLASS_KEYS` (self arrival, internal route, per
+ * person; a listed-start key with pickup or an external route is never
+ * lifted here, even if its flag were on, because Batch 2 never proved it), and
+ * every stored slot is an "any time" slot whose end time is stored, because
+ * the booking sends the stored end (engine-saga.service.ts). Unknown slots
+ * never pass.
  */
-export function listedStartsSellable(gateAllows: boolean, shape: CapTimeShape, slots: readonly { isAnyTime: boolean; endMinutes: number | null }[] | null | undefined): boolean {
-  if (!gateAllows || !isListedStartShape(shape) || !slots || slots.length === 0) return false;
+export function listedStartsSellable(gateAllows: boolean, classKey: string, slots: readonly { isAnyTime: boolean; endMinutes: number | null }[] | null | undefined): boolean {
+  if (!gateAllows || !LISTED_START_CLASS_KEYS.includes(classKey) || !slots || slots.length === 0) return false;
   return slots.every((s) => s.isAnyTime && s.endMinutes !== null);
 }
 

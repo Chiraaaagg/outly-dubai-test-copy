@@ -72,7 +72,8 @@ export interface PickupHotelsDeps {
   now(): Date;
 }
 
-const clean = (s: string | null | undefined) => {
+/** Whitespace collapsed, trimmed and capped at 120 characters; null when empty. Also the quote's hotel name snapshot (supplier-quote.service.ts). */
+export const cleanHotelText = (s: string | null | undefined) => {
   const t = (s ?? "").replace(/\s+/g, " ").trim();
   return t ? t.slice(0, NAME_MAX) : null;
 };
@@ -83,10 +84,10 @@ export function publicHotels(rows: readonly Pick<TravelDeskHotel, "hotelId" | "n
   const out: PickupHotel[] = [];
   for (const h of rows) {
     if (!Number.isSafeInteger(h.hotelId) || h.hotelId <= 0 || seen.has(h.hotelId)) continue;
-    const name = clean(h.name);
+    const name = cleanHotelText(h.name);
     if (!name) continue;
     seen.add(h.hotelId);
-    out.push({ id: String(h.hotelId), name, area: clean(h.regionName) ?? clean(h.cityName) });
+    out.push({ id: String(h.hotelId), name, area: cleanHotelText(h.regionName) ?? cleanHotelText(h.cityName) });
   }
   out.sort((a, b) => a.name.localeCompare(b.name, "en", { sensitivity: "base" }) || a.id.localeCompare(b.id));
   return out.slice(0, PICKUP_HOTEL_LIST_MAX);

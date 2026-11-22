@@ -5,7 +5,7 @@ import { AlertTriangle, RefreshCw } from "lucide-react";
 import { Combobox, type ComboboxOption } from "@/components/ui/combobox";
 import { Button } from "@/components/ui/button";
 import { fetchPickupHotels, type PickupHotelOption } from "@/lib/api/pickup-hotels";
-import { CART_HOTEL_FIELD, cartHotelOptions, itemHotelField, type ListState, type PickupItem, type PickupPlanRow } from "@/lib/pickup-selection";
+import { CART_HOTEL_FIELD, cartHotelOptions, itemHotelField, listsForItems, type ListState, type PickupItem, type PickupPlanRow } from "@/lib/pickup-selection";
 import type { PickupHotelChoice } from "@/lib/types";
 
 /**
@@ -76,7 +76,8 @@ export function PickupHotelFields({
   onAskTeam: (typed: string) => void;
   onRetry: () => void;
 }) {
-  const hotels = useMemo(() => cartHotelOptions([...lists.values()]), [lists]);
+  // Only the lists of the lines in the cart now (a removed line's list never offers its hotels).
+  const hotels = useMemo(() => cartHotelOptions(listsForItems(plan.map((r) => r.item), lists)), [plan, lists]);
   const options = useMemo(() => toOptions(hotels), [hotels]);
   const loading = plan.some((r) => r.status.kind === "loading");
   const unavailable = plan.filter((r) => r.status.kind === "unavailable");
@@ -97,9 +98,11 @@ export function PickupHotelFields({
           label={label}
           required
           hint={
-            several
-              ? "The operators collect you from this hotel for every activity with pickup. Search by hotel name or area."
-              : "The operator collects you from this hotel. Search by hotel name or area."
+            own.length > 0
+              ? "The operators collect you from this hotel where they can. An activity that can't has its own hotel field below. Search by hotel name or area."
+              : several
+                ? "The operators collect you from this hotel for every activity with pickup. Search by hotel name or area."
+                : "The operator collects you from this hotel. Search by hotel name or area."
           }
           error={errors[CART_HOTEL_FIELD]}
           options={options}

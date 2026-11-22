@@ -4,7 +4,7 @@ import { createElement as h } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { Combobox } from "../combobox";
-import { filterOptions, isListKey, moveActive, normaliseForSearch, resultAnnouncement, type ComboboxOption } from "../combobox-logic";
+import { filterOptions, focusLeaves, isListKey, moveActive, normaliseForSearch, pinSelected, resultAnnouncement, type ComboboxOption } from "../combobox-logic";
 
 /**
  * Imported Combobox (halaska-studio, 21st.dev id 34727, MIT), adapted for the
@@ -67,6 +67,31 @@ describe("keyboard", () => {
     for (const k of ["Enter", "Escape", "Tab", "a", " "]) expect(isListKey(k)).toBe(false);
   });
 
+  it("with no query the chosen row is rendered even past the display cap, first, so opening starts on it", () => {
+    const many: ComboboxOption[] = Array.from({ length: 150 }, (_, i) => ({ value: String(i + 1), label: `zz Hotel ${String(i + 1).padStart(3, "0")}` }));
+    const capped = filterOptions(many, "", 100);
+    const pinned = pinSelected(capped, many, "140");
+    expect(pinned.shown).toHaveLength(100);
+    expect(pinned.shown[0].value).toBe("140");
+    expect(pinned.total).toBe(150);
+    // Already shown, nothing chosen, or an unknown value: unchanged.
+    expect(pinSelected(capped, many, "5")).toBe(capped);
+    expect(pinSelected(capped, many, null)).toBe(capped);
+    expect(pinSelected(capped, many, "999")).toBe(capped);
+  });
+
+  it("the panel closes only when focus leaves the whole field, so Tab can reach the empty state's action", () => {
+    const inside = { id: "inside" } as unknown as Node;
+    const root = { contains: (n: Node | null) => n === inside };
+    expect(focusLeaves(root, inside)).toBe(false);
+    expect(focusLeaves(root, { id: "elsewhere" } as unknown as EventTarget)).toBe(true);
+    expect(focusLeaves(root, null)).toBe(true);
+    expect(focusLeaves(null, inside)).toBe(true);
+    // And the field no longer closes on Tab itself.
+    const src = readFileSync(join(process.cwd(), "src/components/ui/combobox.tsx"), "utf8");
+    expect(src).not.toMatch(/key === "Tab"/);
+  });
+
   it("the live region says how many match, in words", () => {
     expect(resultAnnouncement(0, 0, { one: "hotel", many: "hotels" })).toBe("No hotels match");
     expect(resultAnnouncement(1, 1, { one: "hotel", many: "hotels" })).toBe("1 hotel matches");
@@ -74,6 +99,18 @@ describe("keyboard", () => {
     expect(resultAnnouncement(300, 100, { one: "hotel", many: "hotels" })).toMatch(/300 hotels match, first 100 shown/);
   });
 });
+
+/** The outer HTML of the `<div>` starting at `start`, by counting nested divs (static markup, no DOM in the unit project). */
+function elementAt(html: string, start: number): string {
+  let depth = 0;
+  const tag = /<div\b|<\/div>/g;
+  tag.lastIndex = start;
+  for (let m = tag.exec(html); m; m = tag.exec(html)) {
+    depth += m[0] === "</div>" ? -1 : 1;
+    if (depth === 0) return html.slice(start, m.index + m[0].length);
+  }
+  return html.slice(start);
+}
 
 function render(props: Partial<Parameters<typeof Combobox>[0]> = {}): string {
   return renderToStaticMarkup(
@@ -96,25 +133,37 @@ describe("markup (WAI-ARIA 1.2)", () => {
   it("closed: the trigger is named by the visible label and its value, described by hint and error", () => {
     const html = render({ value: "42", error: "Choose the hotel the operator collects you from." });
     expect(html).toContain('<label id="hotel-label" for="hotel"');
-    expect(html).toMatch(/<button id="hotel" type="button"[^>]*role="combobox"[^>]*aria-haspopup="listbox"/);
-    expect(html).toContain('aria-required="true"');
+    // The trigger opens a panel; the combobox role belongs to the filter field inside it (ARIA 1.2).
+    expect(html).toMatch(/<button id="hotel" type="button"[^>]*aria-haspopup="dialog"/);
+    expect(html).not.toContain('role="combobox"');
     expect(html).toContain('aria-expanded="false"');
     expect(html).toContain('aria-labelledby="hotel-label hotel-value"');
     expect(html).toContain('aria-describedby="hotel-hint hotel-error"');
-    expect(html).toContain('aria-invalid="true"');
+    // A button may not carry aria-invalid or aria-required: the error is read through the description.
+    expect(/<button[^>]*>/.exec(html)![0]).not.toMatch(/aria-invalid|aria-required/);
     expect(html).toContain("Example Marina Hotel");
     expect(html).toContain('id="hotel-error"');
     expect(html).not.toContain('role="listbox"');
   });
 
-  it("open: the expanded combobox and its labelled filter field control a listbox of options, with a polite count", () => {
+  it("open: the focused filter field is the combobox, expanded and controlling a listbox of options only, with a polite count", () => {
     const html = render({ value: "42", defaultOpen: true });
-    expect(html).toContain('aria-expanded="true"');
-    expect(html).toMatch(/<input[^>]*aria-autocomplete="list"[^>]*aria-label="Search hotels"/);
+    const input = /<input[^>]*>/.exec(html)![0];
+    expect(input).toContain('role="combobox"');
+    expect(input).toContain('aria-expanded="true"');
+    expect(input).toContain('aria-autocomplete="list"');
+    expect(input).toContain('aria-label="Search hotels"');
+    expect(input).toContain('aria-required="true"');
+    expect(input).toContain('aria-describedby="hotel-hint"');
+    expect(input).toMatch(/aria-activedescendant="[^"]+-opt-\d+"/);
     const list = /role="listbox"[^>]*id="([^"]+)"|id="([^"]+)" role="listbox"/.exec(html);
     expect(list).not.toBeNull();
     const listId = list![1] ?? list![2];
-    expect(html).toContain(`aria-controls="${listId}"`);
+    expect(input).toContain(`aria-controls="${listId}"`);
+    // The trigger controls the panel, a dialog named by the field's label.
+    const panel = /<div id="([^"]+)" role="dialog" aria-labelledby="hotel-label"/.exec(html);
+    expect(panel).not.toBeNull();
+    expect(/<button[^>]*>/.exec(html)![0]).toContain(`aria-controls="${panel![1]}"`);
     expect(html.match(/role="option"/g)).toHaveLength(4);
     expect(html).toMatch(/role="option" aria-selected="true"/);
     expect(html).toContain('aria-live="polite"');
@@ -123,11 +172,43 @@ describe("markup (WAI-ARIA 1.2)", () => {
     expect(html.slice(html.indexOf('role="listbox"'))).not.toContain("<button");
   });
 
+  it("the listbox holds options only: the cap line and the empty state with its action sit beside it", () => {
+    const many: ComboboxOption[] = Array.from({ length: 5 }, (_, i) => ({ value: String(i + 1), label: `zz Hotel ${i + 1}` }));
+    const capped = render({ options: many, maxShown: 3, defaultOpen: true });
+    const listHtml = elementAt(capped, capped.lastIndexOf("<div", capped.indexOf('role="listbox"')));
+    expect(listHtml.match(/role="option"/g)).toHaveLength(3);
+    // Nothing but options inside: no paragraph, no button, no cap line.
+    expect(listHtml).not.toMatch(/<p|<button|Showing/);
+    expect(capped).toContain("Showing 3 of 5");
+
+    const empty = render({ options: [], defaultOpen: true, emptyAction: () => h("button", { type: "button" }, "Ask our team") });
+    expect(empty).not.toContain('role="listbox"');
+    expect(empty).toContain("No hotels match");
+    expect(empty).toContain("Ask our team");
+    // With nothing to show the filter is collapsed and controls nothing.
+    const input = /<input[^>]*>/.exec(empty)![0];
+    expect(input).toContain('aria-expanded="false"');
+    expect(input).not.toContain("aria-controls");
+  });
+
+  it("while unavailable the trigger stays focusable (aria-disabled, not disabled), so an error link can land on it", () => {
+    const html = render({ options: [], disabled: true, error: "We can't load the pickup hotels right now." });
+    const trigger = /<button[^>]*>/.exec(html)![0];
+    expect(trigger).toContain('aria-disabled="true"');
+    expect(trigger).not.toMatch(/\sdisabled(=|\s|>)/);
+  });
+
+  it("keeps one polite live region mounted while closed, empty, so the first count is announced", () => {
+    const html = render();
+    expect(html).toMatch(/<p role="status" aria-live="polite" class="sr-only"><\/p>/);
+  });
+
   it("uses the project's tokens only: no foreign palette, no purple accent, no glyph tick, no blur", () => {
     const src = readFileSync(join(process.cwd(), "src/components/ui/combobox.tsx"), "utf8");
     const code = src.replace(/^\/\/.*$/gm, "");
     expect(code).not.toMatch(/#[0-9a-f]{3,8}\b/i);
-    expect(code).not.toMatch(/purple|violet|8b5cf6|backdrop|blur/i);
+    // No blur effect (the focus handler's onBlur is not one).
+    expect(code.replace(/onBlur/g, "")).not.toMatch(/purple|violet|8b5cf6|backdrop|blur/i);
     expect(code).not.toContain("✓");
     expect(code).toContain("motion-reduce:");
     // The provenance header is kept.

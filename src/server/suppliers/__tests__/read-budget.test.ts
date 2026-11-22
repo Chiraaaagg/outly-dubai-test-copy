@@ -91,10 +91,13 @@ describe("read budget classes (CR-B2-3)", () => {
 });
 
 describe("browse read class (doc 29 §6.3, Batch 2)", () => {
-  it("the shared budget gives browse its own small share beside an unchanged quote share", () => {
+  it("the shared budget carves browse out of the customer share, never out of the engine reserve (decision of 23 November 2026)", () => {
     expect(BROWSE_READ_SHARE).toBe(0.1);
-    expect(READ_BUDGET).toEqual({ perMinute: 120, quoteCap: 30, browseCap: 12, engineReserve: 78 });
-    expect(readLimits(10, 0.5, 0.9)).toEqual({ perMinute: 10, quoteCap: 5, browseCap: 5, engineReserve: 0 });
+    expect(READ_BUDGET).toEqual({ perMinute: 120, quoteCap: 18, browseCap: 12, engineReserve: 90 });
+    // The engine reserve is the same with or without a browse share.
+    expect(READ_BUDGET.engineReserve).toBe(readLimits().engineReserve);
+    expect(readLimits(10, 0.5, 0.9)).toEqual({ perMinute: 10, quoteCap: 0, browseCap: 5, engineReserve: 5 });
+    expect(readLimits(10, 0.5, 0.2)).toEqual({ perMinute: 10, quoteCap: 3, browseCap: 2, engineReserve: 5 });
     expect(readLimits(10, 0.25, Number.NaN)).toMatchObject({ browseCap: 0 });
     // Limits without a browse cap (built before this class) refuse browse.
     expect(admitRead(FRESH, "browse", { perMinute: 10, quoteCap: 2, engineReserve: 8 })).toBeNull();
@@ -109,15 +112,15 @@ describe("browse read class (doc 29 §6.3, Batch 2)", () => {
   it("a browse flood leaves quote and engine reads unaffected", () => {
     const afterFlood = drain(FRESH, "browse", READ_BUDGET).window;
     const quotes = drain(afterFlood, "quote", READ_BUDGET);
-    expect(quotes.n).toBe(30);
+    expect(quotes.n).toBe(18);
     const engine = drain(quotes.window, "engine", READ_BUDGET);
-    expect(engine.n).toBe(READ_BUDGET.engineReserve);
+    expect(engine.n).toBe(90);
     // Without the flood the quotes get exactly as many.
-    expect(drain(FRESH, "quote", READ_BUDGET).n).toBe(30);
+    expect(drain(FRESH, "quote", READ_BUDGET).n).toBe(18);
   });
 
   it("browse never takes a read the quotes' unused share still needs", () => {
-    const limits = readLimits(10, 0.3, 0.3); // 3 quote, 3 browse, 4 engine
+    const limits = readLimits(10, 0.6, 0.3); // 3 quote, 3 browse, 4 engine
     // Engine has used 6: 4 left, 3 of which the quotes may still need, so one browse read at most.
     let w: ReadWindow = { used: 6, quoteUsed: 0 };
     const b = drain(w, "browse", limits);
@@ -128,14 +131,14 @@ describe("browse read class (doc 29 §6.3, Batch 2)", () => {
 
   // Carried over from Batch 3's separate browse module when the two were unified.
   it("with the default budget a busy engine leaves browse only what the quotes do not still need", () => {
-    // The engine has used 85: 35 left, 30 of them owed to quotes.
-    const b = drain({ used: 85, quoteUsed: 0 }, "browse", READ_BUDGET);
-    expect(b.n).toBe(5);
-    expect(drain(b.window, "quote", READ_BUDGET).n).toBe(30);
+    // The engine has used 95: 25 left, 18 of them owed to quotes.
+    const b = drain({ used: 95, quoteUsed: 0 }, "browse", READ_BUDGET);
+    expect(b.n).toBe(7);
+    expect(drain(b.window, "quote", READ_BUDGET).n).toBe(18);
   });
 
   it("quotes already spent free nothing for browse beyond its own cap", () => {
-    expect(drain({ used: 30, quoteUsed: 30 }, "browse", READ_BUDGET).n).toBe(12);
+    expect(drain({ used: 18, quoteUsed: 18 }, "browse", READ_BUDGET).n).toBe(12);
   });
 
   it("under any interleaving of all three classes, browse never costs a quote or the engine reserve", () => {

@@ -306,6 +306,25 @@ function scrubRequestPayload(value: unknown, marker: string): Prisma.InputJsonVa
   return (walk(value, 0) ?? {}) as Prisma.InputJsonValue;
 }
 
+/**
+ * A quote's stored lines with every pickup hotel name cleared (Batch 3 keeps
+ * the accepted hotel's name in `quotes.lines[].pickup.hotelName`), or null
+ * when no line carries one. The hotel id stays: the quote's readers parse it
+ * as required, and the order item's copy of it is cleared on its own.
+ */
+export function clearPickupHotelNames(lines: unknown): Prisma.InputJsonValue | null {
+  if (!Array.isArray(lines)) return null;
+  let changed = false;
+  const next = lines.map((l: unknown) => {
+    if (!l || typeof l !== "object") return l;
+    const pickup = (l as { pickup?: unknown }).pickup;
+    if (!pickup || typeof pickup !== "object" || (pickup as { hotelName?: unknown }).hotelName == null) return l;
+    changed = true;
+    return { ...(l as Record<string, unknown>), pickup: { ...(pickup as Record<string, unknown>), hotelName: null } };
+  });
+  return changed ? (next as Prisma.InputJsonValue) : null;
+}
+
 /** A fresh, unlinkable stand-in for a stored contact hash (the verification row keeps its shape and its other columns). */
 function unlinkableHash(): string {
   return sha256Hex(randomToken(32));
@@ -429,9 +448,28 @@ export async function eraseSubjectRows(tx: Tx, plan: ErasurePlan): Promise<Erasu
   if (erasedOrderIds.length) ocvOr.push({ orderId: { in: erasedOrderIds } });
   const ocvHashes = contacts.map((c) => sha256Hex(c));
   if (ocvHashes.length) ocvOr.push({ orderId: null, contactHash: { in: ocvHashes } });
-  const ocvRows = ocvOr.length ? await tx.orderContactVerification.findMany({ where: { OR: ocvOr }, select: { id: true } }) : [];
+  const ocvRows = ocvOr.length ? await tx.orderContactVerification.findMany({ where: { OR: ocvOr }, select: { id: true, quoteId: true, orderId: true } }) : [];
   for (const v of ocvRows) await tx.orderContactVerification.update({ where: { id: v.id }, data: { contactHash: unlinkableHash() } });
   if (ocvRows.length) note("order_contact_verifications", "contactHash");
+
+  // Quotes keep their own copy of the accepted pickup hotel's name (Batch 3), which says where the person stays,
+  // like `order_items.pickup_hotel_name_snapshot`. Cleared on the quote of every erased order, and on the subject's
+  // quotes no order used (a closed customer's, or one bound to the subject's verified contact). A quote used by a
+  // deferred order keeps it, like the order.
+  const quoteOr: Prisma.QuoteWhereInput[] = [];
+  if (erasedOrderIds.length) quoteOr.push({ usedByOrderId: { in: erasedOrderIds } });
+  if (closedCustomerIds.length) quoteOr.push({ usedByOrderId: null, customerId: { in: closedCustomerIds } });
+  const looseQuoteIds = uniq(ocvRows.filter((v) => v.orderId === null).map((v) => v.quoteId));
+  if (looseQuoteIds.length) quoteOr.push({ usedByOrderId: null, id: { in: looseQuoteIds } });
+  const quoteRows = quoteOr.length ? await tx.quote.findMany({ where: { OR: quoteOr }, select: { id: true, lines: true } }) : [];
+  let quotesScrubbed = 0;
+  for (const q of quoteRows) {
+    const lines = clearPickupHotelNames(q.lines);
+    if (!lines) continue;
+    await tx.quote.update({ where: { id: q.id }, data: { lines } });
+    quotesScrubbed += 1;
+  }
+  if (quotesScrubbed) note("quotes", "lines.pickup.hotelName");
 
   // Supplier attempts of erased orders: the guest name, and any contact an adapter put in the request.
   // Personal columns only, never `state` (SUP-20), and only on settled, unflagged attempts: an open one is an

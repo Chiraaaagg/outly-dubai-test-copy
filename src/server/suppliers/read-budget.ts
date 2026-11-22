@@ -12,18 +12,20 @@
  * - `browse` (doc 29 §6.3, Batches 2 and 3): unauthenticated page reads: an
  *   offer's start times on a date (`/api/catalog/start-times`) and its pickup
  *   hotel list (`/api/catalog/pickup-hotels`), both through
- *   `takeBrowseReadToken`. They may use at most `browseCap` reads,
- *   a share of their own beside the quote share, and never a read the quote
- *   share could still need: a browse read is refused when, after it, the
- *   window would have less room left than the quotes' unused share.
+ *   `takeBrowseReadToken`. They may use at most `browseCap` reads, a share
+ *   carved out of the customer share (quote plus browse), never out of the
+ *   engine reserve, and never a read the quote share could still need: a
+ *   browse read is refused when, after it, the window would have less room
+ *   left than the quotes' unused share.
  *
  * Every read, of any class, counts towards the window total. Because quotes
  * can never hold more than `quoteCap` of it and browse reads more than
- * `browseCap`, engine reads always have at least `engineReserve` reads per
- * window whatever the customer traffic: an engine read is refused only when
- * the whole window is spent, and by then the engine itself has used at least
- * its reserve. A browse flood changes neither guarantee, nor how many quote
- * reads are admitted: browse yields to quotes and engine.
+ * `browseCap`, and the two caps together are the customer share, engine reads
+ * always have at least `engineReserve` reads per window whatever the customer
+ * traffic: an engine read is refused only when the whole window is spent, and
+ * by then the engine itself has used at least its reserve. A browse flood
+ * changes neither guarantee, nor how many quote reads are admitted: browse
+ * yields to quotes and engine. Decision of 23 November 2026, doc 29 §6.5.
  */
 
 export type ReadClass = "engine" | "quote" | "browse";
@@ -36,19 +38,19 @@ export type ReadClass = "engine" | "quote" | "browse";
 export const DEFAULT_READ_BUDGET_PER_MINUTE = 120;
 
 /**
- * Largest share of each window that quote reads may use, rounded down; the
- * rest is left to browse and engine reads. With the default budget, 30 quote
- * reads per minute (and, after the browse share below, a 78-read engine
- * reserve).
+ * Largest share of each window that customer reads (quote and browse
+ * together) may use, rounded down; the rest is the engine reserve. With the
+ * default budget, 30 customer reads per minute and a 90-read engine reserve.
  * PROVISIONAL ops parameter: to be tuned from real quote traffic and the
  * engine's recovery load.
  */
 export const QUOTE_READ_SHARE = 0.25;
 
 /**
- * Largest share of each window that browse reads may use, rounded down; it
- * comes out of what was the engine-only remainder, so the quote share is
- * unchanged. With the default budget: 30 quote, 12 browse, 78 engine reserve.
+ * Largest share of each window that browse reads may use, rounded down. It is
+ * carved out of the customer share above, never out of the engine reserve
+ * (doc 29 §6.3), so the quotes keep the rest of that share. With the default
+ * budget: 18 quote, 12 browse, 90 engine reserve.
  * PROVISIONAL ops parameter, like the two above.
  */
 export const BROWSE_READ_SHARE = 0.1;
@@ -67,15 +69,18 @@ export interface ReadLimits {
 const clampShare = (s: number) => (Number.isFinite(s) ? Math.min(1, Math.max(0, s)) : 0);
 
 /**
- * The limits for a budget, quote share and browse share. A share outside
- * 0…1 is clamped and a non-number share gives that class nothing; the browse
- * share never takes more than the quote share leaves.
+ * The limits for a budget, customer share and browse share. A share outside
+ * 0…1 is clamped and a non-number share gives that class nothing. The browse
+ * cap comes out of the customer share (never more than all of it) and the
+ * quotes keep the rest, so the engine reserve is the budget less the customer
+ * share whatever the browse share. With no browse share the quotes have the
+ * whole customer share.
  */
-export function readLimits(perMinute = DEFAULT_READ_BUDGET_PER_MINUTE, quoteShare = QUOTE_READ_SHARE, browseShare = 0): ReadLimits {
+export function readLimits(perMinute = DEFAULT_READ_BUDGET_PER_MINUTE, customerShare = QUOTE_READ_SHARE, browseShare = 0): ReadLimits {
   const total = Math.max(0, Math.floor(perMinute));
-  const quoteCap = Math.floor(total * clampShare(quoteShare));
-  const browseCap = Math.min(total - quoteCap, Math.floor(total * clampShare(browseShare)));
-  return { perMinute: total, quoteCap, browseCap, engineReserve: total - quoteCap - browseCap };
+  const customer = Math.floor(total * clampShare(customerShare));
+  const browseCap = Math.min(customer, Math.floor(total * clampShare(browseShare)));
+  return { perMinute: total, quoteCap: customer - browseCap, browseCap, engineReserve: total - customer };
 }
 
 /**

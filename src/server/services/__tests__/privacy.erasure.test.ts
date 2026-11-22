@@ -246,13 +246,16 @@ async function webhook(payload: Record<string, unknown>) {
   return id;
 }
 
-async function quoteWithVerification(channel: "phone" | "email", contact: string, orderId: string | null) {
+/** A stored quote line with the Batch 3 pickup copy: the hotel id and the accepted hotel's name. */
+const pickupLine = (hotelRef: string, hotelName: string) => ({ index: 0, productId: uuidv7(), serviceDate: PAST, pickup: { hotelRef, hotelName } });
+
+async function quoteWithVerification(channel: "phone" | "email", contact: string, orderId: string | null, lines: unknown[] = []) {
   const gs = uuidv7();
   await prisma.guestSession.create({ data: { id: gs, tokenHash: sha(randomBytes(8).toString("hex")), expiresAt: new Date(Date.now() + DAY) } });
   created.guestSessions.push(gs);
   const quoteId = uuidv7();
   await prisma.quote.create({
-    data: { id: quoteId, fingerprint: sha(quoteId), ownerKind: "guest", guestSessionId: gs, currency: "AED", totalMinor: 1000n, lines: [], request: {}, status: orderId ? "used" : "active", usedByOrderId: orderId, expiresAt: new Date(Date.now() + DAY) },
+    data: { id: quoteId, fingerprint: sha(quoteId), ownerKind: "guest", guestSessionId: gs, currency: "AED", totalMinor: 1000n, lines: lines as never, request: {}, status: orderId ? "used" : "active", usedByOrderId: orderId, expiresAt: new Date(Date.now() + DAY) },
   });
   created.quotes.push(quoteId);
   const id = uuidv7();
@@ -355,8 +358,10 @@ describe.skipIf(!dbEnabled)("privacy erasure workflow (PRV-3)", () => {
     await prisma.paymentSaga.create({ data: { id: uuidv7(), orderId: o.orderId, orderItemId: o.itemId, paymentId, rail: "aed_card", state: "fulfilled" } });
     const bookingId = await booking(o);
     const t = await tickets(o, bookingId, store);
-    const ocvBound = await quoteWithVerification("phone", P, o.orderId);
-    const ocvLoose = await quoteWithVerification("email", E, null);
+    const ocvBound = await quoteWithVerification("phone", P, o.orderId, [pickupLine("42", "zz Example Marina Hotel"), { index: 1, productId: uuidv7(), serviceDate: PAST, pickup: null }]);
+    const ocvLoose = await quoteWithVerification("email", E, null, [pickupLine("43", "zz Example Creek Hotel")]);
+    const otherQuote = await quoteWithVerification("phone", other, null, [pickupLine("44", "zz Example Other Hotel")]);
+    await prisma.orderItem.update({ where: { id: o.itemId }, data: { pickupHotelId: "42", pickupHotelNameSnapshot: "zz Example Marina Hotel" } });
     const otherRecovery = uuidv7();
     await prisma.otpChallenge.createMany({
       data: [
@@ -423,6 +428,16 @@ describe.skipIf(!dbEnabled)("privacy erasure workflow (PRV-3)", () => {
       expect([sha(P), sha(E)]).not.toContain(row.contactHash);
     }
 
+    // Pickup hotel (Batch 3): the item's id and name, and the quote's copy of the name, on the erased order's quote and on
+    // the subject's unused quote. The hotel id in the quote lines stays (its readers require it); another person's quote is untouched.
+    expect(await prisma.orderItem.findUniqueOrThrow({ where: { id: o.itemId }, select: { pickupHotelId: true, pickupHotelNameSnapshot: true } })).toEqual({ pickupHotelId: null, pickupHotelNameSnapshot: null });
+    expect((await prisma.quote.findUniqueOrThrow({ where: { id: ocvBound.quoteId } })).lines).toEqual([
+      { ...pickupLine("42", "x"), productId: expect.any(String), pickup: { hotelRef: "42", hotelName: null } },
+      { index: 1, productId: expect.any(String), serviceDate: PAST, pickup: null },
+    ]);
+    expect((await prisma.quote.findUniqueOrThrow({ where: { id: ocvLoose.quoteId } })).lines).toMatchObject([{ pickup: { hotelRef: "43", hotelName: null } }]);
+    expect((await prisma.quote.findUniqueOrThrow({ where: { id: otherQuote.quoteId } })).lines).toMatchObject([{ pickup: { hotelRef: "44", hotelName: "zz Example Other Hotel" } }]);
+
     // Supplier attempt, tickets, documents, grants.
     const b = await prisma.supplierBooking.findUniqueOrThrow({ where: { id: bookingId } });
     expect(b.guestName).toBe(marker);
@@ -457,7 +472,7 @@ describe.skipIf(!dbEnabled)("privacy erasure workflow (PRV-3)", () => {
     const audit = await prisma.auditLog.findFirstOrThrow({ where: { action: "privacy.erasure", entityType: "privacy_request", entityId: result.requestId } });
     expect(audit).toMatchObject({ actorType: "admin", actorId: ADMIN.id, before: null });
     const after = audit.after as { fields: string[]; ids: Record<string, unknown>; counts: Record<string, number>; codes: Record<string, unknown> };
-    expect(after.fields).toEqual(expect.arrayContaining(["orders.leadPhone", "customers.email", "notifications.payload", "webhook_events.payload", "supplier_ticket_codes.deleted"]));
+    expect(after.fields).toEqual(expect.arrayContaining(["orders.leadPhone", "customers.email", "notifications.payload", "webhook_events.payload", "supplier_ticket_codes.deleted", "order_items.pickupHotelNameSnapshot", "quotes.lines.pickup.hotelName"]));
     expect(after.ids.markerToken).toBe(result.token);
     expect(after.counts).toMatchObject({ orders: 1, ticketCodes: 2, suppressedPhone: 1, suppressedEmail: 1 });
     expect(after.codes).toMatchObject({ status: "completed", obligations: [], channels: ["phone", "email"] });
@@ -550,7 +565,8 @@ describe.skipIf(!dbEnabled)("privacy erasure workflow (PRV-3)", () => {
     const o = await order(P, E, { serviceDate: FUTURE, customerId: custId, inquiryId: inqId });
     const bookingId = await booking(o, "confirmed", FUTURE);
     const t = await tickets(o, bookingId, store);
-    const ocv = await quoteWithVerification("phone", P, o.orderId);
+    const ocv = await quoteWithVerification("phone", P, o.orderId, [pickupLine("42", "zz Example Marina Hotel")]);
+    await prisma.orderItem.update({ where: { id: o.itemId }, data: { pickupHotelId: "42", pickupHotelNameSnapshot: "zz Example Marina Hotel" } });
     const nBound = await notification({ recipient: P, orderId: o.orderId });
     const nLoose = await notification({ recipient: P, event: "OTP" });
 
@@ -568,6 +584,9 @@ describe.skipIf(!dbEnabled)("privacy erasure workflow (PRV-3)", () => {
     expect(store.has(t.storageKey)).toBe(true);
     expect(await prisma.guestCapabilityGrant.findUniqueOrThrow({ where: { id: t.grantId } })).toMatchObject({ revokedAt: null });
     expect((await prisma.orderContactVerification.findUniqueOrThrow({ where: { id: ocv.verificationId } })).contactHash).toBe(sha(P));
+    // The pickup hotel is needed to fulfil the deferred order: the item and its quote keep it.
+    expect(await prisma.orderItem.findUniqueOrThrow({ where: { id: o.itemId }, select: { pickupHotelId: true, pickupHotelNameSnapshot: true } })).toEqual({ pickupHotelId: "42", pickupHotelNameSnapshot: "zz Example Marina Hotel" });
+    expect((await prisma.quote.findUniqueOrThrow({ where: { id: ocv.quoteId } })).lines).toMatchObject([{ pickup: { hotelRef: "42", hotelName: "zz Example Marina Hotel" } }]);
     expect(await prisma.notification.findUniqueOrThrow({ where: { id: nBound } })).toMatchObject({ recipient: P, payload: { leadPhone: P } });
     // Not needed for fulfilment: erased even on the deferred order.
     expect(await prisma.orderAttribution.findUniqueOrThrow({ where: { orderId: o.orderId } })).toMatchObject({ fbclid: null, gclid: null });

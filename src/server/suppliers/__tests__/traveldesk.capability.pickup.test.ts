@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
@@ -26,9 +26,13 @@ const capOf = (classKey: string): DerivedCapability => ({
   raw: {} as DerivedCapability["raw"],
 });
 
+/** The coverage ledger lives in the private docs; the public test copy does not carry it, so the coverage case skips there. */
+const LEDGER_PATH = join(import.meta.dirname, "../../../../docs/backend/29a-offer-coverage-ledger.csv");
+const HAS_LEDGER = existsSync(LEDGER_PATH);
+
 /** The ledger's target class per offer (docs/backend/29a-offer-coverage-ledger.csv; no quoted commas in that column's neighbours matter here). */
 function ledgerClasses(): string[] {
-  const text = readFileSync(join(process.cwd(), "docs/backend/29a-offer-coverage-ledger.csv"), "utf8").trim().split("\n");
+  const text = readFileSync(LEDGER_PATH, "utf8").trim().split("\n");
   const header = text[0].split(",");
   const col = header.indexOf("targetCapabilityClass");
   return text.slice(1).map((line) => {
@@ -81,7 +85,7 @@ describe("Batch 3 pickup class keys", () => {
     expect(neverEnabledReason("live.fixed_slot_single.pickup_required.internal.mixed_person_plus_unit")).toBe("private_units_inquiry");
   });
 
-  it("cover 43 offers of the coverage ledger (42 single start, 1 choice)", () => {
+  it.skipIf(!HAS_LEDGER)("cover 43 offers of the coverage ledger (42 single start, 1 choice)", () => {
     const classes = ledgerClasses();
     expect(classes).toHaveLength(317);
     expect(classes.filter((c) => c === PICKUP_CLASS_KEYS[0])).toHaveLength(42);

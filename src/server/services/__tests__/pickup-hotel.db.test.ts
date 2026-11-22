@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { assertDisposableDb, dbEnabled, runId, syntheticPhone } from "@/server/__tests__/helpers/fixtures";
-import { cleanupBusinessRows, db, forbidNetwork, makeOrder } from "@/server/__tests__/security/_mercury-fixtures";
+import { cleanupBusinessRows, db, forbidNetwork, makeOrder, publishedProduct } from "@/server/__tests__/security/_mercury-fixtures";
 import { uuidv7 } from "@/server/lib/ids";
 import { readLimits } from "@/server/suppliers/read-budget";
 
@@ -40,8 +40,8 @@ describe.skipIf(!dbEnabled)("hotel pickup on the database (Batch 3)", () => {
     const account = `browse-${RUN}`;
     const key = engine.requestBudgetKey(CODE, "test", account);
     await prisma.setting.deleteMany({ where: { key } });
-    // 20 a minute: quotes 5, browse 2, the engine at least 13.
-    const limits = readLimits(20, 0.25, 0.1);
+    // 20 a minute, a customer share of 7: quotes 5, browse 2 carved out of it, the engine at least 13.
+    const limits = readLimits(20, 0.35, 0.1);
     expect(limits).toEqual({ perMinute: 20, quoteCap: 5, browseCap: 2, engineReserve: 13 });
     const take = () => engine.takeBrowseReadToken(CODE, "test", account, { limits });
     const quote = () => engine.takeQuoteReadToken(CODE, "test", account, { limits });
@@ -78,11 +78,14 @@ describe.skipIf(!dbEnabled)("hotel pickup on the database (Batch 3)", () => {
 
   it("an order item keeps the accepted pickup hotel id and name; an item without pickup keeps both null", async () => {
     const order = await makeOrder(RUN, { leadPhone: syntheticPhone(RUN, 31), label: "pickup" });
+    // An item names a product or a combo (check order_item_has_product): a seeded published product.
+    const product = await publishedProduct();
     const base = {
       orderId: order.id,
+      productId: product.id,
       titleSnapshot: "zz pickup item",
-      tierSnapshot: "C",
-      slugSnapshot: `zz-pickup-${RUN}`,
+      tierSnapshot: product.tier,
+      slugSnapshot: product.slug,
       kindSnapshot: "activity",
       confirmationSnapshot: "manual" as const,
       fulfilmentModeSnapshot: "inquiry" as const,

@@ -597,7 +597,7 @@ export const supplierCatalogService = {
           capabilityClassKey: capability.verdict.classKey,
           capabilityRefusal: capability.verdict.instant ? null : capability.verdict.reason,
           catalogueSyncedAt: syncedAt?.toISOString() ?? null,
-          listedStartsSellable: listedStartsSellable(capability.verdict.instant, capability.capability.dimensions.timeShape, stored?.timeSlots),
+          listedStartsSellable: listedStartsSellable(capability.verdict.instant, capability.verdict.classKey, stored?.timeSlots),
         },
         blockers,
       };

@@ -167,7 +167,7 @@ describe("Time Slot Picker keyboard rule (radio group with roving focus)", () =>
   it("announces how many times are open, and names the activity's zone, not the browser's", () => {
     expect(availableTimesLine(slots)).toBe("3 start times available");
     expect(availableTimesLine([{ time: "10:00" }])).toBe("1 start time available");
-    expect(availableTimesLine([{ time: "10:00", status: "sold_out" }])).toBe("No start times available on this date");
+    expect(availableTimesLine([{ time: "10:00", status: "sold_out" }])).toBe("No start times can be booked on this date");
     expect(DUBAI_TIME_LABEL).toMatch(/Asia\/Dubai/);
   });
 });
