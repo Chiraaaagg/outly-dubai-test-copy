@@ -285,7 +285,7 @@ export class StateBook {
   load = async (s: CrmSubject): Promise<CrmSubjectState> => structuredClone(this.get(s) ?? { subject: s, exists: false, erased: false, inquiry: null, order: null });
 }
 
-export function inquiryState(id: string, over: { status?: string; reference?: string; source?: string; items?: { title: string; serviceDate: string | null }[] } = {}): CrmSubjectState {
+export function inquiryState(id: string, over: { status?: string; reference?: string; source?: string; items?: { title: string | null; serviceDate: string | null }[] } = {}): CrmSubjectState {
   return {
     subject: { type: "inquiry", id },
     exists: true,

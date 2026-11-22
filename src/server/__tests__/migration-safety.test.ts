@@ -126,12 +126,12 @@ describe.skipIf(!dbEnabled || excludedHere)("migration safety (doc 27 §3)", () 
     expect(FAULTED.filter((n) => !/SET LOCAL lock_timeout/.test(sqlOf(n)))).toEqual(NO_LOCK_TIMEOUT);
     // The lock-free list holds only function replacements.
     for (const n of LOCK_FREE) {
-      // String literals (CHECK value lists such as 'delete') are not statements.
-      const ddl = sqlOf(n).replace(/--.*$/gm, "").replace(/\$\$[^]*?\$\$/g, "").replace(/'[^']*'/g, "''");
+      const ddl = sqlOf(n).replace(/--.*$/gm, "").replace(/\$\$[^]*?\$\$/g, "");
       expect(ddl, n).not.toMatch(/\b(ALTER|LOCK|CREATE\s+(TABLE|INDEX|UNIQUE|TRIGGER|POLICY)|DROP|UPDATE|INSERT|DELETE)\b/i);
     }
     for (const n of NEW_TABLES_ONLY) {
-      const ddl = sqlOf(n).replace(/--.*$/gm, "").replace(/\$\$[^]*?\$\$/g, "");
+      // String literals (CHECK value lists such as 'delete') are not statements.
+      const ddl = sqlOf(n).replace(/--.*$/gm, "").replace(/\$\$[^]*?\$\$/g, "").replace(/'[^']*'/g, "''");
       const created = [...ddl.matchAll(/CREATE\s+TABLE\s+"?(\w+)"?/gi)].map((m) => m[1]);
       expect(created.length, n).toBeGreaterThan(0);
       const named = [...ddl.matchAll(/(?:ALTER\s+TABLE|\bON|REFERENCES)\s+"?(\w+)"?/gi)].map((m) => m[1]);

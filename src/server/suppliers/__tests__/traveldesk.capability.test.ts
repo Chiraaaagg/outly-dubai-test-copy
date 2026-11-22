@@ -89,6 +89,8 @@ describe("deriveCapabilities: one dimension at a time", () => {
     expect(ten.classKey).toBe(SINGLE);
     expect(ten.reviewReasons).toEqual(["slot_units_unexplained"]);
     expect(ten.raw.numberOfUnits).toEqual([10]);
+    // An unreadable count (kept as 0 by the codec, review R10) waits for review too.
+    expect(deriveCapabilities(storedOffer({ timeSlots: [storedSlot({ numberOfUnits: 0 })] })).reviewReasons).toEqual(["slot_units_unexplained"]);
   });
 });
 

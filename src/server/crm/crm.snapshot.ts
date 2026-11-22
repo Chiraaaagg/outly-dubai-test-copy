@@ -9,6 +9,12 @@ import type { CrmItemFacts, CrmOrderFacts, CrmSubject, CrmSubjectState } from ".
  * read solely to detect an erased subject (the `[deleted-…]` marker the
  * erasure workflow writes) and never leave this function.
  *
+ * Line names come from the catalogue (the product's title or the combo's
+ * name), never from the item's `titleSnapshot`: on an assisted inquiry or
+ * quote that snapshot can be agent-edited text, so a customer's name typed
+ * into it would reach the deal (review R14). A line with no catalogue record
+ * gets a generic name.
+ *
  * Money: only provider-verified payments count (`source = gateway_verified`,
  * PAY-9), in the order's currency, less each payment's refunded total. A manual
  * payment recorded by staff is not revenue evidence here (see the C1 record:
@@ -16,6 +22,11 @@ import type { CrmItemFacts, CrmOrderFacts, CrmSubject, CrmSubjectState } from ".
  */
 
 const ERASED = "[deleted-";
+
+/** The catalogue's own name for a line (staff-authored public copy), or null when it has no catalogue record. */
+function catalogueTitle(i: { product: { title: string } | null; combo: { name: string } | null }): string | null {
+  return i.product?.title ?? i.combo?.name ?? null;
+}
 
 function isoDate(d: Date | null): string | null {
   return d ? d.toISOString().slice(0, 10) : null;
@@ -33,7 +44,8 @@ async function orderFacts(orderId: string): Promise<(CrmOrderFacts & { erased: b
       items: {
         select: {
           id: true,
-          titleSnapshot: true,
+          product: { select: { title: true } },
+          combo: { select: { name: true } },
           serviceDate: true,
           status: true,
           fulfilmentOrigin: true,
@@ -67,7 +79,7 @@ async function orderFacts(orderId: string): Promise<(CrmOrderFacts & { erased: b
   const items: CrmItemFacts[] = [...o.items]
     .sort((a, b) => (a.quoteLineIndex ?? 0) - (b.quoteLineIndex ?? 0) || a.id.localeCompare(b.id))
     .map((i) => ({
-      title: i.titleSnapshot,
+      title: catalogueTitle(i),
       serviceDate: isoDate(i.serviceDate),
       totalMinor: i.chargedCurrency === currency && i.chargedAmountMinor !== null ? i.chargedAmountMinor : currency === "AED" ? i.totalAed : i.totalInr,
       status: i.status,
@@ -103,7 +115,10 @@ export async function loadSubjectState(subject: CrmSubject): Promise<CrmSubjectS
       leadPhone: true,
       leadName: true,
       convertedOrderId: true,
-      items: { select: { titleSnapshot: true, serviceDate: true, sortOrder: true }, orderBy: [{ sortOrder: "asc" }, { id: "asc" }] },
+      items: {
+        select: { product: { select: { title: true } }, combo: { select: { name: true } }, serviceDate: true, sortOrder: true },
+        orderBy: [{ sortOrder: "asc" }, { id: "asc" }],
+      },
     },
   });
   if (!q) return { subject, exists: false, erased: false, inquiry: null, order: null };
@@ -119,7 +134,7 @@ export async function loadSubjectState(subject: CrmSubject): Promise<CrmSubjectS
       status: q.status,
       source: q.source,
       currency: q.currency,
-      items: q.items.map((i) => ({ title: i.titleSnapshot, serviceDate: isoDate(i.serviceDate), totalMinor: null })),
+      items: q.items.map((i) => ({ title: catalogueTitle(i), serviceDate: isoDate(i.serviceDate), totalMinor: null })),
     },
     order,
   };

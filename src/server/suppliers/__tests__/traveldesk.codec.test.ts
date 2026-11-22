@@ -234,7 +234,13 @@ describe("tour details", () => {
     );
     expect(d.offers[0].timeSlots[0].numberOfUnits).toBe(10);
     expect("numberOfUnits" in d.offers[0].timeSlots[1]).toBe(false);
-    expect(tourDetailsWire.safeParse({ ...tourDetailsFixture, offers: [offer({ timeSlots: [timeSlot({ numberOfUnits: "10" })] })] }).success).toBe(false);
+  });
+
+  it("an odd slot unit count never fails the tour parse; it is kept as 0 so the class derivation flags it (review R10)", () => {
+    const d = tourDetailFrom(
+      tourDetailsWire.parse({ ...tourDetailsFixture, offers: [offer({ timeSlots: [timeSlot({ numberOfUnits: "10" }), timeSlot({ id: 72, numberOfUnits: 1.5 }), timeSlot({ id: 73, numberOfUnits: 1 })] })] }),
+    );
+    expect(d.offers[0].timeSlots.map((t) => t.numberOfUnits)).toEqual([0, 0, 1]);
   });
 
   it("AED pricing periods are priced; a null-currency period has price null and a warning", () => {

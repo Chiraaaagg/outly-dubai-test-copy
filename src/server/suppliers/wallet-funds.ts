@@ -97,6 +97,44 @@ export function orderSpendable(currentMinor: bigint, firstReadMinor: bigint | nu
 }
 
 /**
+ * Rule 3 anchor. Only an attempt of the order that is still live (it sent its
+ * reserve and was not released) can hold money the wallet may not show yet,
+ * so only such an attempt's read starts the running total: a read of a
+ * released attempt (refused at the floor, expired, cancelled, never created)
+ * or of an attempt that never sent (held by the kill switch) is never the
+ * anchor, so a low read from it cannot block a retry after a top-up. Of each
+ * live attempt the last read counts (the one right before its send); the
+ * anchor is the earliest of those. Null when no live attempt has a read: the
+ * check is then the order's first.
+ */
+export function runningAnchor<T extends { bookingId: string; at: Date; id: string }>(liveReads: readonly T[]): T | null {
+  const last = new Map<string, T>();
+  const later = (a: T, b: T) => a.at.getTime() > b.at.getTime() || (a.at.getTime() === b.at.getTime() && a.id > b.id);
+  for (const r of liveReads) {
+    const prior = last.get(r.bookingId);
+    if (!prior || later(r, prior)) last.set(r.bookingId, r);
+  }
+  let anchor: T | null = null;
+  for (const r of last.values()) if (!anchor || later(anchor, r)) anchor = r;
+  return anchor;
+}
+
+/**
+ * Booking states an accepted reserve or create lands in when the supplier
+ * holds or booked it, so the wallet was debited (doc 29 §4.5 rule 4: debit at
+ * reserve). Only these run the direction guard. Any other outcome of an
+ * accepted answer (cancelled, expired, an unknown or unproven status held for
+ * a re-read, an identity mismatch sent to manual review, a lost race, a
+ * fault) moves no money the guard can reason about: a flat read there is no
+ * evidence of a wrong sign, and never pauses.
+ */
+export const WALLET_DEBITING_OUTCOMES: readonly string[] = ["reserved", "awaiting_payment", "confirmed", "awaiting_external"];
+
+export function debitsWallet(outcome: string | null | undefined): boolean {
+  return typeof outcome === "string" && WALLET_DEBITING_OUTCOMES.includes(outcome);
+}
+
+/**
  * How far a read may be off the expected movement and still count as "about
  * the booking's cost": one dirham, because TravelDesk debits whole dirhams it
  * computes itself (doc 22 §32.27, §32.31).
@@ -127,4 +165,19 @@ export function walletDirection(input: { beforeMinor: bigint; afterMinor: bigint
   if (drop >= -tol) return "flat";
   const rise = -drop;
   return rise >= cost - tol && rise <= cost + tol ? "inverted" : "rose_unexplained";
+}
+
+/** First and longest wait before a reserve refused by the funds check reads the wallet again (doc 29 §4.5 rule 2; review R6). */
+export const FUNDS_RECHECK_MIN_MS = 60_000;
+export const FUNDS_RECHECK_MAX_MS = 15 * 60_000;
+
+/**
+ * Backoff for a reserve held by the funds check: one minute until a human
+ * was alerted, then as long as the refusal has lasted since the alert (so
+ * the wait about doubles each pass), capped at 15 minutes.
+ */
+export function fundsRecheckDelayMs(alertedAt: Date | null, now: Date): number {
+  if (!alertedAt) return FUNDS_RECHECK_MIN_MS;
+  const since = now.getTime() - alertedAt.getTime();
+  return Math.min(FUNDS_RECHECK_MAX_MS, Math.max(FUNDS_RECHECK_MIN_MS, since));
 }

@@ -9,7 +9,8 @@ import type { CrmConfig, CrmStageKey } from "./crm.config";
  *  - a deal only, in the OUTLYY funnel; no Contact record and no personal
  *    data at all (owner decision 14: contacts only after C0/C2 verify the
  *    role restriction). The deal carries the reference, stage, revenue,
- *    currency and product rows (product name and service date) only;
+ *    currency and product rows (the catalogue's product name, never the
+ *    item's editable title snapshot, and the service date) only;
  *  - one deal per inquiry, reused when the inquiry converts to an order;
  *    a new deal only for a direct-checkout order, and only once a card
  *    authorisation (or capture) was verified with the provider. Spam,
@@ -40,7 +41,8 @@ export interface CrmSubject {
 export const CRM_PAYLOAD_VERSION = 1;
 
 export interface CrmItemFacts {
-  title: string;
+  /** The catalogue's name for the line (product title or combo name), never the item's editable title snapshot; null without a catalogue record. */
+  title: string | null;
   /** YYYY-MM-DD, or null when not known (flexible inquiry dates). */
   serviceDate: string | null;
   /** Customer price of the line in the deal currency, minor units; null for inquiry lines. */
@@ -141,11 +143,14 @@ function clean(text: string, max: number): string {
   return text.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
 }
 
+/** The name of a line without a catalogue record. */
+export const GENERIC_LINE = "Activity";
+
 function rowsFor(items: CrmItemFacts[], priced: boolean): ProductRow[] {
   return items
     .filter((i) => i.status !== "rejected" && i.status !== "cancelled")
     .map((i) => ({
-      productName: clean(i.serviceDate ? `${i.title} (${i.serviceDate})` : i.title, 255) || "Activity",
+      productName: clean(i.serviceDate ? `${i.title ?? GENERIC_LINE} (${i.serviceDate})` : (i.title ?? GENERIC_LINE), 255) || GENERIC_LINE,
       price: priced && i.totalMinor !== null && i.totalMinor > 0n ? majorUnits(i.totalMinor) : 0,
       quantity: 1,
     }));

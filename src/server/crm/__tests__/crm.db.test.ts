@@ -112,6 +112,44 @@ describe.skipIf(!dbEnabled)("CRM outbox, links and worker (C1)", () => {
     expect(await prisma.crmLink.findFirstOrThrow({ where: { portal: HOST, entityId: q.id } })).toMatchObject({ localVersion: 3n, state: "pending", originId: `inq:${q.id}` });
   });
 
+  it("a writer that cannot get the link lock in time never waits out its transaction: it writes a deferred row (review R12)", async () => {
+    const { enqueueCrmSync, CRM_DEFERRED_VERSION } = await import("@/server/crm/crm.outbox");
+    const q = await makeInquiry(run, { leadPhone: syntheticPhone(run, 10), product });
+    await prisma.$transaction((tx) => enqueueCrmSync(tx, [{ type: "inquiry", id: q.id }]));
+    let firstCommitted = 0;
+    const first = prisma.$transaction(
+      async (tx) => {
+        await enqueueCrmSync(tx, [{ type: "inquiry", id: q.id }]);
+        await new Promise((r) => setTimeout(r, 3_000));
+        firstCommitted = Date.now();
+      },
+      { timeout: 10_000 },
+    );
+    await new Promise((r) => setTimeout(r, 200));
+    let secondDone = 0;
+    let after = "";
+    const second = prisma.$transaction(
+      async (tx) => {
+        await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '7s'");
+        expect(await enqueueCrmSync(tx, [{ type: "inquiry", id: q.id }])).toBe(1);
+        after = (await tx.$queryRaw<{ v: string }[]>`SELECT current_setting('lock_timeout') AS v`)[0].v;
+        secondDone = Date.now();
+      },
+      { timeout: 10_000 },
+    );
+    await Promise.all([first, second]);
+    // The second writer gave up on the lock after about a second, well before the first committed.
+    expect(secondDone).toBeLessThan(firstCommitted);
+    expect(after).toBe("7s");
+    const rows = await rowsFor(q.id);
+    expect(rows.map((r) => r.version)).toEqual([1n, 2n, CRM_DEFERRED_VERSION]);
+    expect(rows[2].dedupeKey).toContain(":deferred-");
+    expect(rows[2].nextAttemptAt.getTime()).toBeGreaterThan(Date.now());
+    expect(await prisma.crmLink.findFirstOrThrow({ where: { portal: HOST, entityId: q.id } })).toMatchObject({ localVersion: 2n });
+    // Keep it out of the end-to-end push below.
+    await prisma.crmOutbox.updateMany({ where: { portal: HOST, entityId: q.id }, data: { nextAttemptAt: new Date(Date.now() + 3_600_000) } });
+  });
+
   it("a failing enqueue rolls back to its savepoint; the domain change still commits", async () => {
     const { enqueueCrmSync } = await import("@/server/crm/crm.outbox");
     const q = await makeInquiry(run, { leadPhone: syntheticPhone(run, 4), product });
@@ -169,6 +207,9 @@ describe.skipIf(!dbEnabled)("CRM outbox, links and worker (C1)", () => {
     const { enqueueCrmSync } = await import("@/server/crm/crm.outbox");
     const leadPhone = syntheticPhone(run, 8);
     const q = await makeInquiry(run, { leadPhone, product, status: "quoted" });
+    // An agent typed the customer's name into a line title (review R14): the deal shows the catalogue's title instead.
+    const lead = (await prisma.inquiry.findUniqueOrThrow({ where: { id: q.id } })).leadName;
+    await prisma.inquiryItem.update({ where: { id: q.itemIds[0] }, data: { titleSnapshot: `Pickup for ${lead}` } });
     await prisma.$transaction((tx) => enqueueCrmSync(tx, [{ type: "inquiry", id: q.id }]));
 
     const config = { ...fakeConfig({ APP_ENV: "development", CRM_BITRIX_PORTAL_HOST: HOST }) };
@@ -188,10 +229,12 @@ describe.skipIf(!dbEnabled)("CRM outbox, links and worker (C1)", () => {
     const deal = fake.dealsFor(`inq:${q.id}`);
     expect(deal).toHaveLength(1);
     expect(deal[0]).toMatchObject({ title: `OUTLYY ${q.reference}`, stageId: "C7:QUOTED", categoryId: 7, opportunity: 0 });
+    expect(deal[0].productRows.map((r) => r.productName)).toEqual([`${product.title} (2027-01-15)`, `${product.title} (2027-01-15)`]);
     const sent = JSON.stringify([...fake.deals.values()]);
     expect(sent).not.toContain(leadPhone);
     expect(sent).not.toContain("@outlyy.test");
     expect(sent).not.toContain(`zz-sec-${run}`);
+    expect(sent).not.toContain(lead);
     expect(await prisma.crmLink.findFirstOrThrow({ where: { portal: HOST, entityId: q.id } })).toMatchObject({ state: "active", crmId: BigInt(deal[0].id), pushedVersion: 1n });
 
     const erasure = await privacyService.eraseContact({ type: "admin", id: ops.id, roles: ["admin"], permissions: new Set(["privacy.anonymise"]) }, { phoneE164: leadPhone });
@@ -219,6 +262,29 @@ describe.skipIf(!dbEnabled)("CRM outbox, links and worker (C1)", () => {
     expect(rows.map((x) => [x.kind, x.reason, x.status])).toEqual([["delete", "retention", "queued"]]);
     // Run again: a pending delete is not doubled.
     expect((await runCrmRetention(scope, new Date())).scheduled).toBe(0);
+  });
+
+  it("a dead-lettered CRM delete raises an ops-alert incident, ids only, that ops_alerts can store (review R13)", async () => {
+    const { crmDeleteIncidents } = await import("@/server/services/ops-alert.service");
+    const { uuidv7 } = await import("@/server/lib/ids");
+    const q = await makeInquiry(run, { leadPhone: syntheticPhone(run, 11), product });
+    const id = uuidv7();
+    await prisma.crmOutbox.create({
+      data: { id, environment: "development", portal: HOST, entityType: "inquiry", entityId: q.id, kind: "delete", version: 1n, dedupeKey: `delete:inquiry:${q.id}:dead@${HOST}`, reason: "erasure", status: "dead", attempts: 8, outcome: "dead", lastErrorCode: "unavailable" },
+    });
+    const since = new Date(Date.now() - 3_600_000);
+    const found = (await crmDeleteIncidents(since, new Date(Date.now() + 60_000))).filter((i) => i.entityId === `inquiry:${q.id}`);
+    expect(found).toHaveLength(1);
+    expect(found[0]).toMatchObject({ kind: "crm_delete_failed", entityKind: "crm_subject", reason: "crm_erasure_delete_dead", orderReference: null, adminPath: "/admin" });
+    expect(JSON.stringify(found[0])).not.toContain(q.leadPhone);
+    // Migration 20261122140000 lets ops_alerts key the incident.
+    const alertId = uuidv7();
+    await prisma.$executeRaw`INSERT INTO ops_alerts (id, entity_kind, entity_id, reason, incident_at, handled_at, updated_at) VALUES (${alertId}::uuid, 'crm_subject', ${found[0].entityId}, ${found[0].reason}, now(), now(), now())`;
+    await prisma.$executeRaw`DELETE FROM ops_alerts WHERE id = ${alertId}::uuid`;
+    // A sync row that died, or a delete still queued, is not this incident.
+    await prisma.crmOutbox.update({ where: { id }, data: { status: "queued" } });
+    expect((await crmDeleteIncidents(since, new Date(Date.now() + 60_000))).filter((i) => i.entityId === `inquiry:${q.id}`)).toHaveLength(0);
+    await prisma.crmOutbox.update({ where: { id }, data: { nextAttemptAt: new Date(Date.now() + 3_600_000) } });
   });
 
   it("the schema refuses funnel 0, a foreign originator and a non-deal record type", async () => {

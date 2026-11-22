@@ -269,6 +269,11 @@ export const supplierCapabilityService = {
     const adapter = CAPABILITY_ADAPTER;
 
     const result = await prisma.$transaction(async (tx) => {
+      // Switching off a key that has no row changes nothing: no row is created, so nothing unaudited is written (review R11).
+      if (!input.enabled) {
+        const existing = await tx.supplierCapabilityFlag.findUnique({ where: { adapter_environment_classKey: { adapter, environment, classKey } }, select: { id: true } });
+        if (!existing) return { changed: false, enabled: false };
+      }
       // A key without a row is off; the first change creates it off, then changes it under a row lock.
       const inserted = await tx.supplierCapabilityFlag.createMany({
         skipDuplicates: true,

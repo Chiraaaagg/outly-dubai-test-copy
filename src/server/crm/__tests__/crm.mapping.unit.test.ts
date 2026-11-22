@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assertSafeCrmPayload, mapDeal, orderStage, snapshotHash, type CrmOrderFacts } from "@/server/crm/crm.mapping";
+import { assertSafeCrmPayload, GENERIC_LINE, mapDeal, orderStage, snapshotHash, type CrmOrderFacts } from "@/server/crm/crm.mapping";
 import type { DealFields } from "@/server/crm/bitrix.client";
 import { directOrderState, fakeConfig, inquiryState, subjectId } from "./_memory-store";
 
@@ -80,6 +80,11 @@ describe("CRM deal mapping", () => {
   it("sends exactly the allowlisted deal fields: no contact, margin, cost, link, UTM or status field", () => {
     const m = mapDeal(directOrderState(subjectId(), { authorised: true }), cfg);
     expect(m.visible && Object.keys(m.fields).sort()).toEqual(["categoryId", "currencyId", "isManualOpportunity", "opportunity", "originId", "originatorId", "stageId", "title"]);
+  });
+
+  it("a line without a catalogue name gets the generic label, never free text (review R14)", () => {
+    const m = mapDeal(inquiryState(subjectId(), { items: [{ title: null, serviceDate: "2026-12-01" }, { title: null, serviceDate: null }] }), cfg);
+    expect(m.visible && m.rows.map((r) => r.productName)).toEqual([`${GENERIC_LINE} (2026-12-01)`, GENERIC_LINE]);
   });
 
   it("drops rejected and cancelled lines and strips control characters", () => {

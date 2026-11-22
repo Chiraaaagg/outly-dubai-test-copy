@@ -80,6 +80,17 @@ describe("the alert email", () => {
     expect(r.html).toContain('href="https://outlyy.com/admin/bookings/OUT-100001"');
   });
 
+  it("a CRM copy that could not be deleted alerts with ids only (doc 29 §6.5, review R13)", () => {
+    const ctx = incidentContext(
+      incident({ kind: "crm_delete_failed", entityKind: "crm_subject", entityId: `inquiry:${ID}`, reason: "crm_erasure_delete_dead", orderId: null, orderReference: null, bookingId: null, supplierBookingRef: null, adminPath: "/admin" }),
+      "https://outlyy.com",
+    );
+    const r = renderTemplate("OPS_INCIDENT_ALERT", "email", ctx as never);
+    expect(r.subject).toBe(`[OUTLY ALERT] ${OPS_INCIDENT_TITLES.crm_delete_failed}`);
+    expect(r.text).toContain("Reason: crm_erasure_delete_dead");
+    expect(r.text).toContain(`Entity: crm_subject:inquiry:${ID}`);
+  });
+
   it("renders the same bytes from the same stored context (a resend is identical)", () => {
     const ctx = JSON.parse(JSON.stringify(incidentContext(incident(), "https://outlyy.com")));
     expect(renderTemplate("OPS_INCIDENT_ALERT", "email", ctx)).toEqual(renderTemplate("OPS_INCIDENT_ALERT", "email", JSON.parse(JSON.stringify(ctx))));

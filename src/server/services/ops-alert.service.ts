@@ -41,7 +41,11 @@ import { urgentAt } from "./document.service";
  *    `cancel_refused`, a late acceptance, a reserve held back because the
  *    wallet figures failed the funds check (`funds_unverified`);
  *  - `document_attention`: a ticket document flagged for staff past the
- *    existing F12 thresholds (urgent is its own reason).
+ *    existing F12 thresholds (urgent is its own reason);
+ *  - `crm_delete_failed`: a CRM copy that could not be deleted (a
+ *    dead-lettered `delete` row in `crm_outbox`, reason `erasure` or
+ *    `retention`; doc 29 §6.5, review R13). Ids only. Read only when the CRM
+ *    tables exist: a missing table yields no incident, never a failed sweep.
  *
  * Dedup and throttle (`ops_alerts`, one row per entity and reason, under one
  * row lock so concurrent sweeps decide one at a time):
@@ -75,8 +79,17 @@ const DISPATCH_LIMIT = 60;
 const DIGEST = { entityKind: "digest", entityId: "hourly", reason: "suppressed" } as const;
 const EPOCH = new Date(0);
 
-export type OpsIncidentKind = "supplier_outage_paused" | "supplier_wallet_paused" | "saga_attention" | "item_refund_problem" | "refund_failed" | "booking_attention" | "document_attention";
-export type OpsEntityKind = "supplier_account" | "payment_saga" | "order_item" | "supplier_booking" | "supplier_document";
+export type OpsIncidentKind =
+  | "supplier_outage_paused"
+  | "supplier_wallet_paused"
+  | "saga_attention"
+  | "item_refund_problem"
+  | "refund_failed"
+  | "booking_attention"
+  | "document_attention"
+  | "crm_delete_failed";
+/** `crm_subject` needs migration 20261122140000 (ops_alerts_entity_kind_check). */
+export type OpsEntityKind = "supplier_account" | "payment_saga" | "order_item" | "supplier_booking" | "supplier_document" | "crm_subject";
 
 export interface OpsIncident {
   kind: OpsIncidentKind;
@@ -103,6 +116,7 @@ export const OPS_INCIDENT_TITLES: Record<OpsIncidentKind, string> = {
   refund_failed: "Refund failed",
   booking_attention: "Booking needs staff",
   document_attention: "Tickets need staff",
+  crm_delete_failed: "CRM copy could not be deleted",
 };
 
 /** The stored row payload: what the email says plus its idempotency scope. */
@@ -325,7 +339,42 @@ export async function collectOpsIncidents(since: Date, now: Date, limit = COLLEC
       adminPath: bookingPath(str(r.reference)),
     });
   }
+
+  out.push(...(await crmDeleteIncidents(since, now, limit)));
   return out;
+}
+
+/**
+ * Dead-lettered CRM deletes (erasure or retention, doc 29 §6.5): the CRM copy
+ * may still exist, so a human must delete it in the portal. One incident per
+ * subject and reason. The query is guarded: before the CRM migration the
+ * table is absent and this yields nothing rather than failing the sweep.
+ */
+export async function crmDeleteIncidents(since: Date, now: Date, limit = COLLECT_LIMIT): Promise<OpsIncident[]> {
+  const rows = await prisma
+    .$queryRaw<Row[]>`
+    SELECT entity_type, entity_id::text AS entity_id, reason, max(updated_at) AS raised_at
+    FROM crm_outbox
+    WHERE kind = 'delete' AND status = 'dead' AND updated_at >= ${since} AND updated_at <= ${now}
+    GROUP BY entity_type, entity_id, reason
+    ORDER BY raised_at DESC LIMIT ${limit}`
+    .catch((e: unknown) => {
+      // 42P01 undefined_table: the CRM migration is not applied yet.
+      if (/42P01|crm_outbox.*does not exist/.test(String((e as { message?: unknown })?.message ?? "")) || (e as { meta?: { code?: unknown } })?.meta?.code === "42P01") return [] as Row[];
+      throw e;
+    });
+  return rows.map((r) => ({
+    kind: "crm_delete_failed" as const,
+    entityKind: "crm_subject" as const,
+    entityId: `${String(r.entity_type)}:${String(r.entity_id)}`,
+    reason: r.reason === "retention" ? "crm_retention_delete_dead" : "crm_erasure_delete_dead",
+    raisedAt: date(r.raised_at),
+    orderId: null,
+    orderReference: null,
+    bookingId: null,
+    supplierBookingRef: null,
+    adminPath: "/admin",
+  }));
 }
 
 /* ---------------------------------------------------------------------------

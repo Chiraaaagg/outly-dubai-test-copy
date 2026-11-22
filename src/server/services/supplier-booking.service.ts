@@ -39,7 +39,20 @@ import { isConfirmedSnapshot, withinChargeTolerance } from "../suppliers/traveld
 import { SUPPLIER_WALLET_BOOK, type SupplierRefundFigure, walletEntriesFor, walletPhaseOf } from "../suppliers/wallet-ledger";
 import { bookingAccountId, DEFAULT_BOOKING_ACCOUNT_ID } from "../suppliers/control-account";
 import { checkOfferCapability } from "../suppliers/capability-gate";
-import { candidateSpendable, DIRECTION_PAUSES, type DirectionVerdict, type FundsRefusal, type FundsWithWallet, orderSpendable, walletDirection, walletSpendable, type WalletFigures } from "../suppliers/wallet-funds";
+import {
+  candidateSpendable,
+  debitsWallet,
+  DIRECTION_PAUSES,
+  fundsRecheckDelayMs,
+  type DirectionVerdict,
+  type FundsRefusal,
+  type FundsWithWallet,
+  orderSpendable,
+  runningAnchor,
+  walletDirection,
+  walletSpendable,
+  type WalletFigures,
+} from "../suppliers/wallet-funds";
 import { APPROVAL_TTL_MS, canonicalPayload, OPERATION_PERMISSION, privilegedPayloadHash } from "./approval.service";
 
 /**
@@ -2245,11 +2258,14 @@ export const supplierBookingService = {
     }
     // Keep the supplier id first, so a failure further down still leaves the booking findable by id.
     await prisma.supplierBooking.updateMany({ where: { id: b.id }, data: { supplierBookingId: o.snapshot.ref } });
+    let outcome = "apply_failed";
     try {
-      return await this.applySupplierState(sending, o.snapshot, deps, kind === "reserve" ? "reserved_at" : "created", undefined, kind === "create" ? o.tickets : undefined);
+      outcome = await this.applySupplierState(sending, o.snapshot, deps, kind === "reserve" ? "reserved_at" : "created", undefined, kind === "create" ? o.tickets : undefined);
+      return outcome;
     } finally {
-      // After the state is kept: the wallet must have moved the right way (doc 29 §4.5 rule 4). Never throws.
-      await this.walletDirectionGuard(b, { spendableMinor: checked.currentMinor, wallet: (funds as FundsWithWallet).wallet }, o.snapshot, deps);
+      // After the state is kept: the wallet must have moved the right way (doc 29 §4.5 rule 4), checked only when the
+      // kept state is one the supplier debits for (`debitsWallet`). Never throws.
+      await this.walletDirectionGuard(b, { spendableMinor: checked.currentMinor, wallet: (funds as FundsWithWallet).wallet }, o.snapshot, deps, outcome);
     }
   },
 
@@ -2260,9 +2276,12 @@ export const supplierBookingService = {
    * figure is negative, or the two differ by more than a cent beyond Outly's
    * own open holds on the account. An adapter that reports one figure only is
    * taken at its word. For an order, a further item is checked against the
-   * lower of that figure and the order's running total: the order's first
-   * read (its earliest `funds_check` event) minus the expected cost of each
-   * of its items whose reserve was sent since. Every check that passes is
+   * lower of that figure and the order's running total: the anchor read
+   * (`runningAnchor`: the earliest pre-send read of another attempt of the
+   * order that is still live) minus the expected cost of each live attempt
+   * whose reserve was sent since. Reads of released attempts, of attempts
+   * that never sent and of this booking itself never anchor, so an old low
+   * read cannot block a retry after a top-up. Every check that passes is
    * recorded as a `funds_check` event with the current read.
    */
   async fundsCheck(b: SupplierBooking, funds: FundsWithWallet): Promise<{ ok: true; spendableMinor: bigint; currentMinor: bigint } | { ok: false; reason: FundsRefusal | "funds_record_invalid" }> {
@@ -2276,15 +2295,15 @@ export const supplierBookingService = {
     let spendable = current;
     if (b.orderId) {
       const scope = { orderId: b.orderId, supplierId: b.supplierId, environment: b.environment, accountId: b.accountId };
-      const first = await prisma.supplierBookingEvent.findFirst({ where: { kind: "funds_check", booking: scope }, orderBy: [{ at: "asc" }, { id: "asc" }], select: { at: true, detail: true } });
+      const live = { ...scope, id: { not: b.id }, state: { notIn: [...GUARD_RELEASING_STATES, "queued"] as SupplierBookingState[] } };
+      const reads = await prisma.supplierBookingEvent.findMany({ where: { kind: "funds_check", booking: live }, select: { id: true, supplierBookingId: true, at: true, detail: true } });
+      const first = runningAnchor(reads.map((r) => ({ ...r, bookingId: r.supplierBookingId })));
       if (first) {
         const firstRead = (first.detail as { fundsMinor?: unknown } | null)?.fundsMinor;
         if (typeof firstRead !== "number" || !Number.isSafeInteger(firstRead)) return { ok: false, reason: "funds_record_invalid" };
         const since = await prisma.supplierBooking.findMany({
           where: {
-            ...scope,
-            id: { not: b.id },
-            state: { notIn: [...GUARD_RELEASING_STATES, "queued"] },
+            ...live,
             events: { some: { kind: "request_sent", operation: { in: [OPERATION.reserve, OPERATION.create] }, at: { gte: first.at } } },
           },
           select: { expectedNetMinor: true, chargedNetMinor: true },
@@ -2301,6 +2320,10 @@ export const supplierBookingService = {
    * Fail closed on wallet figures that do not add up (doc 29 §4.5 rule 2):
    * nothing is sent, the job waits, and a human is told once per booking
    * (attention, `funds_unverified`, an alert event; the ops sweep emails it).
+   * After that alert the re-check backs off (`fundsRecheckDelayMs`: the wait
+   * grows with the time since the booking was flagged, 1 to 15 minutes, on
+   * the engine clock), so a wallet that
+   * stays inconsistent does not read the balance every minute for ever.
    */
   async refuseForFunds(b: SupplierBooking, kind: string, reason: FundsRefusal | "funds_record_invalid", deps: Deps) {
     const t = deps.now();
@@ -2310,7 +2333,7 @@ export const supplierBookingService = {
       await writeEvent(prisma, b.id, "alert", { detail: { reason: "funds_unverified", code: reason, jobKind: kind } });
       emitEvent("supplier.funds_unverified", { environment: b.environment, account: b.accountId, reason }, "error");
     }
-    await enqueue(prisma, kind, b.id, new Date(t.getTime() + 60_000), deps.holder);
+    await enqueue(prisma, kind, b.id, new Date(t.getTime() + fundsRecheckDelayMs(told === 0 ? null : (b.attentionRequiredAt ?? t), t)), deps.holder);
     return `funds_unverified:${reason}`;
   },
 
@@ -2326,10 +2349,26 @@ export const supplierBookingService = {
    * (a portal cancellation, a top-up): an alert, never a pause. Every verdict
    * is recorded as a `wallet_direction` event. A fault here is reported and
    * never changes the booking.
+   *
+   * `outcome` is what `applySupplierState` kept. Only a state the supplier
+   * debits for (`debitsWallet`: reserved, awaiting payment, confirmed,
+   * awaiting the supplier) is checked; any other outcome (cancelled,
+   * expired, held for a re-read, manual review, a lost race, a fault) is
+   * recorded as `not_applicable` without a read and never pauses.
    */
-  async walletDirectionGuard(b: SupplierBooking, before: { spendableMinor: bigint; wallet?: WalletFigures }, snapshot: Pick<SupplierSnapshot, "chargedNetMinor">, deps: Pick<EngineDeps, "adapter" | "supplierCode">) {
+  async walletDirectionGuard(
+    b: SupplierBooking,
+    before: { spendableMinor: bigint; wallet?: WalletFigures },
+    snapshot: Pick<SupplierSnapshot, "chargedNetMinor">,
+    deps: Pick<EngineDeps, "adapter" | "supplierCode">,
+    outcome: string,
+  ) {
     if (b.environment !== "production" || !before.wallet) return;
     try {
+      if (!debitsWallet(outcome)) {
+        await writeEvent(prisma, b.id, "wallet_direction", { detail: { verdict: "not_applicable", outcome: outcome.slice(0, 40) } });
+        return;
+      }
       const cost = snapshot.chargedNetMinor !== null && snapshot.chargedNetMinor > 0n ? snapshot.chargedNetMinor : b.expectedNetMinor;
       const read = (await deps.adapter.funds().catch(() => null)) as (FundsWithWallet & { accountId: string }) | null;
       const afterMinor = read?.wallet && !accountMismatch(b, read.accountId) ? candidateSpendable(read.wallet) : null;

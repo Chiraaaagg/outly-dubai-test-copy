@@ -115,6 +115,7 @@ export const STRUCTURED_EVENTS = {
   // never a CRM URL, credential, record content or provider message.
   "crm.call": ["method", "status", "durationMs", "outcome"],
   "crm.enqueue_failed": ["entityType", "entityId", "count", "reason"],
+  "crm.enqueue_deferred": ["entityType", "entityId", "kind"],
   "crm.run": ["outcome", "reason", "processed", "pushed", "failed", "dead", "throttled", "breakerOpen", "foreignDue", "durationMs"],
   "crm.row_done": ["outboxId", "entityType", "entityId", "op", "outcome"],
   "crm.row_failed": ["outboxId", "entityType", "entityId", "op", "reason", "attempts"],

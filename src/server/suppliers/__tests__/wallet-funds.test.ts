@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { candidateSpendable, orderSpendable, walletDirection, walletSpendable, DIRECTION_PAUSES } from "../wallet-funds";
+import { candidateSpendable, debitsWallet, fundsRecheckDelayMs, FUNDS_RECHECK_MAX_MS, FUNDS_RECHECK_MIN_MS, orderSpendable, runningAnchor, walletDirection, walletSpendable, DIRECTION_PAUSES, WALLET_DEBITING_OUTCOMES } from "../wallet-funds";
 
 /**
  * Doc 29 §4.5 (defect D1): the wallet funds formula, its fail-closed
@@ -108,5 +108,57 @@ describe("direction guard (rule 4)", () => {
 
   it("a cost inside the tolerance gives no verdict", () => {
     expect(walletDirection({ beforeMinor: 24_406n, afterMinor: 24_406n, costMinor: 150n })).toBe("too_small");
+  });
+});
+
+describe("running total anchor (rule 3, review R2)", () => {
+  const read = (bookingId: string, minute: number, id: string) => ({ bookingId, at: new Date(Date.UTC(2030, 0, 6, 8, minute)), id });
+
+  it("no live attempt with a read: the check is the order's first", () => {
+    expect(runningAnchor([])).toBeNull();
+  });
+
+  it("each live attempt counts with its last read (the one right before its send); the earliest of those anchors", () => {
+    // Attempt A read at 08:00, was held by the kill switch, read again at 08:30 and sent. Attempt B read at 08:10 and sent.
+    const anchor = runningAnchor([read("a", 0, "e1"), read("b", 10, "e2"), read("a", 30, "e3")]);
+    expect(anchor).toMatchObject({ bookingId: "b", id: "e2" });
+  });
+
+  it("reads at the same instant break ties by event id", () => {
+    expect(runningAnchor([read("a", 5, "e9"), read("b", 5, "e2")])).toMatchObject({ bookingId: "b" });
+    expect(runningAnchor([read("a", 5, "e1"), read("a", 5, "e4")])).toMatchObject({ id: "e4" });
+  });
+});
+
+describe("direction guard applies only to a debiting outcome (rule 4, review R1)", () => {
+  it.each(["reserved", "awaiting_payment", "confirmed", "awaiting_external"])("%s debits the wallet: checked", (o) => {
+    expect(debitsWallet(o)).toBe(true);
+  });
+
+  it.each(["cancelled", "expired", "rejected", "not_created", "outcome_unknown", "unknown_status", "manual_review", "unconfirmed", "final_without_payment", "lost_race", "apply_failed", "", null, undefined])(
+    "%s moved no money the guard can reason about: never checked",
+    (o) => {
+      expect(debitsWallet(o as string | null | undefined)).toBe(false);
+    },
+  );
+
+  it("the debiting list is the holding and booked states only", () => {
+    expect([...WALLET_DEBITING_OUTCOMES].sort()).toEqual(["awaiting_external", "awaiting_payment", "confirmed", "reserved"]);
+  });
+});
+
+describe("re-check backoff after a funds refusal (rule 2, review R6)", () => {
+  const t0 = new Date(Date.UTC(2030, 0, 6, 8, 0));
+  const at = (ms: number) => new Date(t0.getTime() + ms);
+
+  it("one minute until a human was alerted, and right after the alert", () => {
+    expect(fundsRecheckDelayMs(null, t0)).toBe(FUNDS_RECHECK_MIN_MS);
+    expect(fundsRecheckDelayMs(t0, at(10_000))).toBe(FUNDS_RECHECK_MIN_MS);
+  });
+
+  it("then as long as the refusal has lasted, so the wait about doubles, capped at 15 minutes", () => {
+    expect(fundsRecheckDelayMs(t0, at(120_000))).toBe(120_000);
+    expect(fundsRecheckDelayMs(t0, at(240_000))).toBe(240_000);
+    expect(fundsRecheckDelayMs(t0, at(3_600_000))).toBe(FUNDS_RECHECK_MAX_MS);
   });
 });

@@ -207,6 +207,14 @@ describe.skipIf(!enabled)("supplier capability flags and evidence (local DB)", (
     expect(code(await svc.setFlag(a, { environment: "test", classKey: PICKUP, enabled: true, reason: "on with the stale approval" }, { approvalId: stale }).catch((e) => e))).toBe("CONFLICT");
   });
 
+  it("switching off a key that has no row creates nothing and writes nothing (review R11)", async () => {
+    const key = "live.fixed_slot_choice.pickup_required.internal.per_person";
+    const where = { adapter: "traveldesk", environment: "production" as const, classKey: key };
+    expect(await prisma.supplierCapabilityFlag.count({ where })).toBe(0);
+    expect(await svc.setFlag(b, { environment: "production", classKey: key, enabled: false, reason: "off before it ever existed" })).toEqual({ changed: false, enabled: false });
+    expect(await prisma.supplierCapabilityFlag.count({ where })).toBe(0);
+  });
+
   it("production: a pending approval does not apply; one approved by a second person does", async () => {
     const { before } = await svc.flagRequest("production", PICKUP, true);
     const payload = cap.flagApprovalPayload("traveldesk", "production", PICKUP, true, before);

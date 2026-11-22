@@ -9,6 +9,7 @@ import { bookingControlKeyFor, GUARD_RELEASING_STATES, type PaymentEvidencePort 
 import type { TravelDeskBooking } from "../../suppliers/traveldesk/traveldesk.booking";
 import { TravelDeskBookingAdapter, type TravelDeskBookingTransport } from "../../suppliers/traveldesk/traveldesk.booking-adapter";
 import { readLimits } from "../../suppliers/read-budget";
+import { FUNDS_RECHECK_MAX_MS, FUNDS_RECHECK_MIN_MS } from "../../suppliers/wallet-funds";
 import { TravelDeskApiError } from "../../suppliers/traveldesk/traveldesk.http";
 import type { CreateIntentInput, EngineDeps } from "../supplier-booking.service";
 
@@ -1913,13 +1914,17 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
       expect((await walletEvents(b.id, "alert")).filter((d) => d.reason === "funds_unverified")).toEqual([{ reason: "funds_unverified", code: "funds_mismatch", jobKind: "reserve" }]);
 
       td.wallet = { balanceMinor: 1_000n, creditFacilityMinor: 0n, payableBalanceMinor: -1_000n };
-      clock += 61_000;
+      // After the alert the re-check backs off (review R6): the wait grows with the time since the alert.
+      clock += 70_000;
       const neg = await svc.runDueJobs(deps(td), { budgetMs: 60_000 });
       expect(neg.processed.map((p) => p.outcome)).toContain("funds_unverified:funds_negative");
       expect(td.calls).toEqual([]);
+      const next = await prisma.supplierJob.findFirstOrThrow({ where: { supplierBookingId: b.id, kind: "reserve", status: "queued" } });
+      expect(next.runAfter.getTime() - clock).toBeGreaterThan(FUNDS_RECHECK_MIN_MS);
+      expect(next.runAfter.getTime() - clock).toBeLessThanOrEqual(FUNDS_RECHECK_MAX_MS);
 
       td.wallet = { balanceMinor: -40_000n, creditFacilityMinor: 0n, payableBalanceMinor: 40_000n };
-      clock += 61_000;
+      clock += FUNDS_RECHECK_MAX_MS;
       await drain(td, 0);
       expect((await booking(b.id)).state).toBe("confirmed");
     });
@@ -1942,6 +1947,48 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
       expect(await walletEvents(refused!.id, "funds_check")).toEqual([{ fundsMinor: 40_000, runningMinor: 16_000 }]);
     });
 
+    it("a read of an attempt refused at the floor never anchors the running total: after a top-up the retry books (review R2)", async () => {
+      const td = new FakeTravelDesk(now);
+      // 100.00 in the wallet, the item costs 240.00: refused at the floor, nothing sent.
+      td.fundsMinor = 10_000n;
+      const ids = await orderItem();
+      const first = await create(forOrder(ids));
+      await drain(td, 0);
+      expect(await booking(first.id)).toMatchObject({ state: "not_created", errorCode: "balance_floor" });
+      expect(await walletEvents(first.id, "funds_check")).toEqual([{ fundsMinor: 10_000, runningMinor: null }]);
+      expect(td.calls).toEqual([]);
+      // Topped up to 400.00: a new attempt for the same item checks the current read only.
+      td.fundsMinor = 40_000n;
+      const retry = await create(forOrder(ids));
+      await drain(td, 0);
+      const again = await booking(retry.id);
+      expect(again.state).not.toBe("not_created");
+      expect(again.reservedAt).not.toBeNull();
+      expect(await walletEvents(retry.id, "funds_check")).toEqual([{ fundsMinor: 40_000, runningMinor: null }]);
+    });
+
+    it("a multi-item order: a dead sibling's low read does not block a further item after a top-up, a live sibling still counts (review R2)", async () => {
+      const td = new FakeTravelDesk(now);
+      td.fundsMinor = 10_000n;
+      const one = await orderItem();
+      const two = await itemOn(one.orderId);
+      const three = await itemOn(one.orderId);
+      const a = await create(forOrder(one));
+      await drain(td, 0);
+      expect(await booking(a.id)).toMatchObject({ state: "not_created", errorCode: "balance_floor" });
+      // Top-up to 600.00. Item two books: the dead attempt of item one is not an anchor.
+      td.fundsMinor = 60_000n;
+      const b = await create(forOrder(two));
+      await drain(td, 0);
+      expect((await booking(b.id)).reservedAt).not.toBeNull();
+      expect(await walletEvents(b.id, "funds_check")).toEqual([{ fundsMinor: 60_000, runningMinor: null }]);
+      // Item three: the fake never shows item two's hold, so only the running total from item two's read (600 − 240) holds it.
+      const c = await create(forOrder(three));
+      await drain(td, 0);
+      expect(await walletEvents(c.id, "funds_check")).toEqual([{ fundsMinor: 60_000, runningMinor: 36_000 }]);
+      expect((await booking(c.id)).reservedAt).not.toBeNull();
+    });
+
     it("the admin overview shows the pinned production row the write action changes, not the default one (D2)", async () => {
       const admin: Actor = { type: "admin", id: uuidv7(), roles: ["admin"], permissions: new Set(["suppliers.manage"]) };
       await prisma.setting.upsert({ where: { key: prodKey() }, create: { key: prodKey(), value: { paused: true, scope: "all_writes", reason: "pinned row" } }, update: { value: { paused: true, scope: "all_writes", reason: "pinned row" } } });
@@ -1955,7 +2002,7 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
 
     describe("direction guard (production)", () => {
       const prepaid = { balanceMinor: -40_000n, creditFacilityMinor: 0n, payableMinor: 40_000n };
-      async function guarded(after: { balanceMinor: bigint; creditFacilityMinor: bigint; payableBalanceMinor: bigint }, chargedNetMinor = 24_000n) {
+      async function guarded(after: { balanceMinor: bigint; creditFacilityMinor: bigint; payableBalanceMinor: bigint }, chargedNetMinor = 24_000n, outcome = "reserved") {
         await prisma.setting.upsert({ where: { key: prodKey() }, create: { key: prodKey(), value: { paused: false } }, update: { value: { paused: false } } });
         const td = new FakeTravelDesk(now);
         td.agencyId = 777;
@@ -1963,10 +2010,28 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
         const row = await create(intent());
         await drain(new FakeTravelDesk(now), 0);
         const b = { ...(await booking(row.id)), environment: "production" as const, accountId: "777" };
-        await svc.walletDirectionGuard(b, { spendableMinor: 40_000n, wallet: prepaid }, { chargedNetMinor }, deps(td, { environment: "production", accountId: "777" }));
+        await svc.walletDirectionGuard(b, { spendableMinor: 40_000n, wallet: prepaid }, { chargedNetMinor }, deps(td, { environment: "production", accountId: "777" }), outcome);
         const control = (await prisma.setting.findUniqueOrThrow({ where: { key: prodKey() } })).value as Record<string, unknown>;
-        return { id: row.id, control, direction: await walletEvents(row.id, "wallet_direction"), alerts: await walletEvents(row.id, "alert") };
+        return { id: row.id, control, reads: td.balanceReads, direction: await walletEvents(row.id, "wallet_direction"), alerts: await walletEvents(row.id, "alert") };
       }
+
+      it.each(["cancelled", "expired", "unknown_status", "manual_review", "unconfirmed", "final_without_payment", "lost_race", "apply_failed"])(
+        "an accepted answer kept as %s moved no money: no read, no pause, recorded not_applicable (review R1)",
+        async (outcome) => {
+          // The read would be flat (a pause if checked).
+          const r = await guarded({ balanceMinor: -40_000n, creditFacilityMinor: 0n, payableBalanceMinor: 40_000n }, 24_000n, outcome);
+          expect(r.direction).toEqual([{ verdict: "not_applicable", outcome }]);
+          expect(r.reads).toBe(0);
+          expect(r.control).toMatchObject({ paused: false });
+          expect(r.alerts).toEqual([]);
+        },
+      );
+
+      it.each(["reserved", "awaiting_payment", "confirmed", "awaiting_external"])("an accepted answer kept as %s debits the wallet and is checked", async (outcome) => {
+        const r = await guarded({ balanceMinor: -16_000n, creditFacilityMinor: 0n, payableBalanceMinor: 16_000n }, 24_000n, outcome);
+        expect(r.reads).toBe(1);
+        expect(r.direction[0]).toMatchObject({ verdict: "consistent" });
+      });
 
       it("funds lower by the cost, or by more (staff booking on the portal meanwhile), never pause", async () => {
         const fell = await guarded({ balanceMinor: -16_000n, creditFacilityMinor: 0n, payableBalanceMinor: 16_000n });
@@ -2003,7 +2068,7 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
       it("a booking in the test environment is never checked", async () => {
         const td = new FakeTravelDesk(now);
         const row = await create(intent());
-        await svc.walletDirectionGuard(await booking(row.id), { spendableMinor: 40_000n, wallet: prepaid }, { chargedNetMinor: 24_000n }, deps(td));
+        await svc.walletDirectionGuard(await booking(row.id), { spendableMinor: 40_000n, wallet: prepaid }, { chargedNetMinor: 24_000n }, deps(td), "reserved");
         expect(await walletEvents(row.id, "wallet_direction")).toEqual([]);
         await drain(td, 0);
       });

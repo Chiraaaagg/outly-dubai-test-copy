@@ -62,6 +62,17 @@ const pricingPeriodWire = offerPriceWire.extend({
   isBookable: z.boolean().optional(),
 });
 
+/**
+ * The undocumented slot unit count as kept on the slot: absent when not sent
+ * (or null), the number when it is a whole number, else 0, a value the
+ * capability derivation never accepts (it flags anything but 1 as
+ * `slot_units_unexplained`).
+ */
+export function slotUnitsFrom(v: unknown): { numberOfUnits?: number } {
+  if (v === undefined || v === null) return {};
+  return { numberOfUnits: typeof v === "number" && Number.isSafeInteger(v) ? v : 0 };
+}
+
 /** TimeSlotPublicDto (L3654). */
 const timeSlotWire = z.object({
   id: int,
@@ -74,7 +85,8 @@ const timeSlotWire = z.object({
   minimumAdvancedBooking: nint,
   isExternal: z.boolean().optional(),
   // Not in the spec; sent on a few offers only (1 or 10, 22 Nov 2026). Meaning unknown (doc 29 §8.2 Q7).
-  numberOfUnits: nint,
+  // Any shape is accepted so an odd value never fails the tour parse (review R10); `slotUnitsFrom` keeps it for review.
+  numberOfUnits: z.unknown().optional(),
 });
 
 /** Offer (L3504). */
@@ -333,6 +345,8 @@ export interface TravelDeskTimeSlot {
    * Undocumented slot unit count, kept as received. Absent when TravelDesk does
    * not send it, so payloads of offers without it hash as before. Never used
    * as a capacity: the capability derivation flags any value but 1 for review.
+   * A value sent that is not a whole number is kept as 0 (`slotUnitsFrom`),
+   * so it is flagged too rather than failing the parse.
    */
   numberOfUnits?: number;
 }
@@ -453,7 +467,7 @@ export function offerFrom(tourId: number, o: z.infer<typeof offerWire>, warnings
       isOnRequest: t.isOnRequest,
       minimumAdvancedBookingHours: t.minimumAdvancedBooking ?? null,
       isExternal: t.isExternal ?? false,
-      ...(typeof t.numberOfUnits === "number" ? { numberOfUnits: t.numberOfUnits } : {}),
+      ...slotUnitsFrom(t.numberOfUnits),
     })),
     pricingPeriods: (o.pricingPeriods ?? []).map((p) => periodFrom(p, warnings)),
   };

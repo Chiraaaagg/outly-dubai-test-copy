@@ -3,6 +3,7 @@ import { BitrixRestClient } from "@/server/crm/bitrix.client";
 import type { CrmScope } from "@/server/crm/crm.config";
 import { originIdFor, type CrmSubject, type CrmSubjectState } from "@/server/crm/crm.mapping";
 import { BREAKER_THRESHOLD, CREATE_SETTLE_MS, pacedLimiter, runCrmWorker } from "@/server/crm/crm.worker";
+import { CRM_DEFERRED_VERSION } from "@/server/crm/crm.outbox";
 import { FakeBitrix24 } from "./_bitrix-fake";
 import { FAKE_HOST, FAKE_SECRET, FAKE_USER, FakeClock, MemoryCrmStore, StateBook, directOrderState, fakeConfig, inquiryState, subjectId } from "./_memory-store";
 
@@ -179,6 +180,22 @@ describe("CRM worker: deal push on the fake portal", () => {
     await h.run();
     expect(late.outcome).toBe("stale");
     expect(h.fake.dealsFor(originIdFor(s))[0].stageId).toBe("C7:QUOTED");
+  });
+
+  it("a deferred row (the link lock was busy at enqueue) is never stale: it re-reads and pushes the latest state (review R12)", async () => {
+    const h = harness();
+    const s = inquiry();
+    h.put(inquiryState(s.id, { status: "new" }));
+    await h.run();
+    // The change whose enqueue could not wait for the link lock: committed state, no versioned row.
+    h.book.set(inquiryState(s.id, { status: "quoted" }));
+    const first = h.store.rows[0];
+    h.store.rows.push({ ...first, id: subjectId(), status: "queued", outcome: null, version: CRM_DEFERRED_VERSION, dedupeKey: `deferred-${first.id}`, seq: first.seq + 100 });
+    await h.run();
+    expect(h.store.rows.at(-1)?.outcome).toBe("pushed");
+    expect(h.fake.dealsFor(originIdFor(s))[0].stageId).toBe("C7:QUOTED");
+    // The push records the link's own version, not the deferred row's: later versioned rows still count.
+    expect(h.store.links[0].pushedVersion).toBe(1n);
   });
 
   it("a lost create answer is adopted by originId on the next attempt: no twin", async () => {

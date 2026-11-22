@@ -1,6 +1,16 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { resetEnvCache } from "@/server/lib/env";
-import { crmOutboxScope, dedupeKeyFor, enqueueCrmDelete, enqueueCrmErasure, enqueueCrmSync, enqueueCrmSyncForOrders } from "@/server/crm/crm.outbox";
+import {
+  CRM_DEFERRED_VERSION,
+  CRM_LINK_LOCK_TIMEOUT,
+  crmOutboxScope,
+  dedupeKeyFor,
+  enqueueCrmDelete,
+  enqueueCrmErasure,
+  enqueueCrmSync,
+  enqueueCrmSyncForOrders,
+  isLockTimeout,
+} from "@/server/crm/crm.outbox";
 import type { CrmScope } from "@/server/crm/crm.config";
 
 /**
@@ -17,12 +27,17 @@ import type { CrmScope } from "@/server/crm/crm.config";
 
 type Call = { op: string; sql: string; values: unknown[] };
 
-function fakeTx(opts: { failOn?: RegExp; order?: { id: string; sourceInquiryId: string | null } | null } = {}) {
+function fakeTx(opts: { failOn?: RegExp; lockTimeoutOn?: RegExp; linkState?: string | null; order?: { id: string; sourceInquiryId: string | null } | null } = {}) {
   const calls: Call[] = [];
   const raw = (op: string) => async (strings: TemplateStringsArray | string, ...values: unknown[]) => {
     const sql = typeof strings === "string" ? strings : strings.join("?");
     calls.push({ op, sql, values });
     if (opts.failOn && opts.failOn.test(sql)) throw Object.assign(new Error("synthetic failure"), { code: "P2010" });
+    // The shape Prisma gives a raw-query failure: P2010 with the Postgres code in `meta`.
+    if (opts.lockTimeoutOn && opts.lockTimeoutOn.test(sql)) throw Object.assign(new Error("synthetic lock wait"), { code: "P2010", meta: { code: "55P03" } });
+    if (sql.includes("current_setting('lock_timeout')")) return [{ setting: "7s" }];
+    if (sql.includes("set_config")) return [{ set_config: values[0] }];
+    if (sql.startsWith("\n    SELECT state FROM crm_links") || /^\s*SELECT state FROM crm_links/.test(sql)) return opts.linkState === null ? [] : [{ state: opts.linkState ?? "active" }];
     if (op === "$queryRaw") return [{ local_version: BigInt(calls.length), state: "pending" }];
     return 1;
   };
@@ -102,6 +117,53 @@ describe("CRM outbox enqueue", () => {
     await enqueueCrmDelete(tx, [{ type: "inquiry", id: A }], "retention", scope);
     expect(calls.some((c) => c.sql.includes("INSERT INTO crm_links"))).toBe(false);
     expect(calls.some((c) => c.sql.includes("UPDATE crm_links"))).toBe(true);
+  });
+
+  it("the link statement waits at most the short lock timeout, and the caller's setting is put back (review R12)", async () => {
+    const { tx, calls } = fakeTx();
+    await enqueueCrmSync(tx, [{ type: "inquiry", id: A }], scope);
+    const sets = calls.filter((c) => c.sql.includes("set_config"));
+    expect(sets.map((c) => c.values[0])).toEqual([CRM_LINK_LOCK_TIMEOUT, "7s"]);
+    const sqls = calls.map((c) => c.sql);
+    // Short timeout before the link statement, restored before the outer savepoint is released.
+    expect(sqls.findIndex((q) => q.includes("set_config"))).toBeLessThan(sqls.findIndex((q) => q.includes("INSERT INTO crm_links")));
+    expect(sqls.findLastIndex((q) => q.includes("set_config"))).toBe(sqls.length - 2);
+    expect(sqls).toContain("SAVEPOINT crm_outbox_link");
+    expect(sqls).toContain("RELEASE SAVEPOINT crm_outbox_link");
+  });
+
+  it("a link lock not granted in time falls back to a deferred row: no wait, no throw, no link bump (review R12)", async () => {
+    const { tx, calls } = fakeTx({ lockTimeoutOn: /INSERT INTO crm_links/ });
+    await expect(enqueueCrmSync(tx, [{ type: "inquiry", id: A }], scope)).resolves.toBe(1);
+    const sqls = calls.map((c) => c.sql);
+    expect(sqls).toContain("ROLLBACK TO SAVEPOINT crm_outbox_link");
+    expect(sqls).not.toContain("ROLLBACK TO SAVEPOINT crm_outbox_enqueue");
+    expect(sqls.at(-1)).toBe("RELEASE SAVEPOINT crm_outbox_enqueue");
+    const row = calls.find((c) => c.sql.includes("INSERT INTO crm_outbox"))!;
+    expect(row.sql).toContain("next_attempt_at");
+    expect(row.values).toContain(CRM_DEFERRED_VERSION);
+    expect(row.values.some((v) => typeof v === "string" && v.startsWith(`sync:inquiry:${A}:deferred-`))).toBe(true);
+  });
+
+  it("a deferred delete is written only for a committed, live link", async () => {
+    const none = fakeTx({ lockTimeoutOn: /UPDATE crm_links/, linkState: null });
+    await expect(enqueueCrmDelete(none.tx, [{ type: "inquiry", id: A }], "erasure", scope)).resolves.toBe(0);
+    expect(none.calls.some((c) => c.sql.includes("INSERT INTO crm_outbox"))).toBe(false);
+    const tomb = fakeTx({ lockTimeoutOn: /UPDATE crm_links/, linkState: "deleted" });
+    await expect(enqueueCrmDelete(tomb.tx, [{ type: "inquiry", id: A }], "erasure", scope)).resolves.toBe(0);
+    const live = fakeTx({ lockTimeoutOn: /UPDATE crm_links/, linkState: "active" });
+    await expect(enqueueCrmDelete(live.tx, [{ type: "inquiry", id: A }], "erasure", scope)).resolves.toBe(1);
+    expect(live.calls.find((c) => c.sql.includes("INSERT INTO crm_outbox"))!.values).toContain("erasure");
+  });
+
+  it("only a lock timeout is a deferral; any other failure still rolls back the whole enqueue", async () => {
+    expect(isLockTimeout({ code: "55P03" })).toBe(true);
+    expect(isLockTimeout({ code: "P2010", meta: { code: "55P03" } })).toBe(true);
+    expect(isLockTimeout(new Error("canceling statement due to lock timeout"))).toBe(true);
+    expect(isLockTimeout({ code: "P2010", meta: { code: "23505" } })).toBe(false);
+    const { tx, calls } = fakeTx({ failOn: /INSERT INTO crm_links/ });
+    await expect(enqueueCrmSync(tx, [{ type: "inquiry", id: A }], scope)).resolves.toBe(0);
+    expect(calls.at(-1)?.sql).toBe("ROLLBACK TO SAVEPOINT crm_outbox_enqueue");
   });
 
   it("dedupe keys name the kind, subject, version and scope", () => {

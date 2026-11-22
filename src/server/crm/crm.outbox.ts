@@ -30,9 +30,30 @@ import { CRM_PAYLOAD_VERSION, originIdFor, type CrmSubject } from "./crm.mapping
  * any error rolls back to it, emits `crm.enqueue_failed` and returns. The
  * CRM copy then lags until the subject's next change (the C3 reconciler is
  * the backstop). A missing migration therefore cannot break checkout.
+ *
+ * Never waits long on the link lock (review R12): a payment, booking or
+ * refund transaction must not run into its own timeout because another
+ * transaction on the same deal subject holds the link row. The link
+ * statement runs with `lock_timeout` = `CRM_LINK_LOCK_TIMEOUT` under its own
+ * savepoint (the caller's setting is restored afterwards). When the lock is
+ * not granted in time (55P03) the change is enqueued deferred instead: an
+ * outbox row that does not touch the link, due `CRM_DEFERRED_DELAY_MS`
+ * later, with `CRM_DEFERRED_VERSION` (above any real version) so the worker
+ * never treats it as stale: it re-reads the subject then, after both
+ * transactions have committed, and pushes the full snapshot unless the hash
+ * is unchanged. If the transaction holding the lock was creating the link
+ * and rolled back, the deferred row finds no link and the change waits for
+ * the subject's next one (the C3 reconciler is the backstop).
  */
 
 const SAVEPOINT = "crm_outbox_enqueue";
+const LINK_SAVEPOINT = "crm_outbox_link";
+/** How long an enqueue waits for the subject's link row lock before it falls back to a deferred row. */
+export const CRM_LINK_LOCK_TIMEOUT = "1s";
+/** A deferred row is due this much later, after the transactions holding the link lock have committed. */
+export const CRM_DEFERRED_DELAY_MS = 60_000;
+/** The version of a deferred row: above any link version, so it is never a stale no-op (the push takes the link's own version). */
+export const CRM_DEFERRED_VERSION = 2n ** 62n;
 
 export type CrmOutboxKind = "sync" | "delete";
 export type CrmDeleteReason = "erasure" | "retention";
@@ -59,8 +80,52 @@ export function dedupeKeyFor(kind: CrmOutboxKind, subject: CrmSubject, version: 
   return `${kind}:${subject.type}:${subject.id}:${version}@${scope.environment}/${scope.portal}`;
 }
 
-/** One subject's link bump and outbox row. Returns false when nothing was written (a delete with no link, or a tombstone). */
-async function writeOne(tx: Tx, scope: CrmScope, subject: CrmSubject, kind: CrmOutboxKind, reason: CrmDeleteReason | null): Promise<boolean> {
+/** Postgres `lock_not_available` (a `lock_timeout` expiry), however the driver reports it. */
+export function isLockTimeout(e: unknown): boolean {
+  const err = e as { code?: unknown; meta?: { code?: unknown; driverAdapterError?: { cause?: { originalCode?: unknown; code?: unknown } } }; message?: unknown } | null;
+  const codes = [err?.code, err?.meta?.code, err?.meta?.driverAdapterError?.cause?.originalCode, err?.meta?.driverAdapterError?.cause?.code];
+  if (codes.includes("55P03")) return true;
+  return typeof err?.message === "string" && /55P03|lock timeout/i.test(err.message);
+}
+
+/** The link statement under its own savepoint, bounded by the short lock timeout. Null when the lock was not granted in time. */
+async function bumpLink(tx: Tx, scope: CrmScope, subject: CrmSubject, kind: CrmOutboxKind): Promise<{ local_version: bigint; state: string }[] | null> {
+  await tx.$executeRawUnsafe(`SAVEPOINT ${LINK_SAVEPOINT}`);
+  try {
+    const rows = await linkStatement(tx, scope, subject, kind);
+    await tx.$executeRawUnsafe(`RELEASE SAVEPOINT ${LINK_SAVEPOINT}`);
+    return rows;
+  } catch (e) {
+    if (!isLockTimeout(e)) throw e;
+    await tx.$executeRawUnsafe(`ROLLBACK TO SAVEPOINT ${LINK_SAVEPOINT}`);
+    return null;
+  }
+}
+
+/**
+ * The fallback when the link lock was busy: a row that does not touch the
+ * link (a plain read never waits on a row lock), due later. Its key carries
+ * its own id, so it never collides with the versioned rows. A delete is only
+ * written for a subject with a committed, not-deleted link.
+ */
+async function writeDeferred(tx: Tx, scope: CrmScope, subject: CrmSubject, kind: CrmOutboxKind, reason: CrmDeleteReason | null): Promise<boolean> {
+  const [link] = await tx.$queryRaw<{ state: string }[]>`
+    SELECT state FROM crm_links
+    WHERE environment = ${scope.environment} AND portal = ${scope.portal} AND entity_type = ${subject.type} AND entity_id = ${subject.id}::uuid`;
+  if (link?.state === "deleted") return false;
+  if (kind === "delete" && !link) return false;
+  const version = CRM_DEFERRED_VERSION;
+  const id = uuidv7();
+  await tx.$executeRaw`
+    INSERT INTO crm_outbox (id, environment, portal, entity_type, entity_id, kind, version, payload_version, dedupe_key, reason, next_attempt_at, updated_at)
+    VALUES (${id}::uuid, ${scope.environment}, ${scope.portal}, ${subject.type}, ${subject.id}::uuid, ${kind}, ${version},
+            ${CRM_PAYLOAD_VERSION}, ${`${kind}:${subject.type}:${subject.id}:deferred-${id}@${scope.environment}/${scope.portal}`}, ${reason},
+            now() + ${`${CRM_DEFERRED_DELAY_MS} milliseconds`}::interval, now())`;
+  emitEvent("crm.enqueue_deferred", { entityType: subject.type, entityId: subject.id, kind }, "warn");
+  return true;
+}
+
+async function linkStatement(tx: Tx, scope: CrmScope, subject: CrmSubject, kind: CrmOutboxKind): Promise<{ local_version: bigint; state: string }[]> {
   let rows: { local_version: bigint; state: string }[];
   if (kind === "sync") {
     rows = await tx.$queryRaw<{ local_version: bigint; state: string }[]>`
@@ -78,6 +143,13 @@ async function writeOne(tx: Tx, scope: CrmScope, subject: CrmSubject, kind: CrmO
         AND entity_id = ${subject.id}::uuid AND state <> 'deleted'
       RETURNING local_version, state`;
   }
+  return rows;
+}
+
+/** One subject's link bump and outbox row. Returns false when nothing was written (a delete with no link, or a tombstone). */
+async function writeOne(tx: Tx, scope: CrmScope, subject: CrmSubject, kind: CrmOutboxKind, reason: CrmDeleteReason | null): Promise<boolean> {
+  const rows = await bumpLink(tx, scope, subject, kind);
+  if (rows === null) return writeDeferred(tx, scope, subject, kind, reason);
   const link = rows[0];
   if (!link) return false;
   // A tombstoned subject is never re-created by a later change (doc 29 §6.4, 30-bitrix-crm §8 deletion).
@@ -94,7 +166,11 @@ async function writeOne(tx: Tx, scope: CrmScope, subject: CrmSubject, kind: CrmO
 async function guarded(tx: Tx, subjects: CrmSubject[], run: () => Promise<number>): Promise<number> {
   await tx.$executeRawUnsafe(`SAVEPOINT ${SAVEPOINT}`);
   try {
+    // Local to the transaction; a rollback to the savepoint undoes it, and the caller's value is put back below.
+    const [prior] = await tx.$queryRaw<{ setting: string }[]>`SELECT current_setting('lock_timeout') AS setting`;
+    await tx.$queryRaw`SELECT set_config('lock_timeout', ${CRM_LINK_LOCK_TIMEOUT}, true)`;
     const n = await run();
+    await tx.$queryRaw`SELECT set_config('lock_timeout', ${prior?.setting ?? "0"}, true)`;
     await tx.$executeRawUnsafe(`RELEASE SAVEPOINT ${SAVEPOINT}`);
     return n;
   } catch (e) {
