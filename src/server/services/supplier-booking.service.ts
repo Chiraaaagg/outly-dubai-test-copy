@@ -433,6 +433,8 @@ const DETAIL_KEYS = new Set([
   "expectedMinor",
   "deltaMinor",
   "verdict",
+  // The state the engine kept after an accepted answer (a short code), for the direction guard's not_applicable record.
+  "outcome",
 ]);
 const DETAIL_CODE = /^[A-Za-z0-9_.:-]{1,80}$/;
 
