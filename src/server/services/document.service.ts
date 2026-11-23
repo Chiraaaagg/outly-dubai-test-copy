@@ -25,6 +25,7 @@ import type {
   UnitCounts,
 } from "../documents/contracts";
 import { validatePdf, sha256Of } from "../documents/pdf";
+import { isCompleteTicketSet } from "../documents/ticket-completeness";
 import { getDocumentStore, storageEnvironment } from "../documents/store";
 
 /**
@@ -364,7 +365,8 @@ export const documentService = {
 
     const expected = unitsOf(booking);
     const issued = set.units();
-    const complete = issued.adult === expected.adult && issued.child === expected.child && issued.infant === expected.infant;
+    // Per ticket type: a combined-admission offer issues one code per guest for each type (doc 29 §8.6).
+    const complete = isCompleteTicketSet(expected, set.tickets());
     const status = complete ? "valid" : "incomplete";
     const target = docs.find((d) => d.status === "pending" && d.codes.length === 0) ?? null;
     const reissue = withCodes.length > 0;
@@ -710,7 +712,10 @@ export const documentService = {
    *  - a ticket document (codes or PDF) that is still pending, incomplete or
    *    failed, with no valid one of its kind for the booking, raises attention
    *    at visit start minus 24 hours and again as urgent at minus 6 hours
-   *    (Asia/Dubai), whatever F12 and the retries did before;
+   *    (Asia/Dubai), whatever F12 and the retries did before. A booking
+   *    confirmed inside that window is first given F12's own grace
+   *    (`TICKET_TIMING.attentionAfterMs`): codes normally arrive within it,
+   *    and F12 already raises a near-start ticket as urgent at that age;
    *  - a valid or incomplete code set whose earliest ticket `validUntil` day
    *    (the UTC day the supplier wrote, `validityDayOf`) is before the visit
    *    date raises attention on that document once.
@@ -730,6 +735,7 @@ export const documentService = {
       JOIN suppliers s ON s.id = b.supplier_id
       WHERE d.status IN ('pending', 'incomplete', 'failed') AND d.kind IN ('ticket_codes', 'tickets_pdf') AND d.invalidated_at IS NULL
         AND b.state = 'confirmed' AND b.booking_kind = 'ticket_only'
+        AND b.confirmed_at IS NOT NULL AND b.confirmed_at <= ${after(now, -TICKET_TIMING.attentionAfterMs)}
         AND b.service_date >= ${from} AND b.service_date <= ${to}
         AND NOT EXISTS (
           SELECT 1 FROM supplier_documents v

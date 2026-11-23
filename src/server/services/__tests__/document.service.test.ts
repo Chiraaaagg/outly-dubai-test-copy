@@ -230,17 +230,23 @@ describe.skipIf(!enabled)("documentService (local DB, fake source, memory store)
    * ---------------------------------------------------------------------- */
 
   it("Batch 5: the ticket facts read the live code set without any code, per type and with the earliest per-ticket validity", async () => {
+    // Two adults and a combined admission of two types: one code per adult for each type (doc 29 §8.6) is a complete
+    // set, so it is `valid` (only a valid set is read, review 86 B5-05). External-style codes: no type id, a type name.
     const b = await confirmed({ adults: 2 });
     const combo = (i: number, name: string, validUntil: string): IssuedTicket => ({ ...t(i, "adult", `C-${RUN}-B5-${i}`), ticketTypeName: name, validUntil });
-    await persist(b, [combo(0, "Park A", "2030-07-16T00:00:00Z"), combo(1, "Park B", "2030-08-01T00:00:00Z"), combo(2, "Park A", "2030-07-16T00:00:00Z"), combo(3, "Park B", "2030-08-01T00:00:00Z")]);
+    const set = [combo(0, "Park A", "2030-07-16T00:00:00Z"), combo(1, "Park B", "2030-08-01T00:00:00Z"), combo(2, "Park A", "2030-07-16T00:00:00Z"), combo(3, "Park B", "2030-08-01T00:00:00Z")];
+    expect((await persist(b, set)).status).toBe("valid");
     const { ticketFactsForOrder } = await import("../ticket-facts.service");
     const facts = await ticketFactsForOrder(b.orderId!);
     const f = facts.get(b.orderItemId!);
     expect(f).toMatchObject({ validUntil: "2030-07-16", types: [{ label: "Park A (adult)", count: 2 }, { label: "Park B (adult)", count: 2 }] });
     expect(JSON.stringify([...facts.values()])).not.toContain(`C-${RUN}`);
     // A reissue supersedes the old set: the types are not counted twice.
-    await persist(b, [combo(0, "Park A", "2030-07-16T00:00:00Z"), combo(1, "Park B", "2030-08-01T00:00:00Z")].map((x) => ({ ...x, code: `${x.code}-R` })));
-    expect((await ticketFactsForOrder(b.orderId!)).get(b.orderItemId!)?.types).toEqual([{ label: "Park A (adult)", count: 1 }, { label: "Park B (adult)", count: 1 }]);
+    expect((await persist(b, set.map((x) => ({ ...x, code: `${x.code}-R` })))).status).toBe("valid");
+    expect((await ticketFactsForOrder(b.orderId!)).get(b.orderItemId!)?.types).toEqual([{ label: "Park A (adult)", count: 2 }, { label: "Park B (adult)", count: 2 }]);
+    // A partial reissue (one code per type for two adults) is still being prepared: its counts are not shown as issued.
+    expect((await persist(b, set.slice(0, 2).map((x) => ({ ...x, code: `${x.code}-P` })))).status).toBe("incomplete");
+    expect((await ticketFactsForOrder(b.orderId!)).get(b.orderItemId!)?.types).toEqual([]);
   });
 
   it("Batch 5: an issued ticket booking is never sent a cancel; the request is refused and no cancel job is queued", async () => {

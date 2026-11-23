@@ -101,7 +101,7 @@ export type DocumentKind = "ticket_codes" | "tickets_pdf" | "voucher_pdf";
  * Document version status.
  *  - `pending`: expected, not yet obtained (`confirmed_ticket_pending`).
  *  - `valid`: complete and checked; the only status ever served.
- *  - `incomplete`: issued units differ from ordered units (TKT-2, F48).
+ *  - `incomplete`: for some ticket type, issued adult/child (and, where the type tickets infants, infant) codes differ from ordered units (TKT-2, F48; per-type rule in `ticket-completeness.ts`).
  *  - `quarantined`: malformed, oversized, active content or the wrong booking (F13). Never served.
  *  - `superseded`: replaced by a newer version (reissue). Never served.
  *  - `failed`: given up after the attempt limit; a human decides.

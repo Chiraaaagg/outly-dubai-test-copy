@@ -169,7 +169,7 @@ describe.skipIf(!dbEnabled || excludedHere)("migration safety (doc 27 §3)", () 
       expect(statements[0], n).toBe("SET LOCAL lock_timeout = '5s'");
       expect(statements.length, n).toBeGreaterThan(1);
       for (const st of statements.slice(1)) {
-        expect(st, n).toMatch(/^ALTER TABLE "?\w+"? ADD COLUMN "?\w+"? (TEXT|INTEGER|BIGINT|BOOLEAN|UUID|JSONB|TIMESTAMPTZ\(\d\))$/i);
+        expect(st, n).toMatch(/^ALTER TABLE "?\w+"? ADD COLUMN "?\w+"? (TEXT|INTEGER|BIGINT|BOOLEAN|UUID|JSONB|DATE|TIMESTAMPTZ\(\d\))$/i);
       }
     }
   });

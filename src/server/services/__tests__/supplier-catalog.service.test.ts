@@ -6,6 +6,7 @@ import type { Actor } from "../../lib/actor";
 import { isAppError } from "../../lib/errors";
 import { uuidv7 } from "../../lib/ids";
 import type { TravelDeskOffer, TravelDeskTourDetail, TravelDeskTourSummary } from "../../suppliers/traveldesk/traveldesk.codec";
+import { readLimits } from "../../suppliers/read-budget";
 import { offerTermsHash } from "../../suppliers/traveldesk/traveldesk.offer-terms";
 import { assessReadiness, fromCatalogReadiness } from "../readiness.service";
 import { fakeMargin, instantDoc, product } from "./_b2-fakes";
@@ -26,6 +27,14 @@ const enabled = Boolean(process.env.DATABASE_URL);
 const RUN = uuidv7().slice(-8);
 const CODE = `zz-td-${RUN}`;
 const BASE = 900_000_000 + Math.floor(Math.random() * 90_000_000);
+/**
+ * The syncs here draw on a test read budget. With the default (120 reads a
+ * minute per supplier code) this file's syncs, one read per tour plus the
+ * list, used up the window within a second and the next sync waited for the
+ * window to roll over, past the test timeout. The budget itself is tested in
+ * read-budget.test.ts and supplier-booking.service.test.ts.
+ */
+const LANE = { readLimits: readLimits(100_000) };
 
 const admin: Actor = { type: "admin", id: uuidv7(), roles: ["admin"], permissions: new Set(["*"]) };
 const content: Actor = { type: "admin", id: uuidv7(), roles: ["content"], permissions: new Set(["products.edit"]) };
@@ -175,7 +184,7 @@ describe.skipIf(!enabled)("supplierCatalogService (local DB)", () => {
 
   it("sync stores tours and offers, detects changes, and only a complete pull removes inventory", async () => {
     const t = tour(TOUR, "Alexandra Dhow Cruise in Dubai Marina", [offer(OFFER_A, TOUR), offer(OFFER_B, TOUR, { name: "Dinner Cruise, Lower Deck", pricingPeriods: [] })]);
-    const first = await svc.syncTravelDeskCatalogue(source([t]), "test", { supplierCode: CODE });
+    const first = await svc.syncTravelDeskCatalogue(source([t]), "test", { supplierCode: CODE, lane: LANE });
     expect(first).toMatchObject({ tours: 1, offers: 2, added: 3, removed: 0, removalsApplied: true });
 
     // Each offer's capability is derived and stored with its provenance (doc 29 Batch 1a).
@@ -191,32 +200,32 @@ describe.skipIf(!enabled)("supplierCatalogService (local DB)", () => {
     expect(caps[0].offerTermsHash).toMatch(/^[0-9a-f]{64}$/);
     expect(JSON.stringify(caps[0].rawValues)).not.toMatch(/12000|8000/);
 
-    const again = await svc.syncTravelDeskCatalogue(source([t]), "test", { supplierCode: CODE });
+    const again = await svc.syncTravelDeskCatalogue(source([t]), "test", { supplierCode: CODE, lane: LANE });
     expect(again).toMatchObject({ added: 0, changed: 0, removed: 0 });
     expect(await prisma.supplierOfferCapability.count({ where: { supplierId: sup.id, environment: "test" } })).toBe(2);
 
     const changed = tour(TOUR, t.name!, [offer(OFFER_A, TOUR, { maxPax: 40 }), t.offers[1]]);
-    expect((await svc.syncTravelDeskCatalogue(source([changed]), "test", { supplierCode: CODE })).changed).toBe(1);
+    expect((await svc.syncTravelDeskCatalogue(source([changed]), "test", { supplierCode: CODE, lane: LANE })).changed).toBe(1);
 
     // A failed tour fetch keeps that tour's items (removals are judged per tour, SUP-15).
-    const partial = await svc.syncTravelDeskCatalogue(source([changed], [TOUR]), "test", { supplierCode: CODE });
+    const partial = await svc.syncTravelDeskCatalogue(source([changed], [TOUR]), "test", { supplierCode: CODE, lane: LANE });
     expect(partial).toMatchObject({ failedTours: [TOUR], removed: 0 });
 
     // An empty tour list (upstream glitch) never removes anything.
-    const empty = await svc.syncTravelDeskCatalogue(source([]), "test", { supplierCode: CODE });
+    const empty = await svc.syncTravelDeskCatalogue(source([]), "test", { supplierCode: CODE, lane: LANE });
     expect(empty).toMatchObject({ removalsApplied: false, removalsSkipped: "empty_tour_list", removed: 0 });
 
     // Losing more than 20% of live items at once is treated as suspicious and skipped.
     const withoutB = tour(TOUR, t.name!, [changed.offers[0]]);
-    const suspicious = await svc.syncTravelDeskCatalogue(source([withoutB]), "test", { supplierCode: CODE });
+    const suspicious = await svc.syncTravelDeskCatalogue(source([withoutB]), "test", { supplierCode: CODE, lane: LANE });
     expect(suspicious).toMatchObject({ removalsApplied: false, removalsSkipped: "too_many_removals", removed: 0 });
 
     // With enough other live items, the same single disappearance is applied, and coming back revives it.
     const filler = Array.from({ length: 6 }, (_, i) => tour(BASE + 100 + i, `Filler tour ${i}`, []));
-    await svc.syncTravelDeskCatalogue(source([changed, ...filler]), "test", { supplierCode: CODE });
-    const applied = await svc.syncTravelDeskCatalogue(source([withoutB, ...filler]), "test", { supplierCode: CODE });
+    await svc.syncTravelDeskCatalogue(source([changed, ...filler]), "test", { supplierCode: CODE, lane: LANE });
+    const applied = await svc.syncTravelDeskCatalogue(source([withoutB, ...filler]), "test", { supplierCode: CODE, lane: LANE });
     expect(applied).toMatchObject({ removalsApplied: true, removed: 1 });
-    expect((await svc.syncTravelDeskCatalogue(source([changed, ...filler]), "test", { supplierCode: CODE })).revived).toBe(1);
+    expect((await svc.syncTravelDeskCatalogue(source([changed, ...filler]), "test", { supplierCode: CODE, lane: LANE })).revived).toBe(1);
   });
 
   it("generates suggestions only, with evidence, conflicts and margin; product content and mode untouched", async () => {
@@ -438,7 +447,7 @@ describe.skipIf(!enabled)("supplierCatalogService (local DB)", () => {
     const asStored = tour(TOUR, "Alexandra Dhow Cruise in Dubai Marina", [offer(OFFER_A, TOUR, { maxPax: 40 }), lower]);
 
     const reevaluateMany = vi.spyOn(readinessService, "reevaluateMany");
-    const same = await svc.syncTravelDeskCatalogue(source([asStored, ...filler]), "test", { supplierCode: CODE });
+    const same = await svc.syncTravelDeskCatalogue(source([asStored, ...filler]), "test", { supplierCode: CODE, lane: LANE });
     expect(reevaluateMany).toHaveBeenCalledWith([productId], "sync");
     reevaluateMany.mockRestore();
     expect(same.mappingsChanged).toBe(0);
@@ -470,7 +479,7 @@ describe.skipIf(!enabled)("supplierCatalogService (local DB)", () => {
     expect((await svc.mappingReadinessFor(productId, "production", { supplierCode: CODE })).variants.every((v) => v.blockers.includes("variant_without_mapping"))).toBe(true);
 
     const younger = tour(TOUR, asStored.name!, [offer(OFFER_A, TOUR, { maxPax: 40, childAge: 10 }), lower]);
-    const drift = await svc.syncTravelDeskCatalogue(source([younger, ...filler]), "test", { supplierCode: CODE });
+    const drift = await svc.syncTravelDeskCatalogue(source([younger, ...filler]), "test", { supplierCode: CODE, lane: LANE });
     expect(drift.mappingsChanged).toBe(1);
     expect((await mapping()).syncStatus).toBe("changed");
     // N3: children 10 and 11 are page children but TravelDesk adults here, so the child unit is not mapped either.
@@ -481,17 +490,17 @@ describe.skipIf(!enabled)("supplierCatalogService (local DB)", () => {
     // A price-only change is not drift: every booking re-checks the price live.
     const price = offer(OFFER_A, TOUR).pricingPeriods[0];
     const dearer = tour(TOUR, asStored.name!, [offer(OFFER_A, TOUR, { maxPax: 40, pricingPeriods: [{ ...price, price: { ...price.price!, perAdultMinor: 12_600n } }] }), lower]);
-    await svc.syncTravelDeskCatalogue(source([dearer, ...filler]), "test", { supplierCode: CODE });
+    await svc.syncTravelDeskCatalogue(source([dearer, ...filler]), "test", { supplierCode: CODE, lane: LANE });
     expect((await mapping()).syncStatus).toBe("ok");
 
     // An approval from before B2 has no hash: the next sync records the current terms once (code path, not SQL).
     const m = await mapping();
     await prisma.productSupplierMapping.update({ where: { id: m.id }, data: { approvedOfferHash: null, approvedSlotHours: null } });
     expect((await readiness("deluxe")).blockers).toEqual(["mapping_changed_upstream"]);
-    const backfill = await svc.syncTravelDeskCatalogue(source([dearer, ...filler]), "test", { supplierCode: CODE });
+    const backfill = await svc.syncTravelDeskCatalogue(source([dearer, ...filler]), "test", { supplierCode: CODE, lane: LANE });
     expect(backfill.hashesBackfilled).toBe(1);
     expect(await mapping()).toMatchObject({ approvedOfferHash: m.approvedOfferHash, approvedSlotHours: 2, syncStatus: "ok" });
-    expect((await svc.syncTravelDeskCatalogue(source([dearer, ...filler]), "test", { supplierCode: CODE })).hashesBackfilled).toBe(0);
+    expect((await svc.syncTravelDeskCatalogue(source([dearer, ...filler]), "test", { supplierCode: CODE, lane: LANE })).hashesBackfilled).toBe(0);
   });
 
   it("review 85 A1: a derived end's hours are approved beside the hash; the deploy backfill keeps the approval, a later change of hours invalidates it", async () => {
@@ -505,7 +514,7 @@ describe.skipIf(!enabled)("supplierCatalogService (local DB)", () => {
       tour(TOUR, "Alexandra Dhow Cruise in Dubai Marina", [offer(OFFER_A, TOUR, { maxPax: 40, pricingPeriods: [{ ...price, price: { ...price.price!, perAdultMinor: 12_600n } }], ...over }), lower]);
     const slot = offer(OFFER_A, TOUR).timeSlots[0];
     const derived = (hours: number) => dearer({ durationHours: hours, timeSlots: [{ ...slot, endMinutes: null }] });
-    const sync = (t: TravelDeskTourDetail) => svc.syncTravelDeskCatalogue(source([t, ...filler]), "test", { supplierCode: CODE });
+    const sync = (t: TravelDeskTourDetail) => svc.syncTravelDeskCatalogue(source([t, ...filler]), "test", { supplierCode: CODE, lane: LANE });
     const before = await mapping();
 
     // An approval of an offer whose slot stores no end, written before the column existed: a hash and no hours.
@@ -609,10 +618,10 @@ describe.skipIf(!enabled)("supplierCatalogService (local DB)", () => {
     // Names unlike the test product, so the matcher in later tests ignores them.
     const tourX = tour(X, "Failing tour", [offer(X + 1, X, { name: "Synthetic quad bike ride" })]);
     const tourY = tour(Y, "Healthy tour", [offer(Y + 1, Y, { name: "Synthetic camel trek" }), offer(Y + 2, Y, { name: "Synthetic sandboarding" })]);
-    await svc.syncTravelDeskCatalogue(source([main, ...filler, tourX, tourY]), "test", { supplierCode: CODE });
+    await svc.syncTravelDeskCatalogue(source([main, ...filler, tourX, tourY]), "test", { supplierCode: CODE, lane: LANE });
 
     const withdrawn = tour(Y, "Healthy tour", [tourY.offers[0]]);
-    const r = await svc.syncTravelDeskCatalogue(source([main, ...filler, tourX, withdrawn], [X]), "test", { supplierCode: CODE });
+    const r = await svc.syncTravelDeskCatalogue(source([main, ...filler, tourX, withdrawn], [X]), "test", { supplierCode: CODE, lane: LANE });
     expect(r).toMatchObject({ failedTours: [X], removalsApplied: true, removed: 1 });
     const item = (kind: string, externalId: number) =>
       prisma.supplierCatalogueItem.findUniqueOrThrow({ where: { supplierId_environment_kind_externalId: { supplierId: supplier.id, environment: "test", kind, externalId: String(externalId) } } });

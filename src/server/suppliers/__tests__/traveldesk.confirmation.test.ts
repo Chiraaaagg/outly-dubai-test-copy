@@ -204,12 +204,18 @@ describe("isSameBooking (SUP-3, before releasing)", () => {
 });
 
 describe("doc 29 §8.7: the returned pickup time", () => {
-  it("reads whole minutes, HH:mm, HH:mm:ss or a zoneless date-time; anything else is unknown, and never fails the parse", async () => {
+  it("reads a plain time of day only (whole minutes, HH:mm, HH:mm:ss); anything else is unknown, and never fails the parse", async () => {
     const { pickupMinutesOf } = await import("../traveldesk/traveldesk.booking");
     expect(pickupMinutesOf(495)).toBe(495);
+    expect(pickupMinutesOf(0)).toBe(0);
     expect(pickupMinutesOf("08:15")).toBe(495);
+    expect(pickupMinutesOf(" 08:15 ")).toBe(495);
     expect(pickupMinutesOf("08:15:00")).toBe(495);
-    expect(pickupMinutesOf("2026-11-10T08:15:00")).toBe(495);
-    for (const bad of [1440, -1, 8.5, "8:15", "24:00", "08:15Z", "2026-11-10T08:15:00+04:00", "08:15 - 08:45", "", null, undefined, {}, true]) expect(pickupMinutesOf(bad), String(bad)).toBeNull();
+    expect(pickupMinutesOf("23:59")).toBe(1439);
+    // Review 86 R-01: a date-time is not shown. Without a zone it may be UTC (as reservationDeadline is), 4 hours off Dubai.
+    for (const dateTime of ["2026-11-10T08:15:00", "2026-11-10T08:15", "2026-11-10T08:15:00.000", "2026-11-10 08:15:00", "2026-11-10T08:15:00Z", "2026-11-10T08:15:00+04:00"]) {
+      expect(pickupMinutesOf(dateTime), dateTime).toBeNull();
+    }
+    for (const bad of [1440, -1, 8.5, "8:15", "24:00", "08:15Z", "08:15+04:00", "08:15 - 08:45", "", null, undefined, {}, true]) expect(pickupMinutesOf(bad), String(bad)).toBeNull();
   });
 });

@@ -125,14 +125,17 @@ export interface TravelDeskBooking {
 
 /**
  * The returned pickup time as minutes after midnight, Asia/Dubai, like
- * `startTime`. Accepted: whole minutes (0 to 1439), "HH:mm", "HH:mm:ss" or a
- * date-time without a zone (its wall-clock time). A value with a zone or
- * anything else is unknown (null) and is not shown.
+ * `startTime`. Accepted: a plain time of day only, as whole minutes (0 to
+ * 1439), "HH:mm" or "HH:mm:ss". Anything else is unknown (null) and is not
+ * shown. That includes a date-time: without a zone it is ambiguous, since
+ * TravelDesk's zone-less `reservationDeadline` is UTC and a pickup read as
+ * Dubai time could be 4 hours off (review 86 R-01; asked of TravelDesk). A
+ * missing pickup time is safer than a wrong one.
  */
 export function pickupMinutesOf(v: unknown): number | null {
   if (typeof v === "number") return Number.isInteger(v) && v >= 0 && v < 24 * 60 ? v : null;
   if (typeof v !== "string") return null;
-  const m = /^(?:\d{4}-\d{2}-\d{2}T)?([01]\d|2[0-3]):([0-5]\d)(?::[0-5]\d(?:\.\d{1,7})?)?$/.exec(v.trim());
+  const m = /^([01]\d|2[0-3]):([0-5]\d)(?::[0-5]\d(?:\.\d{1,7})?)?$/.exec(v.trim());
   return m ? Number(m[1]) * 60 + Number(m[2]) : null;
 }
 
