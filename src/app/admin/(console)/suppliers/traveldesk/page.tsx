@@ -9,6 +9,7 @@ import { requirePage } from "../../../_lib/guard";
 import { PageHeader, Panel, StatCard, StatusPill, type PillTone } from "../../../_components/ui";
 import { BookingControls } from "./booking-controls";
 import { CatalogueSync } from "./catalogue-sync";
+import { ReadinessRerun } from "./readiness-rerun";
 import { ReviewForm } from "./review-form";
 import { TicketEvidenceForm } from "./ticket-evidence-form";
 
@@ -149,6 +150,7 @@ export default async function TravelDeskMappingPage({ searchParams }: { searchPa
           )}
         </div>
         <CatalogueSync environment={syncEnvironment} />
+        <ReadinessRerun />
       </Panel>
 
       <Panel

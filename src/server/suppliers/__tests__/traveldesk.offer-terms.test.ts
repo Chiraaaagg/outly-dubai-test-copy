@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { offerTermsHash, offerTermsOf, parseStoredOffer, parseStoredPolicy } from "../traveldesk/traveldesk.offer-terms";
+import { offerTermsHash, offerTermsOf, parseStoredOffer, parseStoredPolicy, slotEndMinutes } from "../traveldesk/traveldesk.offer-terms";
 import { storedOffer, storedSlot, storedTour } from "./fixtures/traveldesk-terms";
 
 /**
@@ -61,5 +61,25 @@ describe("approved offer hash (SUP-15)", () => {
       { moreThanHours: 72, refundPercent: 100 },
     ]);
     expect(offerTermsOf(storedOffer(), storedTour())?.priceBasis).toEqual({ privateType: "sharing", tripUnit: null, perPerson: true, perTrip: false });
+  });
+});
+
+describe("derived slot end (OpenAPI TimeSlotPublicDto.endTime)", () => {
+  it("is the stored end, else start plus the offer's hours; unknown without positive whole hours or past midnight", () => {
+    expect(slotEndMinutes({ startMinutes: 600, endMinutes: 690 }, 5)).toBe(690);
+    expect(slotEndMinutes({ startMinutes: 600, endMinutes: null }, 3)).toBe(780);
+    for (const h of [undefined, null, 0, -1, 1.5]) expect(slotEndMinutes({ startMinutes: 600, endMinutes: null }, h)).toBeNull();
+    expect(slotEndMinutes({ startMinutes: 1260, endMinutes: null }, 3)).toBe(1440);
+    expect(slotEndMinutes({ startMinutes: 1260, endMinutes: null }, 4)).toBeNull();
+  });
+
+  it("the hours join the approved terms only when a slot's end is derived, so existing hashes are unchanged", () => {
+    const tour = storedTour();
+    const withEnds = (h: number) => storedOffer({ durationHours: h, timeSlots: [storedSlot({ endMinutes: 1365 })] });
+    expect(offerTermsHash(withEnds(2), tour)).toBe(offerTermsHash(withEnds(5), tour));
+    expect(offerTermsOf(withEnds(2), tour)).not.toHaveProperty("slotHours");
+    const derived = (h: number) => storedOffer({ durationHours: h, timeSlots: [storedSlot({ endMinutes: null })] });
+    expect(offerTermsHash(derived(2), tour)).not.toBe(offerTermsHash(derived(3), tour));
+    expect(offerTermsOf(derived(2), tour)).toMatchObject({ slotHours: 2 });
   });
 });

@@ -1,5 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { admitRead, BROWSE_READ_SHARE, DEFAULT_READ_BUDGET_PER_MINUTE, QUOTE_READ_SHARE, READ_BUDGET, type ReadClass, readLimits, type ReadWindow } from "../read-budget";
+import {
+  admitRead,
+  BROWSE_READ_SHARE,
+  type BrowseRoute,
+  DEFAULT_READ_BUDGET_PER_MINUTE,
+  PICKUP_HOTELS_BROWSE_RESERVE,
+  QUOTE_READ_SHARE,
+  READ_BUDGET,
+  type ReadClass,
+  readLimits,
+  type ReadWindow,
+} from "../read-budget";
 
 /**
  * The read-class rule of the per-account read budget (CR-B2-3): quote reads
@@ -93,7 +104,7 @@ describe("read budget classes (CR-B2-3)", () => {
 describe("browse read class (doc 29 §6.3, Batch 2)", () => {
   it("the shared budget carves browse out of the customer share, never out of the engine reserve (decision of 23 November 2026)", () => {
     expect(BROWSE_READ_SHARE).toBe(0.1);
-    expect(READ_BUDGET).toEqual({ perMinute: 120, quoteCap: 18, browseCap: 12, engineReserve: 90 });
+    expect(READ_BUDGET).toEqual({ perMinute: 120, quoteCap: 18, browseCap: 12, startTimesCap: 8, engineReserve: 90 });
     // The engine reserve is the same with or without a browse share.
     expect(READ_BUDGET.engineReserve).toBe(readLimits().engineReserve);
     expect(readLimits(10, 0.5, 0.9)).toEqual({ perMinute: 10, quoteCap: 0, browseCap: 5, engineReserve: 5 });
@@ -174,6 +185,68 @@ describe("browse read class (doc 29 §6.3, Batch 2)", () => {
       const withoutFlood = play(ops.filter((c) => c !== "browse"));
       // The same quote and engine requests, with and without the flood: quotes get at least as many.
       expect(withFlood.quote).toBeGreaterThanOrEqual(withoutFlood.quote);
+    }
+  });
+});
+
+describe("fair sharing inside browse (review 82: start times must not starve hotel lists)", () => {
+  /** Takes browse reads for `route` until one is refused. */
+  function drainRoute(window: ReadWindow, route: BrowseRoute, limits = READ_BUDGET) {
+    let w = window;
+    let n = 0;
+    for (; n < 1000; n++) {
+      const next = admitRead(w, "browse", limits, route);
+      if (!next) break;
+      w = next;
+    }
+    return { n, window: w };
+  }
+
+  it("the default budget keeps a third of browse for hotel lists: start times 8, hotel lists at least 4", () => {
+    expect(PICKUP_HOTELS_BROWSE_RESERVE).toBeCloseTo(1 / 3);
+    expect(READ_BUDGET.startTimesCap).toBe(8);
+    expect(readLimits(120, 0.25, 0.1, 0)).toMatchObject({ browseCap: 12, startTimesCap: 12 });
+    expect(readLimits(120, 0.25, 0.1, 1)).toMatchObject({ browseCap: 12, startTimesCap: 0 });
+    expect(readLimits(10, 0.5, 0.2, 1 / 3)).toMatchObject({ browseCap: 2, startTimesCap: 1 });
+    // Without the fourth argument nothing changes for existing callers.
+    expect(readLimits(10, 0.5, 0.2)).not.toHaveProperty("startTimesCap");
+  });
+
+  it("a start-times flood stops at its cap and leaves the hotel lists their reserve", () => {
+    const flood = drainRoute({ used: 0, quoteUsed: 0 }, "start_times");
+    expect(flood.n).toBe(8);
+    expect(flood.window).toEqual({ used: 8, quoteUsed: 0, browseUsed: 8, startTimesUsed: 8 });
+    const hotels = drainRoute(flood.window, "pickup_hotels");
+    expect(hotels.n).toBe(4);
+    expect(hotels.window).toMatchObject({ used: 12, browseUsed: 12, startTimesUsed: 8 });
+    // Quotes and the engine are unaffected by both.
+    expect(drain(hotels.window, "quote", READ_BUDGET).n).toBe(18);
+  });
+
+  it("hotel lists may use the whole browse share, and then start times get nothing more", () => {
+    const hotels = drainRoute({ used: 0, quoteUsed: 0 }, "pickup_hotels");
+    expect(hotels.n).toBe(12);
+    expect(drainRoute(hotels.window, "start_times").n).toBe(0);
+  });
+
+  it("under any interleaving, start times never pass their cap, so browse is never full before hotel lists had their reserve", () => {
+    const reserve = READ_BUDGET.browseCap! - READ_BUDGET.startTimesCap!;
+    let seed = 7;
+    for (let run = 0; run < 200; run++) {
+      let w: ReadWindow = { used: 0, quoteUsed: 0 };
+      let hotels = 0;
+      for (let i = 0; i < 60; i++) {
+        seed = (Math.imul(seed, 1_103_515_245) + 12_345) >>> 0;
+        const pick = seed % 10;
+        const cls: ReadClass = pick < 1 ? "quote" : pick < 2 ? "engine" : "browse";
+        const route: BrowseRoute = pick < 9 ? "start_times" : "pickup_hotels"; // a start-times-heavy flood
+        const next = admitRead(w, cls, READ_BUDGET, cls === "browse" ? route : undefined);
+        // A hotel list refused because browse is full: the hotel lists themselves took at least the reserve.
+        if (!next && cls === "browse" && route === "pickup_hotels" && (w.browseUsed ?? 0) >= READ_BUDGET.browseCap!) expect(hotels).toBeGreaterThanOrEqual(reserve);
+        if (next && cls === "browse" && route === "pickup_hotels") hotels++;
+        if (next) w = next;
+        expect(w.startTimesUsed ?? 0).toBeLessThanOrEqual(READ_BUDGET.startTimesCap!);
+      }
     }
   });
 });

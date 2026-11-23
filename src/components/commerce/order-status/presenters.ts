@@ -211,7 +211,7 @@ export const INELIGIBLE_REASON_TEXT: Record<CancellationIneligibleReason, string
   past_deadline: "The free cancellation deadline for this booking has passed, so it cannot be cancelled for a refund online.",
   // The same words as the quote and the review step (CO-01, `freeCancellationCopy`).
   non_refundable: NON_REFUNDABLE_STATEMENT,
-  tickets_issued: "The operator issues tickets as soon as the booking is confirmed, and issued tickets cannot be cancelled online.",
+  tickets_issued: "These tickets are non-refundable once issued: the operator issues them as soon as the booking is confirmed, and they cannot be cancelled online.",
   activity_started: "This activity has already started or its date has passed.",
   not_supported: "This booking cannot be cancelled online.",
   payment_not_refundable: "A refund cannot be started online for this payment right now.",

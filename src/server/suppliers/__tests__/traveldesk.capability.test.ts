@@ -4,10 +4,12 @@ import { describe, expect, it } from "vitest";
 import choiceFixture from "./fixtures/traveldesk/capability-fixed-slot-choice.json";
 import listedChoiceFixture from "./fixtures/traveldesk/capability-listed-starts-choice.json";
 import listedSingleFixture from "./fixtures/traveldesk/capability-listed-start-single.json";
+import ticketFixture from "./fixtures/traveldesk/capability-ticket-open-dated.json";
 import tourFixture from "./fixtures/traveldesk/tour-5.json";
 import { storedOffer, storedSlot } from "./fixtures/traveldesk-terms";
 import { tourDetailFrom, tourDetailsWire, type TravelDeskOffer } from "../traveldesk/traveldesk.codec";
 import {
+  bookingKindSellable,
   capabilityVerdict,
   classKeyOf,
   deriveCapabilities,
@@ -18,6 +20,7 @@ import {
   neverEnabledReason,
   parseClassKey,
   SEEDED_CLASS_KEYS,
+  TICKET_CLASS_KEYS,
   UNKNOWN_CLASS,
   type CapabilityFlagState,
   type DerivedCapability,
@@ -136,11 +139,15 @@ describe("class keys", () => {
     }
   });
 
-  it("per-unit, date-only, ticket, unknown and inquiry keys can never be switched on (owner decisions 6 and 7)", () => {
+  it("per-unit, date-only, other ticket, unknown and inquiry keys can never be switched on (owner decisions 6 and 7; Batch 5 builds one ticket key)", () => {
     expect(neverEnabledReason("live.listed_starts_customer_selected.self.internal.per_unit")).toBe("private_units_inquiry");
     expect(neverEnabledReason("live.fixed_slot_single.pickup_required.internal.mixed_person_plus_unit")).toBe("private_units_inquiry");
     expect(neverEnabledReason("live.date_only_no_slot_metadata.self.internal.per_person")).toBe("date_only_inquiry");
-    expect(neverEnabledReason("ticket.open_dated.self.internal.per_person")).toBe("ticket_booking_refused");
+    // Batch 5: the one open-dated, self-arrival, internal, per-person ticket key may be switched on (by approval, with evidence); no other ticket key.
+    expect(neverEnabledReason("ticket.open_dated.self.internal.per_person")).toBeNull();
+    expect(neverEnabledReason("ticket.open_dated.self.external.per_person")).toBe("ticket_booking_refused");
+    expect(neverEnabledReason("ticket.open_dated.pickup_required.internal.per_person")).toBe("ticket_booking_refused");
+    expect(neverEnabledReason("ticket.open_dated.self.internal.per_unit")).toBe("private_units_inquiry");
     expect(neverEnabledReason(UNKNOWN_CLASS)).toBe("not_a_class");
     expect(neverEnabledReason(INQUIRY_CLASS)).toBe("not_a_class");
     for (const k of SEEDED_CLASS_KEYS) expect(neverEnabledReason(k)).toBeNull();
@@ -393,7 +400,7 @@ describe("Batch 2 listed-start keys", () => {
     expect(capabilityVerdict(cap, { enabled: true, requiresOfferEvidence: true }, [{ classKey: SINGLE, offerTermsHash: HASH, revokedAt: null }], HASH).instant).toBe(false);
     expect(capabilityVerdict(cap, { enabled: true, requiresOfferEvidence: true }, [{ classKey: key, offerTermsHash: HASH, revokedAt: null }], HASH)).toEqual({ instant: true, classKey: key });
     // Its slots are all "any time" with a stored end, so the offer may sell as listed starts once the gate allows it.
-    const slots = (payload as { timeSlots: { isAnyTime: boolean; endMinutes: number | null }[] }).timeSlots;
+    const slots = (payload as { timeSlots: { isAnyTime: boolean; startMinutes: number; endMinutes: number | null }[] }).timeSlots;
     expect(listedStartsSellable(true, cap.classKey, slots)).toBe(true);
     expect(listedStartsSellable(false, cap.classKey, slots)).toBe(false);
   });
@@ -417,18 +424,28 @@ describe("Batch 2 listed-start keys", () => {
   });
 
   it("listed starts sell only when every slot is 'any time' with a stored end; fixed shapes and unknown slots never", () => {
-    const anyTime = (end: number | null) => ({ isAnyTime: true, endMinutes: end });
+    const anyTime = (end: number | null, start = 600) => ({ isAnyTime: true, startMinutes: start, endMinutes: end });
     const [single, choice] = LISTED_START_CLASS_KEYS;
     expect(listedStartsSellable(true, choice, [anyTime(660), anyTime(720)])).toBe(true);
     expect(listedStartsSellable(true, choice, [anyTime(660), anyTime(null)])).toBe(false);
-    expect(listedStartsSellable(true, single, [{ isAnyTime: false, endMinutes: 660 }])).toBe(false);
+    expect(listedStartsSellable(true, single, [{ isAnyTime: false, startMinutes: 600, endMinutes: 660 }])).toBe(false);
     expect(listedStartsSellable(true, "live.fixed_slot_choice.self.internal.per_person", [anyTime(660)])).toBe(false);
     expect(listedStartsSellable(true, single, [])).toBe(false);
     expect(listedStartsSellable(true, single, null)).toBe(false);
   });
 
+  it("a slot with no stored end sells when the offer's hours give one (OpenAPI TimeSlotPublicDto.endTime), never without them", () => {
+    const anyTime = (end: number | null, start = 600) => ({ isAnyTime: true, startMinutes: start, endMinutes: end });
+    const [, choice] = LISTED_START_CLASS_KEYS;
+    expect(listedStartsSellable(true, choice, [anyTime(660), anyTime(null)], 2)).toBe(true);
+    for (const hours of [undefined, null, 0, -1]) expect(listedStartsSellable(true, choice, [anyTime(660), anyTime(null)], hours)).toBe(false);
+    // A derived end past midnight is undocumented: unknown.
+    expect(listedStartsSellable(true, choice, [anyTime(null, 22 * 60)], 3)).toBe(false);
+    expect(listedStartsSellable(true, choice, [anyTime(null, 22 * 60)], 2)).toBe(true);
+  });
+
   it("only the two Batch 2 keys lift the listed-start refusal: a flagged pickup or external listed-start key never does", () => {
-    const anyTime = (end: number | null) => ({ isAnyTime: true, endMinutes: end });
+    const anyTime = (end: number | null, start = 600) => ({ isAnyTime: true, startMinutes: start, endMinutes: end });
     for (const shape of ["listed_start_single", "listed_starts_customer_selected"]) {
       for (const key of [`live.${shape}.pickup_required.internal.per_person`, `live.${shape}.self.external.per_person`, `live.${shape}.pickup_required.external.per_person`]) {
         expect(LISTED_START_CLASS_KEYS).not.toContain(key);
@@ -475,5 +492,112 @@ describe.skipIf(!HAS_LEDGER)("Batch 2 coverage over the 22 November 2026 catalog
       if (cap.dimensions.pricingUnit === "per_person") continue;
       expect(capabilityVerdict(cap, { enabled: true, requiresOfferEvidence: false }, [], HASH).instant).toBe(false);
     }
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * Batch 5: the one open-dated ticket key (doc 29 §3.3, §7.3)
+ * ------------------------------------------------------------------------ */
+
+const TICKET = "ticket.open_dated.self.internal.per_person";
+const ticketEvidence = (classKey: string) => (classKey === TICKET ? [{ classKey, offerTermsHash: HASH, revokedAt: null }] : []);
+/** Every composed ticket key the vocabulary allows, switched on without asking for evidence (a flag row that lies). */
+const ALL_TICKET_KEYS = ["self", "pickup_required"].flatMap((arrival) => ["internal", "external"].flatMap((route) => ["per_person", "per_unit", "mixed_person_plus_unit"].map((unit) => `ticket.open_dated.${arrival}.${route}.${unit}`)));
+
+describe("Batch 5 ticket key", () => {
+  it("is exactly one key, open dated, self arrival, internal, per person; sellable in principle and never seeded", () => {
+    expect([...TICKET_CLASS_KEYS]).toEqual([TICKET]);
+    expect(parseClassKey(TICKET)).toEqual({ fulfilment: "ticket", timeShape: "open_dated", arrival: "self", route: "internal", pricingUnit: "per_person" });
+    expect(neverEnabledReason(TICKET)).toBeNull();
+    expect(SEEDED_CLASS_KEYS).not.toContain(TICKET);
+    for (const k of ALL_TICKET_KEYS.filter((k) => k !== TICKET)) expect(neverEnabledReason(k), k).not.toBeNull();
+  });
+
+  it("contract fixture (synthetic) parses with the production schema, derives the ticket key, and is instant only with its flag on and evidence for it", () => {
+    const parsed = tourDetailsWire.safeParse(ticketFixture);
+    expect(parsed.success).toBe(true);
+    const detail = tourDetailFrom(parsed.data!);
+    expect(detail.warnings).toEqual([]);
+    const cap = deriveCapabilities(asStored(detail.offers[0]));
+    expect(cap.classKey).toBe(TICKET);
+    expect(cap.reviewReasons).toEqual([]);
+    expect(capabilityVerdict(cap, null, [], HASH)).toEqual({ instant: false, classKey: TICKET, reason: "flag_off" });
+    expect(capabilityVerdict(cap, { enabled: false, requiresOfferEvidence: true }, ticketEvidence(TICKET), HASH).instant).toBe(false);
+    // A flag row claiming no evidence is needed is not believed for a non-seeded key.
+    expect(capabilityVerdict(cap, { enabled: true, requiresOfferEvidence: false }, [], HASH)).toMatchObject({ instant: false, reason: "offer_evidence_missing" });
+    expect(capabilityVerdict(cap, { enabled: true, requiresOfferEvidence: true }, [{ classKey: SINGLE, offerTermsHash: HASH, revokedAt: null }], HASH).instant).toBe(false);
+    expect(capabilityVerdict(cap, { enabled: true, requiresOfferEvidence: true }, [{ classKey: TICKET, offerTermsHash: "e".repeat(64), revokedAt: null }], HASH).instant).toBe(false);
+    expect(capabilityVerdict(cap, { enabled: true, requiresOfferEvidence: true }, [{ classKey: TICKET, offerTermsHash: HASH, revokedAt: "2026-11-20T00:00:00Z" }], HASH).instant).toBe(false);
+    expect(capabilityVerdict(cap, { enabled: true, requiresOfferEvidence: true }, ticketEvidence(TICKET), HASH)).toEqual({ instant: true, classKey: TICKET });
+  });
+
+  it("the same ticket fixture with a slot, hotel pickup or an external route leaves the ticket key and can never be switched on", () => {
+    const base = (ticketFixture as { offers: Json[] }).offers[0];
+    const variant = (over: Json) => deriveCapabilities(asStored(tourDetailFrom(tourDetailsWire.parse({ ...ticketFixture, offers: [{ ...base, ...over }] })).offers[0]));
+    const slot = { id: 951, name: "Midnight", startTime: 0, endTime: 0, daysOffered: 0, isAnyTime: false, isOnRequest: false, minimumAdvancedBooking: 0, isExternal: false, offerId: 90051 };
+    const withSlot = variant({ timeSlots: [slot] });
+    expect(withSlot.classKey).toBe(UNKNOWN_CLASS);
+    expect(withSlot.reviewReasons).toContain("ticket_with_slots");
+    const pickup = variant({ isDirectReporting: false });
+    expect(pickup.classKey).toBe("ticket.open_dated.pickup_required.internal.per_person");
+    const external = variant({ isExternal: true });
+    expect(external.classKey).toBe("ticket.open_dated.self.external.per_person");
+    for (const cap of [withSlot, pickup, external]) {
+      expect(capabilityVerdict(cap, { enabled: true, requiresOfferEvidence: true }, [{ classKey: cap.classKey, offerTermsHash: HASH, revokedAt: null }], HASH).instant).toBe(false);
+    }
+  });
+
+  it("bookingKindSellable: the kind must agree with the class, and nothing passes a refused verdict", () => {
+    const yes = (classKey: string) => ({ instant: true as const, classKey });
+    expect(bookingKindSellable("live_book", yes(SINGLE))).toBe(true);
+    expect(bookingKindSellable("ticket_only", yes(TICKET))).toBe(true);
+    expect(bookingKindSellable("ticket_only", yes(SINGLE))).toBe(false);
+    expect(bookingKindSellable("live_book", yes(TICKET))).toBe(false);
+    expect(bookingKindSellable("ticket_only", yes("ticket.open_dated.self.external.per_person"))).toBe(false);
+    expect(bookingKindSellable("on_request", yes(SINGLE))).toBe(false);
+    expect(bookingKindSellable("unknown", yes(TICKET))).toBe(false);
+    expect(bookingKindSellable("ticket_only", { instant: false, classKey: TICKET, reason: "flag_off" })).toBe(false);
+    expect(bookingKindSellable("live_book", { instant: false, classKey: SINGLE, reason: "flag_off" })).toBe(false);
+  });
+});
+
+describe.skipIf(!HAS_LEDGER)("Batch 5 coverage over the 22 November 2026 catalogue", () => {
+  const verdictWith = (flags: Map<string, CapabilityFlagState>, evidence: (k: string) => { classKey: string; offerTermsHash: string; revokedAt: null }[]) =>
+    LEDGER.map((r) => {
+      const payload = offerFromLedger(r);
+      const cap = deriveCapabilities(payload);
+      const v = capabilityVerdict(cap, flags.get(cap.classKey) ?? null, evidence(cap.classKey), HASH);
+      const kind = r.bookingKind;
+      return { r, payload, cap, v, sellable: bookingKindSellable(kind, v) };
+    });
+
+  it("with the ticket flag off (no row), the gate and the kind check pass exactly the 16 Batch 0 offers, never more than the old gate", () => {
+    const rows = verdictWith(SEEDED_FLAGS, () => []);
+    const passed = rows.filter((x) => x.sellable).map((x) => x.r.offerId);
+    for (const x of rows.filter((x) => x.sellable)) expect(legacyLiveBookGate(x.payload)).toBe(true);
+    expect(passed.sort()).toEqual(LEDGER.filter((r) => r.planBatch === "B0").map((r) => r.offerId).sort());
+    expect(rows.some((x) => x.sellable && x.cap.dimensions.fulfilment === "ticket")).toBe(false);
+  });
+
+  it("with the ticket flag on and per-offer evidence, exactly the 54 Batch 5 offers are added; offer 1592 never passes", () => {
+    const flags = new Map<string, CapabilityFlagState>([...SEEDED_FLAGS, [TICKET, { enabled: true, requiresOfferEvidence: true }]]);
+    const rows = verdictWith(flags, ticketEvidence);
+    const tickets = rows.filter((x) => x.sellable && x.cap.classKey === TICKET).map((x) => x.r.offerId);
+    const want = LEDGER.filter((r) => r.planBatch === "B5").map((r) => r.offerId);
+    expect(want).toHaveLength(54);
+    expect(tickets.sort()).toEqual(want.sort());
+    expect(rows.filter((x) => x.sellable).length).toBe(16 + 54);
+    expect(rows.find((x) => x.r.offerId === "1592")!.sellable).toBe(false);
+    // The ticket offers sell only as TicketOnly, never under a live-book mapping.
+    for (const x of rows.filter((x) => x.cap.classKey === TICKET)) expect(bookingKindSellable("live_book", x.v)).toBe(false);
+  });
+
+  it("with every ticket key switched on and evidence for each, still only the 54 internal self-arrival offers pass", () => {
+    const flags = new Map<string, CapabilityFlagState>([...SEEDED_FLAGS, ...ALL_TICKET_KEYS.map((k) => [k, { enabled: true, requiresOfferEvidence: false }] as const)]);
+    const rows = verdictWith(flags, (k) => [{ classKey: k, offerTermsHash: HASH, revokedAt: null }]);
+    const tickets = rows.filter((x) => x.sellable && x.cap.dimensions.fulfilment === "ticket");
+    expect(tickets).toHaveLength(54);
+    expect(tickets.every((x) => x.cap.classKey === TICKET)).toBe(true);
+    expect(rows.find((x) => x.r.offerId === "1592")!.v.instant).toBe(false);
   });
 });

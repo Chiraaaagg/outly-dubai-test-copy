@@ -12,7 +12,12 @@ export interface PickupHotelOption {
   area: string | null;
 }
 
-export type PickupHotelList = { status: "ready"; hotels: PickupHotelOption[] } | { status: "unavailable" };
+/**
+ * `not_offered`: the server sells no instant pickup for that variant (review
+ * 83 L7). Asking again cannot help, so it is kept like a list; the page
+ * offers the inquiry only. `unavailable`: the list could not be read now.
+ */
+export type PickupHotelList = { status: "ready"; hotels: PickupHotelOption[] } | { status: "not_offered" } | { status: "unavailable" };
 
 const TTL_MS = 5 * 60_000;
 const cache = new Map<string, { at: number; promise: Promise<PickupHotelList> }>();
@@ -29,12 +34,13 @@ async function load(productId: string, variantId: string): Promise<PickupHotelLi
   const qs = new URLSearchParams({ productId, variantId });
   const res = await fetch(`/api/catalog/pickup-hotels?${qs}`, { credentials: "omit", headers: { accept: "application/json" } });
   if (!res.ok) return { status: "unavailable" };
-  const body = (await res.json()) as { ok?: boolean; hotels?: unknown };
+  const body = (await res.json()) as { ok?: boolean; hotels?: unknown; reason?: unknown };
+  if (body.ok === false && body.reason === "not_offered") return { status: "not_offered" };
   if (body.ok !== true || !Array.isArray(body.hotels)) return { status: "unavailable" };
   return { status: "ready", hotels: body.hotels.filter(isHotel) };
 }
 
-/** The list for one variant. Never rejects: any failure is `unavailable`, which is not kept. */
+/** The list for one variant. Never rejects: any failure is `unavailable`, which is not kept (`not_offered` and a list are). */
 export function fetchPickupHotels(productId: string, variantId: string, now = Date.now()): Promise<PickupHotelList> {
   const key = `${productId}:${variantId}`;
   const hit = cache.get(key);
@@ -42,7 +48,7 @@ export function fetchPickupHotels(productId: string, variantId: string, now = Da
   const promise = load(productId, variantId)
     .catch((): PickupHotelList => ({ status: "unavailable" }))
     .then((r) => {
-      if (r.status !== "ready") cache.delete(key);
+      if (r.status === "unavailable") cache.delete(key);
       return r;
     });
   cache.set(key, { at: now, promise });

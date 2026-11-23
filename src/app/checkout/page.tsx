@@ -59,7 +59,17 @@ import { resumePayment } from "@/lib/resume-payment";
 import { inquiryHref, inquiryReasonForQuote, inquiryReasonText, type InquiryReason } from "@/lib/inquiry-handoff";
 import { retimeHrefFor } from "@/lib/start-time-retry";
 import { PickupHotelFields, usePickupHotelLists } from "@/components/checkout/pickup-hotel-fields";
-import { CART_HOTEL_FIELD, initialCartHotel, itemHotelField, pickupErrors, pickupItemsFor, pickupPlan, pickupUpdates } from "@/lib/pickup-selection";
+import {
+  CART_HOTEL_FIELD,
+  initialCartHotel,
+  itemHotelField,
+  pickupErrors,
+  pickupItemsFor,
+  pickupPlan,
+  pickupUpdates,
+  refusedPickupHotels,
+  withoutRefusedHotels,
+} from "@/lib/pickup-selection";
 import type { PickupHotelChoice } from "@/lib/types";
 
 /**
@@ -279,7 +289,11 @@ export default function CheckoutPage() {
   const cartHotelStarted = useRef(false);
   const leavingForInquiry = useRef(false);
   const focusHotelField = useRef(false);
-  const plan = useMemo(() => pickupPlan(pickupItems, pickupLists, cartHotel), [pickupItems, pickupLists, cartHotel]);
+  // Hotels the quote refused on this page are no longer offered (review 83 L8), so "Choose another hotel" cannot loop.
+  const [refusedHotelIds, setRefusedHotelIds] = useState<ReadonlySet<string>>(() => new Set());
+  const refusedPickup = useRef<string[]>([]);
+  const shownPickupLists = useMemo(() => withoutRefusedHotels(pickupLists, refusedHotelIds), [pickupLists, refusedHotelIds]);
+  const plan = useMemo(() => pickupPlan(pickupItems, shownPickupLists, cartHotel), [pickupItems, shownPickupLists, cartHotel]);
   // The kept choice comes back after a reload, Edit or the inquiry form and back.
   useEffect(() => {
     if (!hydrated || cartHotelStarted.current || !pickupItems.length) return;
@@ -501,6 +515,7 @@ export default function CheckoutPage() {
         // or, when only a start time was refused, another time first (Batch 2).
         setRetimeHref(retimeHrefFor(r.lines, cart, activities));
         setInquiryReason(inquiryReasonForQuote(r.lines.map((l) => l.reason)));
+        refusedPickup.current = refusedPickupHotels(r.lines, cart).hotelIds;
         setQuoteState("idle");
         return null;
       }
@@ -1024,6 +1039,12 @@ export default function CheckoutPage() {
                       variant="outline"
                       onClick={() => {
                         focusHotelField.current = true;
+                        // Drop the refused hotels from the choices and from the cart field; the plan then clears the lines.
+                        const refused = refusedPickup.current;
+                        if (refused.length) {
+                          setRefusedHotelIds((prev) => new Set([...prev, ...refused]));
+                          if (cartHotel?.hotelId && refused.includes(cartHotel.hotelId)) setCartHotel(null);
+                        }
                         setRetimeHref(null);
                         setInquiryReason(null);
                         editDetails();
@@ -1107,7 +1128,7 @@ export default function CheckoutPage() {
                   <PickupHotelFields
                     label="Hotel for pickup"
                     plan={plan}
-                    lists={pickupLists}
+                    lists={shownPickupLists}
                     cartHotel={cartHotel}
                     onCartHotel={(h) => {
                       setCartHotel(h);

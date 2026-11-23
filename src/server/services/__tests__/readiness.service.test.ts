@@ -532,7 +532,7 @@ describe("doc 29 Batch 2: listed starts pass the time rule only with their flag 
   const page = instantDoc({ timeSlots: ["10:00", "13:00", "16:00"] });
 
   it("an 'any time' offer sold as listed starts is instant when the page lists exactly those starts", async () => {
-    expect(READINESS_RULES_VERSION).toBe(9);
+    expect(READINESS_RULES_VERSION).toBe(11);
     expect(await reasonsFor(product({}, page), [listed()])).toMatchObject({ effective: "instant", reasons: [] });
     expect(slotTimesAgree(["16:00", "10:00", "13:00"], listed())).toBe("ok");
   });
@@ -571,5 +571,50 @@ describe("doc 29 Batch 2: listed starts pass the time rule only with their flag 
       ],
     } as never);
     expect(out.map((o) => o.listedStartsSellable)).toEqual([true, false, false]);
+  });
+});
+
+describe("doc 29 Batch 5: open-dated tickets pass the time rule only with their ticket key on", () => {
+  const ticket = (over: Partial<MappingReadiness> = {}) => mapping({ slotStartMinutes: [], anyTimeSlots: false, openDatedSellable: true, ...over });
+  const page = instantDoc({ timeSlots: [] });
+
+  it("a sellable ticket offer with no page times and no stored slots is instant, non-refundable", async () => {
+    expect(await reasonsFor(product({}, page), [ticket()])).toMatchObject({ effective: "instant", reasons: [] });
+    expect(slotTimesAgree([], ticket())).toBe("ok");
+  });
+
+  it("with the ticket key off (the flag's default), the same product is inquiry: no times on the page cannot pass", async () => {
+    // What mappingReadinessFor reports while the flag is off: not sellable, so the capability blocker too.
+    const off = ticket({ openDatedSellable: false, capabilityReady: false });
+    const r = await reasonsFor(product({}, page), [off]);
+    expect(r.effective).toBe("inquiry");
+    expect(r.reasons).toEqual(expect.arrayContaining(["capability_not_ready", "slot_times_mismatch"]));
+    expect(slotTimesAgree([], ticket({ openDatedSellable: null }))).toBe("slot_times_mismatch");
+  });
+
+  it("a ticket page that offers a time, an offer with stored slots or unknown slots never passes", () => {
+    expect(slotTimesAgree(["09:00"], ticket())).toBe("slot_times_mismatch");
+    expect(slotTimesAgree([], ticket({ slotStartMinutes: [540] }))).toBe("slot_times_mismatch");
+    expect(slotTimesAgree([], ticket({ slotStartMinutes: null }))).toBe("slot_times_mismatch");
+    expect(slotTimesAgree([], ticket({ anyTimeSlots: null }))).toBe("slot_times_mismatch");
+  });
+
+  it("a ticket page promising free cancellation is refused, even if the ticket evidence says no tickets at confirm", async () => {
+    const generous = instantDoc({ timeSlots: [], freeCancellationHours: 24, cancellationPolicy: policyText(24) });
+    const r = await reasonsFor(product({}, generous), [ticket({ issuesTicketsAtConfirm: "no", supplierFreeCancellationHours: 48 })]);
+    expect(r.effective).toBe("inquiry");
+    expect(r.reasons).toContain("policy_exceeds_supplier");
+  });
+
+  it("the catalogue fact reaches readiness only when the catalogue says so", () => {
+    const base = { productId: PRODUCT_ID, environment: "test" as const, evaluatedAt: "2030-01-01T00:00:00Z" };
+    const facts = (openDatedSellable: unknown) =>
+      fromCatalogReadiness({
+        ...base,
+        variants: [{ variantCode: "shared", blockers: [], mapping: { mappingId: "m", variantCode: "shared", environment: "test", isActive: true, syncStatus: "ok", lastSyncedAt: null, bookingKind: "ticket_only", tourExternalId: "1", offerExternalId: "2", approvedOfferHash: "a".repeat(64), currentOfferHash: "a".repeat(64), issuesTicketsAtConfirm: "yes", openDatedSellable } as never }],
+      })[0];
+    expect(facts(true).openDatedSellable).toBe(true);
+    expect(facts("true").openDatedSellable).toBe(false);
+    expect(facts(undefined).openDatedSellable).toBe(false);
   });
 });

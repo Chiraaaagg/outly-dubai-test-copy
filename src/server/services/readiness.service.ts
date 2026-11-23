@@ -53,9 +53,12 @@ import type { ProductMappingReadiness, VariantMappingState } from "./supplier-ca
  *    are unknown does not pass. An offer with an "any time" slot is
  *    `slot_any_time_unsupported`, unless it sells as a choice among its
  *    listed starts (doc 29 Batch 2, `listedStartsSellable`: its exact
- *    listed-start class key is switched on and every slot has a stored end);
+ *    listed-start class key is switched on and every slot has a known end:
+ *    stored, or start plus the offer's hours, Batch 3b `slotEndMinutes`);
  *    then the same set equality applies to its listed starts. Never an
- *    arbitrary time;
+ *    arbitrary time. An open-dated ticket (doc 29 Batch 5,
+ *    `openDatedSellable`: its ticket key switched on, with evidence) passes
+ *    only with no page times and no stored slots, and only non-refundable;
  *  - page price equals quote price: every unit is one of the page's pax
  *    types and its authored price equals the price the activity page shows
  *    for that type (`unit_price_mismatch`);
@@ -96,8 +99,14 @@ import type { ProductMappingReadiness, VariantMappingState } from "./supplier-ca
  * 8 (doc 29 Batch 1b, review R2): the age is the mapped offer's own last successful read, no later
  * than the latest complete run (which must have read at least one tour).
  * 9 (doc 29 Batch 2): an "any time" offer passes the time rule when it sells as listed starts.
+ * 10 (doc 29 Batch 5): an open-dated ticket offer whose ticket key is switched on passes the time rule
+ * with no page times and no stored slots, and only with a non-refundable page (0 hours).
+ * 11 (doc 29 Batch 3b, TravelDesk OpenAPI `TimeSlotPublicDto.endTime`): a listed-start offer whose slot
+ * has no stored end now passes `listedStartsSellable` when the end derives from the offer's hours
+ * (start + numberOfHours x 60, not past midnight; `slotEndMinutes`). Bumped at the Batch 3b + 5 merge:
+ * Batch 3b changed this fact without a bump, and Batch 5 had taken 10.
  */
-export const READINESS_RULES_VERSION = 9;
+export const READINESS_RULES_VERSION = 11;
 
 /**
  * Per-mapping facts the readiness rules need, adapted from the supplier
@@ -137,6 +146,8 @@ export interface MappingReadiness {
   anyTimeSlots?: boolean | null;
   /** Doc 29 Batch 2: the offer sells as a choice among its listed starts (flag on for its exact key). Absent or null = no. */
   listedStartsSellable?: boolean | null;
+  /** Doc 29 Batch 5: the offer is an open-dated ticket sold instantly (flag on for the ticket key, with evidence). Absent or null = no. */
+  openDatedSellable?: boolean | null;
 }
 
 export interface MappingReadinessSource {
@@ -177,7 +188,9 @@ export type ReadinessTrigger =
   /** Per-offer enablement evidence was recorded or revoked (doc 29 §3.3). */
   | "offer_evidence"
   /** A scheduled catalogue sync did not complete: the catalogue's age is re-checked (doc 29 Batch 1b). */
-  | "catalogue_age";
+  | "catalogue_age"
+  /** An administrator re-ran readiness from stored facts, without supplier calls (doc 29 §9.4). */
+  | "admin_rerun";
 
 /** Settings whose values the margin rule reads; writing one re-runs readiness (`reevaluateAfterSetting`). */
 export const PRICING_SETTING_KEYS: readonly string[] = [MARGIN_POLICY_SETTING_KEY, FX_INR_PER_AED_SETTING_KEY, MARGIN_COST_INPUTS_SETTING_KEY];
@@ -288,8 +301,10 @@ export function pageStartMinutes(time: string): number | null {
  */
 export function slotTimesAgree(
   pageTimes: readonly string[],
-  m: Pick<MappingReadiness, "slotStartMinutes" | "anyTimeSlots" | "listedStartsSellable">,
+  m: Pick<MappingReadiness, "slotStartMinutes" | "anyTimeSlots" | "listedStartsSellable" | "openDatedSellable">,
 ): "ok" | "slot_times_mismatch" | "slot_any_time_unsupported" {
+  // Batch 5: an open-dated ticket has no start time. The page must offer none, and the offer must store none.
+  if (m.openDatedSellable === true) return pageTimes.length === 0 && Array.isArray(m.slotStartMinutes) && m.slotStartMinutes.length === 0 && m.anyTimeSlots === false ? "ok" : "slot_times_mismatch";
   if (m.anyTimeSlots === null || m.anyTimeSlots === undefined) return "slot_times_mismatch";
   // Batch 2: "any time" sells only as one of the listed starts, below, and only with its flag on.
   if (m.anyTimeSlots === true && m.listedStartsSellable !== true) return "slot_any_time_unsupported";
@@ -391,6 +406,8 @@ export async function assessReadiness(input: ReadinessInput): Promise<ReadinessA
     const times = slotTimesAgree(activity.timeSlots, m);
     if (times !== "ok") reasons.add(times);
     if (!policyWithinSupplier(activity.freeCancellationHours, m)) reasons.add("policy_exceeds_supplier");
+    // Batch 5: issued tickets can never be cancelled, so a ticket page offers no free cancellation, whatever evidence says.
+    if (m.openDatedSellable === true && activity.freeCancellationHours !== 0) reasons.add("policy_exceeds_supplier");
     if (!pickupAgrees(activity.pickupIncluded, m.pickupOffered ?? null)) reasons.add("safety_fact_unknown");
     if (!units.every((u) => unitPriceShown(activity, v, u))) reasons.add("unit_price_mismatch");
     if (units.some(unitRestricted)) reasons.add("safety_fact_unknown");
@@ -666,6 +683,7 @@ export function fromCatalogReadiness(r: ProductMappingReadiness): MappingReadine
       slotStartMinutes: startsOf(extra.slotStartMinutes),
       anyTimeSlots: typeof extra.anyTimeSlots === "boolean" ? extra.anyTimeSlots : null,
       listedStartsSellable: extra.listedStartsSellable === true,
+      openDatedSellable: extra.openDatedSellable === true,
     });
   }
   return [...out.values()];
@@ -691,6 +709,15 @@ function asReasons(raw: unknown): ReadinessReason[] {
   return Array.isArray(raw) ? (raw.filter((r) => typeof r === "string") as ReadinessReason[]) : [];
 }
 
+/** Products requested instant or with an instant verdict on record: every product whose storefront mode readiness can change. */
+export async function listInstantCandidates(): Promise<string[]> {
+  const [requested, verdicts] = await Promise.all([
+    prisma.product.findMany({ where: { fulfilmentMode: "instant" }, select: { id: true } }),
+    prisma.productEligibility.findMany({ where: { effectiveMode: "instant" }, select: { productId: true } }),
+  ]);
+  return [...new Set([...requested.map((p) => p.id), ...verdicts.map((r) => r.productId)])];
+}
+
 export const readinessService = createReadinessService({
   async loadProducts(ids) {
     return prisma.product.findMany({ where: { id: { in: ids } }, select: { id: true, status: true, deletedAt: true, fulfilmentMode: true, content: true, version: true } });
@@ -702,13 +729,7 @@ export const readinessService = createReadinessService({
     const rows = await prisma.productEligibility.findMany({ where: { productId: { in: ids } }, select: { productId: true, effectiveMode: true, reasons: true, readinessVersion: true } });
     return new Map(rows.map((r) => [r.productId, { effectiveMode: r.effectiveMode, reasons: asReasons(r.reasons), readinessVersion: r.readinessVersion }]));
   },
-  async listInstantCandidates() {
-    const [requested, verdicts] = await Promise.all([
-      prisma.product.findMany({ where: { fulfilmentMode: "instant" }, select: { id: true } }),
-      prisma.productEligibility.findMany({ where: { effectiveMode: "instant" }, select: { productId: true } }),
-    ]);
-    return [...new Set([...requested.map((p) => p.id), ...verdicts.map((r) => r.productId)])];
-  },
+  listInstantCandidates,
   async writeEligibility(productId, row) {
     const data = { effectiveMode: row.effectiveMode, reasons: row.reasons, readinessVersion: row.readinessVersion, evaluatedAt: row.evaluatedAt };
     await prisma.productEligibility.upsert({ where: { productId }, create: { productId, ...data }, update: data });

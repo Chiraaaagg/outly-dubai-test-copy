@@ -117,6 +117,14 @@ describe("TravelDesk statuses as the engine sees them", () => {
     for (const s of [2, 3, 6, 99]) expect(travelDeskStatus({ status: s, externalInProgress: false, externalFailed: false })).toBe("UNKNOWN");
   });
 
+  it("payment failed (6, with the supplier's message) and payment required (3) stay unknown; the message never reaches the snapshot", () => {
+    for (const status of [3, 6]) {
+      const s = snapshotFrom(booking({ status, paymentErrorMessage: "Insufficient balance" }));
+      expect(s).toMatchObject({ status: "UNKNOWN", rawStatus: status });
+      expect(JSON.stringify(s, (_k, v) => (typeof v === "bigint" ? v.toString() : v))).not.toContain("Insufficient");
+    }
+  });
+
   it("keeps the raw status in the snapshot for the predicate, and no ticket claim it cannot make", () => {
     const s = snapshotFrom(booking({ status: 5, reservationDeadline: null }));
     expect(s).toMatchObject({ ref: "100", status: "CONFIRMED", rawStatus: 5, holdExpiresAtUtc: null, ticketsIssued: null, chargedNetMinor: 24_000n });

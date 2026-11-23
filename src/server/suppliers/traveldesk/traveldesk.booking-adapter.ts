@@ -107,7 +107,11 @@ export function travelDeskStatus(r: Pick<TravelDeskBooking, "status" | "external
     case 5:
       return r.externalInProgress === true && r.externalFailed !== true ? "PENDING" : "CONFIRMED";
     default:
-      return "UNKNOWN"; // 2 on-request, 3 payment required, 6 payment failed, codes not in the spec
+      // 2 on-request, 3 payment required, 6 payment failed, codes not in the spec. 6 stays unknown (OpenAPI,
+      // 22 Nov 2026: "PaymentFailed", with `paymentErrorMessage`, e.g. balance): the spec does not say the
+      // booking holds no seats, was not charged, or cannot still be paid and confirmed (Q-B11 open), and the
+      // engine treats no REJECTED as definite yet. Unknown keeps recovery and a human in the loop.
+      return "UNKNOWN";
   }
 }
 
@@ -134,6 +138,7 @@ export function snapshotFrom(r: TravelDeskBooking, holdCapUtc: string | null = n
     status,
     holdExpiresAtUtc: status === "ON_HOLD" ? earliest(r.reservationDeadline, holdCapUtc) : null,
     ticketsIssued: ticketsReturned || r.hasTickets ? true : null,
+    ...(r.ticketsValidUntil ? { ticketsValidUntil: r.ticketsValidUntil } : {}),
     // The supplier wallet book's refund figure (wallet-ledger.ts); absent means TravelDesk did not say.
     refundedNetMinor: r.refundMinor,
   };

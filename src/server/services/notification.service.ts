@@ -12,6 +12,8 @@ import { emitEvent } from "../lib/structured-events";
 import { analyticsService } from "./analytics.service";
 import { capabilityService } from "./capability.service";
 import { documentService } from "./document.service";
+import { ticketFactsForOrder } from "./ticket-facts.service";
+import { ticketTypeLine } from "@/lib/ticket-validity";
 import type { AgentPublic, InquiryDetail } from "./inquiry.types";
 import { dedupKeyOf, type CapabilityIssuedFor, type TicketMessageRef } from "../documents/contracts";
 import {
@@ -279,10 +281,15 @@ async function prepareTicketMessage(row: Notification, ref: TicketMessageRef, no
 
   const e = env();
   const firstName = order.leadName.trim().split(/\s+/)[0] || undefined;
+  // Doc 29 Batch 5: an open-dated ticket item adds its validity and ticket types (never a code).
+  const tickets = await ticketFactsForOrder(ref.orderId, { orderItemIds: [ref.orderItemId] });
   const rendered = renderTicketsReady({
     firstName,
     orderReference: order.reference,
-    items: order.items.map((i) => ({ title: i.titleSnapshot, dateLabel: dateLabel(i.serviceDate) })),
+    items: order.items.map((i) => {
+      const t = tickets.get(ref.orderItemId);
+      return { title: i.titleSnapshot, dateLabel: dateLabel(i.serviceDate), ...(t ? { ticket: { validityCopy: t.validityCopy, types: t.types.map(ticketTypeLine) } } : {}) };
+    }),
     link: ticketLink(e.NEXT_PUBLIC_SITE_URL, token),
     expiresLabel: dateLabel(expiresAt),
     supportEmail: e.NEXT_PUBLIC_SUPPORT_EMAIL ?? e.EMAIL_REPLY_TO,

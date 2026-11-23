@@ -6,7 +6,9 @@ import { chargedTotal } from "./order.service";
 import { documentService } from "./document.service";
 import { orderAccessService, type OrderAccess } from "./order-access.service";
 import { evaluateCancellation, loadCancellationFacts, serviceStartUtc, type CancellationFacts } from "./cancellation.service";
-import { freeCancellationCopy } from "@/lib/utils";
+import { ticketFactsForOrder } from "./ticket-facts.service";
+import type { CustomerTicketFacts } from "@/lib/ticket-validity";
+import { freeCancellationCopy, TICKET_NON_REFUNDABLE_STATEMENT } from "@/lib/utils";
 import {
   formatDubaiAndUtc,
   remedySentence,
@@ -90,6 +92,8 @@ export interface StatusItemSnapshot {
   ticketsEmailed?: boolean;
   /** An `instant_checkout` item: the order's payment saga covers it even when it names another item (multi-item). */
   instant?: boolean;
+  /** Doc 29 Batch 5: an open-dated ticket item (no codes); absent or null for other items. */
+  ticket?: CustomerTicketFacts | null;
 }
 
 export interface StatusSnapshot {
@@ -546,9 +550,11 @@ function words(
 
 /** The item's cancellation statement in the quote's words (CO-01); none once the item is no longer a live booking. */
 function cancellationTermsOf(item: StatusItemSnapshot, state: CustomerOrderState): string | null {
+  if (["refunded", "payment_released", "payment_failed", "refund_processing", "cancelled", "completed"].includes(state)) return null;
+  // Doc 29 Batch 5: a ticket item's one statement, whatever policy was stored.
+  if (item.ticket) return TICKET_NON_REFUNDABLE_STATEMENT;
   const p = item.cancellation?.policy;
   if (!p) return null;
-  if (["refunded", "payment_released", "payment_failed", "refund_processing", "cancelled", "completed"].includes(state)) return null;
   return freeCancellationCopy(p.nonRefundableAfterConfirm ? null : p.freeCancellationUntilUtc);
 }
 
@@ -598,6 +604,7 @@ export function projectCustomerStatus(s: StatusSnapshot, now: Date): CustomerOrd
     refundUntilUtc: refundUntil(item),
     cancellationTerms: cancellationTermsOf(item, itemSt),
     cancellation: cancellationView(item, itemSt, now),
+    ...(item.ticket ? { ticket: { validUntil: item.ticket.validUntil, validityCopy: item.ticket.validityCopy, nonRefundableCopy: item.ticket.nonRefundableCopy, types: item.ticket.types.map((t) => ({ label: t.label, count: t.count })) } } : {}),
   }));
 
   const ahead = items.map((i) => i.refundUntilUtc).filter((t): t is string => Boolean(t) && Date.parse(t!) > now.getTime());
@@ -665,11 +672,12 @@ export async function loadStatusSnapshot(access: Pick<OrderAccess, "orderId" | "
   });
   if (!order) return null;
   const itemIds = order.items.map((i) => i.id);
-  const [refunds, tickets, facts, ticketEmails] = await Promise.all([
+  const [refunds, tickets, facts, ticketEmails, ticketFacts] = await Promise.all([
     itemIds.length ? prisma.refund.findMany({ where: { orderItemId: { in: itemIds } }, select: { orderItemId: true, status: true, createdAt: true, updatedAt: true } }) : Promise.resolve([]),
     documentService.listForOrder(access.orderId),
     loadCancellationFacts(access.orderId),
     prisma.notification.findMany({ where: { orderId: access.orderId, event: "TICKETS_READY", status: { in: ["sent", "delivered", "read"] } }, select: { payload: true } }),
+    ticketFactsForOrder(access.orderId),
   ]);
   const emailedItems = new Set(ticketEmails.map((n) => (n.payload as { orderItemId?: unknown } | null)?.orderItemId).filter((x): x is string => typeof x === "string"));
   const payment = order.paymentSaga?.paymentId ? (order.payments.find((p) => p.id === order.paymentSaga!.paymentId) ?? null) : (order.payments[0] ?? null);
@@ -707,6 +715,7 @@ export async function loadStatusSnapshot(access: Pick<OrderAccess, "orderId" | "
         cancellation: facts.get(item.id) ?? null,
         ticketsEmailed: emailedItems.has(item.id),
         instant: item.fulfilmentOrigin === "instant_checkout",
+        ticket: ticketFacts.get(item.id) ?? null,
       };
     }),
   };

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { slotEndMinutes } from "./traveldesk.offer-terms";
 
 /**
  * Booking capability of one TravelDesk offer (doc 29 §3.1, §3.3; Batch 1a).
@@ -85,13 +86,19 @@ export const LISTED_START_CLASS_KEYS: readonly string[] = Object.freeze([
  * one of the two `LISTED_START_CLASS_KEYS` (self arrival, internal route, per
  * person; a listed-start key with pickup or an external route is never
  * lifted here, even if its flag were on, because Batch 2 never proved it), and
- * every stored slot is an "any time" slot whose end time is stored, because
- * the booking sends the stored end (engine-saga.service.ts). Unknown slots
- * never pass.
+ * every stored slot is an "any time" slot whose end time is known: stored,
+ * or start plus the offer's hours when none is stored (`slotEndMinutes`,
+ * OpenAPI `TimeSlotPublicDto.endTime`), because the booking sends that end
+ * (engine-saga.service.ts). Unknown slots or hours never pass.
  */
-export function listedStartsSellable(gateAllows: boolean, classKey: string, slots: readonly { isAnyTime: boolean; endMinutes: number | null }[] | null | undefined): boolean {
+export function listedStartsSellable(
+  gateAllows: boolean,
+  classKey: string,
+  slots: readonly { isAnyTime: boolean; startMinutes: number; endMinutes: number | null }[] | null | undefined,
+  durationHours?: number | null,
+): boolean {
   if (!gateAllows || !LISTED_START_CLASS_KEYS.includes(classKey) || !slots || slots.length === 0) return false;
-  return slots.every((s) => s.isAnyTime && s.endMinutes !== null);
+  return slots.every((s) => s.isAnyTime && slotEndMinutes(s, durationHours) !== null);
 }
 
 /**
@@ -113,6 +120,37 @@ export const PICKUP_CLASS_KEYS: readonly string[] = Object.freeze([
   "live.fixed_slot_single.pickup_required.internal.per_person",
   "live.fixed_slot_choice.pickup_required.internal.per_person",
 ]);
+
+/**
+ * The one Batch 5 key (doc 29 §3.3, §7.3 Batch 5): an open-dated TicketOnly
+ * offer, self arrival, internal route, per-person price; 54 offers in the
+ * coverage ledger. Booked like a live offer, in two steps (reserve holds the
+ * stock, confirm issues the codes; TEST drill, doc 22 §32.44), and the
+ * confirm is only sent after captured payment, so the irreversible moment
+ * comes after the money is taken. **Not seeded**: no flag row means off.
+ * Switching it on goes through the approval path with per-offer evidence for
+ * this exact key (`capabilityVerdict`), and needs TravelDesk's written
+ * permission (Q11, Q13) and the owner's approval first. Every other ticket
+ * key stays refused (`neverEnabledReason`): pickup tickets were never proven,
+ * and the external ticket offer 1592 has a slot, so it derives `unknown`.
+ */
+export const TICKET_CLASS_KEYS: readonly string[] = Object.freeze(["ticket.open_dated.self.internal.per_person"]);
+
+/**
+ * Whether a booking of `bookingKind` may be sold for an offer whose gate
+ * verdict is `verdict` (doc 29 Batch 5): the gate allowed the offer, and the
+ * kind agrees with the class's fulfilment. A live-book offer needs a live
+ * class; a TicketOnly offer needs one of `TICKET_CLASS_KEYS`. Readiness, the
+ * saga intake and the engine intake all ask this, so a ticket offer is never
+ * more sellable than its flag, and a mapping whose kind disagrees with its
+ * stored offer is refused.
+ */
+export function bookingKindSellable(bookingKind: string, verdict: CapabilityVerdict): boolean {
+  if (!verdict.instant) return false;
+  if (bookingKind === "live_book") return parseClassKey(verdict.classKey)?.fulfilment === "live";
+  if (bookingKind === "ticket_only") return TICKET_CLASS_KEYS.includes(verdict.classKey);
+  return false;
+}
 
 export interface CapabilityDimensions {
   fulfilment: CapFulfilment;
@@ -230,8 +268,9 @@ export function parseClassKey(key: string): CapabilityDimensions | null {
  *    (owner decision 7, 22 Nov 2026: private units stay inquiry);
  *  - `date_only_inquiry`: no slot metadata (owner decision 6: date-only stays
  *    inquiry until TravelDesk answers Q5);
- *  - `ticket_booking_refused`: ticket booking is refused by the engine until
- *    Batch 5 builds it.
+ *  - `ticket_booking_refused`: a ticket class other than the one Batch 5
+ *    builds (`TICKET_CLASS_KEYS`: open dated, self arrival, internal, per
+ *    person). Pickup and external tickets were never proven.
  * The database refuses an enabled per-unit flag as well (migration 20261122120000).
  */
 export function neverEnabledReason(key: string): "not_a_class" | "private_units_inquiry" | "date_only_inquiry" | "ticket_booking_refused" | null {
@@ -239,7 +278,7 @@ export function neverEnabledReason(key: string): "not_a_class" | "private_units_
   if (!d) return "not_a_class";
   if (d.pricingUnit === "per_unit" || d.pricingUnit === "mixed_person_plus_unit") return "private_units_inquiry";
   if (d.timeShape === "date_only_no_slot_metadata") return "date_only_inquiry";
-  if (d.fulfilment === "ticket") return "ticket_booking_refused";
+  if (d.fulfilment === "ticket" && !TICKET_CLASS_KEYS.includes(key)) return "ticket_booking_refused";
   return null;
 }
 

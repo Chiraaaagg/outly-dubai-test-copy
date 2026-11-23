@@ -16,6 +16,7 @@ import {
   supplierBookingService,
   TRAVELDESK_SUPPLIER_CODE,
 } from "@/server/services/supplier-booking.service";
+import { type ReadinessRerunResult, rerunReadiness } from "@/server/services/readiness-rerun.service";
 import { supplierCatalogService } from "@/server/services/supplier-catalog.service";
 import { type CatalogueSyncResult, runTravelDeskCatalogueSync } from "@/server/services/traveldesk-catalogue-sync.service";
 import { traveldeskConfigFrom } from "@/server/suppliers/traveldesk/traveldesk.config";
@@ -246,6 +247,25 @@ export async function syncTravelDeskCatalogueAction(_prev: CatalogueSyncActionRe
     const { actor } = await authService.requireCookies("suppliers.manage");
     const input = parseWith(catalogueSyncSchema, { totpCode: form.str(fd, "totpCode") ?? "" });
     const result = await runTravelDeskCatalogueSync(actor, input.totpCode);
+    revalidatePath("/admin/suppliers/traveldesk");
+    return result;
+  });
+}
+
+const readinessRerunSchema = z.object({ totpCode: z.string().trim().regex(/^\d{6}$/, "Enter the 6-digit code from your authenticator app") }).strict();
+
+export type ReadinessRerunActionResult = ActionResult<ReadinessRerunResult>;
+
+/**
+ * Re-run readiness for every product that is or asks to be instant, from the
+ * stored facts, with no TravelDesk call (doc 29 §9.4, readiness-rerun.service.ts).
+ * `suppliers.manage` plus a fresh authenticator code.
+ */
+export async function rerunReadinessAction(_prev: ReadinessRerunActionResult | null, fd: FormData): Promise<ReadinessRerunActionResult> {
+  return runAction(async () => {
+    const { actor } = await authService.requireCookies("suppliers.manage");
+    const input = parseWith(readinessRerunSchema, { totpCode: form.str(fd, "totpCode") ?? "" });
+    const result = await rerunReadiness(actor, input.totpCode);
     revalidatePath("/admin/suppliers/traveldesk");
     return result;
   });

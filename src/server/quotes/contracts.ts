@@ -221,6 +221,8 @@ export interface QuoteLineSnapshot {
   nonRefundableAfterConfirm: boolean;
   /** TicketOnly: last day the ticket can be used (Asia/Dubai, YYYY-MM-DD), when the supplier gives one. */
   ticketValidUntil?: string | null;
+  /** Doc 29 Batch 5: the line is an open-dated ticket (non-refundable once issued); absent on other lines and older quotes. */
+  openDatedTicket?: boolean;
 }
 
 export interface QuoteSnapshot {
@@ -294,6 +296,8 @@ export type SupplierQuoteResult =
       supplierFreeCancellationUntilUtc: string | null;
       /** TicketOnly: last day (Asia/Dubai, YYYY-MM-DD) the ticket can be used, when the supplier gives one; null otherwise. */
       ticketValidUntil: string | null;
+      /** Doc 29 Batch 5: a TicketOnly quote (open dated, non-refundable once issued). Absent for slot bookings. */
+      openDatedTicket?: true;
       /** With a pickup: the accepted hotel's name on the supplier's list, when it has one (Batch 3). */
       pickupHotelName?: string | null;
     }

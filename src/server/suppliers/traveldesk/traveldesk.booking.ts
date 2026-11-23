@@ -58,6 +58,8 @@ export const bookingWire = z.object({
   reservationDeadline: nstr,
   hasTickets: z.boolean().optional(),
   paymentErrorMessage: nstr,
+  /** OpenAPI (22 Nov 2026): "Tickets valid until if applicable". A date without a time zone. */
+  ticketsValidUntil: nstr,
 });
 
 export const bookingListWire = z.object({
@@ -112,6 +114,8 @@ export interface TravelDeskBooking {
   hasTickets: boolean;
   creationState: number | null;
   paymentErrorMessage: string | null;
+  /** Booking-level ticket validity, `YYYY-MM-DD` (doc 29 Batch 5); absent or null when TravelDesk gives none. */
+  ticketsValidUntil?: string | null;
 }
 
 function minor(v: number | null | undefined): bigint | null {
@@ -164,6 +168,7 @@ export function bookingFrom(w: z.infer<typeof bookingWire>): TravelDeskBooking {
     hasTickets: w.hasTickets === true,
     creationState: w.creationState ?? null,
     paymentErrorMessage: w.paymentErrorMessage ?? null,
+    ticketsValidUntil: w.ticketsValidUntil ? datePart(w.ticketsValidUntil) : null,
   };
 }
 

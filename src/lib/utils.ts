@@ -116,6 +116,14 @@ function statementWords(d: Date): string {
 export const NON_REFUNDABLE_STATEMENT = "This booking is non-refundable once confirmed.";
 
 /**
+ * The one cancellation statement for an open-dated ticket (doc 29 §4.4,
+ * Batch 5): the codes are issued at confirmation and TravelDesk cannot cancel
+ * them. Shown on the product page, the checkout review, the status page, the
+ * ticket card and the tickets email.
+ */
+export const TICKET_NON_REFUNDABLE_STATEMENT = "These tickets are non-refundable once issued.";
+
+/**
  * The one cancellation statement for a quote or a booking, from the quote's
  * own `freeCancellationUntilUtc` (CR-B2-6; checkout redesign CO-01): the
  * exact deadline in Dubai time. The quote, the review step and the status

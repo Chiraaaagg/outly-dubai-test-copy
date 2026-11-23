@@ -70,3 +70,28 @@ export async function renderedModeFor(activity: Pick<Activity, "fulfilmentMode" 
   if (activity.fulfilmentMode !== "instant" || !activity.productId) return "inquiry";
   return effectiveModeFor(activity.productId);
 }
+
+/**
+ * Doc 29 Batch 5: whether the product is sold as an open-dated ticket, so its
+ * page states the ticket terms (valid until the operator's date, shown with
+ * the price before payment; non-refundable once issued). True when an active
+ * mapping in the deployment's TravelDesk environment is TicketOnly. The terms
+ * are true whether the page is instant or inquiry. A failed read says false
+ * (the page then shows only its authored policy).
+ */
+export async function openDatedTicketFor(productId: string | null | undefined): Promise<boolean> {
+  if (!productId) return false;
+  try {
+    let environment: "test" | "production" = "production";
+    try {
+      environment = env().TRAVELDESK_ENV ?? "production";
+    } catch {
+      environment = "production";
+    }
+    const n = await prisma.productSupplierMapping.count({ where: { productId, environment, isActive: true, bookingKind: "ticket_only" } });
+    return n > 0;
+  } catch (error) {
+    log.warn("catalog.ticket_terms_read_failed", { productId, error });
+    return false;
+  }
+}

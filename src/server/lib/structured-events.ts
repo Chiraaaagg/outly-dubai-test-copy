@@ -141,6 +141,10 @@ export const STRUCTURED_EVENTS = {
   "retention.purge_failed": ["table", "reason", "batches"],
   // Request timing (doc 29 §6.6; Batch 1c). A fixed route code, the status and durations only.
   "route.timing": ["route", "status", "totalMs", "supplierMs", "supplierCalls", "dbMs", "dbQueries"],
+  // Quote budget alert (review 82; quote-budget-alert.ts). Supplier and environment codes and the episode's refusal count only.
+  "supplier.quote_budget_refused": ["supplier", "environment", "refusals", "episodeStart"],
+  // Admin re-run of readiness without supplier calls (doc 29 §9.4). Counts only.
+  "readiness.rerun": ["candidates", "instant", "inquiry", "durationMs"],
 } as const satisfies Record<string, readonly string[]>;
 
 export type StructuredEventName = keyof typeof STRUCTURED_EVENTS;

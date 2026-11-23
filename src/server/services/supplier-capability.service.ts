@@ -37,8 +37,9 @@ import { TRAVELDESK_SUPPLIER_CODE, useApproval } from "./supplier-booking.servic
  *    row as it was when asked; a fresh code, and in production a second
  *    person (approval.service.ts). The approval is used once.
  *  - A key that is unknown, inquiry, per unit (owner decision 7), date only
- *    (decision 6) or a ticket (refused by the engine until Batch 5) can
- *    never be switched on; the database refuses an enabled per-unit key too.
+ *    (decision 6) or a ticket class other than the one Batch 5 builds
+ *    (open dated, self arrival, internal, per person) can never be switched
+ *    on; the database refuses an enabled per-unit key too.
  *  - Evidence is revoked, never deleted or edited (database guard).
  */
 
@@ -95,7 +96,7 @@ const NEVER_MESSAGE: Record<string, string> = {
   not_a_class: "This is not a sellable class",
   private_units_inquiry: "Private-unit classes stay inquiry (owner decision, 22 November 2026)",
   date_only_inquiry: "Date-only classes stay inquiry until TravelDesk answers how to book them",
-  ticket_booking_refused: "Ticket booking is not built yet; ticket classes stay inquiry",
+  ticket_booking_refused: "Only the open-dated, self-arrival, internal, per-person ticket class is built; other ticket classes stay inquiry",
 };
 
 /** References name a test, drill or booking; anything that looks like contact data is refused. */

@@ -32,7 +32,7 @@ import {
   type UnitDefinition,
 } from "../quotes/contracts";
 import { authoredCouponValue, couponByCode, couponDiscountMinor, type Coupon } from "@/lib/pricing";
-import { dubaiDayStartUtc, dubaiToday, freeCancellationCopy, ticketValidityCopy } from "@/lib/utils";
+import { dubaiDayStartUtc, dubaiToday, freeCancellationCopy, TICKET_NON_REFUNDABLE_STATEMENT, ticketValidityCopy } from "@/lib/utils";
 import type { Activity, Currency } from "@/lib/types";
 
 /**
@@ -364,6 +364,8 @@ export interface PublicQuoteLine {
   /** TicketOnly: last day the ticket can be used, and the line that says so; null for other bookings. */
   ticketValidUntil: string | null;
   ticketValidityCopy: string | null;
+  /** Doc 29 Batch 5: an open-dated ticket; `freeCancellationCopy` then says the tickets are non-refundable once issued. */
+  openDatedTicket: boolean;
 }
 
 export type PublicQuoteResult =
@@ -400,10 +402,11 @@ export function toPublicQuote(result: QuoteResult): PublicQuoteResult {
       discountAllocMinor: l.discountAllocMinor.toString(),
       taxAllocMinor: l.taxAllocMinor.toString(),
       freeCancellationUntilUtc: l.freeCancellationUntilUtc,
-      freeCancellationCopy: freeCancellationCopy(l.freeCancellationUntilUtc),
+      freeCancellationCopy: l.openDatedTicket === true ? TICKET_NON_REFUNDABLE_STATEMENT : freeCancellationCopy(l.freeCancellationUntilUtc),
       nonRefundableAfterConfirm: l.nonRefundableAfterConfirm,
       ticketValidUntil: l.ticketValidUntil ?? null,
       ticketValidityCopy: ticketValidityCopy(l.ticketValidUntil),
+      openDatedTicket: l.openDatedTicket === true,
     })),
   };
 }
@@ -494,6 +497,11 @@ export function createQuoteService(deps: QuoteDeps): QuoteServiceImpl {
 
     // TKT-7 with the fresh supplier facts, not only the approved snapshot.
     const hours = local.activity.freeCancellationHours;
+    // Doc 29 Batch 5: issued tickets are never refundable, so a ticket line with a free-cancellation promise is refused.
+    if (supplier.openDatedTicket === true && hours !== 0) {
+      await deps.readiness.reevaluate(line.productId, "supplier_policy_changed");
+      return "policy_exceeds_supplier";
+    }
     let freeUntil: Date | null = null;
     if (hours > 0) {
       const supplierUntil = supplier.supplierFreeCancellationUntilUtc;
@@ -630,6 +638,7 @@ export function createQuoteService(deps: QuoteDeps): QuoteServiceImpl {
           freeCancellationUntilUtc: c.freeCancellationUntilUtc,
           nonRefundableAfterConfirm: c.nonRefundableAfterConfirm,
           ticketValidUntil: c.supplier.ticketValidUntil ?? null,
+          ...(c.supplier.openDatedTicket === true ? { openDatedTicket: true } : {}),
         });
       }
       if (refusals.length) return refused(refusals);

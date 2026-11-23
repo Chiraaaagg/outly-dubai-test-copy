@@ -76,6 +76,37 @@ describe.skipIf(!dbEnabled)("hotel pickup on the database (Batch 3)", () => {
     await prisma.setting.deleteMany({ where: { key } });
   });
 
+  it("start-times reads leave the hotel lists their reserve inside browse (review 82); an unnamed browse read counts as start times", async () => {
+    const account = `browse-${RUN}-fair`;
+    const key = engine.requestBudgetKey(CODE, "test", account);
+    await prisma.setting.deleteMany({ where: { key } });
+    // 40 a minute, customer share 12: browse 6 of it, hotel lists keep 2, start times 4.
+    const limits = readLimits(40, 0.3, 0.15, 1 / 3);
+    expect(limits).toMatchObject({ perMinute: 40, quoteCap: 6, browseCap: 6, startTimesCap: 4, engineReserve: 28 });
+    const times = () => engine.takeBrowseReadToken(CODE, "test", account, { limits, route: "start_times" });
+    const unnamed = () => engine.takeBrowseReadToken(CODE, "test", account, { limits });
+    const hotels = () => engine.takeBrowseReadToken(CODE, "test", account, { limits, route: "pickup_hotels" });
+
+    // A start-times flood (concurrent): four pass, then an unnamed read is held to the same cap.
+    const flood = await Promise.all(Array.from({ length: 10 }, times));
+    expect(flood.filter(Boolean)).toHaveLength(4);
+    expect(await unnamed()).toBe(false);
+    expect((await prisma.setting.findUniqueOrThrow({ where: { key } })).value).toMatchObject({ used: 4, browseUsed: 4, startTimesUsed: 4 });
+    // The hotel lists still get their two, then browse is full.
+    expect([await hotels(), await hotels(), await hotels()]).toEqual([true, true, false]);
+    // Quotes are untouched by both.
+    for (let i = 0; i < 6; i++) expect(await engine.takeQuoteReadToken(CODE, "test", account, { limits })).toBe(true);
+
+    // A row written before this counter (no startTimesUsed) counts none; a new window starts the counter afresh.
+    await prisma.setting.update({ where: { key }, data: { value: { windowStart: new Date().toISOString(), used: 1, quoteUsed: 0, browseUsed: 1 } } });
+    expect(await times()).toBe(true);
+    expect((await prisma.setting.findUniqueOrThrow({ where: { key } })).value).toMatchObject({ used: 2, browseUsed: 2, startTimesUsed: 1 });
+    await prisma.setting.update({ where: { key }, data: { value: { windowStart: new Date(Date.now() - 120_000).toISOString(), used: 9, quoteUsed: 0, browseUsed: 6, startTimesUsed: 4 } } });
+    expect(await times()).toBe(true);
+    expect((await prisma.setting.findUniqueOrThrow({ where: { key } })).value).toMatchObject({ used: 1, quoteUsed: 0, browseUsed: 1, startTimesUsed: 1 });
+    await prisma.setting.deleteMany({ where: { key } });
+  });
+
   it("an order item keeps the accepted pickup hotel id and name; an item without pickup keeps both null", async () => {
     const order = await makeOrder(RUN, { leadPhone: syntheticPhone(RUN, 31), label: "pickup" });
     // An item names a product or a combo (check order_item_has_product): a seeded published product.

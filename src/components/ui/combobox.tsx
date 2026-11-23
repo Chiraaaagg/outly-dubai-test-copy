@@ -216,6 +216,14 @@ function Combobox({
           onMouseDown={(e) => {
             if (e.target !== inputRef.current) e.preventDefault();
           }}
+          // Escape closes the panel from any control inside it (e.g. the empty-state action), not only the filter.
+          onKeyDown={(e) => {
+            if (e.key === "Escape") {
+              e.preventDefault();
+              e.stopPropagation();
+              closeAndReturn();
+            }
+          }}
           className={cn(
             "absolute inset-x-0 top-full z-30 mt-1 overflow-hidden rounded-[var(--radius-card)] border border-ink-200 bg-paper shadow-pop",
             "origin-top transition-[opacity,scale] duration-150 ease-[var(--ease-out-soft)] starting:scale-[0.97] starting:opacity-0 motion-reduce:starting:scale-100",
@@ -234,7 +242,7 @@ function Combobox({
               aria-describedby={describedBy}
               aria-invalid={error ? true : undefined}
               aria-required={required || undefined}
-              aria-controls={filtered.length > 0 ? listId : undefined}
+              aria-controls={listId}
               aria-activedescendant={active >= 0 ? `${uid}-opt-${active}` : undefined}
               autoComplete="off"
               spellCheck={false}
@@ -261,6 +269,8 @@ function Combobox({
             />
           </div>
           <div className="max-h-[40vh] overflow-y-auto overscroll-contain">
+            {/* The listbox stays mounted (empty when nothing matches) so the filter's aria-controls always resolves. */}
+            {filtered.length === 0 ? <div id={listId} role="listbox" aria-labelledby={labelId} /> : null}
             {filtered.length === 0 ? (
               <div className="px-4 py-4 text-sm text-ink-700">
                 <p className="font-semibold text-ink-900">No {noun.many} match &ldquo;{query.trim()}&rdquo;</p>

@@ -81,6 +81,7 @@ export function PickupHotelFields({
   const options = useMemo(() => toOptions(hotels), [hotels]);
   const loading = plan.some((r) => r.status.kind === "loading");
   const unavailable = plan.filter((r) => r.status.kind === "unavailable");
+  const notOffered = plan.filter((r) => r.status.kind === "not_offered");
   const own = plan.filter((r): r is PickupPlanRow & { status: { kind: "own"; hotels: PickupHotelOption[] } } => r.status.kind === "own");
   const several = plan.length > 1;
 
@@ -150,6 +151,23 @@ export function PickupHotelFields({
           emptyAction={ask}
         />
       ))}
+
+      {notOffered.length > 0 && (
+        // Not offered online (review 83 L7): asking again cannot help, so no "Try again", only our team.
+        <div
+          role="status"
+          className="rounded-[var(--radius-control)] border border-[color-mix(in_oklab,var(--color-warning)_30%,white)] bg-[var(--color-warning-bg)] p-3.5 text-sm text-[color-mix(in_oklab,var(--color-warning)_85%,black)]"
+        >
+          <p className="flex gap-2.5">
+            <AlertTriangle aria-hidden="true" className="mt-0.5 size-4.5 shrink-0" />
+            <span>
+              Pickup for {notOffered.length === 1 ? notOffered[0].item.title : "some activities"} can&apos;t be booked online. Send your trip to our team and they
+              confirm the pickup with you before you pay.
+            </span>
+          </p>
+          <div className="mt-2.5 flex flex-wrap gap-2">{ask(cartHotel?.name ?? "")}</div>
+        </div>
+      )}
 
       {unavailable.length > 0 && (
         <div

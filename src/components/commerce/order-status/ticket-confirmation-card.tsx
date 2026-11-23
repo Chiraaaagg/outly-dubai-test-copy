@@ -39,6 +39,11 @@
  *     zoom-in-50 / zoom-in-75, durations and delays) are written with the app's
  *     own `pop-in` keyframe (fade + scale from 94%) at the same 500 ms
  *     durations and 300 / 500 ms delays; the app's reduced-motion rule stops it.
+ * Edits for open-dated tickets (doc 29 §8.5, Batch 5; same component, no new
+ * import): optional `dateOnly` (the date without a time, under `dateLabel`),
+ * `details` (the validity line, the ticket types and the non-refundable
+ * statement) and `action` (the secure download), each rendered only when
+ * given, so the existing voucher card is unchanged.
  */
 "use client";
 
@@ -182,6 +187,14 @@ export interface TicketProps extends Omit<React.HTMLAttributes<HTMLDivElement>, 
   subtitle?: React.ReactNode;
   /** Currency code printed before the amount (copy edit, part B: INR orders exist). */
   currency?: string;
+  /** Batch 5: show the date only (an open-dated ticket has no start time). */
+  dateOnly?: boolean;
+  /** Label above the date; defaults to "When (Dubai time)". */
+  dateLabel?: string;
+  /** Batch 5: extra rows under the date (validity, ticket types, non-refundable statement). */
+  details?: React.ReactNode;
+  /** Batch 5: the secure download action, shown at the foot of the card. */
+  action?: React.ReactNode;
 }
 
 const AnimatedTicket = React.forwardRef<HTMLDivElement, TicketProps>(
@@ -198,6 +211,10 @@ const AnimatedTicket = React.forwardRef<HTMLDivElement, TicketProps>(
       title = "Your booking is confirmed",
       subtitle = "Confirmed by the operator",
       currency = "AED",
+      dateOnly = false,
+      dateLabel = "When (Dubai time)",
+      details,
+      action,
       ...props
     },
     ref
@@ -219,16 +236,18 @@ const AnimatedTicket = React.forwardRef<HTMLDivElement, TicketProps>(
 
     const formattedAmount = `${currency} ${amount.toFixed(2)}`;
 
-    const formattedDate = new Intl.DateTimeFormat("en-GB", {
-      timeZone: "Asia/Dubai",
-      weekday: 'short',
-      day: 'numeric',
-      month: 'short',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false
-    }).format(date).replace(/,(?=[^,]*$)/, ' ·');
+    const formattedDate = dateOnly
+      ? new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Dubai", weekday: "short", day: "numeric", month: "short", year: "numeric" }).format(date).replace(",", "")
+      : new Intl.DateTimeFormat("en-GB", {
+          timeZone: "Asia/Dubai",
+          weekday: 'short',
+          day: 'numeric',
+          month: 'short',
+          year: 'numeric',
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: false
+        }).format(date).replace(/,(?=[^,]*$)/, ' ·');
 
     return (
       <>
@@ -271,9 +290,11 @@ const AnimatedTicket = React.forwardRef<HTMLDivElement, TicketProps>(
               </div>
 
               <div>
-                  <p className="text-xs text-ink-600 uppercase">When (Dubai time)</p>
+                  <p className="text-xs text-ink-600 uppercase">{dateLabel}</p>
                   <p className="font-medium tabular-nums">{formattedDate}</p>
               </div>
+
+              {details ? <div className="space-y-1.5 text-left text-sm text-ink-700">{details}</div> : null}
 
               <div className="bg-shell p-4 rounded-[var(--radius-card)] flex items-center space-x-4">
                   {icon ?? <MastercardIcon />}
@@ -291,6 +312,8 @@ const AnimatedTicket = React.forwardRef<HTMLDivElement, TicketProps>(
                   <p className="py-2 text-center text-[0.9375rem] font-semibold text-ink-900">{barcodeValue}</p>
                 </>
               ) : null}
+
+              {action ? <div className="relative z-10">{action}</div> : null}
           </div>
         </div>
       </>

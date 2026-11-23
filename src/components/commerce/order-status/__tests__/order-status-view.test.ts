@@ -161,3 +161,58 @@ describe("OrderStatusView: unreadable amount (follow-up C)", () => {
     expect(html).not.toContain('data-testid="booking-confirmation"');
   });
 });
+
+describe("OrderStatusView: open-dated tickets (doc 29 Batch 5)", () => {
+  const ticketDoc = { ...doc, kind: "tickets_pdf" as const };
+  const ticket = {
+    validUntil: "2030-07-16",
+    validityCopy: "Ticket valid until Tuesday, 16 July 2030.",
+    nonRefundableCopy: "These tickets are non-refundable once issued.",
+    types: [
+      { label: "Park A (adult)", count: 2 },
+      { label: "Park B (adult)", count: 2 },
+    ],
+  };
+  const ticketItem = (over: Partial<CustomerItemStatus> = {}) =>
+    item({
+      title: "Synthetic attraction",
+      timeslot: null,
+      paxLabel: "2 adults",
+      cancellationTerms: ticket.nonRefundableCopy,
+      cancellation: { kind: "not_eligible", reason: "tickets_issued", exceptionAllowed: true },
+      ticket,
+      tickets: { fulfilment: "issued", documents: [ticketDoc] },
+      ...over,
+    });
+
+  it("the ticket card shows the visit date without a time, the validity, each ticket type, non-refundable once issued and the secure download", () => {
+    const html = render(status({ items: [ticketItem()] }));
+    expect(html).toContain('data-testid="booking-confirmation"');
+    expect(html).toContain("Visit date");
+    expect(html).not.toContain("When (Dubai time)");
+    expect(html).toContain("Ticket valid until Tuesday, 16 July 2030.");
+    expect(html).toContain("Park A (adult) × 2");
+    expect(html).toContain("Park B (adult) × 2");
+    expect((html.match(/These tickets are non-refundable once issued\./g) ?? []).length).toBeGreaterThanOrEqual(2);
+    expect(html).toContain('data-testid="ticket-card-download"');
+    expect(html).toContain("Download tickets");
+    // The download goes through the access-checked document route only.
+    const hrefs = [...html.matchAll(/href="([^"]+)"/g)].map((m) => m[1]).filter((h) => h.includes("/api/tickets/"));
+    expect(new Set(hrefs)).toEqual(new Set([DOC_HREF]));
+  });
+
+  it("not authorised: the card shows no download and no document URL; the code unlock instead", () => {
+    const html = render(status({ canDownload: false, items: [ticketItem({ tickets: { fulfilment: "issued", documents: [] } })] }));
+    expect(html).toContain('data-testid="booking-confirmation"');
+    expect(html).not.toContain('data-testid="ticket-card-download"');
+    expect(html).not.toContain("/api/tickets/documents/");
+    expect(html).toContain("These tickets are non-refundable once issued.");
+  });
+
+  it("a voucher booking keeps the voucher card and label", () => {
+    const html = render(status());
+    expect(html).toContain("Download voucher");
+    expect(html).not.toContain("Visit date");
+    expect(html).not.toContain("non-refundable once issued");
+  });
+});

@@ -19,11 +19,11 @@ import {
 import { assessReadiness, READINESS_RULES_VERSION, type MappingReadiness, type ReadinessProduct } from "../readiness.service";
 import { isAppError } from "../../lib/errors";
 import { MAX_INSTANT_ITEMS_PER_ORDER, MULTI_INSTANT_ITEM_POLICY, QUOTE_TTL_MS, SAME_DAY_INSTANT_POLICY, type QuoteLineRequest, type QuoteRequest, type QuoteSnapshot, type SupplierQuoteResult } from "../../quotes/contracts";
-import { ADULT, CHILD, fakeMargin, instantDoc, MAPPING_ID, mapping, POLICY, product, PRODUCT_ID } from "./_b2-fakes";
+import { ADULT, CHILD, fakeMargin, instantDoc, MAPPING_ID, mapping, POLICY, policyText, product, PRODUCT_ID } from "./_b2-fakes";
 import type { ReadinessTrigger } from "../readiness.service";
 import type { Activity } from "@/lib/types";
 import { coupons } from "@/lib/pricing";
-import { freeCancellationCopy } from "@/lib/utils";
+import { freeCancellationCopy, TICKET_NON_REFUNDABLE_STATEMENT } from "@/lib/utils";
 import { instantOrderCapVerdict } from "../../payments/exposure-limits";
 
 /**
@@ -710,7 +710,7 @@ describe("quote: ticket validity (TicketOnly, Q-T2)", () => {
 describe("quote: the public projection (CR-B2-1)", () => {
   const FORBIDDEN = /supplier|margin|cost|fx|inrPerAed|mapping|offerHash|fingerprint|owner|guestSession|customerId|policyVersion|floorBps|unitDefinitions|readiness|environment|productVersion|checkedAt/i;
   const ALLOWED_TOP = ["ok", "quoteId", "expiresAt", "currency", "totalMinor", "lines"];
-  const ALLOWED_LINE = ["index", "productId", "variantId", "serviceDate", "slotRef", "units", "addonIds", "chargedMinor", "discountAllocMinor", "taxAllocMinor", "freeCancellationUntilUtc", "freeCancellationCopy", "nonRefundableAfterConfirm", "ticketValidUntil", "ticketValidityCopy"];
+  const ALLOWED_LINE = ["index", "productId", "variantId", "serviceDate", "slotRef", "units", "addonIds", "chargedMinor", "discountAllocMinor", "taxAllocMinor", "freeCancellationUntilUtc", "freeCancellationCopy", "nonRefundableAfterConfirm", "ticketValidUntil", "ticketValidityCopy", "openDatedTicket"];
 
   function keysOf(v: unknown, path = ""): string[] {
     if (Array.isArray(v)) return v.flatMap((x, i) => keysOf(x, `${path}[${i}]`));
@@ -968,5 +968,55 @@ describe("doc 29 Batch 2: listed-start products at quote", () => {
     expect(await refusal(w, request({ lines: [line({ slotRef: "13:00" }), line({ productId: OTHER_ID })] }))).toEqual([{ index: 1, reason: "requires_inquiry" }]);
     expect(w.supplierCalls).toEqual([]);
     expect(w.store.rows).toEqual([]);
+  });
+});
+
+describe("doc 29 Batch 5: open-dated ticket lines", () => {
+  const ticketDoc = instantDoc({ timeSlots: [] });
+  const ticketMapping = mapping({ slotStartMinutes: [], anyTimeSlots: false, openDatedSellable: true });
+  const ticketSupplier = (over: Partial<Extract<SupplierQuoteResult, { ok: true }>> = {}) =>
+    okSupplier({ slotRef: null, ticketValidUntil: "2027-07-16", openDatedTicket: true, supplierFreeCancellationUntilUtc: null, ...over });
+  const ticketWorld = (over: Partial<World> = {}) =>
+    world({ products: new Map([[PRODUCT_ID, product({}, ticketDoc)]]), mappings: new Map([[PRODUCT_ID, [ticketMapping]]]), supplier: () => ticketSupplier(), ...over });
+
+  it("a ticket line is quoted with no slot, non-refundable, with its validity, and marked open dated in the stored snapshot", async () => {
+    const w = ticketWorld();
+    const q = await w.svc.create(GUEST, request({ lines: [line({ slotRef: null })] }));
+    expect(q.ok).toBe(true);
+    if (!q.ok) return;
+    expect(q.lines[0]).toMatchObject({ slotRef: null, freeCancellationUntilUtc: null, nonRefundableAfterConfirm: true, ticketValidUntil: "2027-07-16", openDatedTicket: true });
+    const pub = toPublicQuote(q);
+    expect(pub.ok && pub.lines[0]).toMatchObject({ openDatedTicket: true, freeCancellationCopy: TICKET_NON_REFUNDABLE_STATEMENT, ticketValidityCopy: "Ticket valid until Friday, 16 July 2027." });
+  });
+
+  it("a ticket answer on a line whose page promises free cancellation is refused and readiness re-runs (issued tickets are never refundable)", async () => {
+    // Readiness passes here (a live mapping recorded as issuing no tickets, with a 24-hour supplier window): only the quote's own guard is left.
+    const generous = instantDoc({ freeCancellationHours: 24, cancellationPolicy: policyText(24) });
+    const w = world({
+      products: new Map([[PRODUCT_ID, product({}, generous)]]),
+      mappings: new Map([[PRODUCT_ID, [mapping({ issuesTicketsAtConfirm: "no", supplierFreeCancellationHours: 24 })]]]),
+      supplier: () => ticketSupplier({ issuesTicketsAtConfirm: "no", supplierFreeCancellationUntilUtc: "2026-11-01T00:00:00Z" }),
+    });
+    expect(await refusal(w, request())).toEqual([{ index: 0, reason: "policy_exceeds_supplier" }]);
+    expect(w.reevaluated).toEqual([[PRODUCT_ID, "supplier_policy_changed"]]);
+    expect(w.store.rows).toEqual([]);
+  });
+
+  it("mixed cart: an instant ticket line plus an inquiry line stays a wholly unpaid inquiry; no supplier read, no quote (doc 29 §7.4)", async () => {
+    const w = ticketWorld({
+      products: new Map([
+        [PRODUCT_ID, product({}, ticketDoc)],
+        [OTHER_ID, product({ id: OTHER_ID, fulfilmentMode: "inquiry" })],
+      ]),
+    });
+    expect(await refusal(w, request({ lines: [line({ slotRef: null }), line({ productId: OTHER_ID })] }))).toEqual([{ index: 1, reason: "requires_inquiry" }]);
+    expect(w.supplierCalls).toEqual([]);
+    expect(w.store.rows).toEqual([]);
+  });
+
+  it("with the ticket key off, the ticket product is inquiry at quote time", async () => {
+    const w = ticketWorld({ mappings: new Map([[PRODUCT_ID, [mapping({ slotStartMinutes: [], anyTimeSlots: false, openDatedSellable: false, capabilityReady: false })]]]) });
+    expect(await refusal(w, request({ lines: [line({ slotRef: null })] }))).toEqual([{ index: 0, reason: "requires_inquiry" }]);
+    expect(w.supplierCalls).toEqual([]);
   });
 });

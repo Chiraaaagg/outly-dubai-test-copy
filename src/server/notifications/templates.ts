@@ -1,6 +1,7 @@
 import type { PaxCount } from "@/lib/types";
 import { ACK_AVAILABILITY, FOLLOWUP_SENTENCES, WHATSAPP_TEMPLATES, renderWhatsAppBody } from "./whatsapp-templates";
 import { siteConfig } from "@/lib/site-config";
+import { TICKET_NON_REFUNDABLE_STATEMENT } from "@/lib/utils";
 
 /**
  * Notification templates — version-controlled in the repo (AC-WA-04), never
@@ -472,7 +473,12 @@ export interface TicketsReadyContext {
   /** Customer first name; omitted when unknown. */
   firstName?: string;
   orderReference: string;
-  items: { title: string; dateLabel?: string }[];
+  /**
+   * Doc 29 Batch 5: an open-dated ticket item carries `ticket` (its validity
+   * line and its ticket types, never a code); the email then also says the
+   * tickets are non-refundable once issued.
+   */
+  items: { title: string; dateLabel?: string; ticket?: { validityCopy: string | null; types: string[] } }[];
   /** `${siteUrl}/t#${token}`. Built by `ticketLink`. */
   link: string;
   /** When the link stops working (e.g. "15 Feb 2030"). */
@@ -488,11 +494,15 @@ export function ticketLink(siteUrl: string, token: string): string {
 
 export function renderTicketsReady(ctx: TicketsReadyContext): Rendered {
   const greeting = ctx.firstName ? `Hi ${ctx.firstName},` : "Hi,";
-  const lines = ctx.items.length ? ctx.items.map((i) => `• ${i.title}${i.dateLabel ? ` · ${i.dateLabel}` : ""}`).join("\n") : "";
+  const itemLine = (i: TicketsReadyContext["items"][number]) =>
+    [`• ${i.title}${i.dateLabel ? ` · ${i.dateLabel}` : ""}`, ...(i.ticket?.types ?? []).map((t) => `  ${t}`), ...(i.ticket?.validityCopy ? [`  ${i.ticket.validityCopy}`] : [])].join("\n");
+  const lines = ctx.items.length ? ctx.items.map(itemLine).join("\n") : "";
   const validity = ctx.expiresLabel ? `The link works until ${ctx.expiresLabel}.` : "";
+  const openDated = ctx.items.some((i) => i.ticket);
   const text = [
     `${greeting} your tickets for booking ${ctx.orderReference} are ready.`,
     lines,
+    openDated ? TICKET_NON_REFUNDABLE_STATEMENT : "",
     `Open your tickets: ${ctx.link}`,
     `This link is personal to your booking. Please do not forward it. ${validity}`.trim(),
     `If you did not make this booking, reply to this email and we will look into it.`,
@@ -503,6 +513,7 @@ export function renderTicketsReady(ctx: TicketsReadyContext): Rendered {
   const html =
     p(`${escapeHtml(greeting)} your tickets for booking <strong>${escapeHtml(ctx.orderReference)}</strong> are ready.`) +
     (lines ? p(pre(lines)) : "") +
+    (openDated ? p(`<strong>${escapeHtml(TICKET_NON_REFUNDABLE_STATEMENT)}</strong>`) : "") +
     p(`<a href="${safeHref(ctx.link)}" style="display:inline-block;background:#1c1917;color:#fff;padding:10px 16px;border-radius:999px;text-decoration:none">Open your tickets</a>`) +
     p(escapeHtml(`This link is personal to your booking. Please do not forward it. ${validity}`.trim())) +
     p(`If you did not make this booking, reply to this email and we will look into it.`);

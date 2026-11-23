@@ -31,6 +31,13 @@ describe.skipIf(!dbEnabled)("request timing: database phase", () => {
     expect(timing.supplier.count).toBe(0);
   });
 
+  it("a batch transaction is counted too (review 81 R9): each statement may record the batch's time, an overcount only", async () => {
+    const { result, timing } = await withRequestTiming(async () => prisma.$transaction([prisma.setting.count(), prisma.$queryRaw<{ one: number }[]>`SELECT 1::int AS one`]));
+    expect(result[1][0].one).toBe(1);
+    expect(timing.db.count).toBeGreaterThanOrEqual(1);
+    expect(timing.db.ms).toBeGreaterThanOrEqual(0);
+  });
+
   it("leaves queries outside a timed request unchanged", async () => {
     const [{ one }] = await prisma.$queryRaw<{ one: number }[]>`SELECT 1::int AS one`;
     expect(one).toBe(1);

@@ -440,7 +440,11 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
     const ids = await orderItem();
     expect(code(await create(forOrder(ids, { fulfilmentOrigin: "assisted_conversion" })).catch((e) => e))).toBe("VALIDATION_FAILED");
     expect(code(await create(forOrder(ids, { quoteId: undefined })).catch((e) => e))).toBe("VALIDATION_FAILED");
+    // Doc 29 Batch 5: a customer ticket names no slot and no hotel; without them, a ticket kind over a live offer is a conflict.
     expect(code(await create(forOrder(ids, { bookingKind: "ticket_only" })).catch((e) => e))).toBe("VALIDATION_FAILED");
+    expect(code(await create(forOrder(ids, { bookingKind: "ticket_only", slot: null, hotelId: 42 })).catch((e) => e))).toBe("VALIDATION_FAILED");
+    expect(code(await create(forOrder(ids, { bookingKind: "ticket_only", slot: null })).catch((e) => e))).toBe("CONFLICT");
+    expect(await prisma.supplierBooking.count({ where: { orderItemId: ids.orderItemId } })).toBe(0);
     expect(code(await create(forOrder(ids, { mode: "one_step" })).catch((e) => e))).toBe("VALIDATION_FAILED");
     expect(code(await create(forOrder(ids, { drill: true })).catch((e) => e))).toBe("VALIDATION_FAILED");
     const ok = await create(forOrder(ids));

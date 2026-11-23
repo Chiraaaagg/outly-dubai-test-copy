@@ -9,6 +9,7 @@ import { emitEvent } from "../lib/structured-events";
 import type { OpsAlertContext, OpsAlertDigestContext, TemplateContext } from "../notifications/templates";
 import { notificationService, type DispatchResult } from "./notification.service";
 import { urgentAt } from "./document.service";
+import { quoteBudgetIncidents } from "./quote-budget-alert";
 
 /**
  * Ops alert emails for instant-path incidents (doc 22 §32.24: alerts by
@@ -54,7 +55,11 @@ import { urgentAt } from "./document.service";
  *    (48 h; doc 29 Batch 1b, review 81 R7). Raised at the moment it turned
  *    stale. If the scheduled sync stopped (no `CRON_SECRET`, or the schedule
  *    line removed as the rollback), stored instant verdicts no longer age
- *    while live quotes refuse them, so staff must sync or look.
+ *    while live quotes refuse them, so staff must sync or look;
+ *  - `quote_budget_refused`: customer quotes were refused because the quote
+ *    share of the supplier read budget was spent, so customers were sent to
+ *    the inquiry (one incident per episode of refusals, raised at its first;
+ *    thresholds in quote-budget-alert.ts). Codes only.
  *
  * Dedup and throttle (`ops_alerts`, one row per entity and reason, under one
  * row lock so concurrent sweeps decide one at a time):
@@ -97,7 +102,8 @@ export type OpsIncidentKind =
   | "booking_attention"
   | "document_attention"
   | "crm_delete_failed"
-  | "catalogue_stale";
+  | "catalogue_stale"
+  | "quote_budget_refused";
 /** `crm_subject` needs migration 20261122140000 (ops_alerts_entity_kind_check). */
 export type OpsEntityKind = "supplier_account" | "payment_saga" | "order_item" | "supplier_booking" | "supplier_document" | "crm_subject";
 
@@ -128,6 +134,7 @@ export const OPS_INCIDENT_TITLES: Record<OpsIncidentKind, string> = {
   document_attention: "Tickets need staff",
   crm_delete_failed: "CRM copy could not be deleted",
   catalogue_stale: "Supplier catalogue not synced for 48 hours",
+  quote_budget_refused: "Quote read budget spent: customers sent to inquiry",
 };
 
 /** The stored row payload: what the email says plus its idempotency scope. */
@@ -354,6 +361,7 @@ export async function collectOpsIncidents(since: Date, now: Date, limit = COLLEC
   out.push(...(await crmDeleteIncidents(since, now, limit)));
   const tdEnvironment = traveldeskConfigFrom(env())?.environment;
   if (tdEnvironment) out.push(...(await catalogueStaleIncidents(tdEnvironment, since, now)));
+  out.push(...(await quoteBudgetIncidents(since, now, limit)));
   return out;
 }
 

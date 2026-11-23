@@ -9,6 +9,7 @@ import { Alert, Card } from "@/components/ui/primitives";
 import type { CustomerOrderStatus } from "@/lib/customer-status";
 import type { ReturnHint } from "@/lib/checkout-return";
 import { fetchOrderStatus, OrderRequestError, removeBrowserAccess } from "@/lib/api/order-status";
+import { ticketTypeLine } from "@/lib/ticket-validity";
 import { cn, formatDateLong } from "@/lib/utils";
 import { CancellationPanel } from "./cancellation-panel";
 import {
@@ -216,6 +217,10 @@ export function OrderStatusView({ initial, returnHint = null }: { initial: Custo
   // The confirmation card: a single item the operator has confirmed, with a start time to show.
   const ticketItem = !multi && BOOKED_STATES.includes(status.state) && firstItem?.timeslot && /^\d{2}:\d{2}$/.test(firstItem.timeslot) ? firstItem : null;
   const ticketDate = ticketItem ? new Date(`${ticketItem.serviceDate}T${ticketItem.timeslot}:00+04:00`) : null;
+  // Doc 29 Batch 5: an open-dated ticket has no start time; the card shows the visit date, the validity and the download.
+  const openTicketItem = !multi && !ticketItem && BOOKED_STATES.includes(status.state) && firstItem?.ticket ? firstItem : null;
+  const openTicketDate = openTicketItem ? new Date(`${openTicketItem.serviceDate}T12:00:00+04:00`) : null;
+  const openTicketDocs = openTicketItem ? allDocs.filter((d) => d.item.orderItemId === openTicketItem.orderItemId) : [];
 
   // After an unlock the "Send me a code" form is gone: focus moves to the download that replaced it.
   const focusDownloads = useRef(false);
@@ -303,7 +308,7 @@ export function OrderStatusView({ initial, returnHint = null }: { initial: Custo
                     href={doc.href}
                     rel="noreferrer"
                     className="w-full"
-                    label={allDocs.length > 1 ? `Download voucher: ${item.title}` : "Download voucher"}
+                    label={downloadLabel(doc.kind, allDocs.length > 1 ? item.title : null)}
                     aria-describedby={fileId}
                   />
                   <p id={fileId} className="text-sm text-ink-600">
@@ -358,6 +363,40 @@ export function OrderStatusView({ initial, returnHint = null }: { initial: Custo
         </section>
       )}
 
+      {openTicketItem?.ticket && openTicketDate && paidMajor !== null && (
+        <section aria-label="Booking confirmation" className="mt-8 px-2" data-testid="booking-confirmation">
+          <AnimatedTicket
+            className="mx-auto"
+            title={openTicketItem.title}
+            subtitle={
+              status.steps.booking.at
+                ? `Confirmed by the operator at ${dubaiClockOf(status.steps.booking.at)} Dubai time.`
+                : "Confirmed by the operator."
+            }
+            ticketId={status.reference}
+            amount={paidMajor}
+            currency={status.currency}
+            date={openTicketDate}
+            dateOnly
+            dateLabel="Visit date"
+            cardHolder={openTicketItem.paxLabel}
+            last4Digits="Show the tickets PDF at the entrance."
+            icon={<Users aria-hidden="true" className="size-6 shrink-0 text-sun-700" />}
+            barcodeValue=""
+            details={<TicketFacts ticket={openTicketItem.ticket} />}
+            action={
+              openTicketDocs.length > 0 ? (
+                <div className="flex flex-col gap-2" data-testid="ticket-card-download">
+                  {openTicketDocs.map(({ doc }) => (
+                    <DownloadLink key={doc.id} href={doc.href} rel="noreferrer" className="w-full" label={downloadLabel(doc.kind, null)} />
+                  ))}
+                </div>
+              ) : null
+            }
+          />
+        </section>
+      )}
+
       {/* TKT-8 (doc 22 B5): the time the remedy runs by itself. It can still move when the saga's own
           deadline moves; a fixed time from authorisation needs a server change (CO-05, reported). */}
       {remedy && status.deadlines.remedyAtUtc && (
@@ -407,6 +446,18 @@ export function OrderStatusView({ initial, returnHint = null }: { initial: Custo
                       <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-lagoon-700" aria-hidden="true" />
                       <span>{item.cancellationTerms}</span>
                     </p>
+                  )}
+                  {item.ticket && (item.ticket.validityCopy || item.ticket.types.length > 0) && (
+                    <div className="mt-2 space-y-1 text-sm text-ink-700" data-testid="ticket-validity">
+                      {item.ticket.validUntil && item.ticket.validityCopy ? <time dateTime={item.ticket.validUntil}>{item.ticket.validityCopy}</time> : null}
+                      {item.ticket.types.length > 0 && (
+                        <ul aria-label="Tickets issued" className="list-disc pl-5">
+                          {item.ticket.types.map((t) => (
+                            <li key={t.label}>{ticketTypeLine(t)}</li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
                   )}
 
                   <div className="mt-4 border-t border-dashed border-ink-300 pt-4">
@@ -462,6 +513,33 @@ export function OrderStatusView({ initial, returnHint = null }: { initial: Custo
         {status.canRemoveBrowserAccess && <RemoveBrowserAccess reference={status.reference} />}
       </Card>
     </div>
+  );
+}
+
+/** The download's visible name: tickets for a tickets PDF (doc 29 Batch 5), voucher otherwise; the activity when several files are listed. */
+function downloadLabel(kind: "tickets_pdf" | "voucher_pdf", title: string | null): string {
+  const base = kind === "tickets_pdf" ? "Download tickets" : "Download voucher";
+  return title ? `${base}: ${title}` : base;
+}
+
+/** The ticket card's rows for an open-dated ticket: validity, the tickets per type (combo offers list each type), non-refundable. */
+function TicketFacts({ ticket }: { ticket: NonNullable<CustomerOrderStatus["items"][number]["ticket"]> }) {
+  return (
+    <>
+      {ticket.validUntil && ticket.validityCopy ? (
+        <p>
+          <time dateTime={ticket.validUntil}>{ticket.validityCopy}</time>
+        </p>
+      ) : null}
+      {ticket.types.length > 0 && (
+        <ul aria-label="Tickets issued" className="list-disc pl-5">
+          {ticket.types.map((t) => (
+            <li key={t.label}>{ticketTypeLine(t)}</li>
+          ))}
+        </ul>
+      )}
+      <p className="font-semibold text-ink-900">{ticket.nonRefundableCopy}</p>
+    </>
   );
 }
 

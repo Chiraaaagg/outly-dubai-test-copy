@@ -240,6 +240,8 @@ export interface QuoteResponseLine {
   /** TicketOnly: last day the ticket can be used, and the server-worded line; null for other bookings. */
   ticketValidUntil?: string | null;
   ticketValidityCopy?: string | null;
+  /** Doc 29 Batch 5: an open-dated ticket; `freeCancellationCopy` then says the tickets are non-refundable once issued. */
+  openDatedTicket?: boolean;
 }
 
 /** The client view of `toPublicQuote` (amounts arrive as decimal strings of minor units). */

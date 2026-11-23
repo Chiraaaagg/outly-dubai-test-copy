@@ -299,6 +299,40 @@ describe("TicketOnly (Q-T2)", () => {
     // Not asked for: an adults-only party is not affected by the child sentinel.
     expect(tickets({ childTicketsLeft: 999_999 }, { adults: 2, children: 0, infants: 0 }).ok).toBe(true);
   });
+
+  it("Batch 5: a ticket quote is marked open dated and carries no supplier refund window, even when the tour has a full-refund policy", () => {
+    const r = tickets();
+    expect(r).toMatchObject({ ok: true, openDatedTicket: true, supplierFreeCancellationUntilUtc: null });
+    // The same policy gives a slot booking a window, so the null is the ticket rule, not a missing policy.
+    const s = slot([row()]);
+    expect(s.ok && s.supplierFreeCancellationUntilUtc).not.toBeNull();
+    expect(s.ok && "openDatedTicket" in s).toBe(false);
+  });
+
+  it("Batch 5 (OpenAPI isSameTicketForAdultAndChild): one shared stock is counted once for adults and children, never twice", () => {
+    // 3 shared tickets left: a party of 2 adults and 1 child fits exactly; a fourth guest does not.
+    const shared = { sameTicketForAdultAndChild: true, adultTicketsLeft: 3, childTicketsLeft: 3 };
+    expect(tickets(shared)).toMatchObject({ ok: true, seatsLeft: 3 });
+    expect(tickets(shared, { adults: 3, children: 1, infants: 0 })).toEqual({ ok: false, reason: "sold_out" });
+    // Separate stocks are each checked against their own guests.
+    expect(tickets({ adultTicketsLeft: 2, childTicketsLeft: 1 })).toMatchObject({ ok: true, seatsLeft: 1 });
+    expect(tickets({ adultTicketsLeft: 2, childTicketsLeft: 0 })).toEqual({ ok: false, reason: "sold_out" });
+  });
+
+  it("Batch 5: Dubai date boundaries for the visit and the validity", () => {
+    const at = (now: string, serviceDate: string, validUntil: string | null, priceDate: string) =>
+      quoteTickets({ offer, policy, serviceDate, units: TWO_ADULTS_ONE_CHILD, stock: ticketStock({ validUntil, price: { date: priceDate } }), now: new Date(now), issuesTicketsAtConfirm: "yes" });
+    // 19:59 UTC is 23:59 in Dubai on 1 Nov: still 1 Nov's price; at 20:00 UTC it is 2 Nov in Dubai.
+    expect(at("2026-11-01T19:59:00Z", "2026-11-12", "2026-11-12", "2026-11-01").ok).toBe(true);
+    expect(at("2026-11-01T20:00:00Z", "2026-11-12", "2026-11-12", "2026-11-01")).toEqual({ ok: false, reason: "availability_unknown" });
+    expect(at("2026-11-01T20:00:00Z", "2026-11-12", "2026-11-12", "2026-11-02").ok).toBe(true);
+    // A same-day visit just after Dubai midnight is today, not yesterday.
+    expect(at("2026-11-01T20:00:00Z", "2026-11-02", null, "2026-11-02").ok).toBe(true);
+    expect(at("2026-11-01T20:00:00Z", "2026-11-01", null, "2026-11-02")).toEqual({ ok: false, reason: "past_cutoff" });
+    // The last valid day is a valid visit day; the day after is not.
+    expect(at("2026-11-01T08:00:00Z", "2027-02-28", "2027-02-28", "2026-11-01")).toMatchObject({ ok: true, ticketValidUntil: "2027-02-28" });
+    expect(at("2026-11-01T08:00:00Z", "2027-03-01", "2027-02-28", "2026-11-01")).toEqual({ ok: false, reason: "availability_unknown" });
+  });
 });
 
 describe("free cancellation and time", () => {
@@ -431,8 +465,18 @@ describe("listed starts: the quote (Batch 2)", () => {
     expect(slot([listedRow(601)], { offer: listedOffer(), slotRef: "10:01" })).toEqual({ ok: false, reason: "invalid_slot" });
   });
 
-  it("refuses a listed start with no stored end time: the booking would have no end to send", () => {
-    expect(slot([listedRow(780)], { offer: listedOffer({}, () => null), slotRef: "13:00" })).toEqual({ ok: false, reason: "availability_unknown" });
+  it("a listed start with no stored end sells with start plus the offer's hours (OpenAPI TimeSlotPublicDto.endTime); without hours it is refused", () => {
+    // The fixture offer runs 2 hours, so 13:00 ends 15:00.
+    expect(slot([listedRow(780)], { offer: listedOffer({}, () => null), slotRef: "13:00" })).toMatchObject({ ok: true, slotRef: "31@13:00" });
+    expect(listedStartsOn(listedOffer({}, () => null), SERVICE_DATE, [listedRow(780)], NOW)).not.toBeNull();
+    for (const durationHours of [0, null, -2]) {
+      expect(slot([listedRow(780)], { offer: listedOffer({ durationHours }, () => null), slotRef: "13:00" })).toEqual({ ok: false, reason: "availability_unknown" });
+      expect(listedStartsOn(listedOffer({ durationHours }, () => null), SERVICE_DATE, [listedRow(780)], NOW)).toBeNull();
+    }
+    // A payload stored before the hours were read: unknown.
+    const old = storedOffer({ timeSlots: [600, 780].map((startMinutes) => storedSlot({ timeSlotId: 31, startMinutes, endMinutes: null, isAnyTime: true })) }) as Record<string, unknown>;
+    delete old.durationHours;
+    expect(slot([listedRow(780)], { offer: parseStoredOffer(old)!, slotRef: "13:00" })).toEqual({ ok: false, reason: "availability_unknown" });
   });
 
   it("stale slot: a listed start that sold out since the page read it is sold_out at quote", () => {
@@ -469,9 +513,43 @@ describe("listed starts: the public start-times answer (Batch 2)", () => {
     expect(listedStartsOn(listedOffer(), SERVICE_DATE, [listedRow(600, { date: "2026-11-13" })], NOW)?.[0]).toEqual({ time: "10:00", status: "unavailable" });
   });
 
-  it("is null for an offer that is not wholly 'any time' with stored ends, so the page keeps its stored times", () => {
+  it("is null for an offer that is not wholly 'any time' with known ends, so the page keeps its stored times", () => {
     expect(listedStartsOn(offerOf(), SERVICE_DATE, [row()], NOW)).toBeNull();
-    expect(listedStartsOn(listedOffer({}, (s) => (s === 960 ? null : s + 60)), SERVICE_DATE, [], NOW)).toBeNull();
+    // A missing end with no hours to derive it from (16:00 + 0 h) is unknown.
+    expect(listedStartsOn(listedOffer({ durationHours: 0 }, (s) => (s === 960 ? null : s + 60)), SERVICE_DATE, [], NOW)).toBeNull();
     expect(listedStartsOn(offerOf({ timeSlots: [] }), SERVICE_DATE, [], NOW)).toBeNull();
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * TravelDesk OpenAPI (dashboard copy, 22 Nov 2026): rows that share a time, and `left`
+ * ------------------------------------------------------------------------ */
+
+describe("rows that share a start time (OpenAPI TimeSlot remark, AvailabilityDto.timeSlotId)", () => {
+  it("uses the first row, in the supplier's order, with enough seats left, and books that row's slot id and start", () => {
+    // Two slot ids at 21:00: the first has too few seats for three guests.
+    const rows = [row({ timeSlotId: 11, seatsLeft: 2 }), row({ timeSlotId: 12, seatsLeft: 9 }), row({ timeSlotId: 13, seatsLeft: 30 })];
+    const offer = offerOf({ timeSlots: [11, 12, 13].map((timeSlotId) => storedSlot({ timeSlotId })) });
+    expect(slot(rows, { offer })).toMatchObject({ ok: true, slotRef: "12@21:00", seatsLeft: 9 });
+  });
+
+  it("rows repeating one slot id (one per available unit) are tried in order too", () => {
+    const rows = [row({ seatsLeft: 1 }), row({ seatsLeft: 4 }), row({ seatsLeft: 30 })];
+    expect(slot(rows)).toMatchObject({ ok: true, slotRef: "11@21:00", seatsLeft: 4 });
+  });
+
+  it("an exact reference keeps the asked slot id: another id at the same time is never booked instead", () => {
+    const rows = [row({ timeSlotId: 11, seatsLeft: 2 }), row({ timeSlotId: 12, seatsLeft: 30 })];
+    const offer = offerOf({ timeSlots: [11, 12].map((timeSlotId) => storedSlot({ timeSlotId })) });
+    expect(slot(rows, { offer, slotRef: "11@21:00" })).toEqual({ ok: false, reason: "sold_out" });
+  });
+});
+
+describe("`left` counts adults and children only (OpenAPI AvailabilityDto.left)", () => {
+  it("infants never count against the seats left", () => {
+    const party = (infants: number): QuoteUnits => ({ adults: 2, children: 1, infants });
+    const offer = offerOf({ infantsAllowed: true });
+    expect(slot([row({ seatsLeft: 3 })], { offer, units: party(2) })).toMatchObject({ ok: true, seatsLeft: 3 });
+    expect(slot([row({ seatsLeft: 2 })], { offer, units: party(0) })).toEqual({ ok: false, reason: "sold_out" });
   });
 });

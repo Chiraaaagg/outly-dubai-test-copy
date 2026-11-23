@@ -228,8 +228,9 @@ describe.skipIf(!enabled)("supplier capability flags and evidence (local DB)", (
     expect(await svc.setFlag(a, { environment: "production", classKey: PICKUP, enabled: false, reason: "back off after the check" })).toMatchObject({ changed: true });
   });
 
-  it("per-unit, date-only, ticket, unknown and inquiry keys can never be switched on", async () => {
-    for (const key of [PER_UNIT, "live.date_only_no_slot_metadata.self.internal.per_person", "ticket.open_dated.self.internal.per_person"]) {
+  it("per-unit, date-only, unbuilt ticket, unknown and inquiry keys can never be switched on", async () => {
+    // Batch 5 builds only ticket.open_dated.self.internal.per_person; pickup and external tickets stay refused.
+    for (const key of [PER_UNIT, "live.date_only_no_slot_metadata.self.internal.per_person", "ticket.open_dated.self.external.per_person", "ticket.open_dated.pickup_required.internal.per_person"]) {
       const appr = await flagApproval("test", key);
       expect(code(await svc.setFlag(a, { environment: "test", classKey: key, enabled: true, reason: "try a never-on key" }, { approvalId: appr }).catch((e) => e)), key).toBe("CONFLICT");
     }

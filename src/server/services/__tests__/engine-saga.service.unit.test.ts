@@ -161,11 +161,15 @@ describe("engineSagaApi (B3)", () => {
       [fakeTx({ mapping: { isActive: false } }), "mapping_inactive"],
       [fakeTx({ mapping: { environment: "production" } }), "mapping_environment_changed"],
       [fakeTx({ mapping: { approvedOfferHash: "b".repeat(64) } }), "mapping_changed"],
-      [fakeTx({ mapping: { externalRef: { tourId: 3001, offerId: 501, bookingKind: "ticket_only", isExternal: false } } }), "not_live_book"],
+      [fakeTx({ mapping: { externalRef: { tourId: 3001, offerId: 501, bookingKind: "on_request", isExternal: false } } }), "not_live_book"],
+      // Batch 5: a TicketOnly mapping over a live stored offer (a live class) is refused; the kinds must agree.
+      [fakeTx({ mapping: { externalRef: { tourId: 3001, offerId: 501, bookingKind: "ticket_only", isExternal: false } } }), "booking_kind_mismatch"],
       [fakeTx({ lines: [line({ supplierAccountId: "another-agency" })] }), "supplier_account_changed"],
       [fakeTx({ lines: [line({ slotRef: "21:00" })] }), "slot_unknown"],
       [fakeTx({ lines: [line({ slotRef: "12@21:00" })] }), "slot_rules_unknown"],
-      [fakeTx({ offer: storedOffer({ timeSlots: [storedSlot({ endMinutes: null })] }) }), "slot_rules_unknown"],
+      // No stored end and no hours to derive one from (OpenAPI TimeSlotPublicDto.endTime).
+      [fakeTx({ offer: storedOffer({ durationHours: 0, timeSlots: [storedSlot({ endMinutes: null })] }) }), "slot_rules_unknown"],
+      [fakeTx({ offer: storedOffer({ durationHours: 4, timeSlots: [storedSlot({ endMinutes: null })] }) }), "slot_rules_unknown"], // 21:00 + 4 h passes midnight
       [fakeTx({ offer: { not: "an offer" } }), "offer_unreadable"],
       // The capability gate (doc 29 Batch 1a): a class switched off since the quote, or a class never switched on.
       [fakeTx({ flags: [] }), "capability_not_enabled"],
@@ -182,6 +186,12 @@ describe("engineSagaApi (B3)", () => {
     expect(await refusal(api(null).startAttempt(fakeTx(), ids))).toBe("supplier_not_configured");
     expect(await refusal(api({ ...config, environment: "production" as never }).startAttempt(fakeTx(), ids))).toBe("supplier_not_configured");
     expect(engine.createIntent).not.toHaveBeenCalled();
+  });
+
+  it("a slot with no stored end books start plus the offer's hours as its end (OpenAPI TimeSlotPublicDto.endTime)", async () => {
+    expect(await api().startAttempt(fakeTx({ offer: storedOffer({ durationHours: 2, timeSlots: [storedSlot({ endMinutes: null })] }) }), ids)).toEqual({ supplierBookingId: "sb-1" });
+    expect(engine.createIntent.mock.calls[0][1]).toMatchObject({ slot: { timeSlotId: 11, startMinutes: 1260, endMinutes: 1380 } });
+    engine.createIntent.mockClear();
   });
 
   it("multi-item: an item with a quote line index reads its own line, even when another line has the same mapping", async () => {
@@ -244,5 +254,69 @@ describe("engineSagaApi (B3)", () => {
   it("releaseHold goes to the engine with the reason", async () => {
     expect(await api().releaseHold("sb-1", "payment_refunded")).toBe("queued");
     expect(engine.releaseHold).toHaveBeenCalledWith("sb-1", "payment_refunded", expect.objectContaining({}));
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * Doc 29 Batch 5: open-dated tickets through the same two-step intake
+ * ------------------------------------------------------------------------ */
+
+describe("engineSagaApi: open-dated tickets (Batch 5)", () => {
+  const TICKET = "ticket.open_dated.self.internal.per_person";
+  const ticketOffer = (over: Record<string, unknown> = {}) => storedOffer({ bookingKind: "ticket_only", bookingTypeRaw: 2, timeSlots: [], ...over });
+  const ticketRef = { tourId: 3001, offerId: 501, bookingKind: "ticket_only", isExternal: false };
+  const ticketLine = (over: Record<string, unknown> = {}) => line({ slotRef: null, pickup: null, ...over });
+  const ticketTx = (over: Parameters<typeof fakeTx>[0] = {}) =>
+    fakeTx({
+      mapping: { externalRef: ticketRef },
+      offer: ticketOffer(),
+      lines: [ticketLine()],
+      flags: [...SEEDED_FLAGS, { classKey: TICKET, enabled: true, requiresOfferEvidence: true }],
+      ...over,
+    });
+  /** Evidence for the ticket key and the approved terms: what the approval path records per offer. */
+  function withEvidence(tx: ReturnType<typeof fakeTx>, classKey = TICKET, hash = HASH): ReturnType<typeof fakeTx> {
+    const evidence = { findMany: async () => [{ offerExternalId: "501", classKey, offerTermsHash: hash, revokedAt: null }] };
+    return { ...tx, supplierOfferEnablement: evidence } as unknown as ReturnType<typeof fakeTx>;
+  }
+
+  beforeEach(() => engine.createIntent.mockClear());
+
+  it("with the ticket flag on and evidence, builds a two-step, await-payment TicketOnly intent with no slot and no hotel", async () => {
+    const tx = withEvidence(ticketTx());
+    expect(await api().startAttempt(tx, ids)).toEqual({ supplierBookingId: "sb-1" });
+    const [, input] = engine.createIntent.mock.calls[0];
+    expect(input).toMatchObject({ bookingKind: "ticket_only", mode: "two_step", afterReserve: "await_payment", fulfilmentOrigin: "instant_checkout", slot: null, hotelId: null, adults: 2, children: 1 });
+  });
+
+  it("is refused while the ticket flag is off, without evidence, or with evidence for other terms or another key (parity: never more permissive than before)", async () => {
+    const cases: [ReturnType<typeof fakeTx>, string][] = [
+      // No flag row: the state the migration leaves (unseeded, off).
+      [withEvidence(ticketTx({ flags: SEEDED_FLAGS })), "capability_not_enabled"],
+      [withEvidence(ticketTx({ flags: [...SEEDED_FLAGS, { classKey: TICKET, enabled: false, requiresOfferEvidence: true }] })), "capability_not_enabled"],
+      [ticketTx(), "capability_not_enabled"],
+      // A flag row claiming no evidence is needed is not believed for a non-seeded key.
+      [ticketTx({ flags: [...SEEDED_FLAGS, { classKey: TICKET, enabled: true, requiresOfferEvidence: false }] }), "capability_not_enabled"],
+      [withEvidence(ticketTx(), TICKET, "c".repeat(64)), "capability_not_enabled"],
+      [withEvidence(ticketTx(), "live.fixed_slot_single.self.internal.per_person"), "capability_not_enabled"],
+    ];
+    for (const [tx, reason] of cases) expect(await refusal(api().startAttempt(tx, ids)), reason).toBe(reason);
+    expect(engine.createIntent).not.toHaveBeenCalled();
+  });
+
+  it("refuses a ticket line that names a slot or a hotel, a ticket offer with pickup or an external route, and kinds that disagree", async () => {
+    const cases: [ReturnType<typeof fakeTx>, string][] = [
+      [withEvidence(ticketTx({ lines: [ticketLine({ slotRef: "11@21:00" })] })), "ticket_slot_unexpected"],
+      [withEvidence(ticketTx({ lines: [ticketLine({ pickup: { hotelRef: "42" } })] })), "ticket_pickup_unexpected"],
+      // A pickup or external ticket derives another ticket key, which can never be switched on.
+      [withEvidence(ticketTx({ offer: ticketOffer({ isDirectReporting: false }) }), "ticket.open_dated.pickup_required.internal.per_person"), "capability_not_enabled"],
+      [withEvidence(ticketTx({ offer: ticketOffer({ isExternal: true }), mapping: { externalRef: { ...ticketRef, isExternal: true } } }), "ticket.open_dated.self.external.per_person"), "capability_not_enabled"],
+      // A ticket offer with a slot (offer 1592's shape) is an unknown class.
+      [withEvidence(ticketTx({ offer: ticketOffer({ timeSlots: [storedSlot({ startMinutes: 0 })] }) })), "capability_not_enabled"],
+      // A live-book mapping over a ticket offer: the ticket class is allowed, the kind is not.
+      [withEvidence(ticketTx({ mapping: { externalRef: { ...ticketRef, bookingKind: "live_book" } } })), "booking_kind_mismatch"],
+    ];
+    for (const [tx, reason] of cases) expect(await refusal(api().startAttempt(tx, ids)), reason).toBe(reason);
+    expect(engine.createIntent).not.toHaveBeenCalled();
   });
 });

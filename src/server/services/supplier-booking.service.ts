@@ -26,6 +26,7 @@ import {
   type SupplierRef,
   type SupplierSnapshot,
   type SupplierStatus,
+  ticketCancelRefused,
   type WindowLister,
 } from "../suppliers/booking-port";
 import { RESERVE_REQUIRES, type SagaNotifier } from "../payments/contracts";
@@ -33,12 +34,13 @@ import type { TicketEvidence } from "../documents/contracts";
 import { emitEvent } from "../lib/structured-events";
 import { documentService, reportPersisted, type PersistResult } from "./document.service";
 import { buildBookingRequest } from "../suppliers/traveldesk/traveldesk.booking";
-import { READ_BUDGET, type ReadClass, type ReadLimits } from "../suppliers/read-budget";
+import { type BrowseRoute, READ_BUDGET, type ReadClass, type ReadLimits } from "../suppliers/read-budget";
 import { mutationHealth, READ_BUDGET_REASON, type ReadGate } from "../suppliers/traveldesk/traveldesk.booking-adapter";
 import { isConfirmedSnapshot, withinChargeTolerance } from "../suppliers/traveldesk/traveldesk.confirmation";
 import { SUPPLIER_WALLET_BOOK, type SupplierRefundFigure, walletEntriesFor, walletPhaseOf } from "../suppliers/wallet-ledger";
 import { bookingAccountId, DEFAULT_BOOKING_ACCOUNT_ID } from "../suppliers/control-account";
 import { checkOfferCapability } from "../suppliers/capability-gate";
+import { bookingKindSellable } from "../suppliers/traveldesk/traveldesk.capability";
 import {
   candidateSpendable,
   debitsWallet,
@@ -287,6 +289,7 @@ const HOLDING: SupplierBookingState[] = ["reserved", "awaiting_payment"];
 /** A mutation is in flight from these. */
 const SENDING: SupplierBookingState[] = ["reserving", "confirming", "cancelling"];
 const CANCELLABLE: SupplierBookingState[] = ["reserved", "awaiting_payment", "confirmed", "awaiting_external"];
+
 /** States in which the scheduled run sends a saga's hold-release cancel: a hold, or a lookup the cancel waits for (doc 22 §32.22, review P3-6). */
 const RELEASE_CANCEL_STATES: readonly SupplierBookingState[] = [...HOLDING, ...RECOVERING];
 
@@ -954,10 +957,12 @@ export async function takeQuoteReadToken(supplierCode: string, environment: Supp
  * quote share could still need, so a browse flood cannot delay or refuse a
  * quote, and the engine keeps its reserve (`admitRead`,
  * suppliers/read-budget.ts). False when refused: the page then shows the
- * stored times, or offers the inquiry for the hotel. `opts.limits` is for tests; the default is `READ_BUDGET` (N5).
+ * stored times, or offers the inquiry for the hotel. `opts.route` names the
+ * page: start times may use only `startTimesCap` of the browse share, so hotel
+ * lists keep the rest; absent counts as start times. `opts.limits` is for tests; the default is `READ_BUDGET` (N5).
  */
-export async function takeBrowseReadToken(supplierCode: string, environment: SupplierEnvironment, accountId: string, opts: { limits?: ReadLimits } = {}) {
-  return takeClassReadToken(supplierCode, environment, accountId, "browse", opts.limits ?? READ_BUDGET);
+export async function takeBrowseReadToken(supplierCode: string, environment: SupplierEnvironment, accountId: string, opts: { limits?: ReadLimits; route?: BrowseRoute } = {}) {
+  return takeClassReadToken(supplierCode, environment, accountId, "browse", opts.limits ?? READ_BUDGET, opts.route ?? "start_times");
 }
 
 /**
@@ -965,29 +970,34 @@ export async function takeBrowseReadToken(supplierCode: string, environment: Sup
  * re-check the row they wait on. Rows written before the quote or browse
  * class count no reads of that class.
  */
-async function takeClassReadToken(supplierCode: string, environment: SupplierEnvironment, accountId: string, cls: ReadClass, limits: ReadLimits) {
+async function takeClassReadToken(supplierCode: string, environment: SupplierEnvironment, accountId: string, cls: ReadClass, limits: ReadLimits, route?: BrowseRoute) {
   const key = requestBudgetKey(supplierCode, environment, accountId);
   const q = cls === "quote" ? 1 : 0;
   const b = cls === "browse" ? 1 : 0;
+  const t = cls === "browse" && route === "start_times" ? 1 : 0;
   const browseCap = limits.browseCap ?? 0;
+  const startTimesCap = limits.startTimesCap ?? browseCap;
   await prisma.$executeRaw`
-    INSERT INTO settings (key, value, updated_at) VALUES (${key}, jsonb_build_object('windowStart', now(), 'used', 0, 'quoteUsed', 0, 'browseUsed', 0), now())
+    INSERT INTO settings (key, value, updated_at) VALUES (${key}, jsonb_build_object('windowStart', now(), 'used', 0, 'quoteUsed', 0, 'browseUsed', 0, 'startTimesUsed', 0), now())
     ON CONFLICT (key) DO NOTHING`;
   const n = await prisma.$executeRaw`
     UPDATE settings SET
       value = CASE WHEN (value->>'windowStart')::timestamptz <= now() - interval '1 minute'
-                   THEN jsonb_build_object('windowStart', now(), 'used', 1, 'quoteUsed', ${q}::int, 'browseUsed', ${b}::int)
-                   ELSE jsonb_set(jsonb_set(jsonb_set(value, '{used}', to_jsonb((value->>'used')::int + 1)),
+                   THEN jsonb_build_object('windowStart', now(), 'used', 1, 'quoteUsed', ${q}::int, 'browseUsed', ${b}::int, 'startTimesUsed', ${t}::int)
+                   ELSE jsonb_set(jsonb_set(jsonb_set(jsonb_set(value, '{used}', to_jsonb((value->>'used')::int + 1)),
                                   '{quoteUsed}', to_jsonb(COALESCE((value->>'quoteUsed')::int, 0) + ${q}::int)),
-                                  '{browseUsed}', to_jsonb(COALESCE((value->>'browseUsed')::int, 0) + ${b}::int)) END,
+                                  '{browseUsed}', to_jsonb(COALESCE((value->>'browseUsed')::int, 0) + ${b}::int)),
+                                  '{startTimesUsed}', to_jsonb(COALESCE((value->>'startTimesUsed')::int, 0) + ${t}::int)) END,
       updated_at = now()
     WHERE key = ${key} AND CASE WHEN (value->>'windowStart')::timestamptz <= now() - interval '1 minute'
                                 THEN 0 < ${limits.perMinute}::int AND (${q}::int = 0 OR 0 < ${limits.quoteCap}::int)
                                      AND (${b}::int = 0 OR (0 < ${browseCap}::int AND 1 + ${limits.quoteCap}::int <= ${limits.perMinute}::int))
+                                     AND (${t}::int = 0 OR 0 < ${startTimesCap}::int)
                                 ELSE (value->>'used')::int < ${limits.perMinute}::int
                                      AND (${q}::int = 0 OR COALESCE((value->>'quoteUsed')::int, 0) < ${limits.quoteCap}::int)
                                      AND (${b}::int = 0 OR (COALESCE((value->>'browseUsed')::int, 0) < ${browseCap}::int
-                                          AND (value->>'used')::int + 1 + GREATEST(0, ${limits.quoteCap}::int - COALESCE((value->>'quoteUsed')::int, 0)) <= ${limits.perMinute}::int)) END`;
+                                          AND (value->>'used')::int + 1 + GREATEST(0, ${limits.quoteCap}::int - COALESCE((value->>'quoteUsed')::int, 0)) <= ${limits.perMinute}::int))
+                                     AND (${t}::int = 0 OR COALESCE((value->>'startTimesUsed')::int, 0) < ${startTimesCap}::int) END`;
   return n === 1;
 }
 
@@ -1744,7 +1754,9 @@ export const supplierBookingService = {
       if (input.quoteId === undefined) throw Errors.validation({ quoteId: "A customer intent carries its quote id (null until quotes exist)" });
       if (input.afterReserve !== undefined && input.afterReserve !== "await_payment") throw Errors.validation({ afterReserve: "A booking for an order item waits for captured payment before it is confirmed" });
       if (mode !== "two_step") throw Errors.validation({ mode: "A booking for an order item reserves first and confirms on captured payment" });
-      if (input.bookingKind !== "live_book") throw Errors.validation({ bookingKind: "Only live bookings may be sold until ticket-only booking is proven" });
+      if (input.bookingKind !== "live_book" && input.bookingKind !== "ticket_only") throw Errors.validation({ bookingKind: "Only live and ticket bookings may be sold" });
+      // Doc 29 Batch 5: a ticket sold to a customer is open dated, self arrival. Whether its class is switched on is checked below.
+      if (input.bookingKind === "ticket_only" && (input.slot || input.hotelId)) throw Errors.validation({ bookingKind: "A ticket booking for an order item names no slot and no hotel" });
     } else if (input.afterReserve === "await_payment") {
       throw Errors.validation({ afterReserve: "Only a booking for an order item waits for payment" });
     }
@@ -1797,6 +1809,10 @@ export const supplierBookingService = {
         });
         if (!capability.verdict.instant) {
           throw Errors.conflict("This offer's booking class is not enabled for instant sale", { classKey: capability.verdict.classKey, reason: capability.verdict.reason });
+        }
+        // The booking kind must be the kind of that class: a live key for live book, the Batch 5 ticket key for TicketOnly.
+        if (!bookingKindSellable(input.bookingKind, capability.verdict)) {
+          throw Errors.conflict("The booking kind does not match this offer's booking class", { classKey: capability.verdict.classKey, reason: "booking_kind_mismatch" });
         }
       }
       const { control } = await readControl(code, input.environment, accountId);
@@ -1912,6 +1928,7 @@ export const supplierBookingService = {
     const b = await prisma.supplierBooking.findUnique({ where: { id: bookingId } });
     if (!b) throw Errors.notFound("Supplier booking");
     if (!b.supplierBookingId || !CANCELLABLE.includes(b.state)) throw Errors.conflict(`A booking in state ${b.state} cannot be cancelled`, { bookingId });
+    if (ticketCancelRefused(b)) throw Errors.conflict("Issued tickets cannot be cancelled with the operator; a refund is a goodwill exception for our team", { bookingId, reason: "tickets_issued" });
     await enqueue(prisma, "cancel", b.id, (opts.now ?? (() => new Date()))());
   },
 
@@ -2669,6 +2686,8 @@ export const supplierBookingService = {
       return "cancel_pending";
     }
     if (!b.supplierBookingId || !CANCELLABLE.includes(b.state) || !deps.adapter.cancel) return `skip:${b.state}`;
+    // Doc 29 §4.4: a confirmed ticket is never cancelled through the API, whoever queued the job.
+    if (ticketCancelRefused(b)) return "skip:tickets_issued";
     const acct = await deps.adapter.account().catch(() => null);
     if (!acct) {
       await enqueue(prisma, "cancel", b.id, new Date(deps.now().getTime() + 15_000), deps.holder);

@@ -67,3 +67,17 @@ describe("AnimatedTicket", () => {
     expect(html).not.toMatch(/\b(?:bg|text|border)-(?:card|primary|muted|background|foreground)\b/);
   });
 });
+
+describe("AnimatedTicket: open-dated ticket additions (doc 29 §8.5, Batch 5)", () => {
+  it("date only under its own label, with details and an action, each only when given", () => {
+    const html = render({ dateOnly: true, dateLabel: "Visit date", details: h("p", null, "Ticket valid until Tuesday, 16 July 2030."), action: h("a", { href: "/api/tickets/documents/x" }, "Download tickets") });
+    expect(html).toContain("Visit date");
+    expect(html).toContain("Wed 18 Nov 2026");
+    expect(html).not.toContain("18:30");
+    expect(html).toContain("Ticket valid until Tuesday, 16 July 2030.");
+    expect(html).toContain("Download tickets");
+    const plain = render();
+    expect(plain).toContain("When (Dubai time)");
+    expect(plain).not.toContain("Download tickets");
+  });
+});

@@ -226,6 +226,37 @@ describe.skipIf(!enabled)("documentService (local DB, fake source, memory store)
   });
 
   /* -------------------------------------------------------------------------
+   * Doc 29 Batch 5: ticket facts from stored codes, and no cancel of an issued ticket
+   * ---------------------------------------------------------------------- */
+
+  it("Batch 5: the ticket facts read the live code set without any code, per type and with the earliest per-ticket validity", async () => {
+    const b = await confirmed({ adults: 2 });
+    const combo = (i: number, name: string, validUntil: string): IssuedTicket => ({ ...t(i, "adult", `C-${RUN}-B5-${i}`), ticketTypeName: name, validUntil });
+    await persist(b, [combo(0, "Park A", "2030-07-16T00:00:00Z"), combo(1, "Park B", "2030-08-01T00:00:00Z"), combo(2, "Park A", "2030-07-16T00:00:00Z"), combo(3, "Park B", "2030-08-01T00:00:00Z")]);
+    const { ticketFactsForOrder } = await import("../ticket-facts.service");
+    const facts = await ticketFactsForOrder(b.orderId!);
+    const f = facts.get(b.orderItemId!);
+    expect(f).toMatchObject({ validUntil: "2030-07-16", types: [{ label: "Park A (adult)", count: 2 }, { label: "Park B (adult)", count: 2 }] });
+    expect(JSON.stringify([...facts.values()])).not.toContain(`C-${RUN}`);
+    // A reissue supersedes the old set: the types are not counted twice.
+    await persist(b, [combo(0, "Park A", "2030-07-16T00:00:00Z"), combo(1, "Park B", "2030-08-01T00:00:00Z")].map((x) => ({ ...x, code: `${x.code}-R` })));
+    expect((await ticketFactsForOrder(b.orderId!)).get(b.orderItemId!)?.types).toEqual([{ label: "Park A (adult)", count: 1 }, { label: "Park B (adult)", count: 1 }]);
+  });
+
+  it("Batch 5: an issued ticket booking is never sent a cancel; the request is refused and no cancel job is queued", async () => {
+    const b = await confirmed();
+    const { supplierBookingService } = await import("../supplier-booking.service");
+    const e = await supplierBookingService.requestCancel(b.id).catch((x) => x);
+    expect(codeOf(e)).toBe("CONFLICT");
+    expect(await prisma.supplierJob.count({ where: { supplierBookingId: b.id, kind: "cancel" } })).toBe(0);
+    // A live booking in the same state still may be cancelled (the engine then follows its own rules).
+    const live = await confirmed({ kind: "live_book" });
+    await supplierBookingService.requestCancel(live.id);
+    expect(await prisma.supplierJob.count({ where: { supplierBookingId: live.id, kind: "cancel" } })).toBe(1);
+    await prisma.supplierJob.deleteMany({ where: { supplierBookingId: live.id, kind: "cancel" } });
+  });
+
+  /* -------------------------------------------------------------------------
    * Persisting codes (TKT-1, TKT-2)
    * ---------------------------------------------------------------------- */
 

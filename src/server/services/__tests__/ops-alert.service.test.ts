@@ -390,3 +390,65 @@ describe.skipIf(!dbEnabled)("ops alert emails (doc 22 §32.24)", () => {
     warn.mockRestore();
   });
 });
+
+/**
+ * Quote budget alert (review 82; quote-budget-alert.ts) on the disposable
+ * database: budget refusals group into episodes in one `settings` row per
+ * account, and the sweep's collector raises one incident per episode at its
+ * first refusal. Uses the database clock, so it reads a window around now
+ * (the sweeps above use 2033 and 2034 and never see these rows).
+ */
+describe.skipIf(!dbEnabled)("quote budget alert on the database (review 82)", () => {
+  let prisma: Prisma;
+  let alert: typeof import("../quote-budget-alert");
+  let mod: typeof import("../ops-alert.service");
+  const CODE = `zz-qb-${run}`;
+
+  beforeAll(async () => {
+    assertDisposableDb();
+    forbidNetwork();
+    prisma = await db();
+    alert = await import("../quote-budget-alert");
+    mod = await import("../ops-alert.service");
+  });
+
+  afterAll(async () => {
+    await prisma.setting.deleteMany({ where: { key: { startsWith: `supplier_quote_refusals.${CODE}.` } } });
+  });
+
+  it("refusals within ten minutes are one episode and one incident; a later refusal starts a new one; codes only", async () => {
+    const key = alert.quoteBudgetRefusalKey(CODE, "test", "default");
+    for (let i = 0; i < 3; i++) await alert.recordQuoteBudgetRefusal(CODE, "test", "default");
+    const first = (await prisma.setting.findUniqueOrThrow({ where: { key } })).value as Record<string, unknown>;
+    expect(first).toMatchObject({ supplier: CODE, environment: "test", account: "default", count: 3 });
+    expect(Object.keys(first).sort()).toEqual(["account", "count", "environment", "episodeStart", "lastAt", "supplier"]);
+
+    const window = () => ({ since: new Date(Date.now() - HOUR), now: new Date(Date.now() + MIN) });
+    let { since, now } = window();
+    const mine = (list: OpsIncident[]) => list.filter((i) => i.entityId.startsWith(`${CODE}.`));
+    const collected = mine(await mod.collectOpsIncidents(since, now));
+    expect(collected).toHaveLength(1);
+    expect(collected[0]).toMatchObject({ kind: "quote_budget_refused", entityKind: "supplier_account", entityId: `${CODE}.quote_budget.test.default`, reason: "quote_budget_spent", orderId: null });
+    expect(collected[0].raisedAt.getTime()).toBe(new Date(String(first.episodeStart)).getTime());
+
+    // The last refusal was 11 minutes ago: the next one starts a new episode (a new incident).
+    const old = new Date(Date.now() - 20 * MIN).toISOString();
+    await prisma.setting.update({ where: { key }, data: { value: { ...first, episodeStart: old, lastAt: new Date(Date.now() - 11 * MIN).toISOString() } } });
+    await alert.recordQuoteBudgetRefusal(CODE, "test", "default");
+    const second = (await prisma.setting.findUniqueOrThrow({ where: { key } })).value as Record<string, unknown>;
+    expect(second.count).toBe(1);
+    expect(new Date(String(second.episodeStart)).getTime()).toBeGreaterThan(new Date(old).getTime());
+
+    // Within the gap the episode continues and keeps its start.
+    await prisma.setting.update({ where: { key }, data: { value: { ...second, episodeStart: old, lastAt: new Date(Date.now() - 9 * MIN).toISOString() } } });
+    await alert.recordQuoteBudgetRefusal(CODE, "test", "default");
+    const third = (await prisma.setting.findUniqueOrThrow({ where: { key } })).value as Record<string, unknown>;
+    expect(third.count).toBe(2);
+    expect(new Date(String(third.episodeStart)).getTime()).toBe(new Date(old).getTime());
+
+    // An episode that began before the window is not raised again.
+    ({ since, now } = window());
+    expect(mine(await alert.quoteBudgetIncidents(new Date(Date.now() - 15 * MIN), now, 100))).toHaveLength(0);
+    expect(mine(await alert.quoteBudgetIncidents(since, now, 100))).toHaveLength(1);
+  });
+});

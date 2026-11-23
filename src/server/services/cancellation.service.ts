@@ -23,6 +23,9 @@ import type { CancellationIneligibleReason, CancellationRequestStatus, Cancellat
  *  - the quote line offered a free cancellation and is not
  *    `nonRefundableAfterConfirm` (`non_refundable`), and now is before its
  *    `freeCancellationUntilUtc` (`past_deadline`);
+ *  - the booking is not a TicketOnly booking (doc 29 §4.4, Batch 5: a
+ *    confirmed ticket is never cancellable through the API; `tickets_issued`,
+ *    with the exception request to our team still offered);
  *  - the offer does not issue tickets at confirmation: the mapping's ticket
  *    evidence says `no` (`yes` or unknown is `tickets_issued`; the operator
  *    cannot cancel issued tickets through the API), and the booking itself
@@ -78,8 +81,8 @@ export interface CancellationFacts {
   serviceDate: string;
   /** Local start minute of the slot when the booking knows it; null = the start of the day (the earliest it could start). */
   startMinutes: number | null;
-  /** The item's latest supplier attempt. */
-  booking: { id: string; state: string } | null;
+  /** The item's latest supplier attempt; `bookingKind` absent on facts built before Batch 5 (read as live book). */
+  booking: { id: string; state: string; bookingKind?: string } | null;
   /** The stored verified policy (quote line snapshot); null when none was stored. */
   policy: { freeCancellationUntilUtc: string | null; nonRefundableAfterConfirm: boolean } | null;
   issuesTicketsAtConfirm: Tristate;
@@ -126,6 +129,8 @@ export function evaluateCancellation(f: CancellationFacts, now: Date): Cancellat
   if (f.booking?.state === "cancel_refused") return started ? notEligible("activity_started", false) : notEligible("non_refundable", true);
   if (!f.booking || f.booking.state !== "confirmed") return { kind: "none" };
   if (started) return notEligible("activity_started", false);
+  // Doc 29 Batch 5: tickets are issued at confirmation and cannot be cancelled; only a goodwill request to our team.
+  if (f.booking.bookingKind === "ticket_only") return notEligible("tickets_issued", true);
   const until = f.policy?.freeCancellationUntilUtc ? Date.parse(f.policy.freeCancellationUntilUtc) : Number.NaN;
   if (!f.policy || f.policy.nonRefundableAfterConfirm || !Number.isFinite(until)) return notEligible("non_refundable", true);
   if (now.getTime() >= until) return notEligible("past_deadline", true);
@@ -191,7 +196,7 @@ export async function loadCancellationFacts(orderId: string, db: Db = prisma): P
       currency: true,
       status: true,
       items: { select: { id: true, fulfilmentOrigin: true, serviceDate: true, mappingId: true, quoteId: true, cancellationPolicySnapshot: true, chargedCurrency: true, chargedAmountMinor: true, discountAllocMinor: true, taxAllocMinor: true } },
-      supplierBookings: { select: { id: true, orderItemId: true, state: true, startMinutes: true, mappingId: true, createdAt: true }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] },
+      supplierBookings: { select: { id: true, orderItemId: true, state: true, bookingKind: true, startMinutes: true, mappingId: true, createdAt: true }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] },
       paymentSaga: { select: { orderItemId: true, paymentId: true, state: true } },
       payments: { select: { capturedMinor: true } },
     },
@@ -225,7 +230,7 @@ export async function loadCancellationFacts(orderId: string, db: Db = prisma): P
       fulfilmentOrigin: item.fulfilmentOrigin,
       serviceDate: isoDay(item.serviceDate),
       startMinutes: booking?.startMinutes ?? null,
-      booking: booking ? { id: booking.id, state: booking.state } : null,
+      booking: booking ? { id: booking.id, state: booking.state, bookingKind: booking.bookingKind } : null,
       policy: policyFor(item, lines),
       issuesTicketsAtConfirm: await issuesTicketsAtConfirm(db, booking?.mappingId ?? item.mappingId),
       ticketsStored: await ticketsStored(db, booking?.id ?? null),

@@ -10,7 +10,12 @@
 #  - the database job uses a Postgres 17 service container that lives and dies
 #    with the job, reached on 127.0.0.1 only through the target guard; never a
 #    hosted database;
-#  - skips count as failures in the database job (OUTLY_REQUIRE_DB=1).
+#  - skips count as failures in the database job (OUTLY_REQUIRE_DB=1);
+#  - the browser and accessibility job runs the app against its own service
+#    container with synthetic data and generated local-only secrets; every
+#    supplier read the pages make is answered inside the browser, and the
+#    artifacts it uploads (screenshots, report) are public, so they hold
+#    synthetic data only.
 #
 # Before enabling: re-check each pinned SHA against its tag
 # (`git ls-remote https://github.com/actions/<name> refs/tags/<tag>`).
@@ -124,3 +129,62 @@ jobs:
           APP_ENV: development
           NEXT_PUBLIC_SITE_URL: http://localhost:3000
         run: npm run build
+
+  a11y:
+    name: browser and accessibility checks
+    runs-on: ubuntu-24.04
+    # Expected about 10 minutes: install, prepare, production build, 21 browser tests.
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          # A throwaway credential for a container that exists only for this job.
+          POSTGRES_USER: outly_test
+          POSTGRES_PASSWORD: outly_ci_disposable_only
+          POSTGRES_DB: outly_test_main
+        ports:
+          - 127.0.0.1:55434:5432
+        options: >-
+          --health-cmd "pg_isready -U outly_test -d outly_test_main"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: Playwright version (cache key)
+        id: playwright
+        run: echo "version=$(node -p "require('./node_modules/@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+      - name: Cache the Playwright Chromium build
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ steps.playwright.outputs.version }}-chromium-ubuntu-24.04
+      - name: Install Chromium only, with its system libraries
+        run: npx playwright install --with-deps chromium
+      - name: Prepare the disposable database (marker, API roles, migrations, seed)
+        env:
+          PGPASSWORD: outly_ci_disposable_only
+        run: sh scripts/test-db/ci-prepare.sh
+      - name: Synthetic shop, next build, next start, browser and accessibility checks
+        # scripts/shop/a11y.sh: fixture (two seeded products instant), app env with
+        # INSTANT_RELEASE_ENABLED=true for this job's app only, guarded build and start
+        # on localhost:3100, then Playwright project a11y (e2e/a11y-*.spec.ts).
+        run: sh scripts/shop/a11y.sh --ci
+      - name: Upload screenshots and report (public; synthetic data only)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: a11y-screenshots-and-report
+          path: |
+            test-results/a11y-screenshots/
+            playwright-report/
+          if-no-files-found: warn
+          retention-days: 14

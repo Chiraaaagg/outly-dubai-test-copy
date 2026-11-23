@@ -14,6 +14,7 @@ import { hotelOnPickupList, listedStartsOn, pickupShapeFits, quoteSlot, quoteTic
 import { TtlCache } from "../suppliers/cache";
 import { cleanHotelText } from "./pickup-hotels.service";
 import { bookingAccountId, DEFAULT_BOOKING_ACCOUNT_ID, takeBrowseReadToken, takeQuoteReadToken } from "./supplier-booking.service";
+import { alertingQuoteToken } from "./quote-budget-alert";
 
 /**
  * Supplier quote for one line (SUP-14, doc 22 §23 B2; `SupplierQuoteService`
@@ -307,7 +308,8 @@ function liveSource(environment: SupplierEnvironment) {
 export const supplierQuoteService: SupplierQuoteService & SupplierStartTimesReader = createSupplierQuoteService({
   load: loadContext,
   source: liveSource,
-  takeQuoteReadToken: (code, environment, accountId) => takeQuoteReadToken(code, environment, accountId),
-  takeBrowseReadToken: (code, environment, accountId) => takeBrowseReadToken(code, environment, accountId),
+  // A budget refusal sends the customer to the inquiry: record it for the ops alert (quote-budget-alert.ts).
+  takeQuoteReadToken: alertingQuoteToken((code, environment, accountId) => takeQuoteReadToken(code, environment, accountId)),
+  takeBrowseReadToken: (code, environment, accountId) => takeBrowseReadToken(code, environment, accountId, { route: "start_times" }),
   now: () => new Date(),
 });

@@ -182,13 +182,15 @@ describe("markup (WAI-ARIA 1.2)", () => {
     expect(capped).toContain("Showing 3 of 5");
 
     const empty = render({ options: [], defaultOpen: true, emptyAction: () => h("button", { type: "button" }, "Ask our team") });
-    expect(empty).not.toContain('role="listbox"');
+    // The listbox stays mounted but empty, so aria-controls always resolves; the empty state sits beside it.
+    const emptyList = elementAt(empty, empty.lastIndexOf("<div", empty.indexOf('role="listbox"')));
+    expect(emptyList).not.toMatch(/role="option"|<p|<button/);
     expect(empty).toContain("No hotels match");
     expect(empty).toContain("Ask our team");
-    // With nothing to show the filter is collapsed and controls nothing.
+    // With nothing to show the filter is collapsed; it still names its (empty) listbox.
     const input = /<input[^>]*>/.exec(empty)![0];
     expect(input).toContain('aria-expanded="false"');
-    expect(input).not.toContain("aria-controls");
+    expect(input).toMatch(/aria-controls="[^"]+-list"/);
   });
 
   it("while unavailable the trigger stays focusable (aria-disabled, not disabled), so an error link can land on it", () => {

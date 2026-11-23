@@ -66,6 +66,8 @@ const REDACT_KEYS = [
   "redemptioncode",
   "qrcode",
   "barcode",
+  // TravelDesk `downloadCodeLink` (OpenAPI, 22 Nov 2026): a public image URL that embeds the ticket code itself.
+  "codelink",
 ];
 
 /** Exact match only: as a suffix, `code` would also hide error and country codes. */

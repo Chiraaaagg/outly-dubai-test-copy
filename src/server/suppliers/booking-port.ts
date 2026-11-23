@@ -25,6 +25,20 @@ import type { TicketEvidence } from "../documents/contracts";
  */
 export const GUARD_RELEASING_STATES = ["not_created", "rejected", "expired", "cancelled"] as const;
 
+/**
+ * Doc 29 §4.4 and Batch 5: TravelDesk cannot cancel issued tickets, so a
+ * TicketOnly booking is never sent a cancel once its confirm went through
+ * (confirmed, waiting on an external confirmation, or a confirmation time
+ * recorded). An unconfirmed reservation (`reserved`, `awaiting_payment`)
+ * still releases normally: no code exists before the confirm (TEST drill,
+ * doc 22 §32.44). `hasTickets` is not read here, because TravelDesk reports
+ * it as true on an unconfirmed reservation too. A refund after the confirm
+ * is a goodwill exception our team handles, never an engine cancel.
+ */
+export function ticketCancelRefused(b: { bookingKind: string; state: string; confirmedAt: Date | null }): boolean {
+  return b.bookingKind === "ticket_only" && (b.confirmedAt !== null || b.state === "confirmed" || b.state === "awaiting_external");
+}
+
 /** Blocking states added in B1a. They keep the order item locked against a second attempt. */
 export const B1A_BLOCKING_STATES = [
   /** Reserved, waiting for provider-verified capture before any confirm (PAY-1). */
@@ -159,6 +173,8 @@ export interface SupplierSnapshot extends ConfirmationSnapshot {
   holdExpiresAtUtc: string | null;
   /** Whether admission codes have been issued; null when unknown. */
   ticketsIssued: boolean | null;
+  /** Doc 29 Batch 5: the booking's own "tickets valid until" day (`YYYY-MM-DD`), when the supplier gives one. Never a code. */
+  ticketsValidUntil?: string | null;
 }
 
 /**

@@ -136,6 +136,18 @@ export interface CustomerItemStatus {
    */
   cancellationTerms?: string | null;
   cancellation: CancellationView;
+  /**
+   * Doc 29 Batch 5: an open-dated ticket item, with its last valid day, the
+   * non-refundable statement and the issued tickets per type (combo offers
+   * issue one per guest per type). Absent or null for other items. Never a
+   * ticket code.
+   */
+  ticket?: {
+    validUntil: string | null;
+    validityCopy: string | null;
+    nonRefundableCopy: string;
+    types: { label: string; count: number }[];
+  } | null;
 }
 
 export interface CustomerOrderStatus {

@@ -8,9 +8,10 @@ import type { EngineSagaApi, SagaNotifier } from "../payments/contracts";
 import { dbPaymentEvidence } from "../payments/evidence";
 import { GUARD_RELEASING_STATES, type PaymentEvidencePort } from "../suppliers/booking-port";
 import { checkOfferCapability } from "../suppliers/capability-gate";
+import { bookingKindSellable } from "../suppliers/traveldesk/traveldesk.capability";
 import { travelDeskExternalRefSchema } from "../suppliers/traveldesk/traveldesk.adapter";
 import { traveldeskConfigFrom } from "../suppliers/traveldesk/traveldesk.config";
-import { parseStoredOffer } from "../suppliers/traveldesk/traveldesk.offer-terms";
+import { parseStoredOffer, slotEndMinutes } from "../suppliers/traveldesk/traveldesk.offer-terms";
 import { exactSlotOf, slotRulesFor, unitsFrom } from "../suppliers/traveldesk/traveldesk.quote";
 import { bookingAccountId, supplierBookingService, TRAVELDESK_SUPPLIER_CODE } from "./supplier-booking.service";
 import { supplierGuestName } from "@/lib/guest-name";
@@ -29,7 +30,12 @@ import { supplierGuestName } from "@/lib/guest-name";
  *    in `await_payment` mode (`fulfilmentOrigin: instant_checkout`) and is
  *    idempotent per order item: the key is `order:<o>:item:<i>:try:1`, so a
  *    repeat returns the same attempt and the saga never makes a second one
- *    (only a human may, invariant 2).
+ *    (only a human may, invariant 2). A TicketOnly item (doc 29 Batch 5) is
+ *    accepted only when its exact ticket class key is switched on (with
+ *    per-offer evidence) and the mapping's kind matches the stored offer; it
+ *    is booked in the same two steps, with no slot and no hotel: the reserve
+ *    holds the stock, and the confirm, which issues the codes and cannot be
+ *    undone, follows only captured payment.
  *  - `confirmIfPaid(id)` queues the confirm; the confirm job re-reads the
  *    payment evidence and the deadline itself before sending. `too_late` when
  *    the deadline gate refuses already, or the attempt is closed or released.
@@ -147,7 +153,9 @@ export function createEngineSagaApi(deps: EngineSagaDeps): EngineSagaApi {
       if (mapping.environment !== line.supplierEnvironment) refuse("mapping_environment_changed", "The mapping's environment changed since the quote");
       if (mapping.approvedOfferHash !== line.approvedOfferHash) refuse("mapping_changed", "The approved offer terms changed since the quote");
       const ref = travelDeskExternalRefSchema.safeParse(mapping.externalRef);
-      if (!ref.success || ref.data.bookingKind !== "live_book") refuse("not_live_book", "Only live-book offers may be booked");
+      // Live-book offers, and (doc 29 Batch 5) TicketOnly offers whose ticket key is switched on, checked below.
+      if (!ref.success || (ref.data.bookingKind !== "live_book" && ref.data.bookingKind !== "ticket_only")) refuse("not_live_book", "Only live-book and ticket offers may be booked");
+      const bookingKind = ref.data.bookingKind;
 
       const config = deps.config();
       if (!config || config.environment !== line.supplierEnvironment) refuse("supplier_not_configured", "TravelDesk is not configured for this environment");
@@ -155,9 +163,6 @@ export function createEngineSagaApi(deps: EngineSagaDeps): EngineSagaApi {
       if (!accountId) refuse("supplier_account_unpinned", "No supplier account is pinned for this environment");
       if (line.supplierAccountId && line.supplierAccountId !== accountId) refuse("supplier_account_changed", "The supplier account changed since the quote");
 
-      // The exact slot the supplier check accepted, with its end time from the approved stored offer.
-      const slot = exactSlotOf(line.slotRef);
-      if (!slot) refuse("slot_unknown", "The quote line names no exact supplier slot");
       const offerRow = mapping.supplierOfferId
         ? await db.supplierCatalogueItem.findUnique({
             where: { supplierId_environment_kind_externalId: { supplierId: mapping.supplierId, environment: config.environment, kind: "offer", externalId: mapping.supplierOfferId } },
@@ -176,9 +181,27 @@ export function createEngineSagaApi(deps: EngineSagaDeps): EngineSagaApi {
         termsHash: mapping.approvedOfferHash,
       });
       if (!capability.verdict.instant) refuse("capability_not_enabled", `This offer's booking class (${capability.verdict.classKey}) is not enabled for instant sale: ${capability.verdict.reason}`);
-      const rules = slotRulesFor(stored.timeSlots, slot.timeSlotId, slot.startMinutes);
-      const endMinutes = stored.timeSlots.find((s) => s.timeSlotId === slot.timeSlotId && s.startMinutes === slot.startMinutes)?.endMinutes ?? null;
-      if (!rules || endMinutes === null) refuse("slot_rules_unknown", "The slot's stored rules or end time are unknown");
+      // The kind the mapping names must be the kind of the stored offer's class (a live key for live book, the ticket key for TicketOnly).
+      if (!bookingKindSellable(bookingKind, capability.verdict) || stored.bookingKind !== bookingKind) {
+        refuse("booking_kind_mismatch", `The mapping's booking kind does not match this offer's booking class (${capability.verdict.classKey})`);
+      }
+
+      let slotForIntent: { timeSlotId: number; startMinutes: number; endMinutes: number } | null = null;
+      if (bookingKind === "ticket_only") {
+        // Doc 29 Batch 5: an open-dated ticket has no slot and, in its one class, no pickup. A line that names either was not a ticket quote.
+        if (line.slotRef !== null) refuse("ticket_slot_unexpected", "A ticket quote line names no slot");
+        if (line.pickup) refuse("ticket_pickup_unexpected", "A ticket of this class has no hotel pickup");
+      } else {
+        // The exact slot the supplier check accepted, with its end time from the approved stored offer.
+        const slot = exactSlotOf(line.slotRef);
+        if (!slot) refuse("slot_unknown", "The quote line names no exact supplier slot");
+        const rules = slotRulesFor(stored.timeSlots, slot.timeSlotId, slot.startMinutes);
+        // The stored end, or start plus the offer's hours when none is stored (OpenAPI TimeSlotPublicDto.endTime; Batch 3b).
+        const exactSlot = stored.timeSlots.find((s) => s.timeSlotId === slot.timeSlotId && s.startMinutes === slot.startMinutes);
+        const endMinutes = exactSlot ? slotEndMinutes(exactSlot, stored.durationHours) : null;
+        if (!rules || endMinutes === null) refuse("slot_rules_unknown", "The slot's stored rules or end time are unknown");
+        slotForIntent = { timeSlotId: slot.timeSlotId, startMinutes: slot.startMinutes, endMinutes };
+      }
 
       const pax = unitsFrom(supplierUnitsOf(line.unitDefinitions, line.units));
       if (!pax) refuse("unit_rule_failed", "The quote line's units are not TravelDesk pax");
@@ -204,7 +227,7 @@ export function createEngineSagaApi(deps: EngineSagaDeps): EngineSagaApi {
           orderId: input.orderId,
           orderItemId: input.orderItemId,
           mappingId: line.mappingId,
-          bookingKind: "live_book",
+          bookingKind,
           mode: "two_step",
           afterReserve: "await_payment",
           fulfilmentOrigin: "instant_checkout",
@@ -212,7 +235,7 @@ export function createEngineSagaApi(deps: EngineSagaDeps): EngineSagaApi {
           tourId: ref.data.tourId,
           offerId: ref.data.offerId,
           serviceDate: line.serviceDate,
-          slot: { timeSlotId: slot.timeSlotId, startMinutes: slot.startMinutes, endMinutes },
+          slot: slotForIntent,
           adults: pax.adults,
           children: pax.children,
           infants: pax.infants,

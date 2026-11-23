@@ -2,7 +2,7 @@ import { createElement, type ComponentProps } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { OrderSummary, type ServerQuote } from "../order-summary";
-import { freeCancellationCopy } from "@/lib/utils";
+import { freeCancellationCopy, TICKET_NON_REFUNDABLE_STATEMENT } from "@/lib/utils";
 
 /**
  * The checkout order summary shows each line's exact refund deadline when a
@@ -77,5 +77,15 @@ describe("OrderSummary: refund deadline at checkout", () => {
     const html = render({ quote: quote([{ index: 0, freeCancellationUntilUtc: UNTIL }]) });
     expect(html).toContain("This is the exact amount your card will be charged.");
     expect(html).not.toMatch(/\bUPI\b|\bnetbanking\b|\bEMI\b/i);
+  });
+});
+
+describe("OrderSummary: open-dated ticket line at checkout review (doc 29 Batch 5)", () => {
+  it("states non-refundable once issued and the validity, from the quote's own words", () => {
+    const q = quote([{ index: 0, freeCancellationUntilUtc: null }]);
+    q.lines[0] = { ...q.lines[0], slotRef: null, freeCancellationCopy: TICKET_NON_REFUNDABLE_STATEMENT, openDatedTicket: true, ticketValidUntil: "2027-07-16", ticketValidityCopy: "Ticket valid until Friday, 16 July 2027." };
+    const html = render({ quote: q });
+    expect(html).toContain(TICKET_NON_REFUNDABLE_STATEMENT);
+    expect(html).toContain('<time dateTime="2027-07-16">Ticket valid until Friday, 16 July 2027.</time>');
   });
 });

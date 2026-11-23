@@ -28,6 +28,8 @@ export interface PickupItem {
 export type PickupStatus =
   | { kind: "loading" }
   | { kind: "unavailable" }
+  /** No instant pickup is sold for this activity (the server said `not_offered`, or every listed hotel was refused): inquiry only. */
+  | { kind: "not_offered" }
   /** The cart hotel is on this activity's list, or none is chosen yet. */
   | { kind: "cart" }
   /** The cart hotel is not on this activity's list: it needs its own choice from `hotels`. */
@@ -80,6 +82,7 @@ export function pickupPlan(items: readonly PickupItem[], lists: ReadonlyMap<stri
   return items.map((item) => {
     const list = lists.get(item.listKey) ?? { status: "loading" as const };
     if (list.status === "loading") return { item, status: { kind: "loading" }, hotel: null };
+    if (list.status === "not_offered") return { item, status: { kind: "not_offered" }, hotel: null };
     // A list with no hotel cannot be chosen from: the same as one that could not be read.
     if (list.status === "unavailable" || list.hotels.length === 0) return { item, status: { kind: "unavailable" }, hotel: null };
     if (!cartHotel?.hotelId || onList(list.hotels, cartHotel.hotelId)) {
@@ -100,6 +103,7 @@ export const itemHotelField = (itemId: string) => `hotel-${itemId.replace(/[^a-z
 export function pickupErrors(plan: readonly PickupPlanRow[]): Record<string, string> {
   const errors: Record<string, string> = {};
   if (plan.some((r) => r.status.kind === "loading")) errors[CART_HOTEL_FIELD] = "The pickup hotels are still loading. Try again in a moment.";
+  else if (plan.some((r) => r.status.kind === "not_offered")) errors[CART_HOTEL_FIELD] = "Pickup can't be booked online for this trip. Send it to our team to arrange the pickup.";
   else if (plan.some((r) => r.status.kind === "unavailable")) errors[CART_HOTEL_FIELD] = "We can't load the pickup hotels right now. Try again, or send your trip to our team.";
   else if (plan.some((r) => r.status.kind === "cart" && !r.hotel)) errors[CART_HOTEL_FIELD] = "Choose the hotel the operator collects you from.";
   for (const r of plan) {
@@ -112,13 +116,13 @@ const same = (a: PickupHotelChoice | null | undefined, b: PickupHotelChoice | nu
 
 /**
  * The cart line updates that bring each line's `pickupHotel` in line with the
- * plan. Lines whose list is still loading or unavailable are left as they
+ * plan. Lines whose list is still loading, unavailable or not offered are left as they
  * are (a kept choice comes back when the list does).
  */
 export function pickupUpdates(plan: readonly PickupPlanRow[]): { itemId: string; pickupHotel: PickupHotelChoice | undefined }[] {
   const out: { itemId: string; pickupHotel: PickupHotelChoice | undefined }[] = [];
   for (const r of plan) {
-    if (r.status.kind === "loading" || r.status.kind === "unavailable") continue;
+    if (r.status.kind === "loading" || r.status.kind === "unavailable" || r.status.kind === "not_offered") continue;
     if (!same(r.hotel, r.item.chosen)) out.push({ itemId: r.item.itemId, pickupHotel: r.hotel ?? undefined });
   }
   return out;
@@ -133,4 +137,44 @@ export function initialCartHotel(items: readonly PickupItem[]): PickupHotelChoic
 /** The hotel to carry into the inquiry form (doc 29 §7.3: in the form, never in the URL). */
 export function hotelForInquiry(cart: readonly CartItem[]): string {
   return cart.find((i) => i.pickupHotel?.name)?.pickupHotel?.name.slice(0, 120) ?? "";
+}
+
+/**
+ * The hotels the quote refused (`pickup_unavailable`, review 83 L8): each
+ * refused line's chosen hotel id, by the line's index in the cart (the
+ * quote's lines follow the cart's order). The page clears those choices and
+ * stops offering those hotels, so "Choose another hotel" cannot loop back to
+ * the same refusal while the cached list still names it.
+ */
+export function refusedPickupHotels(refused: readonly { index: number; reason: string }[], cart: readonly CartItem[]): { itemIds: string[]; hotelIds: string[] } {
+  const itemIds: string[] = [];
+  const hotelIds = new Set<string>();
+  for (const l of refused) {
+    if (l.reason !== "pickup_unavailable") continue;
+    const item = cart[l.index];
+    const id = item?.pickupHotel?.hotelId;
+    if (!item || !id) continue;
+    itemIds.push(item.id);
+    hotelIds.add(id);
+  }
+  return { itemIds: [...new Set(itemIds)], hotelIds: [...hotelIds] };
+}
+
+/**
+ * The lists without the refused hotels. A list left with none becomes
+ * `not_offered` (the operator collects from none of the hotels it named), so
+ * the page offers the inquiry rather than an empty field or "Try again".
+ */
+export function withoutRefusedHotels(lists: ReadonlyMap<string, ListState>, refused: ReadonlySet<string>): Map<string, ListState> {
+  if (!refused.size) return new Map(lists);
+  const out = new Map<string, ListState>();
+  for (const [key, list] of lists) {
+    if (list.status !== "ready") {
+      out.set(key, list);
+      continue;
+    }
+    const hotels = list.hotels.filter((h) => !refused.has(h.id));
+    out.set(key, hotels.length === list.hotels.length ? list : hotels.length ? { status: "ready", hotels } : { status: "not_offered" });
+  }
+  return out;
 }

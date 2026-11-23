@@ -31,6 +31,16 @@
 export type ReadClass = "engine" | "quote" | "browse";
 
 /**
+ * Which page a browse read is for (review 82, cross-feature Low). Start-time
+ * date stepping may use at most `startTimesCap` of the browse share, so the
+ * rest stays for pickup hotel lists: a burst of date stepping can no longer
+ * leave a pickup buyer's hotel list `unavailable`. Hotel lists may use the
+ * whole browse share; they are kept 10 minutes per offer on the server, and
+ * a start-times page that loses a read still shows its stored times.
+ */
+export type BrowseRoute = "start_times" | "pickup_hotels";
+
+/**
  * Supplier reads per account per minute, all classes together.
  * PROVISIONAL ops parameter: TravelDesk gives no numeric rate limit (Q-O1); to be
  * set from the supplier's answer or observed throttling.
@@ -55,6 +65,14 @@ export const QUOTE_READ_SHARE = 0.25;
  */
 export const BROWSE_READ_SHARE = 0.1;
 
+/**
+ * Part of the browse share kept for pickup hotel lists, rounded up: start
+ * times may use the rest (`startTimesCap`). With the default budget, start
+ * times 8 and hotel lists at least 4 of the 12 browse reads a minute.
+ * PROVISIONAL ops parameter, like the shares above.
+ */
+export const PICKUP_HOTELS_BROWSE_RESERVE = 1 / 3;
+
 export interface ReadLimits {
   /** Reads per window, all classes. */
   perMinute: number;
@@ -62,6 +80,8 @@ export interface ReadLimits {
   quoteCap: number;
   /** Most browse reads per window; absent counts as 0 (browse refused). */
   browseCap?: number;
+  /** Most start-times browse reads per window (`BrowseRoute`); absent: no limit beyond `browseCap`. */
+  startTimesCap?: number;
   /** Least engine reads per window, whatever quotes and browse have used. */
   engineReserve: number;
 }
@@ -76,11 +96,14 @@ const clampShare = (s: number) => (Number.isFinite(s) ? Math.min(1, Math.max(0, 
  * share whatever the browse share. With no browse share the quotes have the
  * whole customer share.
  */
-export function readLimits(perMinute = DEFAULT_READ_BUDGET_PER_MINUTE, customerShare = QUOTE_READ_SHARE, browseShare = 0): ReadLimits {
+export function readLimits(perMinute = DEFAULT_READ_BUDGET_PER_MINUTE, customerShare = QUOTE_READ_SHARE, browseShare = 0, hotelReserveShare?: number): ReadLimits {
   const total = Math.max(0, Math.floor(perMinute));
   const customer = Math.floor(total * clampShare(customerShare));
   const browseCap = Math.min(customer, Math.floor(total * clampShare(browseShare)));
-  return { perMinute: total, quoteCap: customer - browseCap, browseCap, engineReserve: total - customer };
+  const limits: ReadLimits = { perMinute: total, quoteCap: customer - browseCap, browseCap, engineReserve: total - customer };
+  // The hotel lists' reserve inside browse; start times get the rest.
+  if (hotelReserveShare !== undefined) limits.startTimesCap = browseCap - Math.min(browseCap, Math.ceil(browseCap * clampShare(hotelReserveShare)));
+  return limits;
 }
 
 /**
@@ -91,30 +114,38 @@ export function readLimits(perMinute = DEFAULT_READ_BUDGET_PER_MINUTE, customerS
  * value; the engine's `readLimits` dependency exists for tests only, and
  * replaces the whole object (total and quote cap together).
  */
-export const READ_BUDGET: ReadLimits = readLimits(DEFAULT_READ_BUDGET_PER_MINUTE, QUOTE_READ_SHARE, BROWSE_READ_SHARE);
+export const READ_BUDGET: ReadLimits = readLimits(DEFAULT_READ_BUDGET_PER_MINUTE, QUOTE_READ_SHARE, BROWSE_READ_SHARE, PICKUP_HOTELS_BROWSE_RESERVE);
 
-/** Reads already taken in the current window. `browseUsed` absent counts as 0 (rows written before the browse class). */
+/** Reads already taken in the current window. `browseUsed` and `startTimesUsed` absent count as 0 (rows written before them). */
 export interface ReadWindow {
   used: number;
   quoteUsed: number;
   browseUsed?: number;
+  /** Browse reads for start times (part of `browseUsed`). */
+  startTimesUsed?: number;
 }
 
 /**
  * The window after one more read of `cls`, or null when it is refused. A
- * fresh window starts from `{ used: 0, quoteUsed: 0 }`. `takeReadToken`
- * applies the same rule in one SQL update.
+ * fresh window starts from `{ used: 0, quoteUsed: 0 }`. `route` names the
+ * page of a browse read; a start-times read is also held to `startTimesCap`.
+ * `takeReadToken` applies the same rule in one SQL update.
  */
-export function admitRead(window: ReadWindow, cls: ReadClass, limits: ReadLimits): ReadWindow | null {
+export function admitRead(window: ReadWindow, cls: ReadClass, limits: ReadLimits, route?: BrowseRoute): ReadWindow | null {
   if (window.used >= limits.perMinute) return null;
   if (cls === "quote" && window.quoteUsed >= limits.quoteCap) return null;
   const browseUsed = window.browseUsed ?? 0;
+  const startTimesUsed = window.startTimesUsed ?? 0;
+  const startTimes = cls === "browse" && route === "start_times";
   if (cls === "browse") {
     if (browseUsed >= (limits.browseCap ?? 0)) return null;
     // Never a read the quotes' unused share could still need.
     if (window.used + 1 + Math.max(0, limits.quoteCap - window.quoteUsed) > limits.perMinute) return null;
+    // Start times leave the hotel lists their reserve.
+    if (startTimes && limits.startTimesCap !== undefined && startTimesUsed >= limits.startTimesCap) return null;
   }
   const next: ReadWindow = { used: window.used + 1, quoteUsed: window.quoteUsed + (cls === "quote" ? 1 : 0) };
   if (cls === "browse" || window.browseUsed !== undefined) next.browseUsed = browseUsed + (cls === "browse" ? 1 : 0);
+  if (startTimes || window.startTimesUsed !== undefined) next.startTimesUsed = startTimesUsed + (startTimes ? 1 : 0);
   return next;
 }

@@ -24,6 +24,17 @@ import { defineConfig, devices } from "@playwright/test";
  * Chromium comes from PLAYWRIGHT_BROWSERS_PATH (pre-installed; never run
  * `playwright install` here). Specs only talk to E2E_BASE_URL: any request
  * to another origin is a failure on the private pages.
+ *
+ * Two projects:
+ *  - `chromium` (`npm run test:e2e`): the B5 customer pages above;
+ *  - `a11y` (`npm run test:e2e:a11y`): `e2e/a11y-*.spec.ts`, the browser and
+ *    accessibility checks of the new controls (hotel Combobox, Time Slot
+ *    Picker) against the synthetic shop. `sh scripts/shop/a11y.sh` prepares
+ *    the database, builds, starts the app and runs it, on a workstation and
+ *    in CI (job "browser and accessibility checks"); see scripts/shop/README.md.
+ *
+ * In CI an HTML report is written too (playwright-report/, uploaded with the
+ * screenshots; synthetic data only).
  */
 const baseURL = process.env.E2E_BASE_URL ?? "http://localhost:3000";
 
@@ -37,7 +48,7 @@ export default defineConfig({
   retries: 0,
   timeout: 60_000,
   expect: { timeout: 10_000 },
-  reporter: [["list"]],
+  reporter: process.env.CI ? [["list"], ["html", { open: "never", outputFolder: "playwright-report" }]] : [["list"]],
   outputDir: "test-results/e2e",
   use: {
     ...devices["Desktop Chrome"],
@@ -48,5 +59,8 @@ export default defineConfig({
     screenshot: "only-on-failure",
     serviceWorkers: "block",
   },
-  projects: [{ name: "chromium", use: { browserName: "chromium" } }],
+  projects: [
+    { name: "chromium", testIgnore: /a11y-[^/]*\.spec\.ts$/, use: { browserName: "chromium" } },
+    { name: "a11y", testMatch: /a11y-[^/]*\.spec\.ts$/, use: { browserName: "chromium" } },
+  ],
 });

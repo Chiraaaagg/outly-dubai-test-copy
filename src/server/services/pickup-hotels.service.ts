@@ -20,7 +20,8 @@ import { bookingAccountId, DEFAULT_BOOKING_ACCOUNT_ID, takeBrowseReadToken } fro
  * `not_offered` and makes no supplier call. The list is read with
  * `GET /hotels/foroffer` from the browse share of the read budget
  * (`takeBrowseReadToken`, suppliers/read-budget.ts; the same class the
- * start-times read uses), never the quote or engine share, and kept
+ * start-times read uses, as route `pickup_hotels`, which keeps a reserve
+ * start-times reads cannot take), never the quote or engine share, and kept
  * per offer and environment for `PICKUP_HOTEL_LIST_TTL_MS`. A refused token or
  * a failed read is `unavailable` (kept briefly, so a failing supplier is not
  * asked again on every keystroke of every visitor); the page then offers the
@@ -192,6 +193,6 @@ function liveSource(environment: SupplierEnvironment) {
 export const pickupHotelsService = createPickupHotelsService({
   target: loadTarget,
   source: liveSource,
-  takeBrowseReadToken: (code, environment, accountId) => takeBrowseReadToken(code, environment, accountId),
+  takeBrowseReadToken: (code, environment, accountId) => takeBrowseReadToken(code, environment, accountId, { route: "pickup_hotels" }),
   now: () => new Date(),
 });

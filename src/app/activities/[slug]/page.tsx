@@ -16,6 +16,7 @@ import { ActivityCard } from "@/components/commerce/activity-card";
 import { toCard } from "@/lib/catalog/card";
 import { ComboCard } from "@/components/commerce/cards";
 import { BookingWidget, StickyBookingBar } from "@/components/commerce/booking-widget";
+import { TicketTerms } from "@/components/commerce/ticket-terms";
 import { parseRetimeId } from "@/lib/start-time-retry";
 import { Gallery } from "@/components/commerce/gallery";
 import { PriceBlock } from "@/components/commerce/price";
@@ -38,7 +39,7 @@ import {
 import { Breadcrumbs, Card, Rating, SectionHeading } from "@/components/ui/primitives";
 import { Rail, RailItem } from "@/components/ui/rail";
 import { getActivities, getActivityBySlug, getActivitiesBySlugs, getCategoryBySlug } from "@/lib/catalog/server";
-import { renderedModeFor } from "@/lib/catalog/eligibility";
+import { openDatedTicketFor, renderedModeFor } from "@/lib/catalog/eligibility";
 import { combos } from "@/lib/data/combos";
 import { formatDuration } from "@/lib/utils";
 import { productOfferJsonLd, serializeJsonLd } from "@/lib/json-ld";
@@ -98,6 +99,8 @@ export default async function ActivityPage({
   if (!cached) notFound();
   // The badge, the attributes and the booking widget all follow the mode read now, not the cached snapshot's (N6).
   const activity = { ...cached, fulfilmentMode: await renderedModeFor(cached) };
+  // Doc 29 Batch 5: an open-dated ticket states its validity and that it is non-refundable once issued.
+  const openDatedTicket = await openDatedTicketFor(cached.productId);
 
   const category = await getCategoryBySlug(activity.categorySlug);
   const relatedAll = await getActivitiesBySlugs(activity.relatedSlugs);
@@ -350,13 +353,17 @@ export default async function ActivityPage({
               <p className="mt-3 text-sm leading-relaxed text-ink-700">
                 {activity.cancellationPolicy}
               </p>
-              <p className="mt-3 text-xs text-ink-500">
-                You can cancel yourself from{" "}
-                <Link href="/manage-booking" className="font-bold text-sun-700 underline">
-                  Manage booking
-                </Link>{" "}
-               , the exact refund amount and credit date are shown before you confirm.
-              </p>
+              {openDatedTicket ? (
+                <TicketTerms />
+              ) : (
+                <p className="mt-3 text-xs text-ink-500">
+                  You can cancel yourself from{" "}
+                  <Link href="/manage-booking" className="font-bold text-sun-700 underline">
+                    Manage booking
+                  </Link>{" "}
+                 , the exact refund amount and credit date are shown before you confirm.
+                </p>
+              )}
             </Card>
           </section>
 

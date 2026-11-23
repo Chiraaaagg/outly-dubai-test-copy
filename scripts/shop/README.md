@@ -57,3 +57,25 @@ Then re-add the TravelDesk TEST and Stripe test values to `.env.test.shop.local`
 - `.env.test.shop.local` is git-ignored and holds the TEST and Stripe test keys. Never copy it anywhere.
 - The shop runs with `next dev --webpack`. With Turbopack, a stray `package-lock.json` in the home folder makes the dev server watch the whole home directory, and the page reloads forever.
 - Product page times must be plain `HH:mm` (for example `21:00`, not `21:00 sailing`) and equal the TravelDesk slot start. Otherwise the quote answers `invalid_slot` and the cart goes to inquiry.
+
+## Browser and accessibility checks
+
+An automated check of the two new controls, the hotel search at checkout and the start-time picker on the product page: keyboard only, focus, labels and roles, axe (WCAG 2.0 A/AA and 2.1 AA), 320 px phones, 200% zoom and reduced motion. It also takes full-page screenshots for a layout review. It runs on GitHub with every push (job "browser and accessibility checks") and can run here too.
+
+It uses **no TravelDesk and no Stripe**: its own throwaway database with synthetic data, and the hotel lists and start times are made-up answers given inside the test browser. It does not touch the test shop above or its database.
+
+```bash
+OUTLY_TEST_ALLOW_LINKED_PARENT=/Users/ASUS/Programs/OUTLYY npm run test:e2e:a11y
+```
+
+This needs Docker running. It starts a fresh database (`outly-a11y-pg17`, port 55435), makes two seeded products instant there (`scripts/shop/a11y-fixture.ts`), builds the site, starts it on http://localhost:3100, runs the checks, and removes the database again. Add `-- --keep` to keep the database between runs, and put Playwright options after a second `--` (for example `npm run test:e2e:a11y -- -- --headed`).
+
+Screenshots land in `test-results/a11y-screenshots/`: for each control, the whole page and a close-up, at desktop size, 320 px and 200% zoom. On GitHub they are attached to the run as `a11y-screenshots-and-report`. That attachment is public, which is why everything in it is synthetic.
+
+With the site already running (for example after `--keep`), the checks alone are:
+
+```bash
+E2E_BASE_URL=http://localhost:3100 npx playwright test --project=a11y
+```
+
+What the checks cannot do, a real screen reader pass, is listed in `docs/accessibility-and-performance.md` §12.

@@ -12,7 +12,7 @@ import {
   type TravelDeskNetPrice,
   type TravelDeskTicketStock,
 } from "./traveldesk.codec";
-import type { StoredOffer, StoredSlot } from "./traveldesk.offer-terms";
+import { slotEndMinutes, type StoredOffer, type StoredSlot } from "./traveldesk.offer-terms";
 
 /**
  * Fresh TravelDesk answer + stored catalogue rules → one supplier quote
@@ -384,8 +384,9 @@ export function quoteSlot(input: SlotQuoteInput): SupplierQuoteResult {
   const group = rows.filter(matches);
   if (stored.length === 0 && group.length === 0) return refuse("invalid_slot");
   // Doc 29 Batch 2: an "any time" offer sells only one of its listed starts, never a start the stored
-  // slots do not list (even when a fresh row names it), and only with a stored end, which the booking sends.
-  if (offer.timeSlots.some((s) => s.isAnyTime) && (stored.length === 0 || stored.some((s) => s.endMinutes === null))) {
+  // slots do not list (even when a fresh row names it), and only with an end the booking can send:
+  // the stored end, or start plus the offer's hours (`slotEndMinutes`, OpenAPI TimeSlotPublicDto.endTime).
+  if (offer.timeSlots.some((s) => s.isAnyTime) && (stored.length === 0 || stored.some((s) => slotEndMinutes(s, offer.durationHours) === null))) {
     return refuse(stored.length === 0 ? "invalid_slot" : "availability_unknown");
   }
   if (group.length === 0) {
@@ -463,11 +464,12 @@ export const LIMITED_SEATS_AT = 5;
  * ignored, so the page can never offer a time the quote would refuse
  * (`quoteSlot`). A start with no row reads `unavailable` (silence is not
  * availability). Prices in the rows are never returned. Null when the offer
- * is not wholly "any time" with stored end times: the page then keeps its
+ * is not wholly "any time" with known end times (stored, or derived from the
+ * offer's hours, `slotEndMinutes`): the page then keeps its
  * stored times. Indicative only; the quote stays the one promise.
  */
 export function listedStartsOn(offer: StoredOffer, serviceDate: string, rows: TravelDeskAvailabilityRow[], now: Date): ListedStart[] | null {
-  if (offer.timeSlots.length === 0 || offer.timeSlots.some((s) => !s.isAnyTime || s.endMinutes === null)) return null;
+  if (offer.timeSlots.length === 0 || offer.timeSlots.some((s) => !s.isAnyTime || slotEndMinutes(s, offer.durationHours) === null)) return null;
   const starts = [...new Set(offer.timeSlots.map((s) => s.startMinutes))].sort((a, b) => a - b);
   const dated = rows.filter((r) => r.date === serviceDate);
   return starts.map((start): ListedStart => {
@@ -548,14 +550,16 @@ export function quoteTickets(input: TicketQuoteInput): SupplierQuoteResult {
     // period may start: the quote must expire then (and refuse too close to it).
     cutoffUtc: new Date(dubaiInstantMs(today, 24 * 60)).toISOString(),
     ticketValidUntil: s.validUntil,
+    openDatedTicket: true,
   });
 }
 
 function ok(
   input: { serviceDate: string; policy: TravelDeskCancellationRule[] | null; now: Date; issuesTicketsAtConfirm: Tristate },
-  part: Pick<Ok, "slotRef" | "netAedMinor" | "netUsdMinor" | "capacity" | "seatsLeft" | "cutoffUtc"> & { ticketValidUntil?: string | null },
+  part: Pick<Ok, "slotRef" | "netAedMinor" | "netUsdMinor" | "capacity" | "seatsLeft" | "cutoffUtc"> & { ticketValidUntil?: string | null; openDatedTicket?: true },
 ): SupplierQuoteResult {
-  const free = freeCancellationUntilMs(input.serviceDate, input.policy);
+  // Doc 29 §4.4: issued tickets can never be cancelled, so a ticket quote carries no supplier refund window, whatever the tour policy says.
+  const free = part.openDatedTicket ? null : freeCancellationUntilMs(input.serviceDate, input.policy);
   return {
     ok: true,
     ...part,

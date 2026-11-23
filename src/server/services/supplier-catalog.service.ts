@@ -19,7 +19,7 @@ import { ageBandMismatches, offerReadinessFacts } from "../suppliers/traveldesk/
 import { readinessService } from "./readiness.service";
 import { verifyStepUp } from "./approval.service";
 import { gateVerdict, loadCapabilityGate } from "../suppliers/capability-gate";
-import { CAPABILITY_DERIVATION_VERSION, deriveCapabilities, listedStartsSellable } from "../suppliers/traveldesk/traveldesk.capability";
+import { bookingKindSellable, CAPABILITY_DERIVATION_VERSION, deriveCapabilities, listedStartsSellable, TICKET_CLASS_KEYS } from "../suppliers/traveldesk/traveldesk.capability";
 import type { ReadLimits } from "../suppliers/read-budget";
 import { TravelDeskApiError } from "../suppliers/traveldesk/traveldesk.http";
 import { bookingAccountId, DEFAULT_BOOKING_ACCOUNT_ID, mutationInFlight, takeReadToken } from "./supplier-booking.service";
@@ -417,6 +417,14 @@ export interface VariantMappingState {
      * stored end, engine-saga.service.ts). Anything else is false.
      */
     listedStartsSellable?: boolean;
+    /**
+     * Doc 29 Batch 5: the offer is an open-dated ticket sold instantly. True
+     * only when the capability gate allows its exact ticket class key
+     * (`TICKET_CLASS_KEYS`; flag on, evidence for the key and current terms)
+     * and the mapping's booking kind is `ticket_only` on both the mapping and
+     * its approved reference. Anything else is false.
+     */
+    openDatedSellable?: boolean;
   } | null;
   /** Empty when the mapping side is ready; readiness adds its own reasons. */
   blockers: MappingBlocker[];
@@ -497,8 +505,10 @@ export const supplierCatalogService = {
    *    approved hash at all;
    *  - `slot_rules_unknown`: the stored offer cannot be read, or a slot-based
    *    offer has no slots;
-   *  - `capability_not_ready`: not a live-book offer (on request, TicketOnly or
-   *    unknown), the supplier row is not the TravelDesk adapter, or the
+   *  - `capability_not_ready`: not a live-book offer (on request, unknown, or
+   *    a TicketOnly offer whose one Batch 5 ticket key is not switched on, doc
+   *    29 Batch 5), the mapping's booking kind disagrees with its approved
+   *    reference or its stored offer, the supplier row is not the TravelDesk adapter, or the
    *    capability gate refuses the offer (doc 29 §3.3, Batch 1a): its class is
    *    unknown or never sellable, needs review, its exact class key is not
    *    switched on for this environment, or it lacks the per-offer evidence
@@ -563,16 +573,14 @@ export const supplierCatalogService = {
       if (!present || m.syncStatus === "missing_upstream") blockers.push("mapping_missing_upstream");
       else if (m.syncStatus !== "ok" || !m.approvedOfferHash || currentOfferHash !== m.approvedOfferHash) blockers.push("mapping_changed_upstream");
       if (!stored || (stored.bookingKind === "live_book" && stored.timeSlots.length === 0)) blockers.push("slot_rules_unknown");
-      // The capability lookup is added beside the old live-book test, which stays, so the verdict is never more permissive (Batch 1a parity).
+      // The capability lookup decides (Batch 1a parity). The booking kind must agree on the mapping, its approved
+      // reference and the stored offer's class (`bookingKindSellable`): live book needs a live class, TicketOnly the one
+      // ticket key of Batch 5, which is off unless switched on with evidence. With that flag off this is the old
+      // live-book test exactly.
       const capability = gateVerdict(gate, m.supplierOfferId ?? "", offer && !offer.removedAt ? offer.payload : null, currentOfferHash);
-      if (
-        supplier.adapter !== "traveldesk" ||
-        !ref.success ||
-        ref.data.bookingKind !== "live_book" ||
-        m.bookingKind !== "live_book" ||
-        !capability.verdict.instant
-      )
-        blockers.push("capability_not_ready");
+      const kindSellable = ref.success && m.bookingKind === ref.data.bookingKind && bookingKindSellable(ref.data.bookingKind, capability.verdict);
+      if (supplier.adapter !== "traveldesk" || !kindSellable) blockers.push("capability_not_ready");
+      const openDatedSellable = kindSellable && ref.success && ref.data.bookingKind === "ticket_only" && TICKET_CLASS_KEYS.includes(capability.verdict.classKey);
       if (bandMismatch.length) blockers.push("unit_not_mapped");
       const syncedAt = catalogueSyncedAt(lastComplete, offer?.lastSeenAt ?? null);
       if (catalogueStale(syncedAt, at)) blockers.push("catalogue_stale");
@@ -597,7 +605,8 @@ export const supplierCatalogService = {
           capabilityClassKey: capability.verdict.classKey,
           capabilityRefusal: capability.verdict.instant ? null : capability.verdict.reason,
           catalogueSyncedAt: syncedAt?.toISOString() ?? null,
-          listedStartsSellable: listedStartsSellable(capability.verdict.instant, capability.verdict.classKey, stored?.timeSlots),
+          listedStartsSellable: listedStartsSellable(capability.verdict.instant, capability.verdict.classKey, stored?.timeSlots, stored?.durationHours),
+          openDatedSellable: supplier.adapter === "traveldesk" && openDatedSellable,
         },
         blockers,
       };

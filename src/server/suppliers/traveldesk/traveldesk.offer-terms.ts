@@ -64,6 +64,8 @@ export const storedOfferSchema = z.object({
   isDirectCollection: z.boolean(),
   isExternal: z.boolean(),
   tripUnit: z.string().nullable(),
+  /** `numberOfHours`: the offer's length in whole hours; absent in payloads stored before it was read. */
+  durationHours: z.number().int().nullable().optional(),
   timeSlots: z.array(storedSlotSchema),
   pricingPeriods: z.array(storedPeriodSchema),
 });
@@ -75,6 +77,24 @@ const storedTourSchema = z.object({
   tourId: z.number().int(),
   cancellationPolicy: z.array(z.object({ moreThanHours: z.number().int(), refundPercent: z.number().int() })),
 });
+
+/** Latest end a derived slot end may have: midnight. How TravelDesk writes an end past midnight is undocumented, so later is unknown. */
+const DAY_MINUTES = 24 * 60;
+
+/**
+ * The end time a booking sends for a stored slot (TravelDesk OpenAPI,
+ * `TimeSlotPublicDto.endTime`: "if end time is undefined, it should be
+ * calculated from offer's number of hours"). The stored end when there is
+ * one; otherwise start plus `durationHours` × 60. Null (unknown, never
+ * booked) when the hours are missing or not positive, or the derived end
+ * would pass midnight.
+ */
+export function slotEndMinutes(slot: { startMinutes: number; endMinutes: number | null }, durationHours: number | null | undefined): number | null {
+  if (slot.endMinutes !== null) return slot.endMinutes;
+  if (typeof durationHours !== "number" || !Number.isInteger(durationHours) || durationHours <= 0) return null;
+  const end = slot.startMinutes + durationHours * 60;
+  return end <= DAY_MINUTES ? end : null;
+}
 
 /** The stored offer payload, or null when it lacks a field the booking rules need. */
 export function parseStoredOffer(payload: unknown): StoredOffer | null {
@@ -104,6 +124,8 @@ export interface OfferTerms {
   };
   daysOffered: number;
   slots: StoredSlot[];
+  /** Only when a slot has no stored end, so its booked end is derived from these hours (absent otherwise: existing hashes unchanged). */
+  slotHours?: number | null;
   pickup: { directReporting: boolean; directCollection: boolean };
   policy: TravelDeskCancellationRule[];
   priceBasis: { privateType: TravelDeskPrivateType; tripUnit: string | null; perPerson: boolean; perTrip: boolean };
@@ -131,6 +153,8 @@ export function offerTermsOf(offerPayload: unknown, tourPayload: unknown): Offer
     },
     daysOffered: o.daysOffered,
     slots: [...o.timeSlots].sort((a, b) => a.timeSlotId - b.timeSlotId || a.startMinutes - b.startMinutes),
+    // A derived end follows the offer's hours, so a change to them needs a fresh review; offers with every end stored hash as before.
+    ...(o.timeSlots.some((t) => t.endMinutes === null) ? { slotHours: o.durationHours ?? null } : {}),
     pickup: { directReporting: o.isDirectReporting, directCollection: o.isDirectCollection },
     policy: [...policy].sort((a, b) => a.moreThanHours - b.moreThanHours || a.refundPercent - b.refundPercent),
     priceBasis: {
