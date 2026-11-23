@@ -6,12 +6,13 @@ import { TICKET_NON_REFUNDABLE_STATEMENT } from "@/lib/utils";
  * payment (the page has no live stock read), and it is non-refundable once
  * issued. Built from existing typography only; no new component import.
  */
-export function TicketTerms({ className }: { className?: string }) {
+export function TicketTerms({ className, inquiry = false }: { className?: string; inquiry?: boolean }) {
   return (
     <div className={className ?? "mt-3 space-y-1.5 text-sm leading-relaxed text-ink-700"} data-testid="ticket-terms">
       <p>
-        <span className="font-bold text-ink-900">Open-dated ticket.</span> Valid until the date the operator sets; we show it with
-        your price before you pay.
+        <span className="font-bold text-ink-900">Open-dated ticket.</span> Valid until the date the operator sets;{" "}
+        {/* An inquiry page has no quote: our team states the date (review 86 B5-04). */}
+        {inquiry ? "our team confirms it with you before you pay." : "we show it with your price before you pay."}
       </p>
       <p className="font-bold text-ink-900">{TICKET_NON_REFUNDABLE_STATEMENT}</p>
       <p className="text-xs text-ink-500">Issued tickets can&apos;t be cancelled online. If something goes wrong, message us with your reference.</p>

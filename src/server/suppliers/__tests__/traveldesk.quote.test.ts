@@ -67,8 +67,8 @@ describe("live-book slot quote (SUP-14)", () => {
       // 21:00 Asia/Dubai is 17:00 UTC; the slot closes 12 hours before.
       cutoffUtc: "2026-11-12T05:00:00.000Z",
       issuesTicketsAtConfirm: "unknown",
-      // 72 h before 00:00 Asia/Dubai on the service date (2026-11-11T20:00Z).
-      supplierFreeCancellationUntilUtc: "2026-11-08T20:00:00.000Z",
+      // 72 h before the 21:00 Asia/Dubai start (2026-11-12T17:00Z), doc 29 §8.7.
+      supplierFreeCancellationUntilUtc: "2026-11-09T17:00:00.000Z",
       ticketValidUntil: null,
     });
   });
@@ -82,12 +82,24 @@ describe("live-book slot quote (SUP-14)", () => {
     expect(slot([row()], { now: new Date("2026-11-12T04:59:59Z") }).ok).toBe(true);
   });
 
-  it("a negative minimumAdvancedBooking (Q-A5, unconfirmed) is read as hours before the start: the strictest reading", () => {
-    const offer = offerOf({ timeSlots: [storedSlot({ minimumAdvancedBookingHours: -24 })] });
-    expect(slotCutoffMs(SERVICE_DATE, 1260, -24)).toBe(Date.parse("2026-11-11T17:00:00Z"));
-    expect(slot([row()], { offer, now: new Date("2026-11-11T18:00:00Z") })).toEqual({ ok: false, reason: "past_cutoff" });
-    const before = slot([row()], { offer, now: new Date("2026-11-11T16:00:00Z") });
-    expect(before.ok && before.cutoffUtc).toBe("2026-11-11T17:00:00.000Z");
+  it("doc 29 §8.7: a negative minimumAdvancedBooking moves the cut-off later than the start; a positive one is unchanged", () => {
+    // Opening 10:00 Dubai (06:00Z) with -5 h: bookable the same day until 15:00 Dubai (11:00Z).
+    expect(slotCutoffMs(SERVICE_DATE, 600, -5)).toBe(Date.parse("2026-11-12T11:00:00Z"));
+    expect(slotCutoffMs(SERVICE_DATE, 600, 5)).toBe(Date.parse("2026-11-12T01:00:00Z"));
+    expect(slotCutoffMs(SERVICE_DATE, 600, 0)).toBe(Date.parse("2026-11-12T06:00:00Z"));
+    expect(slotCutoffMs(SERVICE_DATE, 600, null)).toBe(Date.parse("2026-11-12T06:00:00Z"));
+    const offer = offerOf({ timeSlots: [storedSlot({ startMinutes: 600, endMinutes: 1200, minimumAdvancedBookingHours: -5 })] });
+    const opening = row({ startMinutes: 600, endMinutes: 1200 });
+    const at = (iso: string) => slot([opening], { offer, slotRef: "10:00", now: new Date(iso) });
+    // After the opening, before the cut-off: still sold, and the quote expires at the cut-off.
+    const open = at("2026-11-12T08:00:00Z");
+    expect(open.ok && open.cutoffUtc).toBe("2026-11-12T11:00:00.000Z");
+    expect(at("2026-11-12T10:59:59Z").ok).toBe(true);
+    expect(at("2026-11-12T11:00:00Z")).toEqual({ ok: false, reason: "past_cutoff" });
+    // A positive value still closes before the start.
+    const ahead = offerOf({ timeSlots: [storedSlot({ startMinutes: 600, endMinutes: 1200, minimumAdvancedBookingHours: 5 })] });
+    expect(slot([opening], { offer: ahead, slotRef: "10:00", now: new Date("2026-11-12T01:00:00Z") })).toEqual({ ok: false, reason: "past_cutoff" });
+    expect(slot([opening], { offer: ahead, slotRef: "10:00", now: new Date("2026-11-12T00:59:59Z") }).ok).toBe(true);
   });
 
   it("without an advance rule the cutoff is the slot start itself", () => {
@@ -269,8 +281,8 @@ describe("TicketOnly (Q-T2)", () => {
     // A price dated the visit day, or any other day, belongs to another pricing period.
     expect(tickets({ price: { date: SERVICE_DATE } })).toEqual({ ok: false, reason: "availability_unknown" });
     expect(tickets({ price: { date: null } })).toEqual({ ok: false, reason: "availability_unknown" });
-    // The visit must fall on or before the last valid day.
-    expect(tickets({ validUntil: "2026-11-11" })).toEqual({ ok: false, reason: "availability_unknown" });
+    // The visit must fall on or before the last valid day; after it is its own reason (review 86 B5-03).
+    expect(tickets({ validUntil: "2026-11-11" })).toEqual({ ok: false, reason: "ticket_validity_ended" });
     expect(tickets({ validUntil: SERVICE_DATE })).toMatchObject({ ok: true, ticketValidUntil: SERVICE_DATE });
     expect(tickets({ validUntil: null })).toMatchObject({ ok: true, ticketValidUntil: null });
   });
@@ -331,7 +343,7 @@ describe("TicketOnly (Q-T2)", () => {
     expect(at("2026-11-01T20:00:00Z", "2026-11-01", null, "2026-11-02")).toEqual({ ok: false, reason: "past_cutoff" });
     // The last valid day is a valid visit day; the day after is not.
     expect(at("2026-11-01T08:00:00Z", "2027-02-28", "2027-02-28", "2026-11-01")).toMatchObject({ ok: true, ticketValidUntil: "2027-02-28" });
-    expect(at("2026-11-01T08:00:00Z", "2027-03-01", "2027-02-28", "2026-11-01")).toEqual({ ok: false, reason: "availability_unknown" });
+    expect(at("2026-11-01T08:00:00Z", "2027-03-01", "2027-02-28", "2026-11-01")).toEqual({ ok: false, reason: "ticket_validity_ended" });
   });
 });
 
@@ -344,6 +356,24 @@ describe("free cancellation and time", () => {
     expect(freeCancellationUntilMs(SERVICE_DATE, null)).toBeNull();
     const r = slot([row()], { policy: null });
     expect(r.ok && r.supplierFreeCancellationUntilUtc).toBeNull();
+  });
+
+  it("doc 29 §8.7: the window counts back from the activity start, not Dubai midnight; tickets stay non-refundable", () => {
+    const h24 = [{ moreThanHours: 24, refundPercent: 100 }];
+    // 21:00 Dubai on 12 Nov is 17:00Z; 24 hours before is 17:00Z on 11 Nov (midnight would have been 20:00Z on 10 Nov).
+    expect(freeCancellationUntilMs(SERVICE_DATE, h24, 21 * 60)).toBe(Date.parse("2026-11-11T17:00:00Z"));
+    expect(freeCancellationUntilMs(SERVICE_DATE, h24)).toBe(Date.parse("2026-11-10T20:00:00Z"));
+    // Boundaries: a start at 00:00 equals the old reading; a start at 23:59 moves it by 23 h 59 min.
+    expect(freeCancellationUntilMs(SERVICE_DATE, h24, 0)).toBe(freeCancellationUntilMs(SERVICE_DATE, h24));
+    expect(freeCancellationUntilMs(SERVICE_DATE, h24, 23 * 60 + 59)).toBe(Date.parse("2026-11-11T19:59:00Z"));
+    // A 0-hour full refund: until the start itself.
+    expect(freeCancellationUntilMs(SERVICE_DATE, [{ moreThanHours: 0, refundPercent: 100 }], 21 * 60)).toBe(Date.parse("2026-11-12T17:00:00Z"));
+    // The quote uses the booked slot's start.
+    const q = slot([row()], { policy: h24 });
+    expect(q.ok && q.supplierFreeCancellationUntilUtc).toBe("2026-11-11T17:00:00.000Z");
+    // TicketOnly quotes carry no window, whatever the tour policy says.
+    const t = quoteTickets({ offer: offerOf(), policy: h24, serviceDate: SERVICE_DATE, units: TWO_ADULTS_ONE_CHILD, stock: ticketStock(), now: NOW, issuesTicketsAtConfirm: "yes" });
+    expect(t.ok && t.supplierFreeCancellationUntilUtc).toBeNull();
   });
 });
 
@@ -466,9 +496,16 @@ describe("listed starts: the quote (Batch 2)", () => {
   });
 
   it("a listed start with no stored end sells with start plus the offer's hours (OpenAPI TimeSlotPublicDto.endTime); without hours it is refused", () => {
-    // The fixture offer runs 2 hours, so 13:00 ends 15:00.
-    expect(slot([listedRow(780)], { offer: listedOffer({}, () => null), slotRef: "13:00" })).toMatchObject({ ok: true, slotRef: "31@13:00" });
+    // The fixture offer runs 2 hours, so 13:00 ends 15:00; the row names the same end.
+    expect(slot([listedRow(780, { endMinutes: 900 })], { offer: listedOffer({}, () => null), slotRef: "13:00" })).toMatchObject({ ok: true, slotRef: "31@13:00" });
+    // Review 85 A2: a row whose end differs from the derived one is unknown (which end TravelDesk books is undocumented).
+    expect(slot([listedRow(780)], { offer: listedOffer({}, () => null), slotRef: "13:00" })).toEqual({ ok: false, reason: "availability_unknown" });
+    // A stored end is sent as stored, whatever the row says (the Dhow path is unchanged).
+    expect(slot([listedRow(780, { endMinutes: 900 })], { offer: listedOffer(), slotRef: "13:00" })).toMatchObject({ ok: true, slotRef: "31@13:00" });
     expect(listedStartsOn(listedOffer({}, () => null), SERVICE_DATE, [listedRow(780)], NOW)).not.toBeNull();
+    const shown = (end: number) => listedStartsOn(listedOffer({}, () => null), SERVICE_DATE, [listedRow(780, { endMinutes: end })], NOW)?.find((x) => x.time === "13:00")?.status;
+    expect(shown(900)).toBe("available");
+    expect(shown(840)).toBe("unavailable"); // the row's end disagrees with the derived one: the quote would refuse it
     for (const durationHours of [0, null, -2]) {
       expect(slot([listedRow(780)], { offer: listedOffer({ durationHours }, () => null), slotRef: "13:00" })).toEqual({ ok: false, reason: "availability_unknown" });
       expect(listedStartsOn(listedOffer({ durationHours }, () => null), SERVICE_DATE, [listedRow(780)], NOW)).toBeNull();

@@ -292,6 +292,8 @@ const CANCELLABLE: SupplierBookingState[] = ["reserved", "awaiting_payment", "co
 
 /** States in which the scheduled run sends a saga's hold-release cancel: a hold, or a lookup the cancel waits for (doc 22 §32.22, review P3-6). */
 const RELEASE_CANCEL_STATES: readonly SupplierBookingState[] = [...HOLDING, ...RECOVERING];
+/** A released hold the supplier refused to cancel, left to lapse at its deadline (review 86 B5-01). */
+const RELEASE_LAPSES_CODE = "release_cancel_refused_hold_lapses";
 
 const POLL_INTERVAL_MS = 15_000;
 /** External-confirmation polls back off from 15 s to this (SUP-17). */
@@ -824,6 +826,9 @@ function responseData(s: SupplierSnapshot): Prisma.SupplierBookingUpdateManyMuta
     externalFailed: s.externalFailed ?? undefined,
     hasTickets: s.ticketsIssued === true ? true : undefined,
     chargedNetMinor: s.chargedNetMinor ?? undefined,
+    // Kept when a later answer omits them (doc 29 §8.7; review 86 B5-07): the list re-read carries neither.
+    pickupTimeMinutes: typeof s.pickupMinutes === "number" ? s.pickupMinutes : undefined,
+    ticketsValidUntil: s.ticketsValidUntil && /^\d{4}-\d{2}-\d{2}$/.test(s.ticketsValidUntil) ? new Date(`${s.ticketsValidUntil}T00:00:00Z`) : undefined,
     lastResponse: snapshotJson(s),
   };
 }
@@ -2694,6 +2699,11 @@ export const supplierBookingService = {
       return "account_unavailable";
     }
     if (accountMismatch(b, acct.accountId)) return this.refuseForAccount(b, "cancel", deps);
+    // An unconfirmed hold the payment saga released (no confirm ever sent): if the supplier refuses to cancel it, it can
+    // still lapse on its own (review 86 B5-01). Decided before the send, on the state the hold was in.
+    const lapses = HOLDING.includes(b.state) && (await this.releaseCancelDue(b));
+    // Already refused once and left to lapse: never ask again; the watchdog records the end.
+    if (lapses && b.errorCode === RELEASE_LAPSES_CODE) return "hold_lapses";
     const sending = await this.startSend(b, "cancelling", lease, OPERATION.cancel, deps);
     if (sending === "lease_lost") {
       await enqueue(prisma, "cancel", b.id, new Date(deps.now().getTime() + 15_000), deps.holder);
@@ -2725,6 +2735,20 @@ export const supplierBookingService = {
         { detail: { via: "cancel", reason: "reread_failed" }, next: recover(RECOVERY_DELAY_MS), holder: deps.holder, saga: deps.saga },
       );
       return "cancel_unverified";
+    }
+    if (o.kind === "rejected" && lapses) {
+      // Review 86 B5-01: TravelDesk documents that TicketOnly bookings cannot be cancelled, and a reservation (status 7)
+      // that is never confirmed times out (status 8) at its deadline, which returns the balance. So a refused release
+      // does not wait for a person: the hold goes back to its state (release_requested still blocks any confirm) and
+      // the watchdog reads it after the deadline (sent + reservationTimeout at the latest, UTC). Only a read showing
+      // it expired or cancelled releases the order item and lets the saga release the card authorisation.
+      await transitionWithEvent(
+        sending,
+        b.state,
+        { errorCode: RELEASE_LAPSES_CODE, errorMessage: "The supplier refused to cancel the unconfirmed hold; it is left to lapse at its deadline" },
+        { detail: { via: "cancel", code: o.code, fallback: "hold_lapses" }, next: [watchdogJob(b, t)], holder: deps.holder, saga: deps.saga },
+      );
+      return "cancel_refused_hold_lapses";
     }
     if (o.kind === "rejected" && o.code === "refused_policy") {
       await transitionWithEvent(sending, "cancel_refused", { errorCode: "cancel_refused", errorMessage: "The supplier refused the cancellation" }, { detail: { via: "cancel", code: o.code }, saga: deps.saga });

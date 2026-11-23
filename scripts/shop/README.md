@@ -72,7 +72,7 @@ This needs Docker running. It starts a fresh database (`outly-a11y-pg17`, port 5
 
 Screenshots land in `test-results/a11y-screenshots/`: for each control, the whole page and a close-up, at desktop size, 320 px and 200% zoom. On GitHub they are attached to the run as `a11y-screenshots-and-report`. That attachment is public, which is why everything in it is synthetic.
 
-With the site already running (for example after `--keep`), the checks alone are:
+With the site already running against that database (`--keep` keeps the database and env files, but the script always stops the site on exit, so start it yourself first), the checks alone are:
 
 ```bash
 E2E_BASE_URL=http://localhost:3100 npx playwright test --project=a11y

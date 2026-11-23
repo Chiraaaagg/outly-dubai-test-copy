@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { addDays } from "@/lib/utils";
 import type { SupplierQuoteInput } from "../../quotes/contracts";
 import { admitRead, READ_BUDGET, type ReadClass, type ReadWindow } from "../../suppliers/read-budget";
-import { offerTermsHash } from "../../suppliers/traveldesk/traveldesk.offer-terms";
+import { offerTermsHash, slotHoursOf } from "../../suppliers/traveldesk/traveldesk.offer-terms";
 import { row, SERVICE_DATE, storedOffer, storedSlot, storedTour } from "../../suppliers/__tests__/fixtures/traveldesk-terms";
 import { mapping, instantDoc, product, PRODUCT_ID, fakeMargin } from "./_b2-fakes";
 
@@ -40,6 +40,7 @@ function context(offer: Record<string, unknown> = LISTED): Context {
       supplierCode: "traveldesk",
       externalRef: { tourId: 3001, offerId: 501, bookingKind: "live_book", isExternal: false },
       approvedOfferHash: offerTermsHash(offer, storedTour())!,
+      approvedSlotHours: slotHoursOf(offer),
     },
     offer: { payload: offer, removed: false },
     tour: { payload: storedTour(), removed: false },
@@ -160,9 +161,10 @@ describe("supplierQuoteService.startTimes (Batch 2)", () => {
     const h = harness();
     const answers = [];
     for (let i = 0; i < 40; i++) answers.push(await h.svc.startTimes({ mappingId: "m-1", serviceDate: addDays(SERVICE_DATE, i) }));
-    expect(answers.filter((a) => a.ok)).toHaveLength(READ_BUDGET.browseCap!);
-    expect(answers.slice(READ_BUDGET.browseCap!).every((a) => !a.ok && a.reason === "busy")).toBe(true);
-    expect(h.budget.window).toMatchObject({ quoteUsed: 0, browseUsed: READ_BUDGET.browseCap });
+    // Start-times reads stop at their own cap inside browse (the hotel lists keep their reserve), as the SQL counts them (review 85 A4).
+    expect(answers.filter((a) => a.ok)).toHaveLength(READ_BUDGET.startTimesCap!);
+    expect(answers.slice(READ_BUDGET.startTimesCap!).every((a) => !a.ok && a.reason === "busy")).toBe(true);
+    expect(h.budget.window).toMatchObject({ quoteUsed: 0, browseUsed: READ_BUDGET.startTimesCap, startTimesUsed: READ_BUDGET.startTimesCap });
     // The quote takes its own share and is answered from a fresh read.
     const q = await h.svc.quote(quoteInput);
     expect(q).toMatchObject({ ok: true, slotRef: "31@10:00" });

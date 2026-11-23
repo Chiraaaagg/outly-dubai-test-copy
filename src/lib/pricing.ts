@@ -3,7 +3,8 @@ import { ZERO, addMoney, scaleMoney } from "./utils";
 import { MAX_INSTANT_ITEMS_PER_ORDER } from "@/server/quotes/contracts";
 
 /** The fields pricing reads — a full `Activity` or the card projection both satisfy it. */
-export type PricedActivity = Pick<Activity, "slug" | "title" | "images" | "price" | "variants" | "addOns" | "quoteOnly" | "confirmation" | "fulfilmentMode" | "freeCancellationHours" | "durationMinutes">;
+export type PricedActivity = Pick<Activity, "slug" | "title" | "images" | "price" | "variants" | "addOns" | "quoteOnly" | "confirmation" | "fulfilmentMode" | "freeCancellationHours" | "durationMinutes"> &
+  Partial<Pick<Activity, "openDatedTicket">>;
 
 /**
  * Price computation.
@@ -189,6 +190,7 @@ export function toCartItem(
     confirmation: activity.confirmation,
     fulfilmentMode: activity.fulfilmentMode,
     freeCancellationHours: activity.freeCancellationHours,
+    ...(activity.openDatedTicket ? { openDatedTicket: true } : {}),
     durationMinutes: activity.durationMinutes,
   };
 }

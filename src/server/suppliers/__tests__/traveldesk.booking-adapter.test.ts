@@ -1,7 +1,7 @@
 import { inspect } from "node:util";
 import { describe, expect, it } from "vitest";
 import { IssuedTicketSet, type TicketEvidence } from "../../documents/contracts";
-import type { TravelDeskBooking } from "../traveldesk/traveldesk.booking";
+import { bookingFrom, bookingWire, type TravelDeskBooking } from "../traveldesk/traveldesk.booking";
 import { ANSWERED_UNVERIFIED_REASON } from "../booking-port";
 import {
   ANSWERED_UNVERIFIED,
@@ -53,7 +53,6 @@ function booking(over: Partial<TravelDeskBooking> = {}): TravelDeskBooking {
     voucherNotReady: false,
     hasTickets: false,
     creationState: null,
-    paymentErrorMessage: null,
     ...over,
   };
 }
@@ -117,18 +116,25 @@ describe("TravelDesk statuses as the engine sees them", () => {
     for (const s of [2, 3, 6, 99]) expect(travelDeskStatus({ status: s, externalInProgress: false, externalFailed: false })).toBe("UNKNOWN");
   });
 
-  it("payment failed (6, with the supplier's message) and payment required (3) stay unknown; the message never reaches the snapshot", () => {
+  it("payment failed (6, with the supplier's message) and payment required (3) stay unknown; the message is not even decoded (review 85 A9)", () => {
     for (const status of [3, 6]) {
-      const s = snapshotFrom(booking({ status, paymentErrorMessage: "Insufficient balance" }));
+      const s = snapshotFrom(booking({ status }));
       expect(s).toMatchObject({ status: "UNKNOWN", rawStatus: status });
-      expect(JSON.stringify(s, (_k, v) => (typeof v === "bigint" ? v.toString() : v))).not.toContain("Insufficient");
     }
+    const decoded = bookingFrom(bookingWire.parse({ id: 1, date: "2026-11-10T00:00:00", offerId: 1, bookingType: 1, tourId: 1, adults: 1, children: 0, infants: 0, totalCost: 1, totalCostUsd: 1, status: 6, paymentErrorMessage: "Insufficient balance" }));
+    expect(JSON.stringify(decoded, (_k, v) => (typeof v === "bigint" ? v.toString() : v))).not.toContain("Insufficient");
   });
 
   it("keeps the raw status in the snapshot for the predicate, and no ticket claim it cannot make", () => {
     const s = snapshotFrom(booking({ status: 5, reservationDeadline: null }));
     expect(s).toMatchObject({ ref: "100", status: "CONFIRMED", rawStatus: 5, holdExpiresAtUtc: null, ticketsIssued: null, chargedNetMinor: 24_000n });
     expect(snapshotFrom(booking({ hasTickets: true })).ticketsIssued).toBe(true);
+  });
+
+  it("carries the returned pickup time (doc 29 §8.7) only when TravelDesk gave one", () => {
+    expect(snapshotFrom(booking({ status: 5, pickupMinutes: 495 })).pickupMinutes).toBe(495);
+    expect(snapshotFrom(booking({ status: 5, pickupMinutes: null }))).not.toHaveProperty("pickupMinutes");
+    expect(snapshotFrom(booking({ status: 5 }))).not.toHaveProperty("pickupMinutes");
   });
 });
 

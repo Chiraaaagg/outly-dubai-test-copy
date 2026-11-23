@@ -28,10 +28,11 @@ import { slotEndMinutes, type StoredOffer, type StoredSlot } from "./traveldesk.
  *  - Times. TravelDesk states no timezone (Q-A2). Dates and slot starts are
  *    read as Asia/Dubai (UTC+4, no daylight saving): that puts every derived
  *    instant earlier than a UTC reading would.
- *  - `minimumAdvancedBooking` is in hours before the slot start (doc 21 §4).
- *    A negative value (Q-A5, unconfirmed: "until N h after start" or "no
- *    cutoff") is read as N hours BEFORE the start, the strictest of the
- *    possible meanings. Missing means the slot start itself.
+ *  - `minimumAdvancedBooking` is in hours before the slot (or opening) start
+ *    (doc 21 §4): the cut-off is the start minus the hours. TravelDesk
+ *    answered Q-A5 (doc 29 §8.7): a negative value counts against the
+ *    opening time too, so it moves the cut-off later the same day (start
+ *    10:00 with -5 h: bookable until 15:00). Missing means the start itself.
  *  - Non-operating days come back as rows with `left: 0, isBookable: true`
  *    (doc 21 Q-A1): that is `closed`, as is a weekday outside `daysOffered`.
  *  - `left` 99999 / 999999 are sentinels (Q-A6), and on per-trip offers `left`
@@ -41,9 +42,12 @@ import { slotEndMinutes, type StoredOffer, type StoredSlot } from "./traveldesk.
  *    and open-dated tickets carry a separate validity, the window in which it
  *    can be USED. So the price is the one dated today (the purchase day,
  *    Asia/Dubai), and the visit date must fall from today up to `validUntil`.
- *  - The full-refund deadline counts the policy hours back from 00:00
- *    Asia/Dubai on the service date (Q-K1 leaves slot start or midnight
- *    open; midnight is earlier). Cancelling must happen strictly before it.
+ *  - The full-refund deadline counts the policy hours back from the
+ *    activity's start, Asia/Dubai: the slot start, or 00:00 on the service
+ *    date when no start is known (the earliest it can begin). TravelDesk
+ *    answered Q-K1 "counted from the activity start", and the owner replaced
+ *    the Dubai-midnight rule on 23 Nov 2026 (doc 29 §8.7; conflict C12
+ *    reversed). Cancelling must happen strictly before it. Tickets have none.
  *  - The AED net is what TravelDesk shows as charged: the booking total
  *    rounded to whole dirhams, half to even (`chargedTotalMinor`). Within a
  *    fil per unit of half a dirham there is no quote.
@@ -110,22 +114,24 @@ export function dubaiInstantMs(isoDate: string, minutes: number): number {
   return Date.parse(`${isoDate}T00:00:00Z`) + minutes * 60_000 - DUBAI_OFFSET_MS;
 }
 
-/** Latest instant a slot may be booked (see the module note on negative values). */
+/** Latest instant a slot may be booked: its start minus the advance hours; a negative value is later than the start (doc 29 §8.7). */
 export function slotCutoffMs(serviceDate: string, startMinutes: number, advanceHours: number | null): number {
   const start = dubaiInstantMs(serviceDate, startMinutes);
-  return advanceHours === null ? start : start - Math.abs(advanceHours) * 3_600_000;
+  return advanceHours === null ? start : start - advanceHours * 3_600_000;
 }
 
 /**
  * Full-refund deadline from the tour policy, or null when the policy offers
  * no full refund or is unknown. "If more than H hours": the smallest H with a
- * 100% refund wins; the deadline itself is excluded.
+ * 100% refund wins; the deadline itself is excluded. Counted from the
+ * activity start (`startMinutes` after Dubai midnight on the service date;
+ * midnight when unknown), doc 29 §8.7.
  */
-export function freeCancellationUntilMs(serviceDate: string, policy: TravelDeskCancellationRule[] | null): number | null {
+export function freeCancellationUntilMs(serviceDate: string, policy: TravelDeskCancellationRule[] | null, startMinutes: number | null = null): number | null {
   if (!policy) return null;
   const full = policy.filter((r) => r.refundPercent >= 100 && r.moreThanHours >= 0).map((r) => r.moreThanHours);
   if (full.length === 0) return null;
-  return dubaiInstantMs(serviceDate, 0) - Math.min(...full) * 3_600_000;
+  return dubaiInstantMs(serviceDate, startMinutes ?? 0) - Math.min(...full) * 3_600_000;
 }
 
 /**
@@ -245,7 +251,7 @@ export interface OfferReadinessFacts {
   supplierUnits: string[];
   /** Highest stored net per supplier unit, AED minor units; null when unknown. */
   netAedMinorByUnit: Record<string, bigint> | null;
-  /** Full-refund hours before 00:00 Asia/Dubai on the service date: 0 = never, null = unknown. */
+  /** Full-refund hours before the activity starts (Asia/Dubai, doc 29 §8.7): 0 = never, null = unknown. */
   supplierFreeCancellationHours: number | null;
   /** True: the guest makes their own way, no pickup. False: the offer collects from hotels. Null: offer unknown. */
   isDirectReporting: boolean | null;
@@ -295,7 +301,7 @@ export function ageBandMismatches(
  *    person and per trip at once (no single unit then carries the trip cost).
  *    Live quotes re-check the actual net for the date.
  *  - Refund hours: the smallest window with a full refund, counted from the
- *    service day's start like `freeCancellationUntilMs` and the customer's
+ *    activity start like `freeCancellationUntilMs` and the customer's
  *    deadline. A window of 0 hours reads as no free cancellation.
  */
 export function offerReadinessFacts(offer: StoredOffer | null, policy: TravelDeskCancellationRule[] | null, today: string): OfferReadinessFacts {
@@ -407,6 +413,12 @@ export function quoteSlot(input: SlotQuoteInput): SupplierQuoteResult {
       reasons.push("on_request");
       continue;
     }
+    // Review 85 A2: the booking sends the derived end (start plus the offer's hours), while the OpenAPI booking schema says to
+    // copy the availability entry's. Where the end is derived and this row names a different one, which TravelDesk would book is unknown.
+    if (rules.endMinutes === null && r.endMinutes !== slotEndMinutes({ startMinutes: r.startMinutes, endMinutes: null }, offer.durationHours)) {
+      reasons.push("availability_unknown");
+      continue;
+    }
     if (!isOfferedOn(rules.daysOffered, serviceDate) || (r.seatsLeft === 0 && r.price.isBookable)) {
       reasons.push("closed");
       continue;
@@ -481,6 +493,8 @@ export function listedStartsOn(offer: StoredOffer, serviceDate: string, rows: Tr
     for (const r of dated.filter((x) => x.startMinutes === start)) {
       const rules = slotRulesFor(offer.timeSlots, r.timeSlotId, r.startMinutes);
       if (!rules || rules.isOnRequest || !isOfferedOn(rules.daysOffered, serviceDate)) continue;
+      // The quote refuses a row whose end differs from the derived one (review 85 A2): never show it as open.
+      if (rules.endMinutes === null && r.endMinutes !== slotEndMinutes({ startMinutes: r.startMinutes, endMinutes: null }, offer.durationHours)) continue;
       if (now.getTime() >= slotCutoffMs(serviceDate, start, rules.minimumAdvancedBookingHours)) continue;
       if (r.seatsLeft === 0 && r.price.isBookable) continue; // a closed day (Q-A1)
       let status: ListedStart["status"];
@@ -525,7 +539,8 @@ export function quoteTickets(input: TicketQuoteInput): SupplierQuoteResult {
   if (!paxAllowed(offer, units)) return refuse("unit_rule_failed");
   // A price for another day belongs to another pricing period: never charge or show it.
   if (s.price.date !== today) return refuse("availability_unknown");
-  if (s.validUntil !== null && s.validUntil < serviceDate) return refuse("availability_unknown");
+  // A visit after the stock's validity is its own reason (review 86 B5-03): the date is the problem, not the stock.
+  if (s.validUntil !== null && s.validUntil < serviceDate) return refuse("ticket_validity_ended");
   if (!s.price.isBookable) return refuse("sold_out");
   const seats = units.adults + units.children;
   const needs: Array<{ left: number; n: number }> = [];
@@ -559,7 +574,9 @@ function ok(
   part: Pick<Ok, "slotRef" | "netAedMinor" | "netUsdMinor" | "capacity" | "seatsLeft" | "cutoffUtc"> & { ticketValidUntil?: string | null; openDatedTicket?: true },
 ): SupplierQuoteResult {
   // Doc 29 §4.4: issued tickets can never be cancelled, so a ticket quote carries no supplier refund window, whatever the tour policy says.
-  const free = part.openDatedTicket ? null : freeCancellationUntilMs(input.serviceDate, input.policy);
+  // Otherwise the window counts back from the booked slot's start (doc 29 §8.7).
+  const startMinutes = part.slotRef ? (exactSlotOf(part.slotRef)?.startMinutes ?? null) : null;
+  const free = part.openDatedTicket ? null : freeCancellationUntilMs(input.serviceDate, input.policy, startMinutes);
   return {
     ok: true,
     ...part,

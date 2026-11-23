@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { assertDisposableDb, assertDisposableDbLive } from "../../__tests__/helpers/target-guard";
 import type { Actor } from "../../lib/actor";
@@ -258,7 +260,8 @@ describe.skipIf(!enabled)("supplierCatalogService (local DB)", () => {
       prisma.supplierCatalogueItem.findUniqueOrThrow({ where: { supplierId_environment_kind_externalId: { supplierId: supplier.id, environment: "test", kind, externalId } } });
     const hash = offerTermsHash((await item("offer", String(OFFER_A))).payload, (await item("tour", String(TOUR))).payload);
     expect(hash).toMatch(/^[0-9a-f]{64}$/);
-    expect(mapping).toMatchObject({ approvedOfferHash: hash, syncStatus: "ok" });
+    // Review 85 A1: the offer's hours are recorded beside the hash, outside it.
+    expect(mapping).toMatchObject({ approvedOfferHash: hash, approvedSlotHours: 2, syncStatus: "ok" });
     const auditRow = await prisma.auditLog.findFirst({ where: { action: "supplier_mapping.approve", entityId: productId }, orderBy: { createdAt: "desc" } });
     expect(auditRow?.reason).toContain("Upper deck");
 
@@ -483,12 +486,59 @@ describe.skipIf(!enabled)("supplierCatalogService (local DB)", () => {
 
     // An approval from before B2 has no hash: the next sync records the current terms once (code path, not SQL).
     const m = await mapping();
-    await prisma.productSupplierMapping.update({ where: { id: m.id }, data: { approvedOfferHash: null } });
+    await prisma.productSupplierMapping.update({ where: { id: m.id }, data: { approvedOfferHash: null, approvedSlotHours: null } });
     expect((await readiness("deluxe")).blockers).toEqual(["mapping_changed_upstream"]);
     const backfill = await svc.syncTravelDeskCatalogue(source([dearer, ...filler]), "test", { supplierCode: CODE });
     expect(backfill.hashesBackfilled).toBe(1);
-    expect(await mapping()).toMatchObject({ approvedOfferHash: m.approvedOfferHash, syncStatus: "ok" });
+    expect(await mapping()).toMatchObject({ approvedOfferHash: m.approvedOfferHash, approvedSlotHours: 2, syncStatus: "ok" });
     expect((await svc.syncTravelDeskCatalogue(source([dearer, ...filler]), "test", { supplierCode: CODE })).hashesBackfilled).toBe(0);
+  });
+
+  it("review 85 A1: a derived end's hours are approved beside the hash; the deploy backfill keeps the approval, a later change of hours invalidates it", async () => {
+    const supplier = await prisma.supplier.findUniqueOrThrow({ where: { code: CODE } });
+    const mapping = () => prisma.productSupplierMapping.findFirstOrThrow({ where: { productId, supplierId: supplier.id, variantCode: "deluxe", isActive: true } });
+    const readiness = async () => (await svc.mappingReadinessFor(productId, "test", { supplierCode: CODE })).variants.find((v) => v.variantCode === "deluxe")!;
+    const filler = Array.from({ length: 6 }, (_, i) => tour(BASE + 100 + i, `Filler tour ${i}`, []));
+    const lower = offer(OFFER_B, TOUR, { name: "Dinner Cruise, Lower Deck", pricingPeriods: [] });
+    const price = offer(OFFER_A, TOUR).pricingPeriods[0];
+    const dearer = (over: Partial<TravelDeskOffer> = {}) =>
+      tour(TOUR, "Alexandra Dhow Cruise in Dubai Marina", [offer(OFFER_A, TOUR, { maxPax: 40, pricingPeriods: [{ ...price, price: { ...price.price!, perAdultMinor: 12_600n } }], ...over }), lower]);
+    const slot = offer(OFFER_A, TOUR).timeSlots[0];
+    const derived = (hours: number) => dearer({ durationHours: hours, timeSlots: [{ ...slot, endMinutes: null }] });
+    const sync = (t: TravelDeskTourDetail) => svc.syncTravelDeskCatalogue(source([t, ...filler]), "test", { supplierCode: CODE });
+    const before = await mapping();
+
+    // An approval of an offer whose slot stores no end, written before the column existed: a hash and no hours.
+    await sync(derived(2));
+    const stored = async (kind: string, externalId: number) =>
+      (await prisma.supplierCatalogueItem.findUniqueOrThrow({ where: { supplierId_environment_kind_externalId: { supplierId: supplier.id, environment: "test", kind, externalId: String(externalId) } } })).payload;
+    const hash = offerTermsHash(await stored("offer", OFFER_A), await stored("tour", TOUR));
+    await prisma.productSupplierMapping.update({ where: { id: before.id }, data: { approvedOfferHash: hash, approvedSlotHours: null } });
+    // Without recorded hours it does not hold where the end is derived (fail closed).
+    await sync(derived(2));
+    expect((await mapping()).syncStatus).toBe("changed");
+
+    // The migration's backfill, scoped to this mapping: it records the hours the stored offer carries now.
+    const sql = readFileSync(path.join(process.cwd(), "prisma/migrations/20261124120000_b3b_mapping_approved_slot_hours/migration.sql"), "utf8");
+    const update = sql.slice(sql.indexOf('UPDATE "product_supplier_mappings"')).trim().replace(/;$/, "");
+    expect(await prisma.$executeRawUnsafe(`${update} AND m."id" = $1::uuid`, before.id)).toBe(1);
+    expect(await mapping()).toMatchObject({ approvedOfferHash: hash, approvedSlotHours: 2 });
+    // The hash is the one recorded before: nothing flips on deploy.
+    await sync(derived(2));
+    expect((await mapping()).syncStatus).toBe("ok");
+    expect((await readiness()).blockers).not.toContain("mapping_changed_upstream");
+
+    // A later change of the hours (the same hash) needs a fresh review.
+    await sync(derived(3));
+    expect((await mapping()).syncStatus).toBe("changed");
+    expect((await readiness()).blockers).toContain("mapping_changed_upstream");
+    await sync(derived(2));
+    expect((await mapping()).syncStatus).toBe("ok");
+
+    // Restore the stored-end offer and the earlier approval for the tests below.
+    await prisma.productSupplierMapping.update({ where: { id: before.id }, data: { approvedOfferHash: before.approvedOfferHash, approvedSlotHours: before.approvedSlotHours } });
+    await sync(dearer());
+    expect((await mapping()).syncStatus).toBe("ok");
   });
 
   it("a stale catalogue blocks readiness with catalogue_stale; a fresh complete run clears it (doc 29 Batch 1b)", async () => {

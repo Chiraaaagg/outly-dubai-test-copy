@@ -159,6 +159,8 @@ export type QuoteRefusalReason =
   | "past_cutoff"
   | "closed"
   | "sold_out"
+  /** Doc 29 §3.5 (review 86 B5-03): the open-dated tickets in stock stop being valid before the visit date. */
+  | "ticket_validity_ended"
   | "availability_unknown"
   | "margin_below_floor"
   | "policy_exceeds_supplier"
@@ -301,7 +303,10 @@ export type SupplierQuoteResult =
       /** With a pickup: the accepted hotel's name on the supplier's list, when it has one (Batch 3). */
       pickupHotelName?: string | null;
     }
-  | { ok: false; reason: "closed" | "sold_out" | "past_cutoff" | "invalid_slot" | "on_request" | "unit_rule_failed" | "pickup_unavailable" | "availability_unknown" | "supplier_unavailable" };
+  | {
+      ok: false;
+      reason: "closed" | "sold_out" | "past_cutoff" | "invalid_slot" | "on_request" | "unit_rule_failed" | "pickup_unavailable" | "ticket_validity_ended" | "availability_unknown" | "supplier_unavailable";
+    };
 
 export interface SupplierQuoteInput {
   mappingId: string;

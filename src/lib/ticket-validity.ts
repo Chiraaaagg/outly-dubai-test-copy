@@ -23,7 +23,16 @@ export interface CustomerTicketFacts {
   nonRefundableCopy: string;
   /** Issued tickets per type; empty until the codes are issued. */
   types: TicketTypeCount[];
+  /**
+   * Neutral copy when the issued tickets stop being valid before the visit date
+   * (review 86 B5-02; staff are alerted by the documents sweep), else null.
+   * Never set from the pre-sale stock hint.
+   */
+  validityConcern: string | null;
 }
+
+/** Shown when the issued tickets' last valid day is before the visit date. States no cause and promises no refund. */
+export const TICKET_VALIDITY_CONCERN = "Our team is checking that your tickets can be used on your visit date. We'll contact you before your visit.";
 
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -108,12 +117,18 @@ export function customerTicketFacts(input: {
   quoteValidUntil: string | null | undefined;
   issued: readonly { ticketTypeName: string | null; ticketFor: string; validUntil: Date | string | null }[];
   bookingValidUntil?: string | null;
+  /** The visit date, YYYY-MM-DD (the order item's service date). */
+  visitDate?: string | null;
 }): CustomerTicketFacts {
   const validUntil = ticketValidUntilDay(input.quoteValidUntil, input.issued.map((t) => t.validUntil), input.bookingValidUntil ?? null);
+  // Only what the supplier issued counts here, never the stock hint (the quote already refused a stock ending before the visit).
+  const issuedDay = ticketValidUntilDay(null, input.issued.map((t) => t.validUntil), input.bookingValidUntil ?? null);
+  const visit = input.visitDate && DAY.test(input.visitDate) ? input.visitDate : null;
   return {
     validUntil,
     validityCopy: ticketValidityCopy(validUntil),
     nonRefundableCopy: TICKET_NON_REFUNDABLE_STATEMENT,
     types: ticketTypeSummary(input.issued),
+    validityConcern: issuedDay && visit && issuedDay < visit ? TICKET_VALIDITY_CONCERN : null,
   };
 }

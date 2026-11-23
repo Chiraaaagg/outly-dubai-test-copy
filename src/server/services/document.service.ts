@@ -116,6 +116,32 @@ export const TICKET_TIMING = Object.freeze({
   sweepGraceMs: 60_000,
 });
 
+/**
+ * Doc 29 §4.4a, Batch 5 (review 86 B5-02): the ticket-class deadline before
+ * the visit. An open-dated ticket can be bought weeks ahead, so F12 (measured
+ * from `confirmedAt`) and the bounded retries are long over by the visit. A
+ * ticket document still not valid this long before the activity starts
+ * (Asia/Dubai) raises attention again, even after `failed`, and again as
+ * urgent closer in. The same sweep flags issued tickets whose earliest
+ * `validUntil` day is before the visit date.
+ */
+export const TICKET_VISIT_DEADLINE = Object.freeze({
+  /** Attention when the tickets are not valid 24 hours before the visit starts. */
+  attentionBeforeMs: 24 * 60 * 60_000,
+  /** Urgent at 6 hours before. */
+  urgentBeforeMs: 6 * 60 * 60_000,
+});
+
+/** The visit-deadline level a document has reached at `now`, with the instant it began; null before the first. */
+export function visitDeadlineLevel(b: Pick<SupplierBooking, "serviceDate" | "startMinutes">, now: Date): { level: "attention" | "urgent"; at: Date } | null {
+  const start = activityStart(b).getTime();
+  const urgent = start - TICKET_VISIT_DEADLINE.urgentBeforeMs;
+  const attention = start - TICKET_VISIT_DEADLINE.attentionBeforeMs;
+  if (now.getTime() >= urgent) return { level: "urgent", at: new Date(urgent) };
+  if (now.getTime() >= attention) return { level: "attention", at: new Date(attention) };
+  return null;
+}
+
 /** Asia/Dubai is UTC+4 all year; service dates and slot minutes are local. */
 const DUBAI_OFFSET_MS = 4 * 60 * 60_000;
 
@@ -539,6 +565,7 @@ export const documentService = {
     const code = deps.source?.supplierCode ?? opts.supplierCode ?? null;
     out.swept = await this.sweepMissing(deps, { max: opts.max, supplierCode: code });
     out.attention = await this.raiseAttention(deps, { max: opts.max, supplierCode: code });
+    out.attention += await this.raiseVisitDeadline(deps, { max: opts.max, supplierCode: code });
     if (deps.source) await this.workClaimed(deps, deps.source, opts, started, out);
     if (deps.store && (opts.auditMax ?? 0) > 0 && !out.outOfTime && Date.now() - started <= opts.budgetMs) {
       const a = await this.auditStoredObjects(deps, { max: opts.auditMax!, sample: true, supplierCode: code, deadline: started + opts.budgetMs });
@@ -673,6 +700,71 @@ export const documentService = {
       }
       raised++;
       emitEvent("document.attention", { documentId: r.id, supplierBookingId: r.supplier_booking_id, reason: isUrgent ? "ticket_missing_urgent" : "ticket_missing", ageMs }, isUrgent ? "error" : "warn");
+    }
+    return raised;
+  },
+
+  /**
+   * The ticket-class deadline before the visit (`TICKET_VISIT_DEADLINE`,
+   * review 86 B5-02), for confirmed TicketOnly bookings:
+   *  - a ticket document (codes or PDF) that is still pending, incomplete or
+   *    failed, with no valid one of its kind for the booking, raises attention
+   *    at visit start minus 24 hours and again as urgent at minus 6 hours
+   *    (Asia/Dubai), whatever F12 and the retries did before;
+   *  - a valid or incomplete code set whose earliest ticket `validUntil` day
+   *    (the UTC day the supplier wrote, `validityDayOf`) is before the visit
+   *    date raises attention on that document once.
+   * Each level is reported once: the report stamps `attentionRequiredAt` at
+   * or after the level's instant. Codes are never read here.
+   */
+  async raiseVisitDeadline(deps: Pick<DocumentDeps, "now">, opts: { max: number; supplierCode: string | null }): Promise<number> {
+    const now = deps.now();
+    // Visits from yesterday (Dubai) to two days ahead: wide enough for every level, narrow enough to stay cheap.
+    const day = (ms: number) => new Date(Date.parse(new Date(now.getTime() + DUBAI_OFFSET_MS + ms).toISOString().slice(0, 10)));
+    const from = day(-24 * 60 * 60_000);
+    const to = day(2 * 24 * 60 * 60_000);
+    const missing = await prisma.$queryRaw<{ id: string; supplier_booking_id: string; attention_required_at: Date | null; service_date: Date; start_minutes: number | null }[]>`
+      SELECT d.id, d.supplier_booking_id, d.attention_required_at, b.service_date, b.start_minutes
+      FROM supplier_documents d
+      JOIN supplier_bookings b ON b.id = d.supplier_booking_id
+      JOIN suppliers s ON s.id = b.supplier_id
+      WHERE d.status IN ('pending', 'incomplete', 'failed') AND d.kind IN ('ticket_codes', 'tickets_pdf') AND d.invalidated_at IS NULL
+        AND b.state = 'confirmed' AND b.booking_kind = 'ticket_only'
+        AND b.service_date >= ${from} AND b.service_date <= ${to}
+        AND NOT EXISTS (
+          SELECT 1 FROM supplier_documents v
+          WHERE v.supplier_booking_id = d.supplier_booking_id AND v.kind = d.kind AND v.status = 'valid' AND v.invalidated_at IS NULL)
+        AND (${opts.supplierCode}::text IS NULL OR s.code = ${opts.supplierCode})
+      ORDER BY b.service_date, d.id
+      LIMIT ${opts.max}`;
+    let raised = 0;
+    for (const r of missing) {
+      const level = visitDeadlineLevel({ serviceDate: r.service_date, startMinutes: r.start_minutes }, now);
+      if (!level || (r.attention_required_at && r.attention_required_at.getTime() >= level.at.getTime())) continue;
+      const n = await prisma.supplierDocument.updateMany({ where: { id: r.id, attentionRequiredAt: r.attention_required_at }, data: { attentionRequiredAt: now } });
+      if (n.count === 0) continue;
+      raised++;
+      const reason = level.level === "urgent" ? "ticket_missing_before_visit_urgent" : "ticket_missing_before_visit";
+      emitEvent("document.attention", { documentId: r.id, supplierBookingId: r.supplier_booking_id, reason }, level.level === "urgent" ? "error" : "warn");
+    }
+
+    // Issued tickets that stop being valid before the visit: flagged once (a reissue makes a new document).
+    const short = await prisma.$queryRaw<{ id: string; supplier_booking_id: string }[]>`
+      SELECT d.id, d.supplier_booking_id
+      FROM supplier_documents d
+      JOIN supplier_bookings b ON b.id = d.supplier_booking_id
+      JOIN suppliers s ON s.id = b.supplier_id
+      WHERE d.kind = 'ticket_codes' AND d.status IN ('valid', 'incomplete') AND d.invalidated_at IS NULL AND d.attention_required_at IS NULL
+        AND b.state = 'confirmed' AND b.booking_kind = 'ticket_only' AND b.service_date >= ${from}
+        AND (SELECT min((t.valid_until AT TIME ZONE 'UTC')::date) FROM supplier_ticket_codes t WHERE t.document_id = d.id) < b.service_date
+        AND (${opts.supplierCode}::text IS NULL OR s.code = ${opts.supplierCode})
+      ORDER BY d.id
+      LIMIT ${opts.max}`;
+    for (const r of short) {
+      const n = await prisma.supplierDocument.updateMany({ where: { id: r.id, attentionRequiredAt: null }, data: { attentionRequiredAt: now } });
+      if (n.count === 0) continue;
+      raised++;
+      emitEvent("document.attention", { documentId: r.id, supplierBookingId: r.supplier_booking_id, reason: "ticket_validity_before_visit" }, "error");
     }
     return raised;
   },

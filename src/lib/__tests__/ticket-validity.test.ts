@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { customerTicketFacts, ticketTypeLine, ticketTypeSummary, ticketValidUntilDay, validityDayOf } from "../ticket-validity";
+import { customerTicketFacts, TICKET_VALIDITY_CONCERN, ticketTypeLine, ticketTypeSummary, ticketValidUntilDay, validityDayOf } from "../ticket-validity";
 import { TICKET_NON_REFUNDABLE_STATEMENT } from "../utils";
 
 /**
@@ -88,8 +88,21 @@ describe("customerTicketFacts", () => {
       validityCopy: "Ticket valid until Friday, 16 July 2027.",
       nonRefundableCopy: TICKET_NON_REFUNDABLE_STATEMENT,
       types: [{ label: "Park A (adult)", count: 1 }],
+      validityConcern: null,
     });
     expect(JSON.stringify(facts)).not.toContain(fake);
     expect(TICKET_NON_REFUNDABLE_STATEMENT).toMatch(/non-refundable once issued/i);
+  });
+
+  it("review 86 B5-02: neutral copy when the issued tickets end before the visit date; never from the stock hint", () => {
+    const issued = (day: string) => [{ ticketTypeName: "Park A", ticketFor: "adult", validUntil: new Date(`${day}T23:59:00Z`) }];
+    expect(customerTicketFacts({ quoteValidUntil: null, issued: issued("2027-07-15"), visitDate: "2027-07-16" }).validityConcern).toBe(TICKET_VALIDITY_CONCERN);
+    expect(customerTicketFacts({ quoteValidUntil: null, issued: issued("2027-07-16"), visitDate: "2027-07-16" }).validityConcern).toBeNull();
+    // The booking's own validity counts as issued too.
+    expect(customerTicketFacts({ quoteValidUntil: null, issued: [], bookingValidUntil: "2027-07-01", visitDate: "2027-07-16" }).validityConcern).toBe(TICKET_VALIDITY_CONCERN);
+    // Before issue only the stock hint is known: no concern (the quote refused a stock that ends before the visit).
+    expect(customerTicketFacts({ quoteValidUntil: "2027-07-01", issued: [], visitDate: "2027-07-16" }).validityConcern).toBeNull();
+    expect(customerTicketFacts({ quoteValidUntil: null, issued: issued("2027-07-15") }).validityConcern).toBeNull();
+    expect(TICKET_VALIDITY_CONCERN).not.toMatch(/refund|expired|sorry/i);
   });
 });

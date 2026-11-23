@@ -17,7 +17,7 @@ import { fetchStartTimes, type StartTimesAnswer } from "@/lib/api/start-times";
 import { startMark } from "@/lib/perf-mark";
 import { useAbortableRead } from "@/lib/use-abortable-read";
 import type { Activity, PaxCount } from "@/lib/types";
-import { EMPTY_PAX, cancellationPolicyBeforeQuote, cn, dubaiToday, formatDateKey, paxBillable, priceIn } from "@/lib/utils";
+import { EMPTY_PAX, TICKET_NON_REFUNDABLE_STATEMENT, cancellationPolicyBeforeQuote, cn, dubaiToday, formatDateKey, paxBillable, priceIn } from "@/lib/utils";
 
 /**
  * BookingWidget — the ADP's conversion engine, now mode-aware.
@@ -363,6 +363,12 @@ export function BookingWidget({
               We check live availability and the final price for this date when you continue. Nothing is charged before you confirm.
             </p>
           )}
+          {/* Doc 29 §3.5 "valid-until note" (review 86 B5-03): the page has no live stock read, so the validity is stated, not guessed. */}
+          {activity.openDatedTicket ? (
+            <p className="mt-1.5 text-xs text-ink-500" data-testid="ticket-date-note">
+              Tickets are valid until a date the operator sets. If your visit date is later, we say so when you continue, before anything is charged.
+            </p>
+          ) : null}
         </div>
 
         {/* ---- Time: the supplier's listed starts for the date when the offer sells that way
@@ -545,13 +551,16 @@ export function BookingWidget({
           ) : null}
           <p className="flex items-start gap-1.5">
             <Check className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[var(--color-success)]" />
-            {activity.freeCancellationHours <= 0
-              ? "This booking is non-refundable once confirmed."
-              : inquiryMode
-                ? `Free cancellation up to ${activity.freeCancellationHours} hours before you go.`
-                : // Instant: before a quote, the catalogue figure as the operator's policy; the quote's
-                  // exact statement replaces it at review (CO-01, the same words as the trip and checkout).
-                  cancellationPolicyBeforeQuote(activity.freeCancellationHours)}
+            {activity.openDatedTicket
+              ? // Doc 29 §4.4 (review 86 B5-03): issued tickets are never refunded, in either mode.
+                TICKET_NON_REFUNDABLE_STATEMENT
+              : activity.freeCancellationHours <= 0
+                ? "This booking is non-refundable once confirmed."
+                : inquiryMode
+                  ? `Free cancellation up to ${activity.freeCancellationHours} hours before you go.`
+                  : // Instant: before a quote, the catalogue figure as the operator's policy; the quote's
+                    // exact statement replaces it at review (CO-01, the same words as the trip and checkout).
+                    cancellationPolicyBeforeQuote(activity.freeCancellationHours)}
           </p>
           {inquiryMode ? (
             <div className="pt-1">

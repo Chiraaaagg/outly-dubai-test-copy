@@ -50,7 +50,6 @@ function booking(over: Partial<TravelDeskBooking> = {}): TravelDeskBooking {
     voucherNotReady: false,
     hasTickets: true,
     creationState: null,
-    paymentErrorMessage: null,
     ...over,
   };
 }

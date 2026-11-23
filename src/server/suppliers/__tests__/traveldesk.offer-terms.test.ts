@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { offerTermsHash, offerTermsOf, parseStoredOffer, parseStoredPolicy, slotEndMinutes } from "../traveldesk/traveldesk.offer-terms";
+import { approvedSlotHoursHold, offerTermsHash, offerTermsOf, parseStoredOffer, parseStoredPolicy, slotEndMinutes, slotHoursOf } from "../traveldesk/traveldesk.offer-terms";
 import { storedOffer, storedSlot, storedTour } from "./fixtures/traveldesk-terms";
 
 /**
@@ -65,21 +65,50 @@ describe("approved offer hash (SUP-15)", () => {
 });
 
 describe("derived slot end (OpenAPI TimeSlotPublicDto.endTime)", () => {
-  it("is the stored end, else start plus the offer's hours; unknown without positive whole hours or past midnight", () => {
+  it("is the stored end, else start plus the offer's hours; unknown without positive whole hours, or at or past midnight", () => {
     expect(slotEndMinutes({ startMinutes: 600, endMinutes: 690 }, 5)).toBe(690);
     expect(slotEndMinutes({ startMinutes: 600, endMinutes: null }, 3)).toBe(780);
     for (const h of [undefined, null, 0, -1, 1.5]) expect(slotEndMinutes({ startMinutes: 600, endMinutes: null }, h)).toBeNull();
-    expect(slotEndMinutes({ startMinutes: 1260, endMinutes: null }, 3)).toBe(1440);
+    expect(slotEndMinutes({ startMinutes: 1260, endMinutes: null }, 2)).toBe(1380);
+    // Review 85 A3: an end of exactly 24:00 is refused like a later one (how TravelDesk writes midnight is undocumented).
+    expect(slotEndMinutes({ startMinutes: 1260, endMinutes: null }, 3)).toBeNull();
     expect(slotEndMinutes({ startMinutes: 1260, endMinutes: null }, 4)).toBeNull();
   });
 
-  it("the hours join the approved terms only when a slot's end is derived, so existing hashes are unchanged", () => {
+  it("keeps the hash of every offer as it was before derived ends (review 85 A1): the hours are not hashed", () => {
     const tour = storedTour();
+    // The exact v1 subset: no key was added, so hashes recorded before Batch 3b still match after deploy.
+    const v1Keys = ["booking", "daysOffered", "offerId", "pax", "pickup", "policy", "priceBasis", "slots", "tourId", "v"];
     const withEnds = (h: number) => storedOffer({ durationHours: h, timeSlots: [storedSlot({ endMinutes: 1365 })] });
+    const derived = (h: number | null) => storedOffer({ durationHours: h, timeSlots: [storedSlot({ endMinutes: null })] });
+    const mixed = (h: number) => storedOffer({ durationHours: h, timeSlots: [storedSlot({ endMinutes: 1365 }), storedSlot({ timeSlotId: 12, startMinutes: 600, endMinutes: null })] });
+    for (const o of [withEnds(2), derived(2), mixed(2)]) expect(Object.keys(offerTermsOf(o, tour)!).sort()).toEqual(v1Keys);
     expect(offerTermsHash(withEnds(2), tour)).toBe(offerTermsHash(withEnds(5), tour));
-    expect(offerTermsOf(withEnds(2), tour)).not.toHaveProperty("slotHours");
-    const derived = (h: number) => storedOffer({ durationHours: h, timeSlots: [storedSlot({ endMinutes: null })] });
-    expect(offerTermsHash(derived(2), tour)).not.toBe(offerTermsHash(derived(3), tour));
-    expect(offerTermsOf(derived(2), tour)).toMatchObject({ slotHours: 2 });
+    expect(offerTermsHash(derived(2), tour)).toBe(offerTermsHash(derived(3), tour));
+    expect(offerTermsHash(mixed(2), tour)).toBe(offerTermsHash(mixed(3), tour));
+    // A payload stored before the hours were read hashes the same too.
+    const old = derived(2);
+    delete old.durationHours;
+    expect(offerTermsHash(old, tour)).toBe(offerTermsHash(derived(2), tour));
+  });
+
+  it("compares the hours on their own: a change invalidates an approval only where an end is derived from them", () => {
+    const withEnds = (h: number) => storedOffer({ durationHours: h, timeSlots: [storedSlot({ endMinutes: 1365 })] });
+    const derived = (h: number | null) => storedOffer({ durationHours: h, timeSlots: [storedSlot({ endMinutes: null })] });
+    const mixed = (h: number) => storedOffer({ durationHours: h, timeSlots: [storedSlot({ endMinutes: 1365 }), storedSlot({ timeSlotId: 12, startMinutes: 600, endMinutes: null })] });
+    expect(slotHoursOf(derived(2))).toBe(2);
+    expect(slotHoursOf(derived(null))).toBeNull();
+    expect(slotHoursOf({ not: "an offer" })).toBeNull();
+    // Every end stored: the hours change nothing that is booked.
+    expect(approvedSlotHoursHold(withEnds(5), 2)).toBe(true);
+    expect(approvedSlotHoursHold(withEnds(5), null)).toBe(true);
+    // A derived end (wholly or on one slot of a mixed offer): the approved hours must still be the stored ones.
+    expect(approvedSlotHoursHold(derived(2), 2)).toBe(true);
+    expect(approvedSlotHoursHold(derived(3), 2)).toBe(false);
+    expect(approvedSlotHoursHold(mixed(2), 2)).toBe(true);
+    expect(approvedSlotHoursHold(mixed(3), 2)).toBe(false);
+    // An approval that recorded no hours (older code) does not hold for an offer whose end is derived.
+    expect(approvedSlotHoursHold(derived(2), null)).toBe(false);
+    expect(approvedSlotHoursHold({ not: "an offer" }, 2)).toBe(false);
   });
 });

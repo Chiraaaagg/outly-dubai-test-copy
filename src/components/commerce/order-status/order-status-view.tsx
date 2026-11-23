@@ -436,6 +436,16 @@ export function OrderStatusView({ initial, returnHint = null }: { initial: Custo
                         <dd className="font-semibold text-ink-900">{item.timeslot}</dd>
                       </div>
                     )}
+                    {/* Doc 29 §8.7: the pickup time the operator returned for this booking. */}
+                    {item.pickup && (
+                      <div data-testid="pickup-time">
+                        <dt className="text-2xs font-bold uppercase tracking-wide text-ink-500">Pickup</dt>
+                        <dd className="font-semibold text-ink-900">
+                          <span className="tnum">{item.pickup.time}</span> Dubai time
+                          {item.pickup.hotel ? <span className="block font-normal text-ink-700">{item.pickup.hotel}</span> : null}
+                        </dd>
+                      </div>
+                    )}
                     <div>
                       <dt className="text-2xs font-bold uppercase tracking-wide text-ink-500">Guests</dt>
                       <dd className="font-semibold text-ink-900">{item.paxLabel}</dd>
@@ -447,9 +457,10 @@ export function OrderStatusView({ initial, returnHint = null }: { initial: Custo
                       <span>{item.cancellationTerms}</span>
                     </p>
                   )}
-                  {item.ticket && (item.ticket.validityCopy || item.ticket.types.length > 0) && (
+                  {item.ticket && (item.ticket.validityCopy || item.ticket.types.length > 0 || item.ticket.validityConcern) && (
                     <div className="mt-2 space-y-1 text-sm text-ink-700" data-testid="ticket-validity">
                       {item.ticket.validUntil && item.ticket.validityCopy ? <time dateTime={item.ticket.validUntil}>{item.ticket.validityCopy}</time> : null}
+                      {item.ticket.validityConcern ? <p className="text-ink-900">{item.ticket.validityConcern}</p> : null}
                       {item.ticket.types.length > 0 && (
                         <ul aria-label="Tickets issued" className="list-disc pl-5">
                           {item.ticket.types.map((t) => (
@@ -464,6 +475,12 @@ export function OrderStatusView({ initial, returnHint = null }: { initial: Custo
                     <h4 id={ticketsHeading} className="text-[0.95rem] font-bold text-ink-900">
                       Voucher
                     </h4>
+                    {item.pickup && (
+                      <p className="mt-1 text-sm text-ink-700" data-testid="voucher-pickup">
+                        Be ready for pickup at <span className="tnum font-semibold text-ink-900">{item.pickup.time}</span> Dubai time
+                        {item.pickup.hotel ? <> at {item.pickup.hotel}</> : null}.
+                      </p>
+                    )}
                     <TicketList
                       tickets={item.tickets}
                       itemState={item.state}
@@ -531,6 +548,7 @@ function TicketFacts({ ticket }: { ticket: NonNullable<CustomerOrderStatus["item
           <time dateTime={ticket.validUntil}>{ticket.validityCopy}</time>
         </p>
       ) : null}
+      {ticket.validityConcern ? <p className="text-ink-900">{ticket.validityConcern}</p> : null}
       {ticket.types.length > 0 && (
         <ul aria-label="Tickets issued" className="list-disc pl-5">
           {ticket.types.map((t) => (

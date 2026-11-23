@@ -704,6 +704,65 @@ describe.skipIf(!enabled)("documentService (local DB, fake source, memory store)
    * F12 thresholds and the customer view
    * ---------------------------------------------------------------------- */
 
+  it("review 86 B5-02: a ticket still missing before the visit raises attention at minus 24 h and urgent at minus 6 h, even after failed; once per level", async () => {
+    // A visit two Dubai days ahead, 10:00 local; the ticket was bought a month earlier and its retries are over.
+    const visitDay = new Date(clock + 2 * 86_400_000 + 4 * 3_600_000).toISOString().slice(0, 10);
+    const start = Date.parse(`${visitDay}T00:00:00Z`) + 600 * 60_000 - 4 * 3_600_000;
+    const b = await confirmed({ serviceDate: visitDay, startMinutes: 600, agoMs: 30 * 86_400_000 });
+    const { documentId } = await svc.markTicketsPending(prisma, b, { reason: "persist_failed", evidence: "confirm_response" }, now());
+    await prisma.supplierDocument.update({ where: { id: documentId }, data: { status: "failed", nextFetchAt: null, attentionRequiredAt: new Date(clock - 29 * 86_400_000) } });
+    const attn = async () => (await prisma.supplierDocument.findUniqueOrThrow({ where: { id: documentId } })).attentionRequiredAt?.getTime() ?? null;
+    const quiet = { source: null };
+    const mine = () => logged.filter((l) => l.includes(documentId) && l.includes("document.attention"));
+    const stamped = await attn();
+
+    clock = start - 25 * 3_600_000;
+    logged = [];
+    await svc.runDue(deps(quiet), { budgetMs: 30_000, max: 50, supplierCode: CODE });
+    expect(await attn()).toBe(stamped);
+    expect(mine()).toEqual([]);
+
+    clock = start - 24 * 3_600_000 + 60_000;
+    await svc.runDue(deps(quiet), { budgetMs: 30_000, max: 50, supplierCode: CODE });
+    expect(await attn()).toBe(clock);
+    expect(mine().join()).toContain('"ticket_missing_before_visit"');
+
+    clock += 60 * 60_000;
+    logged = [];
+    await svc.runDue(deps(quiet), { budgetMs: 30_000, max: 50, supplierCode: CODE });
+    expect(mine()).toEqual([]);
+
+    clock = start - 6 * 3_600_000 + 60_000;
+    await svc.runDue(deps(quiet), { budgetMs: 30_000, max: 50, supplierCode: CODE });
+    expect(await attn()).toBe(clock);
+    expect(mine().join()).toContain("ticket_missing_before_visit_urgent");
+    expect(mod.visitDeadlineLevel({ serviceDate: new Date(visitDay), startMinutes: 600 }, new Date(clock))).toMatchObject({ level: "urgent" });
+  });
+
+  it("review 86 B5-02: issued tickets whose earliest validUntil is before the visit date raise attention once; tickets valid on the day do not", async () => {
+    const visitDay = new Date(clock + 10 * 86_400_000 + 4 * 3_600_000).toISOString().slice(0, 10);
+    const dayBefore = new Date(Date.parse(`${visitDay}T00:00:00Z`) - 86_400_000).toISOString().slice(0, 10);
+    const ticket = (i: number, code: string, validUntil: string): IssuedTicket => ({ ...t(i, "adult", code), validUntil });
+    const short = await confirmed({ serviceDate: visitDay });
+    await persist(short, [ticket(0, `V-${RUN}-1`, `${visitDay}T23:59:00Z`), ticket(1, `V-${RUN}-2`, `${dayBefore}T23:59:00Z`)]);
+    const fine = await confirmed({ serviceDate: visitDay });
+    await persist(fine, [ticket(0, `V-${RUN}-3`, `${visitDay}T00:00:00Z`), ticket(1, `V-${RUN}-4`, `${visitDay}T23:59:00Z`)]);
+    const codesDoc = async (b: Booking) => (await docsOf(b, "ticket_codes")).find((d) => d.invalidatedAt === null)!;
+    expect((await codesDoc(short)).status).toBe("valid");
+
+    logged = [];
+    await svc.runDue(deps({ source: null }), { budgetMs: 30_000, max: 50, supplierCode: CODE });
+    const flagged = await codesDoc(short);
+    expect(flagged.attentionRequiredAt?.getTime()).toBe(clock);
+    expect(logged.filter((l) => l.includes(flagged.id)).join()).toContain("ticket_validity_before_visit");
+    expect((await codesDoc(fine)).attentionRequiredAt).toBeNull();
+
+    clock += 60_000;
+    logged = [];
+    await svc.runDue(deps({ source: null }), { budgetMs: 30_000, max: 50, supplierCode: CODE });
+    expect(logged.filter((l) => l.includes(flagged.id) && l.includes("document.attention"))).toEqual([]);
+  });
+
   it("a missing ticket raises attention at 2 minutes and urgent at 5, or urgent at 2 when the activity starts soon (F12)", async () => {
     // Far from its start whatever the suite's clock (it advances a day per test).
     const far = await confirmed({ serviceDate: "2031-03-20" });

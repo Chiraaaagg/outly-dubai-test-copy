@@ -61,14 +61,18 @@ import { retimeHrefFor } from "@/lib/start-time-retry";
 import { PickupHotelFields, usePickupHotelLists } from "@/components/checkout/pickup-hotel-fields";
 import {
   CART_HOTEL_FIELD,
+  cartHotelOptions,
   initialCartHotel,
   itemHotelField,
+  listsForItems,
+  mergeRefusedHotels,
   pickupErrors,
   pickupItemsFor,
   pickupPlan,
   pickupUpdates,
   refusedPickupHotels,
   withoutRefusedHotels,
+  type RefusedHotels,
 } from "@/lib/pickup-selection";
 import type { PickupHotelChoice } from "@/lib/types";
 
@@ -289,9 +293,9 @@ export default function CheckoutPage() {
   const cartHotelStarted = useRef(false);
   const leavingForInquiry = useRef(false);
   const focusHotelField = useRef(false);
-  // Hotels the quote refused on this page are no longer offered (review 83 L8), so "Choose another hotel" cannot loop.
-  const [refusedHotelIds, setRefusedHotelIds] = useState<ReadonlySet<string>>(() => new Set());
-  const refusedPickup = useRef<string[]>([]);
+  // Hotels the quote refused on this page are no longer offered on that activity's list (review 83 L8, 85 A5), so "Choose another hotel" cannot loop.
+  const [refusedHotelIds, setRefusedHotelIds] = useState<RefusedHotels>(() => new Map());
+  const refusedPickup = useRef<RefusedHotels>(new Map());
   const shownPickupLists = useMemo(() => withoutRefusedHotels(pickupLists, refusedHotelIds), [pickupLists, refusedHotelIds]);
   const plan = useMemo(() => pickupPlan(pickupItems, shownPickupLists, cartHotel), [pickupItems, shownPickupLists, cartHotel]);
   // The kept choice comes back after a reload, Edit or the inquiry form and back.
@@ -515,7 +519,7 @@ export default function CheckoutPage() {
         // or, when only a start time was refused, another time first (Batch 2).
         setRetimeHref(retimeHrefFor(r.lines, cart, activities));
         setInquiryReason(inquiryReasonForQuote(r.lines.map((l) => l.reason)));
-        refusedPickup.current = refusedPickupHotels(r.lines, cart).hotelIds;
+        refusedPickup.current = refusedPickupHotels(r.lines, cart, pickupItems).byList;
         setQuoteState("idle");
         return null;
       }
@@ -1039,11 +1043,14 @@ export default function CheckoutPage() {
                       variant="outline"
                       onClick={() => {
                         focusHotelField.current = true;
-                        // Drop the refused hotels from the choices and from the cart field; the plan then clears the lines.
+                        // Drop each refused hotel from its own activity's list; the plan then clears those lines. The cart field
+                        // keeps its hotel while another activity still collects from it.
                         const refused = refusedPickup.current;
-                        if (refused.length) {
-                          setRefusedHotelIds((prev) => new Set([...prev, ...refused]));
-                          if (cartHotel?.hotelId && refused.includes(cartHotel.hotelId)) setCartHotel(null);
+                        if (refused.size) {
+                          const next = mergeRefusedHotels(refusedHotelIds, refused);
+                          setRefusedHotelIds(next);
+                          const stillOffered = cartHotelOptions(listsForItems(pickupItems, withoutRefusedHotels(pickupLists, next))).some((h) => h.id === cartHotel?.hotelId);
+                          if (cartHotel?.hotelId && !stillOffered) setCartHotel(null);
                         }
                         setRetimeHref(null);
                         setInquiryReason(null);
@@ -1191,7 +1198,7 @@ export default function CheckoutPage() {
                         <ShieldCheck aria-hidden="true" className="mt-0.5 size-5 shrink-0 text-lagoon-700" />
                         <span>
                           {live?.lines.find((l) => l.index === index)?.freeCancellationCopy ??
-                            cancellationPolicyBeforeQuote(item.freeCancellationHours)}
+                            cancellationPolicyBeforeQuote(item.freeCancellationHours, { openDatedTicket: item.openDatedTicket })}
                         </span>
                       </p>
                     </li>

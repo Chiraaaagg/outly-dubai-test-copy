@@ -22,11 +22,12 @@ import {
 const FRESH: ReadWindow = { used: 0, quoteUsed: 0 };
 
 /** Takes reads of `cls` until one is refused; returns how many were admitted and the window. */
+/** Browse reads here are hotel lists, which may use the whole browse share (an unnamed read counts as start times, review 85 A4). */
 function drain(window: ReadWindow, cls: ReadClass, limits: ReturnType<typeof readLimits>, max = 10_000) {
   let w = window;
   let n = 0;
   for (; n < max; n++) {
-    const next = admitRead(w, cls, limits);
+    const next = admitRead(w, cls, limits, cls === "browse" ? "pickup_hotels" : undefined);
     if (!next) break;
     w = next;
   }
@@ -210,6 +211,20 @@ describe("fair sharing inside browse (review 82: start times must not starve hot
     expect(readLimits(10, 0.5, 0.2, 1 / 3)).toMatchObject({ browseCap: 2, startTimesCap: 1 });
     // Without the fourth argument nothing changes for existing callers.
     expect(readLimits(10, 0.5, 0.2)).not.toHaveProperty("startTimesCap");
+  });
+
+  it("an unnamed browse read counts as start times, as the SQL counts it (review 85 A4)", () => {
+    let w: ReadWindow = { used: 0, quoteUsed: 0 };
+    let n = 0;
+    for (; n < 100; n++) {
+      const next = admitRead(w, "browse", READ_BUDGET);
+      if (!next) break;
+      w = next;
+    }
+    expect(n).toBe(READ_BUDGET.startTimesCap);
+    expect(w).toMatchObject({ browseUsed: READ_BUDGET.startTimesCap, startTimesUsed: READ_BUDGET.startTimesCap });
+    // The hotel lists keep their reserve.
+    expect(drainRoute(w, "pickup_hotels").n).toBe(READ_BUDGET.browseCap! - READ_BUDGET.startTimesCap!);
   });
 
   it("a start-times flood stops at its cap and leaves the hotel lists their reserve", () => {

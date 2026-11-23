@@ -275,7 +275,7 @@ export default function CartPage() {
                           {!inquiry && (
                             // Before a quote: the operator's policy, in the same words as the activity page (CO-01).
                             <p className="mt-2 text-xs text-ink-600" data-testid="cart-cancellation-policy">
-                              {cancellationPolicyBeforeQuote(item.freeCancellationHours)}
+                              {cancellationPolicyBeforeQuote(item.freeCancellationHours, { openDatedTicket: item.openDatedTicket })}
                             </p>
                           )}
                         </div>

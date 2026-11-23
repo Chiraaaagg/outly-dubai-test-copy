@@ -439,9 +439,10 @@ describe("Batch 2 listed-start keys", () => {
     const [, choice] = LISTED_START_CLASS_KEYS;
     expect(listedStartsSellable(true, choice, [anyTime(660), anyTime(null)], 2)).toBe(true);
     for (const hours of [undefined, null, 0, -1]) expect(listedStartsSellable(true, choice, [anyTime(660), anyTime(null)], hours)).toBe(false);
-    // A derived end past midnight is undocumented: unknown.
+    // A derived end at or past midnight is undocumented: unknown (review 85 A3).
     expect(listedStartsSellable(true, choice, [anyTime(null, 22 * 60)], 3)).toBe(false);
-    expect(listedStartsSellable(true, choice, [anyTime(null, 22 * 60)], 2)).toBe(true);
+    expect(listedStartsSellable(true, choice, [anyTime(null, 22 * 60)], 2)).toBe(false);
+    expect(listedStartsSellable(true, choice, [anyTime(null, 22 * 60)], 1)).toBe(true);
   });
 
   it("only the two Batch 2 keys lift the listed-start refusal: a flagged pickup or external listed-start key never does", () => {

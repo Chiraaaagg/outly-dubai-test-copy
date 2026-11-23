@@ -59,7 +59,6 @@ export class ScriptedTravelDesk implements TravelDeskBookingTransport {
       voucherNotReady: false,
       hasTickets: false,
       creationState: null,
-      paymentErrorMessage: null,
     };
     this.store.set(id, b);
     return b;

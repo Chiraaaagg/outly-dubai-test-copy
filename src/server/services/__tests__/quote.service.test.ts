@@ -11,6 +11,7 @@ import {
   quoteFingerprint,
   slotStartMinutes,
   storedLineJson,
+  supplierPolicyTightened,
   toPublicQuote,
   type QuoteDeps,
   type QuoteStore,
@@ -453,20 +454,20 @@ describe("quote: displayed policy against the fresh supplier facts (TKT-7, CR-B2
     expect(customerFreeCancellationUntil(LATER, 0)).toBeNull();
   });
 
-  it("the snapshot deadline is the earlier of ours and the supplier's", async () => {
-    // Supplier counts from midnight: its deadline (D-1 00:00 Dubai) is earlier than ours (D-1 18:00 Dubai).
-    const q = await refundable("2026-11-03T20:00:00.000Z").svc.create(GUEST, later());
-    expect(q.ok && q.lines[0]).toMatchObject({ freeCancellationUntilUtc: "2026-11-03T20:00:00.000Z", nonRefundableAfterConfirm: false });
+  it("the snapshot deadline is the earlier of ours and the supplier's, both counted from the activity start (doc 29 §8.7)", async () => {
+    // Slot 18:00 Dubai on 5 Nov (14:00Z); 24 hours before is 14:00Z on 4 Nov, for us and for the supplier.
+    const q = await refundable("2026-11-04T14:00:00.000Z").svc.create(GUEST, later());
+    expect(q.ok && q.lines[0]).toMatchObject({ freeCancellationUntilUtc: "2026-11-04T14:00:00.000Z", nonRefundableAfterConfirm: false });
     // Supplier more generous than us: ours stands.
     const r = await refundable("2026-11-04T16:00:00.000Z").svc.create(GUEST, later());
     expect(r.ok && r.lines[0]).toMatchObject({ freeCancellationUntilUtc: "2026-11-04T14:00:00.000Z", nonRefundableAfterConfirm: false });
   });
 
   it("the copy shown is the snapshot's own exact deadline, in Dubai time (CO-01), and the public line carries it", async () => {
-    const q = toPublicQuote(await refundable("2026-11-03T20:00:00.000Z").svc.create(GUEST, later()));
+    const q = toPublicQuote(await refundable("2026-11-04T14:00:00.000Z").svc.create(GUEST, later()));
     if (!q.ok) throw new Error("expected a quote");
-    // 20:00 UTC on 3 Nov is 00:00 on 4 Nov in Dubai: the one statement the review step and the status page also show.
-    const copy = "Free cancellation until Wed 4 Nov 2026, 00:00 Dubai time. After that, the booking is non-refundable.";
+    // 14:00 UTC on 4 Nov is 18:00 in Dubai, 24 hours before the 18:00 start: the one statement the review step and the status page also show.
+    const copy = "Free cancellation until Wed 4 Nov 2026, 18:00 Dubai time. After that, the booking is non-refundable.";
     expect(freeCancellationCopy(q.lines[0].freeCancellationUntilUtc)).toBe(copy);
     expect(q.lines[0].freeCancellationCopy).toBe(copy);
     expect(freeCancellationCopy(null)).toBe("This booking is non-refundable once confirmed.");
@@ -474,24 +475,31 @@ describe("quote: displayed policy against the fresh supplier facts (TKT-7, CR-B2
     expect(n.ok && n.lines[0].freeCancellationCopy).toBe("This booking is non-refundable once confirmed.");
   });
 
-  it("a supplier deadline earlier than the page's promise counted from the day start refuses the line and re-runs readiness (N1)", async () => {
-    // Page: 24 hours. Earliest honest reading: 24 hours before 00:00 Dubai on 5 Nov = 2026-11-03T20:00Z.
-    const tightened = refundable("2026-11-03T19:59:59.999Z");
+  it("a supplier deadline earlier than the page's promise before the activity start refuses the line and re-runs readiness (N1, doc 29 §8.7)", async () => {
+    // Page: 24 hours before the 18:00 start on 5 Nov = 2026-11-04T14:00Z. A millisecond earlier is tighter.
+    const tightened = refundable("2026-11-04T13:59:59.999Z");
     expect(await refusal(tightened, later())).toEqual([{ index: 0, reason: "policy_exceeds_supplier" }]);
     expect(tightened.reevaluated).toEqual([[PRODUCT_ID, "supplier_policy_changed"]]);
     expect(tightened.store.rows).toEqual([]);
+    // The old Dubai-midnight reading of the same 24 hours (C12, reversed) is now tighter than the promise too.
+    expect(await refusal(refundable("2026-11-03T20:00:00.000Z"), later())).toEqual([{ index: 0, reason: "policy_exceeds_supplier" }]);
     // A supplier now asking 72 hours instead of 24.
-    const w72 = refundable("2026-11-01T20:00:00.000Z");
+    const w72 = refundable("2026-11-02T14:00:00.000Z");
     expect(await refusal(w72, later())).toEqual([{ index: 0, reason: "policy_exceeds_supplier" }]);
     expect(w72.reevaluated).toEqual([[PRODUCT_ID, "supplier_policy_changed"]]);
-    // Exactly at the day-start promise: only the midnight-to-slot gap is clamped, no re-run.
-    const atPromise = refundable("2026-11-03T20:00:00.000Z");
+    // Exactly at the promise: no re-run.
+    const atPromise = refundable("2026-11-04T14:00:00.000Z");
     expect((await atPromise.svc.create(GUEST, later())).ok).toBe(true);
     expect(atPromise.reevaluated).toEqual([]);
+    // Without a slot start the promise counts from the start of the service day, the earliest the activity can begin.
+    expect(supplierPolicyTightened(LATER, 24, "2026-11-03T20:00:00.000Z")).toBe(false);
+    expect(supplierPolicyTightened(LATER, 24, "2026-11-03T19:59:59.999Z")).toBe(true);
+    expect(supplierPolicyTightened(LATER, 24, "2026-11-03T20:00:00.000Z", 18 * 60)).toBe(true);
   });
 
   it("a deadline already passed snapshots no free cancellation", async () => {
-    const q = await refundable("2026-11-01T07:00:00.000Z").svc.create(GUEST, request({ lines: [line({ slotRef: "17@18:00" })] }));
+    // 09:00 Dubai tomorrow (05:00Z on 2 Nov): 24 hours before is 05:00Z today, before NOW (08:00Z).
+    const q = await refundable("2026-11-01T05:00:00.000Z", "no", "17@09:00").svc.create(GUEST, request({ lines: [line({ slotRef: "17@09:00" })] }));
     expect(q.ok && q.lines[0]).toMatchObject({ freeCancellationUntilUtc: null, nonRefundableAfterConfirm: true });
   });
 

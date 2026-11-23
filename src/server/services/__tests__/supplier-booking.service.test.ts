@@ -104,7 +104,6 @@ class FakeTravelDesk implements TravelDeskBookingTransport {
       voucherNotReady: false,
       hasTickets: false,
       creationState: null,
-      paymentErrorMessage: null,
     };
     this.store.set(id, b);
     return b;
@@ -2544,6 +2543,44 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
       expect(await svc.releaseHold(b.id, "payment_refunded", { now })).toBe("not_applicable");
       // The guard is released only by the verified cancel: a new attempt is possible now.
       expect(isConflict(await secondAttempt(ids))).toBe(false);
+    });
+
+    it("review 86 B5-01: a released hold the supplier refuses to cancel lapses at its deadline; the expiry read releases it, with no person and no second cancel", async () => {
+      const refusals = [
+        new TravelDeskApiError("bad_request", "bookings.cancel", { status: 400, reason: "Cancellation is not allowed" }), // a policy answer
+        new TravelDeskApiError("bad_request", "bookings.cancel", { status: 400, reason: "Not found" }), // any other refusal
+      ];
+      for (const refusal of refusals) {
+        const td = new FakeTravelDesk(now);
+        const seen: string[] = [];
+        const saga = { bookingChanged: async (_orderItemId: string, state: string) => void seen.push(state) };
+        const ids = await orderItem();
+        const b = await create(forOrder(ids));
+        await drain(td, 0, 31_000, { saga });
+        expect((await booking(b.id)).state).toBe("awaiting_payment");
+
+        td.steps.cancel.push(refusal);
+        expect(await svc.releaseHold(b.id, "checkout_abandoned", { now, saga })).toBe("queued");
+        await drain(td, 0, 31_000, { saga });
+        // Not cancel_refused and no attention: the hold is back in its state, waiting to lapse (release_requested blocks any confirm).
+        const held = await booking(b.id);
+        expect(held).toMatchObject({ state: "awaiting_payment", errorCode: "release_cancel_refused_hold_lapses", attentionRequiredAt: null });
+        expect(seen).not.toContain("cancel_refused");
+        expect(td.calls.filter((c) => c === "cancel")).toHaveLength(1);
+
+        // The saga asking again queues a cancel, which sends nothing more.
+        expect(await svc.releaseHold(b.id, "checkout_abandoned", { now, saga })).toBe("queued");
+        await drain(td, 0, 31_000, { saga });
+        expect(td.calls.filter((c) => c === "cancel")).toHaveLength(1);
+
+        // After the deadline (sent + reservationTimeout, UTC) the watchdog reads status 8: expired, and the saga is told.
+        await drain(td, 20 * 60_000, 60_000, { saga });
+        expect(await booking(b.id)).toMatchObject({ state: "expired", attentionRequiredAt: null });
+        expect(seen).toContain("expired");
+        expect(td.calls).not.toContain("confirm");
+        // The guard is released by the expiry read: a new attempt is possible.
+        expect(isConflict(await secondAttempt(ids))).toBe(false);
+      }
     });
 
     it("releaseHold closes a never-sent attempt at once and is refused after a confirm was sent", async () => {

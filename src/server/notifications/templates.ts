@@ -478,7 +478,7 @@ export interface TicketsReadyContext {
    * line and its ticket types, never a code); the email then also says the
    * tickets are non-refundable once issued.
    */
-  items: { title: string; dateLabel?: string; ticket?: { validityCopy: string | null; types: string[] } }[];
+  items: { title: string; dateLabel?: string; pickup?: string; ticket?: { validityCopy: string | null; validityConcern?: string | null; types: string[] } }[];
   /** `${siteUrl}/t#${token}`. Built by `ticketLink`. */
   link: string;
   /** When the link stops working (e.g. "15 Feb 2030"). */
@@ -495,7 +495,7 @@ export function ticketLink(siteUrl: string, token: string): string {
 export function renderTicketsReady(ctx: TicketsReadyContext): Rendered {
   const greeting = ctx.firstName ? `Hi ${ctx.firstName},` : "Hi,";
   const itemLine = (i: TicketsReadyContext["items"][number]) =>
-    [`• ${i.title}${i.dateLabel ? ` · ${i.dateLabel}` : ""}`, ...(i.ticket?.types ?? []).map((t) => `  ${t}`), ...(i.ticket?.validityCopy ? [`  ${i.ticket.validityCopy}`] : [])].join("\n");
+    [`• ${i.title}${i.dateLabel ? ` · ${i.dateLabel}` : ""}`, ...(i.pickup ? [`  ${i.pickup}`] : []), ...(i.ticket?.types ?? []).map((t) => `  ${t}`), ...(i.ticket?.validityCopy ? [`  ${i.ticket.validityCopy}`] : []), ...(i.ticket?.validityConcern ? [`  ${i.ticket.validityConcern}`] : [])].join("\n");
   const lines = ctx.items.length ? ctx.items.map(itemLine).join("\n") : "";
   const validity = ctx.expiresLabel ? `The link works until ${ctx.expiresLabel}.` : "";
   const openDated = ctx.items.some((i) => i.ticket);

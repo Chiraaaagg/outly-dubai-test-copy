@@ -128,7 +128,8 @@ export interface ReadWindow {
 /**
  * The window after one more read of `cls`, or null when it is refused. A
  * fresh window starts from `{ used: 0, quoteUsed: 0 }`. `route` names the
- * page of a browse read; a start-times read is also held to `startTimesCap`.
+ * page of a browse read; a start-times read (and an unnamed one) is also held
+ * to `startTimesCap`.
  * `takeReadToken` applies the same rule in one SQL update.
  */
 export function admitRead(window: ReadWindow, cls: ReadClass, limits: ReadLimits, route?: BrowseRoute): ReadWindow | null {
@@ -136,7 +137,8 @@ export function admitRead(window: ReadWindow, cls: ReadClass, limits: ReadLimits
   if (cls === "quote" && window.quoteUsed >= limits.quoteCap) return null;
   const browseUsed = window.browseUsed ?? 0;
   const startTimesUsed = window.startTimesUsed ?? 0;
-  const startTimes = cls === "browse" && route === "start_times";
+  // An unnamed browse read counts as start times, as in the SQL (`takeBrowseReadToken`; review 85 A4).
+  const startTimes = cls === "browse" && (route ?? "start_times") === "start_times";
   if (cls === "browse") {
     if (browseUsed >= (limits.browseCap ?? 0)) return null;
     // Never a read the quotes' unused share could still need.

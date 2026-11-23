@@ -35,7 +35,7 @@ async function main() {
   await assertDisposableDbLive(prisma, { allowTravelDeskTestKey: true });
   const { uuidv7 } = await import("../../src/server/lib/ids");
   const { travelDeskExternalRefSchema } = await import("../../src/server/suppliers/traveldesk/traveldesk.adapter");
-  const { offerTermsHash } = await import("../../src/server/suppliers/traveldesk/traveldesk.offer-terms");
+  const { offerTermsHash, slotHoursOf } = await import("../../src/server/suppliers/traveldesk/traveldesk.offer-terms");
   const { readinessService } = await import("../../src/server/services/readiness.service");
 
   const now = new Date();
@@ -119,6 +119,7 @@ async function main() {
         lastSyncedAt: offer.lastSeenAt,
         syncStatus: hash ? "ok" : "changed",
         approvedOfferHash: hash,
+        approvedSlotHours: slotHoursOf(offer.payload),
       };
       if (existing) await prisma.productSupplierMapping.update({ where: { id: existing.id }, data });
       else await prisma.productSupplierMapping.create({ data: { id: uuidv7(), productId: product.id, supplierId: supplier.id, variantCode, priority: 1, ...data } });

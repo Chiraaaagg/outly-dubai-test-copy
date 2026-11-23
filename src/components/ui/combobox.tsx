@@ -229,7 +229,8 @@ function Combobox({
             "origin-top transition-[opacity,scale] duration-150 ease-[var(--ease-out-soft)] starting:scale-[0.97] starting:opacity-0 motion-reduce:starting:scale-100",
           )}
         >
-          <div className="flex items-center gap-2 border-b border-ink-200 px-3.5">
+          {/* The filter draws no ring of its own, so the row shows focus: a solid 2px sun-700 inset (5.3:1 on paper; WCAG 2.4.7, 2.4.13 area). Not animated: focus moves by keyboard. */}
+          <div className="flex items-center gap-2 border-b border-ink-200 px-3.5 focus-within:shadow-[inset_0_0_0_2px_var(--color-sun-700)]" data-combobox-search>
             <Search aria-hidden="true" className="size-4 shrink-0 text-ink-600" />
             <input
               ref={inputRef}
@@ -268,7 +269,8 @@ function Combobox({
               className="min-h-12 w-full min-w-0 bg-transparent text-base text-ink-900 outline-none placeholder:text-ink-600"
             />
           </div>
-          <div className="max-h-[40vh] overflow-y-auto overscroll-contain">
+          {/* data-combobox-scroll: the stable hook the e2e axe allow-list matches (e2e/support/controls.ts). */}
+          <div className="max-h-[40vh] overflow-y-auto overscroll-contain" data-combobox-scroll>
             {/* The listbox stays mounted (empty when nothing matches) so the filter's aria-controls always resolves. */}
             {filtered.length === 0 ? <div id={listId} role="listbox" aria-labelledby={labelId} /> : null}
             {filtered.length === 0 ? (

@@ -11,7 +11,7 @@ import { checkOfferCapability } from "../suppliers/capability-gate";
 import { bookingKindSellable } from "../suppliers/traveldesk/traveldesk.capability";
 import { travelDeskExternalRefSchema } from "../suppliers/traveldesk/traveldesk.adapter";
 import { traveldeskConfigFrom } from "../suppliers/traveldesk/traveldesk.config";
-import { parseStoredOffer, slotEndMinutes } from "../suppliers/traveldesk/traveldesk.offer-terms";
+import { approvedSlotHoursHold, parseStoredOffer, slotEndMinutes } from "../suppliers/traveldesk/traveldesk.offer-terms";
 import { exactSlotOf, slotRulesFor, unitsFrom } from "../suppliers/traveldesk/traveldesk.quote";
 import { bookingAccountId, supplierBookingService, TRAVELDESK_SUPPLIER_CODE } from "./supplier-booking.service";
 import { supplierGuestName } from "@/lib/guest-name";
@@ -171,6 +171,8 @@ export function createEngineSagaApi(deps: EngineSagaDeps): EngineSagaApi {
         : null;
       const stored = offerRow && !offerRow.removedAt ? parseStoredOffer(offerRow.payload) : null;
       if (!stored || stored.offerId !== ref.data.offerId) refuse("offer_unreadable", "The approved offer cannot be read");
+      // A derived end follows the offer's hours, which are approved outside the hash (review 85 A1): hours changed since the approval are a changed mapping.
+      if (!approvedSlotHoursHold(offerRow!.payload, mapping.approvedSlotHours)) refuse("mapping_changed", "The offer's hours changed since the mapping was approved");
       // The same capability lookup readiness used (doc 29 §3.3): a class switched off since the quote is refused here, before any supplier call.
       const capability = await checkOfferCapability(db, {
         adapter: mapping.supplier.adapter,

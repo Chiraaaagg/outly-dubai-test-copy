@@ -9,10 +9,13 @@ import { customerTicketFacts, type CustomerTicketFacts } from "@/lib/ticket-vali
  *
  * An item is a ticket item when its latest supplier attempt is TicketOnly,
  * or its quote line was an open-dated ticket quote. Its "valid until" is the
- * earliest issued ticket's own, else the booking's `ticketsValidUntil` (kept
- * in the attempt's sanitised `lastResponse`), else the stock's validity the
+ * earliest issued ticket's own, else the booking's `ticketsValidUntil` (the
+ * attempt's own column, kept when a later answer omits it, review 86 B5-07;
+ * older rows: the sanitised `lastResponse`), else the stock's validity the
  * quote carried, a pre-sale hint (`ticketValidUntilDay`). Its ticket types
- * come from the stored ticket rows.
+ * come from the stored ticket rows of the valid code set only. When the
+ * issued validity ends before the visit date it carries neutral copy
+ * (`validityConcern`).
  *
  * Ticket codes never leave the database here: the ticket rows are read with
  * an explicit select of the booking id, guest category, type name and
@@ -63,13 +66,17 @@ export async function ticketFactsForOrder(orderId: string, opts: { orderItemIds?
   if (items.length === 0) return out;
   const ids = items.map((i) => i.id);
   const [bookings, quotes] = await Promise.all([
-    db.supplierBooking.findMany({ where: { orderItemId: { in: ids } }, select: { id: true, orderItemId: true, bookingKind: true, lastResponse: true, createdAt: true }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] }),
+    db.supplierBooking.findMany({
+      where: { orderItemId: { in: ids } },
+      select: { id: true, orderItemId: true, bookingKind: true, lastResponse: true, ticketsValidUntil: true, createdAt: true },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+    }),
     (() => {
       const quoteIds = [...new Set(items.flatMap((i) => (i.quoteId ? [i.quoteId] : [])))];
       return quoteIds.length ? db.quote.findMany({ where: { id: { in: quoteIds } }, select: { id: true, lines: true } }) : Promise.resolve([] as { id: string; lines: unknown }[]);
     })(),
   ]);
-  const latest = new Map<string, { id: string; bookingKind: string; lastResponse: unknown }>();
+  const latest = new Map<string, { id: string; bookingKind: string; lastResponse: unknown; ticketsValidUntil?: Date | null }>();
   for (const b of bookings) if (b.orderItemId && !latest.has(b.orderItemId)) latest.set(b.orderItemId, b);
 
   const candidates = items.flatMap((item) => {
@@ -80,16 +87,20 @@ export async function ticketFactsForOrder(orderId: string, opts: { orderItemIds?
   });
   const ticketBookingIds = candidates.flatMap((c) => (c.booking ? [c.booking.id] : []));
   const codes = ticketBookingIds.length
-    ? // Only the live code set (at most one valid or incomplete ticket-codes document per booking); superseded rows would count twice.
+    ? // Only the complete live code set (review 86 B5-05): an incomplete one is still "being prepared", so its partial
+      // counts are not shown as issued; superseded rows would count twice.
       await db.supplierTicketCode.findMany({
-        where: { supplierBookingId: { in: ticketBookingIds }, document: { status: { in: ["valid", "incomplete"] } } },
+        where: { supplierBookingId: { in: ticketBookingIds }, document: { status: "valid", invalidatedAt: null } },
         select: TICKET_FACT_SELECT,
         orderBy: [{ unitIndex: "asc" }],
       })
     : [];
   for (const c of candidates) {
     const issued = c.booking ? codes.filter((t) => t.supplierBookingId === c.booking!.id) : [];
-    out.set(c.item.id, customerTicketFacts({ quoteValidUntil: c.line?.ticketValidUntil ?? null, issued, bookingValidUntil: bookingValidity(c.booking?.lastResponse) }));
+    out.set(
+      c.item.id,
+      customerTicketFacts({ quoteValidUntil: c.line?.ticketValidUntil ?? null, issued, bookingValidUntil: c.booking?.ticketsValidUntil ? c.booking.ticketsValidUntil.toISOString().slice(0, 10) : bookingValidity(c.booking?.lastResponse), visitDate: c.item.serviceDate.toISOString().slice(0, 10) }),
+    );
   }
   return out;
 }

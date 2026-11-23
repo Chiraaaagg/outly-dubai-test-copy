@@ -38,24 +38,35 @@ export const WCAG_TAGS = ["wcag2a", "wcag2aa", "wcag21aa"] as const;
  */
 export interface KnownAxeIssue {
   rule: string;
-  target: RegExp;
+  /** A pattern over axe's target selector. */
+  target?: RegExp;
+  /** A pattern over the element's own HTML (axe's `node.html`): for a stable `data-` hook that the selector may not name. */
+  html?: RegExp;
   why: string;
 }
 
+/** Whether a known issue covers one axe node: every pattern it names must match. */
+export function knownAxeIssueMatches(k: KnownAxeIssue, rule: string, node: { target: readonly unknown[]; html: string }): boolean {
+  if (k.rule !== rule || (!k.target && !k.html)) return false;
+  return (!k.target || k.target.test(node.target.join(" "))) && (!k.html || k.html.test(node.html));
+}
+
 export const KNOWN_AXE_ISSUES: readonly KnownAxeIssue[] = [
+  // The star rating in product page reviews (aria-prohibited-attr) was fixed with role="img" (review 85 B2a): no entry.
   {
-    rule: "aria-prohibited-attr",
-    target: /\[aria-label="\d(\.\d)? out of 5"\]/,
-    why: "Product page reviews: the star rating is a <span> with aria-label and no role (src/components/commerce/sister-reviews.tsx). Not part of the new controls.",
-  },
-  {
+    // TRACKED KNOWN DEFECT (review 85 B2b), not a false positive: WCAG 2.1.1 Keyboard. Under 640 px the photo rail
+    // scrolls sideways and nothing in it can take focus, so keyboard and switch users cannot reach photos 2 and 3.
+    // Owner: whoever owns src/components/commerce/gallery.tsx. Fix: tabIndex={0}, role="region", aria-label and a
+    // visible focus ring on the rail (or each photo a button that opens the lightbox); then delete this entry.
+    // TODO(test): once fixed, add a phone-width spec that Tabs into the rail, scrolls it with the arrow keys and runs axe.
     rule: "scrollable-region-focusable",
     target: /\.sm\\:hidden\.relative > \.-mx-4\.rail$/,
-    why: "Product page photo rail on phones scrolls sideways but holds nothing focusable (src/components/commerce/gallery.tsx). Not part of the new controls.",
+    why: "TRACKED DEFECT (WCAG 2.1.1, review 85 B2b): the product page photo rail on phones scrolls sideways but holds nothing focusable (src/components/commerce/gallery.tsx). Not part of the new controls; to be fixed by the gallery's owner.",
   },
   {
+    // Matched by its data- hook, not a Tailwind class string (review 85 B2c), and only this rule on this element.
     rule: "scrollable-region-focusable",
-    target: /^\.max-h-\\\[40vh\\\]$/,
+    html: /^<div\b[^>]*\bdata-combobox-scroll\b/,
     why: "Hotel Combobox: the list's scroll box holds options that are reached with aria-activedescendant from the filter (focus never leaves the filter), which axe cannot see; the arrow keys scroll it. To be confirmed in the screen reader pass (Batch 3 follow-up).",
   },
 ];
@@ -90,7 +101,7 @@ export async function expectAxeClean(page: Page): Promise<void> {
     if (v.impact !== "serious" && v.impact !== "critical") continue;
     for (const node of v.nodes) {
       const target = node.target.join(" ");
-      const known = KNOWN_AXE_ISSUES.find((k) => k.rule === v.id && k.target.test(target));
+      const known = KNOWN_AXE_ISSUES.find((k) => knownAxeIssueMatches(k, v.id, node));
       if (known) test.info().annotations.push({ type: "known axe issue", description: `${v.id} ${target}: ${known.why}` });
       else unexpected.push(`${v.impact} ${v.id}: ${v.help} (${target})`);
     }

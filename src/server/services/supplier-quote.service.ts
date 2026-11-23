@@ -9,7 +9,7 @@ import { travelDeskExternalRefSchema } from "../suppliers/traveldesk/traveldesk.
 import { TravelDeskReadClient } from "../suppliers/traveldesk/traveldesk.client";
 import type { TravelDeskAvailabilityRow, TravelDeskTicketStock } from "../suppliers/traveldesk/traveldesk.codec";
 import { traveldeskConfigFrom, type TravelDeskConfig } from "../suppliers/traveldesk/traveldesk.config";
-import { offerTermsHash, parseStoredOffer, parseStoredPolicy } from "../suppliers/traveldesk/traveldesk.offer-terms";
+import { approvedSlotHoursHold, offerTermsHash, parseStoredOffer, parseStoredPolicy } from "../suppliers/traveldesk/traveldesk.offer-terms";
 import { hotelOnPickupList, listedStartsOn, pickupShapeFits, quoteSlot, quoteTickets, unitsFrom, type ListedStart } from "../suppliers/traveldesk/traveldesk.quote";
 import { TtlCache } from "../suppliers/cache";
 import { cleanHotelText } from "./pickup-hotels.service";
@@ -60,6 +60,8 @@ export interface SupplierQuoteContext {
     supplierCode: string;
     externalRef: unknown;
     approvedOfferHash: string | null;
+    /** The offer hours the approval recorded (review 85 A1), compared where a slot's end is derived from them. */
+    approvedSlotHours: number | null;
   };
   offer: { payload: unknown; removed: boolean } | null;
   tour: { payload: unknown; removed: boolean } | null;
@@ -141,7 +143,7 @@ export function createSupplierQuoteService(deps: SupplierQuoteDeps): SupplierQuo
     if (!ref.success) return null;
     if (!ctx.offer || ctx.offer.removed || !ctx.tour || ctx.tour.removed) return null;
     const hash = offerTermsHash(ctx.offer.payload, ctx.tour.payload);
-    if (!hash || hash !== mapping.approvedOfferHash) return null;
+    if (!hash || hash !== mapping.approvedOfferHash || !approvedSlotHoursHold(ctx.offer.payload, mapping.approvedSlotHours)) return null;
     const offer = parseStoredOffer(ctx.offer.payload);
     if (!offer || offer.offerId !== ref.data.offerId) return null;
     return { mapping: { ...mapping, environment: mapping.environment }, ref: ref.data, offer };
@@ -177,7 +179,7 @@ export function createSupplierQuoteService(deps: SupplierQuoteDeps): SupplierQuo
 
       if (!ctx.offer || ctx.offer.removed || !ctx.tour || ctx.tour.removed) return refuse("availability_unknown");
       const hash = offerTermsHash(ctx.offer.payload, ctx.tour.payload);
-      if (!hash || hash !== mapping.approvedOfferHash) return refuse("availability_unknown");
+      if (!hash || hash !== mapping.approvedOfferHash || !approvedSlotHoursHold(ctx.offer.payload, mapping.approvedSlotHours)) return refuse("availability_unknown");
       const offer = parseStoredOffer(ctx.offer.payload);
       const policy = parseStoredPolicy(ctx.tour.payload);
       if (!offer || offer.offerId !== ref.data.offerId) return refuse("availability_unknown");
@@ -268,6 +270,7 @@ async function loadContext(mappingId: string): Promise<SupplierQuoteContext | nu
       supplierCode: m.supplier.code,
       externalRef: m.externalRef,
       approvedOfferHash: m.approvedOfferHash,
+      approvedSlotHours: m.approvedSlotHours,
     },
     offer: await item("offer", m.supplierOfferId),
     tour: await item("tour", m.supplierProductId),

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { CustomerOrderState } from "@/lib/customer-status";
 import { TICKET_NON_REFUNDABLE_STATEMENT } from "@/lib/utils";
+import { TICKET_VALIDITY_CONCERN } from "@/lib/ticket-validity";
 import { ticketCancelRefused } from "../../suppliers/booking-port";
 import { ticketEvidenceFrom } from "../../suppliers/traveldesk/traveldesk.booking";
 import type { CancellationFacts } from "../cancellation.service";
@@ -76,6 +77,7 @@ const ticketFacts = {
     { label: "Park A (adult)", count: 2 },
     { label: "Park B (adult)", count: 2 },
   ],
+  validityConcern: null,
 };
 
 function facts(bookingState: string, over: Partial<CancellationFacts> = {}): CancellationFacts {
@@ -315,7 +317,10 @@ describe("ticketFactsForOrder: the loader reads no code", () => {
         { label: "Park A (adult)", count: 1 },
         { label: "Park B (adult)", count: 1 },
       ],
+      validityConcern: null,
     });
+    // Review 86 B5-05: only the valid (complete) code set is read; an incomplete one is still "being prepared".
+    expect(calls[0]).toMatchObject({ where: { document: { status: "valid", invalidatedAt: null } } });
     // Not booked yet: the stock's validity from the quote, as a pre-sale hint.
     expect(out.get("i-quoted")).toMatchObject({ validUntil: "2031-01-01", types: [] });
     expect(JSON.stringify([...out.values()])).not.toContain(FAKE_CODE);
@@ -324,6 +329,17 @@ describe("ticketFactsForOrder: the loader reads no code", () => {
 
 describe("tickets email: validity, ticket types and non-refundable once issued", () => {
   const link = `https://example.test/t#${"a".repeat(40)}`;
+  it("doc 29 §8.7: the supplier's pickup time goes into the email when present", () => {
+    const r = renderTicketsReady({ orderReference: "OUT-10000017", link, items: [{ title: "Synthetic safari", pickup: "Pickup at 08:15 Dubai time from Example Marina Hotel" }] });
+    for (const body of [r.text, r.html]) expect(body).toContain("Pickup at 08:15 Dubai time from Example Marina Hotel");
+    expect(renderTicketsReady({ orderReference: "OUT-10000017", link, items: [{ title: "Synthetic safari" }] }).text).not.toContain("Pickup at");
+  });
+
+  it("review 86 B5-02: the validity concern goes into the email when set", () => {
+    const r = renderTicketsReady({ orderReference: "OUT-10000017", link, items: [{ title: "Synthetic attraction", ticket: { validityCopy: null, validityConcern: TICKET_VALIDITY_CONCERN, types: [] } }] });
+    for (const body of [r.text, r.html]) expect(body).toContain(TICKET_VALIDITY_CONCERN.slice(0, 40));
+  });
+
   it("an open-dated ticket item adds its lines; a voucher-only email is unchanged", () => {
     const r = renderTicketsReady({ orderReference: "OUT-10000017", link, items: [{ title: "Synthetic attraction", dateLabel: "15 Jan 2030", ticket: { validityCopy: "Ticket valid until Tuesday, 16 July 2030.", types: ["Park A (adult) × 2", "Park B (adult) × 2"] } }] });
     for (const body of [r.text, r.html]) {

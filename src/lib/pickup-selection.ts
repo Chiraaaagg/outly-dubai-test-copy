@@ -139,41 +139,59 @@ export function hotelForInquiry(cart: readonly CartItem[]): string {
   return cart.find((i) => i.pickupHotel?.name)?.pickupHotel?.name.slice(0, 120) ?? "";
 }
 
+/** Hotels the quote refused, per pickup list (`PickupItem.listKey`): a refusal is per offer, so it never hides a hotel from another activity's list (review 85 A5). */
+export type RefusedHotels = ReadonlyMap<string, ReadonlySet<string>>;
+
 /**
  * The hotels the quote refused (`pickup_unavailable`, review 83 L8): each
- * refused line's chosen hotel id, by the line's index in the cart (the
- * quote's lines follow the cart's order). The page clears those choices and
- * stops offering those hotels, so "Choose another hotel" cannot loop back to
- * the same refusal while the cached list still names it.
+ * refused line's chosen hotel id, under the list of that line's activity, by
+ * the line's index in the cart (the quote's lines follow the cart's order).
+ * The page stops offering those hotels on that list only, so "Choose another
+ * hotel" cannot loop back to the same refusal while the cached list still
+ * names it, and another activity that collects from the hotel keeps it.
  */
-export function refusedPickupHotels(refused: readonly { index: number; reason: string }[], cart: readonly CartItem[]): { itemIds: string[]; hotelIds: string[] } {
+export function refusedPickupHotels(
+  refused: readonly { index: number; reason: string }[],
+  cart: readonly CartItem[],
+  items: readonly Pick<PickupItem, "itemId" | "listKey">[],
+): { itemIds: string[]; byList: Map<string, Set<string>> } {
   const itemIds: string[] = [];
-  const hotelIds = new Set<string>();
+  const byList = new Map<string, Set<string>>();
   for (const l of refused) {
     if (l.reason !== "pickup_unavailable") continue;
     const item = cart[l.index];
     const id = item?.pickupHotel?.hotelId;
-    if (!item || !id) continue;
+    const listKey = item ? items.find((i) => i.itemId === item.id)?.listKey : undefined;
+    if (!item || !id || !listKey) continue;
     itemIds.push(item.id);
-    hotelIds.add(id);
+    byList.set(listKey, new Set([...(byList.get(listKey) ?? []), id]));
   }
-  return { itemIds: [...new Set(itemIds)], hotelIds: [...hotelIds] };
+  return { itemIds: [...new Set(itemIds)], byList };
+}
+
+/** Earlier refusals plus new ones, per list. */
+export function mergeRefusedHotels(prev: RefusedHotels, add: RefusedHotels): Map<string, Set<string>> {
+  const out = new Map<string, Set<string>>([...prev].map(([k, v]) => [k, new Set(v)]));
+  for (const [k, ids] of add) out.set(k, new Set([...(out.get(k) ?? []), ...ids]));
+  return out;
 }
 
 /**
- * The lists without the refused hotels. A list left with none becomes
- * `not_offered` (the operator collects from none of the hotels it named), so
- * the page offers the inquiry rather than an empty field or "Try again".
+ * The lists without the hotels refused for each of them. A list left with
+ * none becomes `not_offered` (the operator collects from none of the hotels
+ * it named), so the page offers the inquiry rather than an empty field or
+ * "Try again".
  */
-export function withoutRefusedHotels(lists: ReadonlyMap<string, ListState>, refused: ReadonlySet<string>): Map<string, ListState> {
+export function withoutRefusedHotels(lists: ReadonlyMap<string, ListState>, refused: RefusedHotels): Map<string, ListState> {
   if (!refused.size) return new Map(lists);
   const out = new Map<string, ListState>();
   for (const [key, list] of lists) {
-    if (list.status !== "ready") {
+    const gone = refused.get(key);
+    if (list.status !== "ready" || !gone?.size) {
       out.set(key, list);
       continue;
     }
-    const hotels = list.hotels.filter((h) => !refused.has(h.id));
+    const hotels = list.hotels.filter((h) => !gone.has(h.id));
     out.set(key, hotels.length === list.hotels.length ? list : hotels.length ? { status: "ready", hotels } : { status: "not_offered" });
   }
   return out;

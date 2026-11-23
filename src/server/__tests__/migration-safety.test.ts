@@ -96,13 +96,17 @@ const NEW_TABLES_ONLY = [
 const NULLABLE_COLUMNS_ONLY = [
   // order_items.pickup_hotel_id, pickup_hotel_name_snapshot (doc 29 Batch 3).
   "20261123150000_b3_order_item_pickup_hotel",
+  // supplier_bookings.pickup_time_minutes, tickets_valid_until (doc 29 §8.7; review 86 B5-07).
+  "20261124130000_supplier_booking_pickup_time_ticket_validity",
 ];
 /*
  * Every other faulted migration takes a lock on an existing table and has its
  * own `SET LOCAL lock_timeout`, so behind the held lock it must fail fast and
  * roll back (the default branch of the lock test). That includes index-only
  * migrations on existing tables, e.g. 20261123130000_retention_purge_expiry_indexes
- * (plain CREATE INDEX takes a SHARE lock on its table).
+ * (plain CREATE INDEX takes a SHARE lock on its table), and
+ * 20261124120000_b3b_mapping_approved_slot_hours (a nullable column plus a
+ * one-off UPDATE backfill of product_supplier_mappings, review 85 A1).
  */
 /** How long the injected lock is held. Longer than every `lock_timeout` (5 s). */
 const HOLD_MS = 12_000;

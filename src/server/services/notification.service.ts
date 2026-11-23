@@ -249,10 +249,24 @@ const dateLabel = (d: Date) => d.toLocaleDateString("en-GB", { day: "numeric", m
 type Prepared = { ok: true; rendered: Rendered; grantId?: string } | { ok: false; outcome: Outcome };
 
 /** Ticket message, rendered at send time from ids (TKT-6). Mints the row's capability on the first attempt. */
+/** "Pickup at 08:15 Dubai time from Example Hotel" for the tickets email (doc 29 §8.7); null without a usable time. */
+export function pickupLine(minutes: number | null, hotel: string | null | undefined): string | null {
+  if (typeof minutes !== "number" || !Number.isInteger(minutes) || minutes < 0 || minutes >= 24 * 60) return null;
+  const time = `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
+  const where = typeof hotel === "string" && hotel.trim() ? ` from ${hotel.trim().slice(0, 120)}` : "";
+  return `Pickup at ${time} Dubai time${where}`;
+}
+
 async function prepareTicketMessage(row: Notification, ref: TicketMessageRef, now: Date): Promise<Prepared> {
   const order = await prisma.order.findUnique({
     where: { id: ref.orderId },
-    select: { reference: true, leadName: true, items: { where: { id: ref.orderItemId }, select: { titleSnapshot: true, serviceDate: true } } },
+    select: {
+      reference: true,
+      leadName: true,
+      items: { where: { id: ref.orderItemId }, select: { titleSnapshot: true, serviceDate: true, pickupHotelNameSnapshot: true } },
+      // Doc 29 §8.7: the pickup time the supplier returned, from the item's confirmed attempt.
+      supplierBookings: { where: { orderItemId: ref.orderItemId, state: "confirmed" }, select: { pickupTimeMinutes: true }, orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1 },
+    },
   });
   if (!order) return { ok: false, outcome: { status: "failed", retryable: false, code: "order_missing" } };
 
@@ -288,7 +302,13 @@ async function prepareTicketMessage(row: Notification, ref: TicketMessageRef, no
     orderReference: order.reference,
     items: order.items.map((i) => {
       const t = tickets.get(ref.orderItemId);
-      return { title: i.titleSnapshot, dateLabel: dateLabel(i.serviceDate), ...(t ? { ticket: { validityCopy: t.validityCopy, types: t.types.map(ticketTypeLine) } } : {}) };
+      const pickup = pickupLine(order.supplierBookings[0]?.pickupTimeMinutes ?? null, i.pickupHotelNameSnapshot);
+      return {
+        title: i.titleSnapshot,
+        dateLabel: dateLabel(i.serviceDate),
+        ...(pickup ? { pickup } : {}),
+        ...(t ? { ticket: { validityCopy: t.validityCopy, validityConcern: t.validityConcern, types: t.types.map(ticketTypeLine) } } : {}),
+      };
     }),
     link: ticketLink(e.NEXT_PUBLIC_SITE_URL, token),
     expiresLabel: dateLabel(expiresAt),

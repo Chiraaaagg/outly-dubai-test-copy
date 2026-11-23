@@ -78,7 +78,7 @@ const storedTourSchema = z.object({
   cancellationPolicy: z.array(z.object({ moreThanHours: z.number().int(), refundPercent: z.number().int() })),
 });
 
-/** Latest end a derived slot end may have: midnight. How TravelDesk writes an end past midnight is undocumented, so later is unknown. */
+/** A derived slot end must come before midnight. How TravelDesk writes midnight or a later end is undocumented, so 24:00 and later are unknown (review 85 A3). */
 const DAY_MINUTES = 24 * 60;
 
 /**
@@ -87,13 +87,13 @@ const DAY_MINUTES = 24 * 60;
  * calculated from offer's number of hours"). The stored end when there is
  * one; otherwise start plus `durationHours` × 60. Null (unknown, never
  * booked) when the hours are missing or not positive, or the derived end
- * would pass midnight.
+ * would reach or pass midnight.
  */
 export function slotEndMinutes(slot: { startMinutes: number; endMinutes: number | null }, durationHours: number | null | undefined): number | null {
   if (slot.endMinutes !== null) return slot.endMinutes;
   if (typeof durationHours !== "number" || !Number.isInteger(durationHours) || durationHours <= 0) return null;
   const end = slot.startMinutes + durationHours * 60;
-  return end <= DAY_MINUTES ? end : null;
+  return end < DAY_MINUTES ? end : null;
 }
 
 /** The stored offer payload, or null when it lacks a field the booking rules need. */
@@ -124,8 +124,6 @@ export interface OfferTerms {
   };
   daysOffered: number;
   slots: StoredSlot[];
-  /** Only when a slot has no stored end, so its booked end is derived from these hours (absent otherwise: existing hashes unchanged). */
-  slotHours?: number | null;
   pickup: { directReporting: boolean; directCollection: boolean };
   policy: TravelDeskCancellationRule[];
   priceBasis: { privateType: TravelDeskPrivateType; tripUnit: string | null; perPerson: boolean; perTrip: boolean };
@@ -153,8 +151,6 @@ export function offerTermsOf(offerPayload: unknown, tourPayload: unknown): Offer
     },
     daysOffered: o.daysOffered,
     slots: [...o.timeSlots].sort((a, b) => a.timeSlotId - b.timeSlotId || a.startMinutes - b.startMinutes),
-    // A derived end follows the offer's hours, so a change to them needs a fresh review; offers with every end stored hash as before.
-    ...(o.timeSlots.some((t) => t.endMinutes === null) ? { slotHours: o.durationHours ?? null } : {}),
     pickup: { directReporting: o.isDirectReporting, directCollection: o.isDirectCollection },
     policy: [...policy].sort((a, b) => a.moreThanHours - b.moreThanHours || a.refundPercent - b.refundPercent),
     priceBasis: {
@@ -177,8 +173,42 @@ function canonicalJson(value: unknown): string {
   });
 }
 
-/** sha256 hex of the offer terms, or null when the stored payloads cannot be read. A null hash never passes readiness. */
+/**
+ * sha256 hex of the offer terms, or null when the stored payloads cannot be read. A null hash never passes readiness.
+ *
+ * The offer's hours are deliberately not in the hash (review 85 A1): adding
+ * them would have flipped every approved mapping and every evidence row on an
+ * offer with a slot without a stored end to "changed" on deploy. A derived
+ * end follows the hours, so they are compared on their own instead
+ * (`approvedSlotHoursHold`, against `product_supplier_mappings.approved_slot_hours`).
+ */
 export function offerTermsHash(offerPayload: unknown, tourPayload: unknown): string | null {
   const terms = offerTermsOf(offerPayload, tourPayload);
   return terms ? createHash("sha256").update(canonicalJson(terms)).digest("hex") : null;
+}
+
+/** True when some stored slot has no end of its own, so the booked end is start plus the offer's hours (`slotEndMinutes`). */
+export function derivesSlotEnd(offer: Pick<StoredOffer, "timeSlots">): boolean {
+  return offer.timeSlots.some((t) => t.endMinutes === null);
+}
+
+/**
+ * The offer's hours an approval records with the hash (`approved_slot_hours`):
+ * the stored `durationHours`, null when absent or the payload is unreadable.
+ */
+export function slotHoursOf(offerPayload: unknown): number | null {
+  return parseStoredOffer(offerPayload)?.durationHours ?? null;
+}
+
+/**
+ * Whether the hours an approval recorded still hold for the stored offer
+ * (review 85 A1). Always true when every slot stores its end: the hours then
+ * change nothing that is booked. Otherwise the stored hours must equal the
+ * approved ones, so a later change of `numberOfHours` needs a fresh review
+ * just like a change of any hashed term. False when the payload is unreadable.
+ */
+export function approvedSlotHoursHold(offerPayload: unknown, approvedSlotHours: number | null): boolean {
+  const o = parseStoredOffer(offerPayload);
+  if (!o) return false;
+  return !derivesSlotEnd(o) || (o.durationHours ?? null) === approvedSlotHours;
 }

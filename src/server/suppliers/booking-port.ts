@@ -175,6 +175,8 @@ export interface SupplierSnapshot extends ConfirmationSnapshot {
   ticketsIssued: boolean | null;
   /** Doc 29 Batch 5: the booking's own "tickets valid until" day (`YYYY-MM-DD`), when the supplier gives one. Never a code. */
   ticketsValidUntil?: string | null;
+  /** Doc 29 §8.7: the pickup time the supplier returned, minutes after midnight Asia/Dubai; absent when it gave none. */
+  pickupMinutes?: number | null;
 }
 
 /**

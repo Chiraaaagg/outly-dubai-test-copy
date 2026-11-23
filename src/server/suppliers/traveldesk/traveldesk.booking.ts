@@ -57,9 +57,13 @@ export const bookingWire = z.object({
   reservationTimeout: z.number().int().nullable().optional(),
   reservationDeadline: nstr,
   hasTickets: z.boolean().optional(),
-  paymentErrorMessage: nstr,
   /** OpenAPI (22 Nov 2026): "Tickets valid until if applicable". A date without a time zone. */
   ticketsValidUntil: nstr,
+  /**
+   * The pickup time TravelDesk returns for most tours, by area and tour (doc 29 §8.7). Its shape is not documented:
+   * read leniently (`pickupMinutesOf`), so an odd value never fails the booking parse.
+   */
+  pickUpTime: z.unknown().optional(),
 });
 
 export const bookingListWire = z.object({
@@ -113,9 +117,23 @@ export interface TravelDeskBooking {
   voucherNotReady: boolean;
   hasTickets: boolean;
   creationState: number | null;
-  paymentErrorMessage: string | null;
   /** Booking-level ticket validity, `YYYY-MM-DD` (doc 29 Batch 5); absent or null when TravelDesk gives none. */
   ticketsValidUntil?: string | null;
+  /** The supplier's pickup time, minutes after midnight Asia/Dubai (doc 29 §8.7); null when absent or unreadable. */
+  pickupMinutes?: number | null;
+}
+
+/**
+ * The returned pickup time as minutes after midnight, Asia/Dubai, like
+ * `startTime`. Accepted: whole minutes (0 to 1439), "HH:mm", "HH:mm:ss" or a
+ * date-time without a zone (its wall-clock time). A value with a zone or
+ * anything else is unknown (null) and is not shown.
+ */
+export function pickupMinutesOf(v: unknown): number | null {
+  if (typeof v === "number") return Number.isInteger(v) && v >= 0 && v < 24 * 60 ? v : null;
+  if (typeof v !== "string") return null;
+  const m = /^(?:\d{4}-\d{2}-\d{2}T)?([01]\d|2[0-3]):([0-5]\d)(?::[0-5]\d(?:\.\d{1,7})?)?$/.exec(v.trim());
+  return m ? Number(m[1]) * 60 + Number(m[2]) : null;
 }
 
 function minor(v: number | null | undefined): bigint | null {
@@ -129,9 +147,10 @@ function datePart(v: string): string | null {
 }
 
 /**
- * `reservationDeadline` carries no timezone (Q-A2/Q-B5). Until TravelDesk
- * confirms, a value without an offset is read as UTC and the watchdog keeps a
- * wide margin.
+ * `reservationDeadline` carries no timezone offset. TravelDesk confirmed it is
+ * UTC (doc 29 §8.7, 23 Nov 2026), so a value without an offset is read as UTC;
+ * one with an offset keeps it. The engine still never trusts it past
+ * `sent + reservationTimeout` (snapshotFrom's `holdCapUtc`, CR-9).
  */
 function deadlineIso(v: string | null | undefined): string | null {
   if (!v) return null;
@@ -167,8 +186,8 @@ export function bookingFrom(w: z.infer<typeof bookingWire>): TravelDeskBooking {
     voucherNotReady: w.isExternalVoucherNotReady === true,
     hasTickets: w.hasTickets === true,
     creationState: w.creationState ?? null,
-    paymentErrorMessage: w.paymentErrorMessage ?? null,
     ticketsValidUntil: w.ticketsValidUntil ? datePart(w.ticketsValidUntil) : null,
+    pickupMinutes: pickupMinutesOf(w.pickUpTime),
   };
 }
 

@@ -8,7 +8,7 @@ import { uuidv7 } from "../lib/ids";
 import { emitEvent } from "../lib/structured-events";
 import type { OpsAlertContext, OpsAlertDigestContext, TemplateContext } from "../notifications/templates";
 import { notificationService, type DispatchResult } from "./notification.service";
-import { urgentAt } from "./document.service";
+import { urgentAt, visitDeadlineLevel } from "./document.service";
 import { quoteBudgetIncidents } from "./quote-budget-alert";
 
 /**
@@ -335,20 +335,35 @@ export async function collectOpsIncidents(since: Date, now: Date, limit = COLLEC
 
   // Tickets flagged for staff: the F12 thresholds and the staff-only reads already set `attention_required_at` (document.service.ts).
   const documents = await prisma.$queryRaw<Row[]>`
-    SELECT d.id, d.supplier_booking_id, d.attention_required_at, b.confirmed_at, b.service_date, b.start_minutes, b.supplier_booking_id AS supplier_ref,
-      b.order_id, o.reference
+    SELECT d.id, d.status, d.supplier_booking_id, d.attention_required_at, b.confirmed_at, b.service_date, b.start_minutes, b.booking_kind,
+      b.supplier_booking_id AS supplier_ref, b.order_id, o.reference
     FROM supplier_documents d JOIN supplier_bookings b ON b.id = d.supplier_booking_id LEFT JOIN orders o ON o.id = b.order_id
-    WHERE d.status IN ('pending', 'incomplete', 'failed', 'quarantined')
+    WHERE (d.status IN ('pending', 'incomplete', 'failed', 'quarantined')
+        -- A valid ticket set with attention: its tickets stop being valid before the visit (review 86 B5-02).
+        OR (d.status = 'valid' AND d.kind = 'ticket_codes' AND d.invalidated_at IS NULL))
       AND d.attention_required_at >= ${since} AND d.attention_required_at <= ${now}
     ORDER BY d.attention_required_at DESC LIMIT ${limit}`;
   for (const r of documents) {
     const raisedAt = date(r.attention_required_at);
-    const urgent = urgentAt({ confirmedAt: r.confirmed_at ? date(r.confirmed_at) : null, serviceDate: date(r.service_date), startMinutes: r.start_minutes === null ? null : Number(r.start_minutes) });
+    const timing = { serviceDate: date(r.service_date), startMinutes: r.start_minutes === null ? null : Number(r.start_minutes) };
+    const urgent = urgentAt({ confirmedAt: r.confirmed_at ? date(r.confirmed_at) : null, ...timing });
+    // An open-dated ticket raised by the visit deadline (document.service.ts raiseVisitDeadline) says so, apart from F12.
+    const visit = r.booking_kind === "ticket_only" ? visitDeadlineLevel(timing, raisedAt) : null;
+    const reason =
+      r.status === "valid"
+        ? "ticket_validity_before_visit"
+        : visit
+          ? visit.level === "urgent"
+            ? "tickets_missing_before_visit_urgent"
+            : "tickets_missing_before_visit"
+          : urgent && raisedAt.getTime() >= urgent.getTime()
+            ? "tickets_missing_urgent"
+            : "tickets_need_staff";
     out.push({
       kind: "document_attention",
       entityKind: "supplier_document",
       entityId: String(r.id),
-      reason: urgent && raisedAt.getTime() >= urgent.getTime() ? "tickets_missing_urgent" : "tickets_need_staff",
+      reason,
       raisedAt,
       orderId: str(r.order_id),
       orderReference: str(r.reference),

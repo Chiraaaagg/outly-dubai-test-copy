@@ -75,9 +75,9 @@ test.beforeAll(async ({ request }) => {
 
 let hotels: PickupHotelsFake;
 
-async function open(page: Page, list: "ready" | "unavailable" = "ready"): Promise<void> {
+async function open(page: Page, list: "ready" | "unavailable" | "not_offered" = "ready"): Promise<void> {
   await preparePage(page);
-  hotels = await fakePickupHotels(page, list === "ready" ? { ok: true, hotels: HOTELS, asOf: new Date().toISOString() } : { ok: false, reason: "unavailable" });
+  hotels = await fakePickupHotels(page, list === "ready" ? { ok: true, hotels: HOTELS, asOf: new Date().toISOString() } : { ok: false, reason: list });
   await plantCart(page, [cartLine(activity, { date: dubaiDate(5), time: "15:00", variantId })]);
   await page.goto("/checkout");
   await expect(page.getByRole("heading", { level: 1, name: "Your details" })).toBeVisible();
@@ -127,8 +127,12 @@ test.describe("checkout hotel combobox", () => {
     await expect(trigger(page)).toHaveAttribute("aria-expanded", "true");
     const panelId = await panel(page).getAttribute("id");
     await expect(trigger(page)).toHaveAttribute("aria-controls", panelId!);
-    // Focus moves into the filter field (it draws no ring of its own: the open panel and the caret mark it).
+    // Focus moves into the filter field. It draws no ring of its own; its row shows focus (review 85 B1): a solid
+    // 2px sun-700 inset (#bd4102, 5.3:1 on white), present while the filter has focus.
     await expect(filter(page)).toBeFocused();
+    const rowShadow = () => page.locator("[data-combobox-search]").evaluate((el) => getComputedStyle(el).boxShadow);
+    expect(await rowShadow()).toMatch(/rgb\(189, 65, 2\).*inset|inset.*rgb\(189, 65, 2\)/);
+    expect(await rowShadow()).toContain("2px");
     await expect(filter(page)).toHaveAttribute("aria-autocomplete", "list");
     await expect(filter(page)).toHaveAttribute("aria-expanded", "true");
     const listId = await filter(page).getAttribute("aria-controls");
@@ -258,6 +262,20 @@ test.describe("checkout hotel combobox", () => {
     await notice.getByRole("button", { name: "Try again" }).click();
     await expect(trigger(page)).not.toHaveAttribute("aria-disabled", "true");
     await expect(notice).toHaveCount(0);
+  });
+
+  test("pickup not offered online (Batch 3b L7): said in words, our team only, no Try again; axe clean", async ({ page }) => {
+    await open(page, "not_offered");
+    const notice = page.getByRole("status").filter({ hasText: /can't be booked online/ });
+    await expect(notice).toBeVisible();
+    await expect(notice.getByRole("button", { name: "Ask our team about my hotel" })).toBeVisible();
+    await expect(notice.getByRole("button", { name: "Try again" })).toHaveCount(0);
+    await expect(trigger(page)).toHaveAttribute("aria-disabled", "true");
+    await expectAxeClean(page);
+    // Asking again cannot help, so the page never asks again.
+    const calls = hotels.calls;
+    await page.waitForTimeout(250);
+    expect(hotels.calls).toBe(calls);
   });
 
   test("axe with the panel closed, open, and with no match: no serious or critical violations", async ({ page }) => {

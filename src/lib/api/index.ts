@@ -217,6 +217,7 @@ export type QuoteRefusalReason =
   | "past_cutoff"
   | "closed"
   | "sold_out"
+  | "ticket_validity_ended"
   | "availability_unknown"
   | "supplier_unavailable";
 

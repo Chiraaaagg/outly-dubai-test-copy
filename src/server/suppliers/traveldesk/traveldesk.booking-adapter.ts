@@ -123,8 +123,8 @@ function earliest(a: string | null, b: string | null): string | null {
 
 /**
  * A TravelDesk answer as the engine's snapshot. `holdCapUtc` bounds the hold
- * expiry: TravelDesk's deadline carries no timezone (Q-A2), so the engine
- * never trusts it past `sent + reservationTimeout` (CR-9). `tickets` is what
+ * expiry: TravelDesk's deadline is UTC (doc 29 §8.7) but the engine still never
+ * trusts it past `sent + reservationTimeout` (CR-9). `tickets` is what
  * the same answer said about tickets: issued or malformed ticket data both
  * mean the supplier returned tickets, so they count as issued. The snapshot
  * itself never holds ticket data.
@@ -139,6 +139,7 @@ export function snapshotFrom(r: TravelDeskBooking, holdCapUtc: string | null = n
     holdExpiresAtUtc: status === "ON_HOLD" ? earliest(r.reservationDeadline, holdCapUtc) : null,
     ticketsIssued: ticketsReturned || r.hasTickets ? true : null,
     ...(r.ticketsValidUntil ? { ticketsValidUntil: r.ticketsValidUntil } : {}),
+    ...(typeof r.pickupMinutes === "number" ? { pickupMinutes: r.pickupMinutes } : {}),
     // The supplier wallet book's refund figure (wallet-ledger.ts); absent means TravelDesk did not say.
     refundedNetMinor: r.refundMinor,
   };

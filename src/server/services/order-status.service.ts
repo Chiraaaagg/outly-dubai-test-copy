@@ -80,7 +80,9 @@ export interface StatusItemSnapshot {
   /** order_items.status */
   status: string;
   /** The item's latest supplier attempt. */
-  booking: { state: string; startMinutes: number | null; confirmedAt: Date | null; cancelledAt: Date | null; updatedAt: Date } | null;
+  booking: { state: string; startMinutes: number | null; confirmedAt: Date | null; cancelledAt: Date | null; updatedAt: Date; pickupTimeMinutes?: number | null } | null;
+  /** The pickup hotel chosen at checkout (`order_items.pickup_hotel_name_snapshot`); absent or null without pickup. */
+  pickupHotelName?: string | null;
   tickets: { fulfilment: TicketFulfilment; documents: DocumentSummary[] };
   refunds: Array<{ status: string; createdAt: Date; updatedAt: Date }>;
   remedies: Array<{ kind: string; status: string; refunded: boolean; updatedAt: Date }>;
@@ -441,6 +443,18 @@ function cancellationView(item: StatusItemSnapshot, state: CustomerOrderState, n
   return evaluateCancellation(item.cancellation, now);
 }
 
+/**
+ * The supplier's pickup time for a live booking (doc 29 §8.7), with the hotel
+ * chosen at checkout. Only for a confirmed attempt: a time on a hold that was
+ * released or refused is no promise.
+ */
+function pickupOf(item: StatusItemSnapshot): CustomerItemStatus["pickup"] {
+  const m = item.booking?.state === "confirmed" ? item.booking.pickupTimeMinutes : null;
+  if (typeof m !== "number" || !Number.isInteger(m) || m < 0 || m >= 24 * 60) return null;
+  const time = `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+  return { time, hotel: item.pickupHotelName ?? null };
+}
+
 function refundUntil(item: StatusItemSnapshot): string | null {
   const p = item.cancellation?.policy;
   if (!p || p.nonRefundableAfterConfirm || !p.freeCancellationUntilUtc) return null;
@@ -602,9 +616,20 @@ export function projectCustomerStatus(s: StatusSnapshot, now: Date): CustomerOrd
     state: itemSt,
     tickets: { fulfilment: item.tickets.fulfilment, documents: documentsFor(item, s.canDownload) },
     refundUntilUtc: refundUntil(item),
+    pickup: pickupOf(item),
     cancellationTerms: cancellationTermsOf(item, itemSt),
     cancellation: cancellationView(item, itemSt, now),
-    ...(item.ticket ? { ticket: { validUntil: item.ticket.validUntil, validityCopy: item.ticket.validityCopy, nonRefundableCopy: item.ticket.nonRefundableCopy, types: item.ticket.types.map((t) => ({ label: t.label, count: t.count })) } } : {}),
+    ...(item.ticket
+      ? {
+          ticket: {
+            validUntil: item.ticket.validUntil,
+            validityCopy: item.ticket.validityCopy,
+            nonRefundableCopy: item.ticket.nonRefundableCopy,
+            types: item.ticket.types.map((t) => ({ label: t.label, count: t.count })),
+            validityConcern: item.ticket.validityConcern ?? null,
+          },
+        }
+      : {}),
   }));
 
   const ahead = items.map((i) => i.refundUntilUtc).filter((t): t is string => Boolean(t) && Date.parse(t!) > now.getTime());
@@ -662,8 +687,14 @@ export async function loadStatusSnapshot(access: Pick<OrderAccess, "orderId" | "
       placedAt: true,
       updatedAt: true,
       paidAt: true,
-      items: { select: { id: true, titleSnapshot: true, serviceDate: true, timeslot: true, pax: true, status: true, fulfilmentOrigin: true }, orderBy: [{ serviceDate: "asc" }, { id: "asc" }] },
-      supplierBookings: { select: { orderItemId: true, state: true, startMinutes: true, confirmedAt: true, cancelledAt: true, updatedAt: true, createdAt: true }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] },
+      items: {
+        select: { id: true, titleSnapshot: true, serviceDate: true, timeslot: true, pax: true, status: true, fulfilmentOrigin: true, pickupHotelNameSnapshot: true },
+        orderBy: [{ serviceDate: "asc" }, { id: "asc" }],
+      },
+      supplierBookings: {
+        select: { orderItemId: true, state: true, startMinutes: true, confirmedAt: true, cancelledAt: true, updatedAt: true, createdAt: true, pickupTimeMinutes: true },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      },
       paymentSaga: { select: { orderItemId: true, state: true, deadlineAt: true, attentionRequiredAt: true, updatedAt: true, paymentId: true } },
       payments: { select: { id: true, status: true, capturedMinor: true, refundedMinor: true, authorizedAt: true, capturedAt: true, createdAt: true }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] },
       remedies: { select: { orderItemId: true, kind: true, status: true, refundId: true, updatedAt: true } },
@@ -707,7 +738,10 @@ export async function loadStatusSnapshot(access: Pick<OrderAccess, "orderId" | "
         timeslot: customerTimeslot(item.timeslot),
         pax: item.pax,
         status: item.status,
-        booking: booking ? { state: booking.state, startMinutes: booking.startMinutes, confirmedAt: booking.confirmedAt, cancelledAt: booking.cancelledAt, updatedAt: booking.updatedAt } : null,
+        booking: booking
+          ? { state: booking.state, startMinutes: booking.startMinutes, confirmedAt: booking.confirmedAt, cancelledAt: booking.cancelledAt, updatedAt: booking.updatedAt, pickupTimeMinutes: booking.pickupTimeMinutes }
+          : null,
+        pickupHotelName: item.pickupHotelNameSnapshot,
         tickets: { fulfilment: t?.fulfilment ?? "not_applicable", documents: t?.documents ?? [] },
         refunds: refunds.filter((r) => r.orderItemId === item.id).map((r) => ({ status: r.status, createdAt: r.createdAt, updatedAt: r.updatedAt })),
         remedies: order.remedies.filter((r) => r.orderItemId === item.id).map((r) => ({ kind: r.kind, status: r.status, refunded: Boolean(r.refundId), updatedAt: r.updatedAt })),

@@ -235,11 +235,14 @@ describe("CO-07: the reason a trip goes to the inquiry form", () => {
     expect(inquiryReasonForQuote(["sold_out"])).toBe("sold_out");
     expect(inquiryReasonForQuote(["multi_instant_inquiry"])).toBe("over_limit");
     expect(inquiryReasonForQuote(["requires_inquiry"])).toBe("unavailable");
+    // Review 86 B5-03: a visit after the tickets' validity is said as such, not as a stock problem.
+    expect(inquiryReasonForQuote(["ticket_validity_ended"])).toBe("ticket_validity");
+    expect(inquiryReasonText("ticket_validity")).toMatch(/can't be used on the date you picked/);
     expect(inquiryReasonText("over_limit")).toMatch(/up to 5 activities/);
   });
 
   it("only known reasons come back from the URL", () => {
-    for (const r of ["mixed", "over_limit", "cutoff", "time_slot", "sold_out", "pickup", "unavailable"] as const) {
+    for (const r of ["mixed", "over_limit", "cutoff", "time_slot", "sold_out", "pickup", "ticket_validity", "unavailable"] as const) {
       expect(parseInquiryReason(new URL(inquiryHref(r), "https://outlyy.test").searchParams.get("reason"))).toBe(r);
     }
     for (const bad of ["<script>", "toString", "constructor", "", null, undefined]) expect(parseInquiryReason(bad)).toBeNull();

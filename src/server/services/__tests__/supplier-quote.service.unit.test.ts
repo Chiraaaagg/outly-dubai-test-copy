@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import type { SupplierQuoteInput } from "../../quotes/contracts";
 import { admitRead, readLimits } from "../../suppliers/read-budget";
-import { offerTermsHash } from "../../suppliers/traveldesk/traveldesk.offer-terms";
-import { pickupHotels, row, SERVICE_DATE, storedOffer, storedTour, ticketStock } from "../../suppliers/__tests__/fixtures/traveldesk-terms";
+import { offerTermsHash, slotHoursOf } from "../../suppliers/traveldesk/traveldesk.offer-terms";
+import { pickupHotels, row, SERVICE_DATE, storedOffer, storedSlot, storedTour, ticketStock } from "../../suppliers/__tests__/fixtures/traveldesk-terms";
 
 /**
  * supplierQuoteService (SUP-14): what the service checks before it reads
@@ -21,6 +21,8 @@ type Context = NonNullable<Awaited<ReturnType<Deps["load"]>>>;
 
 const NOW = new Date("2026-11-01T08:00:00Z");
 const HASH = offerTermsHash(storedOffer(), storedTour())!;
+/** An offer whose one slot stores no end, so the booked end is start plus `hours` (review 85 A1). */
+const DERIVED = (hours: number) => storedOffer({ durationHours: hours, timeSlots: [storedSlot({ endMinutes: null })] });
 
 function context(over: Partial<Context["mapping"]> = {}, rest: Partial<Omit<Context, "mapping">> = {}): Context {
   return {
@@ -32,6 +34,7 @@ function context(over: Partial<Context["mapping"]> = {}, rest: Partial<Omit<Cont
       supplierCode: "traveldesk",
       externalRef: { tourId: 3001, offerId: 501, bookingKind: "live_book", isExternal: false },
       approvedOfferHash: HASH,
+      approvedSlotHours: slotHoursOf(rest.offer?.payload ?? storedOffer()),
       ...over,
     },
     offer: { payload: storedOffer(), removed: false },
@@ -40,14 +43,17 @@ function context(over: Partial<Context["mapping"]> = {}, rest: Partial<Omit<Cont
   };
 }
 
-function harness(ctx: Context | null, opts: { configured?: boolean; token?: boolean; fail?: boolean; hotelsFail?: boolean; hotels?: () => ReturnType<typeof pickupHotels> } = {}) {
+function harness(
+  ctx: Context | null,
+  opts: { configured?: boolean; token?: boolean; fail?: boolean; hotelsFail?: boolean; hotels?: () => ReturnType<typeof pickupHotels>; rows?: () => ReturnType<typeof row>[] } = {},
+) {
   const calls: string[] = [];
   const clock = { now: NOW };
   const source = {
     async getAvailability(offerId: number, from: string, to: string, o: { isExternal: boolean }) {
       calls.push(`availability:${offerId}:${from}:${to}:${o.isExternal}`);
       if (opts.fail) throw new Error("timeout");
-      return { rows: [row()] };
+      return { rows: opts.rows ? opts.rows() : [row()] };
     },
     async getTicketStock(offerId: number) {
       calls.push(`tickets:${offerId}`);
@@ -103,6 +109,8 @@ describe("supplierQuoteService.quote (SUP-14)", () => {
       [context({}, { offer: { payload: storedOffer({ childAge: 8 }), removed: false } }), "availability_unknown"], // drifted terms
       [context({}, { offer: { payload: storedOffer(), removed: true } }), "availability_unknown"],
       [context({}, { tour: null }), "availability_unknown"],
+      // Review 85 A1: the hours a derived end follows changed since the approval (same hash, hours compared on their own).
+      [context({ approvedOfferHash: offerTermsHash(DERIVED(3), storedTour()), approvedSlotHours: 2 }, { offer: { payload: DERIVED(3), removed: false } }), "availability_unknown"],
       [context({ externalRef: { tourId: 3001, offerId: 501, bookingKind: "on_request", isExternal: false } }), "on_request"],
       [context({ externalRef: { tourId: 3001, offerId: 501, bookingKind: "unknown", isExternal: false } }), "availability_unknown"],
     ];
@@ -112,6 +120,12 @@ describe("supplierQuoteService.quote (SUP-14)", () => {
       expect(h.calls).toEqual([]);
       expect(h.tokens).toEqual([]);
     }
+  });
+
+  it("a derived-end offer quotes while its hours are the approved ones (review 85 A1)", async () => {
+    // 21:00 plus 2 hours: the row names the same end (review 85 A2).
+    const h = harness(context({ approvedOfferHash: offerTermsHash(DERIVED(2), storedTour()), approvedSlotHours: 2 }, { offer: { payload: DERIVED(2), removed: false } }), { rows: () => [row({ endMinutes: 1380 })] });
+    expect(await h.svc.quote(input)).toMatchObject({ ok: true, slotRef: "11@21:00" });
   });
 
   it("refuses unknown units and a hotel for a direct-reporting offer before reading", async () => {

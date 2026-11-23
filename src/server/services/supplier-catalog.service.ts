@@ -14,7 +14,7 @@ import type { ReadinessReason } from "../quotes/contracts";
 import type { Tristate } from "../suppliers/booking-port";
 import { travelDeskExternalRefSchema } from "../suppliers/traveldesk/traveldesk.adapter";
 import type { TravelDeskAvailabilityRow, TravelDeskOffer, TravelDeskTourDetail, TravelDeskTourSummary } from "../suppliers/traveldesk/traveldesk.codec";
-import { offerTermsHash, parseStoredOffer, parseStoredPolicy } from "../suppliers/traveldesk/traveldesk.offer-terms";
+import { approvedSlotHoursHold, offerTermsHash, parseStoredOffer, parseStoredPolicy, slotHoursOf } from "../suppliers/traveldesk/traveldesk.offer-terms";
 import { ageBandMismatches, offerReadinessFacts } from "../suppliers/traveldesk/traveldesk.quote";
 import { readinessService } from "./readiness.service";
 import { verifyStepUp } from "./approval.service";
@@ -37,8 +37,10 @@ import { supplierCheckAccountId } from "./supplier-quote.service";
  *    `fulfilment_mode` or a price; the instant flip stays a separate audited
  *    action that the TravelDesk capabilities refuse until Stage 3.
  *  - Approval records `approved_offer_hash`, a hash of the offer terms the
- *    editor saw (traveldesk.offer-terms.ts). Every sync compares the stored
- *    terms with it and marks the mapping `changed` on any difference (SUP-15).
+ *    editor saw (traveldesk.offer-terms.ts), and `approved_slot_hours`, the
+ *    offer hours a derived slot end follows (kept outside the hash, review 85
+ *    A1). Every sync compares the stored terms with both and marks the mapping
+ *    `changed` on any difference (SUP-15).
  *  - `mappingReadinessFor` is the mapping half of readiness: one state per
  *    product variant, read by readiness.service.ts. Approve, revoke and every
  *    sync re-evaluate readiness for the products they touch.
@@ -571,7 +573,9 @@ export const supplierCatalogService = {
       const blockers: MappingBlocker[] = [];
       if (!m.isActive) blockers.push("mapping_inactive");
       if (!present || m.syncStatus === "missing_upstream") blockers.push("mapping_missing_upstream");
-      else if (m.syncStatus !== "ok" || !m.approvedOfferHash || currentOfferHash !== m.approvedOfferHash) blockers.push("mapping_changed_upstream");
+      else if (m.syncStatus !== "ok" || !m.approvedOfferHash || currentOfferHash !== m.approvedOfferHash || !approvedSlotHoursHold(offer!.payload, m.approvedSlotHours)) {
+        blockers.push("mapping_changed_upstream");
+      }
       if (!stored || (stored.bookingKind === "live_book" && stored.timeSlots.length === 0)) blockers.push("slot_rules_unknown");
       // The capability lookup decides (Batch 1a parity). The booking kind must agree on the mapping, its approved
       // reference and the stored offer's class (`bookingKindSellable`): live book needs a live class, TicketOnly the one
@@ -770,12 +774,19 @@ export const supplierCatalogService = {
       // instant on TravelDesk before B2, so no sale relied on older terms.
       // Conditional on the column still being null, so a concurrent approval wins.
       let approved = m.approvedOfferHash;
+      let approvedHours = m.approvedSlotHours;
       if (approved === null && m.isActive && current) {
-        const filled = await prisma.productSupplierMapping.updateMany({ where: { id: m.id, approvedOfferHash: null }, data: { approvedOfferHash: current } });
+        const hours = slotHoursOf(item!.payload);
+        const filled = await prisma.productSupplierMapping.updateMany({ where: { id: m.id, approvedOfferHash: null }, data: { approvedOfferHash: current, approvedSlotHours: hours } });
         if (filled.count === 1) {
           approved = current;
+          approvedHours = hours;
           result.hashesBackfilled += 1;
-        } else approved = (await prisma.productSupplierMapping.findUnique({ where: { id: m.id }, select: { approvedOfferHash: true } }))?.approvedOfferHash ?? null;
+        } else {
+          const now = await prisma.productSupplierMapping.findUnique({ where: { id: m.id }, select: { approvedOfferHash: true, approvedSlotHours: true } });
+          approved = now?.approvedOfferHash ?? null;
+          approvedHours = now?.approvedSlotHours ?? null;
+        }
       }
       const ref = travelDeskExternalRefSchema.safeParse(m.externalRef);
       const syncStatus = !present
@@ -785,7 +796,8 @@ export const supplierCatalogService = {
             !ref.success ||
             ref.data.isExternal !== item.isExternal ||
             current === null ||
-            current !== approved
+            current !== approved ||
+            !approvedSlotHoursHold(item.payload, approvedHours)
           ? "changed"
           : "ok";
       await prisma.productSupplierMapping.update({ where: { id: m.id }, data: { syncStatus, lastSyncedAt: runStarted } });
@@ -1169,6 +1181,8 @@ export const supplierCatalogService = {
         // The terms the editor approves (SUP-15). Null when the stored payload is unreadable: the
         // mapping is still recorded for inquiry use, but marked changed and never ready.
         const approvedOfferHash = offerTermsHash(offer.payload, tourRow.payload);
+        // The hours a derived slot end follows are approved alongside the hash, outside it (review 85 A1).
+        const approvedSlotHours = slotHoursOf(offer.payload);
         const mappingData = {
           externalRef,
           supplierProductId: c.tourExternalId,
@@ -1179,6 +1193,7 @@ export const supplierCatalogService = {
           lastSyncedAt: offer.lastSeenAt,
           syncStatus: approvedOfferHash ? "ok" : "changed",
           approvedOfferHash,
+          approvedSlotHours,
         };
         let mappingId: string;
         if (existing) {
@@ -1199,7 +1214,7 @@ export const supplierCatalogService = {
           { type: "product", id: c.productId },
           {
             before: existing ? { mappingId: existing.id, externalRef: existing.externalRef, isActive: existing.isActive } : null,
-            after: { mappingId, candidateId: c.id, externalRef, environment: c.environment, approvedOfferHash },
+            after: { mappingId, candidateId: c.id, externalRef, environment: c.environment, approvedOfferHash, approvedSlotHours },
             reason: note.trim(),
           },
           tx,

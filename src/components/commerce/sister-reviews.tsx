@@ -29,7 +29,8 @@ import { cn } from "@/lib/utils";
 
 function Stars({ value, className }: { value: number; className?: string }) {
   return (
-    <span className={cn("inline-flex items-center gap-0.5", className)} aria-label={`${value} out of 5`}>
+    // role="img": aria-label is not allowed on a bare <span> (axe aria-prohibited-attr), so screen readers could skip the rating.
+    <span role="img" className={cn("inline-flex items-center gap-0.5", className)} aria-label={`${value} out of 5`}>
       {Array.from({ length: 5 }, (_, i) => (
         <Star key={i} className={cn("h-3.5 w-3.5", i < value ? "fill-sun-500 text-sun-500" : "text-ink-300")} aria-hidden="true" />
       ))}

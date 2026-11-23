@@ -130,6 +130,12 @@ export interface CustomerItemStatus {
   /** Full-refund cancellation deadline from the stored verified policy (quote snapshot), UTC ISO, or null when none. */
   refundUntilUtc: string | null;
   /**
+   * Doc 29 §8.7: the pickup the supplier returned for the booking: the time
+   * ("HH:mm", Dubai) and the hotel chosen at checkout. Absent or null when the
+   * supplier gave no time.
+   */
+  pickup?: { time: string; hotel: string | null } | null;
+  /**
    * The booking's one cancellation statement, in the quote's own words
    * (`freeCancellationCopy`, CO-01), from the stored policy snapshot; null
    * when no policy is stored (assisted orders) or the item is no longer live.
@@ -147,6 +153,8 @@ export interface CustomerItemStatus {
     validityCopy: string | null;
     nonRefundableCopy: string;
     types: { label: string; count: number }[];
+    /** Neutral copy when the issued tickets stop being valid before the visit date (review 86 B5-02). */
+    validityConcern?: string | null;
   } | null;
 }
 

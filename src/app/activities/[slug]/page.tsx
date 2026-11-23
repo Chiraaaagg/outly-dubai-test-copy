@@ -98,9 +98,10 @@ export default async function ActivityPage({
   const cached = await getActivityBySlug(slug);
   if (!cached) notFound();
   // The badge, the attributes and the booking widget all follow the mode read now, not the cached snapshot's (N6).
-  const activity = { ...cached, fulfilmentMode: await renderedModeFor(cached) };
-  // Doc 29 Batch 5: an open-dated ticket states its validity and that it is non-refundable once issued.
+  // Doc 29 Batch 5: an open-dated ticket states its validity and that it is non-refundable once issued, on the page,
+  // in the widget and (carried on the cart line) in the trip and checkout (review 86 B5-03).
   const openDatedTicket = await openDatedTicketFor(cached.productId);
+  const activity = { ...cached, fulfilmentMode: await renderedModeFor(cached), ...(openDatedTicket ? { openDatedTicket: true } : {}) };
 
   const category = await getCategoryBySlug(activity.categorySlug);
   const relatedAll = await getActivitiesBySlugs(activity.relatedSlugs);
@@ -350,11 +351,14 @@ export default async function ActivityPage({
             </Card>
             <Card className="p-5">
               <h2 className="text-lg">Cancellation policy</h2>
-              <p className="mt-3 text-sm leading-relaxed text-ink-700">
-                {activity.cancellationPolicy}
-              </p>
+              {/* An open-dated ticket's terms replace the authored line, which may promise a free cancellation (review 86 B5-04). */}
+              {openDatedTicket ? null : (
+                <p className="mt-3 text-sm leading-relaxed text-ink-700">
+                  {activity.cancellationPolicy}
+                </p>
+              )}
               {openDatedTicket ? (
-                <TicketTerms />
+                <TicketTerms inquiry={activity.fulfilmentMode !== "instant"} />
               ) : (
                 <p className="mt-3 text-xs text-ink-500">
                   You can cancel yourself from{" "}

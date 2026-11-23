@@ -297,10 +297,11 @@ export function customerFreeCancellationUntil(serviceDate: string, hours: number
  * never promises a refund the supplier would not give. null when there is
  * none, or when it has already passed.
  *
- * Only the gap between the slot start and the start of the service day is
- * absorbed this way. A supplier deadline earlier than the page's promise
- * counted from the day start is a tightened policy and refuses the line
- * before this runs (`supplierPolicyTightened`, N1).
+ * Both deadlines count back from the activity start (doc 29 §8.7: TravelDesk
+ * counts its window from the activity start, and the owner made ours the
+ * same; conflict C12 reversed). A supplier deadline earlier than the page's
+ * promise is a tightened policy and refuses the line before this runs
+ * (`supplierPolicyTightened`, N1).
  */
 export function freeCancellationDeadline(input: { serviceDate: string; hours: number; startMinutes: number | null; supplierUntilUtc: string; now: Date }): Date | null {
   const ours = customerFreeCancellationUntil(input.serviceDate, input.hours, input.startMinutes);
@@ -310,13 +311,14 @@ export function freeCancellationDeadline(input: { serviceDate: string; hours: nu
 }
 
 /**
- * Whether the supplier's fresh full-refund deadline is earlier than anything
- * the page's "up to N hours" can mean: N hours before the start of the
- * service day, the earliest the activity can begin (N1).
+ * Whether the supplier's fresh full-refund deadline is earlier than the
+ * page's "up to N hours" before the activity starts (N1; doc 29 §8.7). The
+ * start is the quoted slot's; without one, the start of the service day, the
+ * earliest the activity can begin.
  */
-export function supplierPolicyTightened(serviceDate: string, hours: number, supplierUntilUtc: string): boolean {
-  const earliestPromise = customerFreeCancellationUntil(serviceDate, hours);
-  return earliestPromise !== null && Date.parse(supplierUntilUtc) < earliestPromise.getTime();
+export function supplierPolicyTightened(serviceDate: string, hours: number, supplierUntilUtc: string, startMinutes: number | null = null): boolean {
+  const promise = customerFreeCancellationUntil(serviceDate, hours, startMinutes);
+  return promise !== null && Date.parse(supplierUntilUtc) < promise.getTime();
 }
 
 /** sha256 over the coupon definition as applied: a change to its terms is a new version (CR-B2-12). */
@@ -505,7 +507,7 @@ export function createQuoteService(deps: QuoteDeps): QuoteServiceImpl {
     let freeUntil: Date | null = null;
     if (hours > 0) {
       const supplierUntil = supplier.supplierFreeCancellationUntilUtc;
-      if (supplier.issuesTicketsAtConfirm !== "no" || !supplierUntil || Number.isNaN(Date.parse(supplierUntil)) || supplierPolicyTightened(line.serviceDate, hours, supplierUntil)) {
+      if (supplier.issuesTicketsAtConfirm !== "no" || !supplierUntil || Number.isNaN(Date.parse(supplierUntil)) || supplierPolicyTightened(line.serviceDate, hours, supplierUntil, slotStartMinutes(supplier.slotRef))) {
         // The approved terms no longer hold: re-run the product's readiness (awaited, so a serverless
         // instance does not drop it after the response; it never throws).
         await deps.readiness.reevaluate(line.productId, "supplier_policy_changed");

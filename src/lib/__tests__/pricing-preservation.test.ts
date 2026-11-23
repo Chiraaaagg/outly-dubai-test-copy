@@ -170,6 +170,11 @@ describe("toCartItem", () => {
     });
   });
 
+  it("carries the open-dated ticket fact onto the cart line only when set (review 86 B5-03)", () => {
+    expect(toCartItem({ ...activity, openDatedTicket: true }, { date: "2026-12-01", time: "09:00", pax: pax({ adult: 1 }) }).openDatedTicket).toBe(true);
+    expect(toCartItem(activity, { date: "2026-12-01", time: "09:00", pax: pax({ adult: 1 }) })).not.toHaveProperty("openDatedTicket");
+  });
+
   it("uses the recommended variant when none is given", () => {
     const c = toCartItem(activity, { date: "2026-12-01", time: "09:00", pax: pax({ adult: 1 }) });
     expect(c.id).toBe("zz-synthetic-safari-2026-12-01-09:00-std");

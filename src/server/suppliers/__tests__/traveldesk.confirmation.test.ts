@@ -166,6 +166,15 @@ describe("TravelDesk answer → confirmation snapshot", () => {
     expect(isConfirmedSnapshot(expected, confirmationSnapshotFrom(b))).toEqual({ confirmed: false, reasons: ["flag_missing"] });
   });
 
+  it("reservationDeadline is UTC (TravelDesk, doc 29 §8.7): without an offset it reads as UTC; an offset is kept", () => {
+    const at = (reservationDeadline: string | null) => bookingFrom(bookingWire.parse({ ...wire, status: 7, reservationDeadline })).reservationDeadline;
+    expect(at("2026-11-10T10:15:00")).toBe("2026-11-10T10:15:00.000Z");
+    expect(at("2026-11-10T10:15:00.5")).toBe("2026-11-10T10:15:00.500Z");
+    expect(at("2026-11-10T14:15:00+04:00")).toBe("2026-11-10T10:15:00.000Z");
+    expect(at("not a date")).toBeNull();
+    expect(at(null)).toBeNull();
+  });
+
   it("charged amount: paid from balance first; a zero total with nothing paid is missing", () => {
     expect(chargedFrom({ paidFromBalanceMinor: 23_999n, totalCostMinor: 24_000n })).toBe(23_999n);
     expect(chargedFrom({ paidFromBalanceMinor: null, totalCostMinor: 24_000n })).toBe(24_000n);
@@ -191,5 +200,16 @@ describe("isSameBooking (SUP-3, before releasing)", () => {
     expect(isSameBooking(ours, { supplierBookingId: "51002", bookingReference: "OUTTD-T-1" })).toBe(false);
     expect(isSameBooking(ours, { supplierBookingId: "51001", bookingReference: "OUTTD-T-2" })).toBe(false);
     expect(isSameBooking({ supplierBookingId: null, clientRef: "OUTTD-T-1" }, { supplierBookingId: "51001", bookingReference: "AGENT-1" })).toBe(false);
+  });
+});
+
+describe("doc 29 §8.7: the returned pickup time", () => {
+  it("reads whole minutes, HH:mm, HH:mm:ss or a zoneless date-time; anything else is unknown, and never fails the parse", async () => {
+    const { pickupMinutesOf } = await import("../traveldesk/traveldesk.booking");
+    expect(pickupMinutesOf(495)).toBe(495);
+    expect(pickupMinutesOf("08:15")).toBe(495);
+    expect(pickupMinutesOf("08:15:00")).toBe(495);
+    expect(pickupMinutesOf("2026-11-10T08:15:00")).toBe(495);
+    for (const bad of [1440, -1, 8.5, "8:15", "24:00", "08:15Z", "2026-11-10T08:15:00+04:00", "08:15 - 08:45", "", null, undefined, {}, true]) expect(pickupMinutesOf(bad), String(bad)).toBeNull();
   });
 });

@@ -339,6 +339,19 @@ describe("evaluateCancellation: a multi-item order is settled first (lead decisi
   });
 });
 
+describe("doc 29 §8.7: the pickup time the supplier returned", () => {
+  it("shows on a confirmed item with the checkout hotel; never on a hold, and never an unreadable time", () => {
+    const pickupOf = (booking: Item["booking"], hotel: string | null = "Example Marina Hotel") =>
+      projectCustomerStatus(snap("fulfilled", { captured: true, item: { booking, pickupHotelName: hotel } }), NOW).items[0].pickup ?? null;
+    expect(pickupOf({ ...confirmedBooking, pickupTimeMinutes: 8 * 60 + 15 })).toEqual({ time: "08:15", hotel: "Example Marina Hotel" });
+    expect(pickupOf({ ...confirmedBooking, pickupTimeMinutes: 0 }, null)).toEqual({ time: "00:00", hotel: null });
+    expect(pickupOf({ ...confirmedBooking, pickupTimeMinutes: null })).toBeNull();
+    expect(pickupOf({ ...confirmedBooking, pickupTimeMinutes: 24 * 60 })).toBeNull();
+    expect(pickupOf({ ...confirmedBooking, state: "awaiting_payment", pickupTimeMinutes: 8 * 60 })).toBeNull();
+    expect(pickupOf(null)).toBeNull();
+  });
+});
+
 describe("paxLabel", () => {
   it("names counts in plain words and skips zeros", () => {
     expect(paxLabel({ adult: 2, child: 1, infant: 0 })).toBe("2 adults, 1 child");

@@ -88,7 +88,8 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 
 echo "shop/a11y: synthetic shop fixture"
-OUTLY_TEST_ENV_FILE=$DB_ENV_FILE NODE_OPTIONS=--conditions=react-server \
+# env -u: node --env-file does not override variables already exported, so a stray DATABASE_URL would point the fixture elsewhere (review 85 B8).
+env -u DATABASE_URL -u DIRECT_URL OUTLY_TEST_ENV_FILE="$DB_ENV_FILE" NODE_OPTIONS=--conditions=react-server \
   node --no-warnings --env-file="$DB_ENV_FILE" node_modules/tsx/dist/cli.mjs scripts/shop/a11y-fixture.ts
 
 umask 077

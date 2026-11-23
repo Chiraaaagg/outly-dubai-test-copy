@@ -166,6 +166,12 @@ export interface Activity {
   fulfilmentMode: FulfilmentMode;
   /** Hours before start when free cancellation stops. 0 = non-refundable. */
   freeCancellationHours: number;
+  /**
+   * Doc 29 Batch 5: sold as open-dated tickets (an active TicketOnly mapping),
+   * set by the product page at render time. The terms then read
+   * "non-refundable once issued" on every surface (review 86 B5-03).
+   */
+  openDatedTicket?: boolean;
   mobileVoucher: boolean;
 
   dietary: Dietary[];
@@ -292,6 +298,8 @@ export interface CartItem {
   confirmation: ConfirmationType;
   fulfilmentMode: FulfilmentMode;
   freeCancellationHours: number;
+  /** Doc 29 Batch 5: open-dated tickets (from the activity when added): the trip and checkout say non-refundable once issued. */
+  openDatedTicket?: boolean;
   durationMinutes: number;
   /**
    * Batch 3: the hotel the operator collects from, chosen at checkout from the

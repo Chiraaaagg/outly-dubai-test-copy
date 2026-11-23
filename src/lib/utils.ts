@@ -151,7 +151,9 @@ export function ticketValidityCopy(validUntil: string | null | undefined): strin
  * before the quote (CO-01); the quote's `freeCancellationCopy` replaces it
  * from the review step on.
  */
-export function cancellationPolicyBeforeQuote(hours: number): string {
+export function cancellationPolicyBeforeQuote(hours: number, opts: { openDatedTicket?: boolean } = {}): string {
+  // Doc 29 §4.4 (review 86 B5-03): issued tickets are never refunded, whatever the authored hours say.
+  if (opts.openDatedTicket) return TICKET_NON_REFUNDABLE_STATEMENT;
   if (!(hours > 0)) return "The operator's policy: non-refundable once confirmed. Your exact terms are confirmed with the price before you pay.";
   return `The operator's policy: free cancellation up to ${hours} hours before the start. Your exact deadline, in Dubai time, is confirmed with the price before you pay.`;
 }

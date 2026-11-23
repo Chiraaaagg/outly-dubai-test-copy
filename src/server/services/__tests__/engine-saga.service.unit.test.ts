@@ -89,6 +89,7 @@ function fakeTx(
               isActive: true,
               environment: "test",
               approvedOfferHash: HASH,
+              approvedSlotHours: 2,
               supplierId: "sup-1",
               supplierOfferId: "501",
               externalRef: { tourId: 3001, offerId: 501, bookingKind: "live_book", isExternal: false },
@@ -168,8 +169,12 @@ describe("engineSagaApi (B3)", () => {
       [fakeTx({ lines: [line({ slotRef: "21:00" })] }), "slot_unknown"],
       [fakeTx({ lines: [line({ slotRef: "12@21:00" })] }), "slot_rules_unknown"],
       // No stored end and no hours to derive one from (OpenAPI TimeSlotPublicDto.endTime).
-      [fakeTx({ offer: storedOffer({ durationHours: 0, timeSlots: [storedSlot({ endMinutes: null })] }) }), "slot_rules_unknown"],
-      [fakeTx({ offer: storedOffer({ durationHours: 4, timeSlots: [storedSlot({ endMinutes: null })] }) }), "slot_rules_unknown"], // 21:00 + 4 h passes midnight
+      [fakeTx({ mapping: { approvedSlotHours: 0 }, offer: storedOffer({ durationHours: 0, timeSlots: [storedSlot({ endMinutes: null })] }) }), "slot_rules_unknown"],
+      [fakeTx({ mapping: { approvedSlotHours: 4 }, offer: storedOffer({ durationHours: 4, timeSlots: [storedSlot({ endMinutes: null })] }) }), "slot_rules_unknown"], // 21:00 + 4 h passes midnight
+      [fakeTx({ mapping: { approvedSlotHours: 3 }, offer: storedOffer({ durationHours: 3, timeSlots: [storedSlot({ endMinutes: null })] }) }), "slot_rules_unknown"], // 21:00 + 3 h is 24:00 (review 85 A3)
+      // Review 85 A1: the hours a derived end follows changed since the approval (they are not in the hash).
+      [fakeTx({ offer: storedOffer({ durationHours: 1, timeSlots: [storedSlot({ endMinutes: null })] }) }), "mapping_changed"],
+      [fakeTx({ mapping: { approvedSlotHours: null }, offer: storedOffer({ durationHours: 2, timeSlots: [storedSlot({ endMinutes: null })] }) }), "mapping_changed"],
       [fakeTx({ offer: { not: "an offer" } }), "offer_unreadable"],
       // The capability gate (doc 29 Batch 1a): a class switched off since the quote, or a class never switched on.
       [fakeTx({ flags: [] }), "capability_not_enabled"],
