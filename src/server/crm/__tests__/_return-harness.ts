@@ -101,6 +101,8 @@ export class FakeCommands implements CrmReturnCommands {
   async assign(actor: CrmStaffActor | "system", id: string, agentId: string, via: CrmVia, note: string): Promise<CrmCommandResult> {
     this.calls.push({ op: "assign", actor: actor === "system" ? "system" : actor.staffId, id, agentId, via, reason: note });
     const p = this.perms(actor);
+    // As crm.return.commands.ts: a claim needs inquiries.claim, any other assignment inquiries.assign.
+    if (actor !== "system" && !p.has(agentId === actor.staffId ? "inquiries.claim" : "inquiries.assign")) return { ok: false, code: "forbidden" };
     const self = actor !== "system" && agentId === actor.staffId && !this.agents.get(id);
     if (!self && !p.has("inquiries.assign")) return { ok: false, code: "forbidden" };
     const from = this.status(id);

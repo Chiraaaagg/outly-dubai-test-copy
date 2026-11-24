@@ -394,10 +394,13 @@ export class FakeBitrix24 {
     switch (method) {
       case "crm.item.list": {
         const f = (p.filter ?? {}) as Record<string, unknown>;
-        const known = new Set(["=id", "=originatorId", "=originId", "=categoryId", ">=updatedTime", ">id"]);
+        const known = new Set(["=id", "@id", "=originatorId", "=originId", "=categoryId", ">=updatedTime", "=updatedTime", ">id"]);
         if (Object.keys(f).some((k) => !known.has(k))) return { status: 400, body: { error: "INVALID_ARG_VALUE", error_description: "filter" } };
         const since = f[">=updatedTime"] === undefined ? null : Date.parse(String(f[">=updatedTime"]));
-        if (since !== null && !Number.isFinite(since)) return { status: 400, body: { error: "INVALID_ARG_VALUE", error_description: "updatedTime" } };
+        const exact = f["=updatedTime"] === undefined ? null : Date.parse(String(f["=updatedTime"]));
+        if ((since !== null && !Number.isFinite(since)) || (exact !== null && !Number.isFinite(exact))) return { status: 400, body: { error: "INVALID_ARG_VALUE", error_description: "updatedTime" } };
+        const ids = f["@id"] === undefined ? null : (f["@id"] as unknown[]).map(Number);
+        const sec = (d: FakeDeal) => Math.floor((d.updatedTime ?? 0) / 1000) * 1000;
         const now = this.opts.now();
         const order = (p.order ?? { id: "ASC" }) as Record<string, string>;
         const byTime = "updatedTime" in order;
@@ -409,10 +412,12 @@ export class FakeBitrix24 {
               (f["=originId"] === undefined || d.originId === f["=originId"]) &&
               (f["=categoryId"] === undefined || d.categoryId === f["=categoryId"]) &&
               (f[">id"] === undefined || d.id > Number(f[">id"])) &&
-              (since === null || this.ignoreTimeFilter || Math.floor((d.updatedTime ?? 0) / 1000) * 1000 >= since) &&
+              (ids === null || ids.includes(d.id)) &&
+              (since === null || this.ignoreTimeFilter || sec(d) >= since) &&
+              (exact === null || this.ignoreTimeFilter || sec(d) === exact) &&
               (!this.listLagMs || (d.updatedTime ?? 0) <= now - this.listLagMs),
           )
-          .sort((a, b) => (byTime ? (a.updatedTime ?? 0) - (b.updatedTime ?? 0) : 0) || a.id - b.id);
+          .sort((a, b) => (byTime ? sec(a) - sec(b) : 0) || a.id - b.id);
         const start = Number(p.start ?? 0);
         const page = all.slice(start, start + 50);
         const items = page.map((d) => this.listItem(d, p));

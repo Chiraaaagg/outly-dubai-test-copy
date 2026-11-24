@@ -41,6 +41,8 @@ export const DB_SUITES = [
   "src/server/crm/__tests__/crm.db.test.ts",
   // CRM batch C3ab: the return path's Postgres store, checks and alert read.
   "src/server/crm/__tests__/crm.return.db.test.ts",
+  // CRM batch C3ab fix round: the real return path commands on the inquiry service (review C3-08).
+  "src/server/crm/__tests__/crm.return.commands.db.test.ts",
   // Batch 1c: the retention purge leaves live rows alone (doc 26 §2).
   "src/server/jobs/__tests__/retention-purge.db.test.ts",
   // Batch 1c: the Prisma timing extension counts queries of the request it runs in (doc 29 §6.6).

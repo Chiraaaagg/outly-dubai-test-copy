@@ -2,7 +2,7 @@ import "server-only";
 import { prisma } from "../lib/db";
 import { audit } from "../lib/audit";
 import { AppError } from "../lib/errors";
-import { SYSTEM_ACTOR, type Actor } from "../lib/actor";
+import { requirePermission, SYSTEM_ACTOR, type Actor } from "../lib/actor";
 import { adminRepo } from "../repositories/admin.repo";
 import { inquiryService } from "../services/inquiry.service";
 import type { InquiryStatus } from "@/lib/types";
@@ -79,7 +79,12 @@ export const crmReturnCommands: CrmReturnCommands = {
 
   async assign(actor, inquiryId, agentId, via, note) {
     try {
-      await inquiryService.assign(actor === "system" ? SYSTEM_ACTOR : actorOf(actor), inquiryId, agentId, note, { via });
+      const a = actor === "system" ? SYSTEM_ACTOR : actorOf(actor);
+      // As in OUTLYY admin (review C3-01): taking an inquiry for oneself is a claim and needs `inquiries.claim`
+      // (the admin claim route); any other assignment needs `inquiries.assign` (the admin assign action). The
+      // service's own checks (open inquiry, active target with two-factor, self-claim only when unassigned) follow.
+      if (actor !== "system") requirePermission(a, agentId === a.id ? "inquiries.claim" : "inquiries.assign");
+      await inquiryService.assign(a, inquiryId, agentId, note, { via });
       return { ok: true };
     } catch (e) {
       return refusal(e);
@@ -87,9 +92,17 @@ export const crmReturnCommands: CrmReturnCommands = {
   },
 
   async recordPutBack(subject, info) {
-    const action = info.what === "stage" ? "crm.stage_reverted" : "crm.fields_restored";
+    const action = info.what === "stage" ? "crm.stage_reverted" : info.what === "drift" ? "crm.drift_pushed" : "crm.fields_restored";
     const after = { via: "bitrix24", dealId: info.dealId, bitrixUserId: info.bitrixUserId, from: info.from ?? null, to: info.to ?? null, fields: info.fields?.length ? info.fields : undefined };
-    await audit(SYSTEM_ACTOR, action, { type: subject.type, id: subject.id }, { after, reason: info.what === "stage" ? "Stage changed in Bitrix24 was put back" : "OUTLYY fields changed in Bitrix24 were restored" });
+    await audit(SYSTEM_ACTOR, action, { type: subject.type, id: subject.id }, {
+      after,
+      reason:
+        info.what === "stage"
+          ? "Stage changed in Bitrix24 was put back"
+          : info.what === "drift"
+            ? "The deal differed from OUTLYY after OUTLYY's own write: pushed again"
+            : "OUTLYY fields changed in Bitrix24 were restored",
+    });
     if (subject.type === "inquiry" && info.what === "stage") {
       // OUTLYY's own timeline shows it too. Keys and ids only.
       await prisma.inquiryEvent.create({

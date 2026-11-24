@@ -49,6 +49,8 @@ type LinkExtra = Partial<CrmReturnLinkState> & { sweepSeenAt?: Date | null; crea
 
 const EMPTY_PORTAL: CrmReturnPortalState = {
   reconcileCursor: null,
+  reconcileCursorId: null,
+  reconcileCatchingUp: false,
   reconcileCheckedAt: null,
   fingerprintHash: null,
   fingerprintState: null,
@@ -109,6 +111,7 @@ export class MemoryReturnStore extends MemoryCrmStore implements CrmReturnStore 
       lastFieldRestoreAt: l.lastFieldRestoreAt ?? null,
       holdUntil: l.holdUntil ?? null,
       missingSince: l.missingSince ?? null,
+      recheckRequestedAt: l.recheckRequestedAt ?? null,
     };
   }
 
@@ -122,9 +125,26 @@ export class MemoryReturnStore extends MemoryCrmStore implements CrmReturnStore 
     return { ...(this.returnPortals.get(this.pkey(scope)) ?? EMPTY_PORTAL) };
   }
 
-  async setReturnPortal(scope: CrmScope, patch: Partial<CrmReturnPortalState>) {
+  async setReturnPortal(scope: CrmScope, patch: Partial<CrmReturnPortalState>, guard?: { fingerprintHash: string | null }) {
     this.count("setReturnPortal");
+    if (guard && (this.returnPortals.get(this.pkey(scope))?.fingerprintHash ?? null) !== guard.fingerprintHash) return;
     this.returnPortals.set(this.pkey(scope), { ...(this.returnPortals.get(this.pkey(scope)) ?? EMPTY_PORTAL), ...patch });
+  }
+
+  async recheckDue(scope: CrmScope, now: Date, limit: number) {
+    return (this.inScope(scope) as (CrmLinkRow & LinkExtra)[])
+      .filter((l) => l.state === "active" && l.crmId !== null && l.recheckRequestedAt && (!l.holdUntil || l.holdUntil.getTime() <= now.getTime()))
+      .sort((a, b) => a.recheckRequestedAt!.getTime() - b.recheckRequestedAt!.getTime())
+      .slice(0, limit)
+      .map((l) => Number(l.crmId));
+  }
+
+  async requestRecheck(scope: CrmScope, crmId: number, at: Date) {
+    for (const l of this.inScope(scope)) if (l.crmId !== null && Number(l.crmId) === crmId && l.state === "active") Object.assign(l, { recheckRequestedAt: at });
+  }
+
+  async clearRecheck(scope: CrmScope, crmIds: number[]) {
+    for (const l of this.inScope(scope)) if (l.crmId !== null && crmIds.includes(Number(l.crmId))) Object.assign(l, { recheckRequestedAt: null });
   }
 
   async returnLinkByCrmId(scope: CrmScope, crmId: number) {
@@ -204,6 +224,7 @@ export class MemoryReturnStore extends MemoryCrmStore implements CrmReturnStore 
     }
     const stale = prior.lastSeenAt.getTime() < now.getTime() - TAMPER_WINDOW_MS;
     if (stale) prior.raisedAt = f.alertOnRepeat ? new Date(0) : now;
+    else if (f.reraiseAfterMs !== undefined && prior.raisedAt.getTime() > 0 && prior.raisedAt.getTime() < now.getTime() - f.reraiseAfterMs) prior.raisedAt = now;
     else if (f.alertOnRepeat && prior.raisedAt.getTime() === 0) prior.raisedAt = now;
     prior.occurrences += 1;
     prior.lastSeenAt = now;

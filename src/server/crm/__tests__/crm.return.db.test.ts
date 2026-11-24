@@ -175,8 +175,43 @@ describe.skipIf(!dbEnabled)("CRM return path store (C3ab)", () => {
     await expect(prismaCrmStore.recordTimelineMoments(l.id, [{ key: "stage_reverted:x", kind: "stage_reverted", amountAedMinor: null }], new Date())).rejects.toThrow();
   });
 
-  it("crm_return_findings has RLS on", async () => {
+  it("crm_return_findings has RLS on and no privilege for anon or authenticated (review C3-18)", async () => {
     const [r] = await prisma.$queryRaw<{ relrowsecurity: boolean }[]>`SELECT relrowsecurity FROM pg_class WHERE relname = 'crm_return_findings'`;
     expect(r.relrowsecurity).toBe(true);
+    const roles = await prisma.$queryRaw<{ rolname: string }[]>`SELECT rolname FROM pg_roles WHERE rolname IN ('anon', 'authenticated')`;
+    for (const { rolname } of roles) {
+      const [g] = await prisma.$queryRaw<{ any: boolean }[]>`
+        SELECT has_table_privilege(${rolname}, 'crm_return_findings', 'SELECT')
+            OR has_table_privilege(${rolname}, 'crm_return_findings', 'INSERT')
+            OR has_table_privilege(${rolname}, 'crm_return_findings', 'UPDATE')
+            OR has_table_privilege(${rolname}, 'crm_return_findings', 'DELETE') AS any`;
+      expect(g.any, rolname).toBe(false);
+    }
+  });
+
+  it("recheck markers, the keyset cursor and the re-raise rule (fix round)", async () => {
+    const { prismaCrmReturnStore: s } = await import("@/server/crm/crm.return.store");
+    const l = await link();
+    const now = new Date();
+    await s.requestRecheck(scope, Number(l.crmId), now);
+    expect(await s.recheckDue(scope, new Date(now.getTime() + 1_000), 50)).toContain(Number(l.crmId));
+    await prisma.crmLink.update({ where: { id: l.id }, data: { holdUntil: new Date(now.getTime() + 3_600_000) } });
+    expect(await s.recheckDue(scope, new Date(now.getTime() + 1_000), 50)).not.toContain(Number(l.crmId));
+    await s.clearRecheck(scope, [Number(l.crmId)]);
+    expect((await prisma.crmLink.findUniqueOrThrow({ where: { id: l.id } })).recheckRequestedAt).toBeNull();
+
+    await s.setReturnPortal(scope, { reconcileCursor: now, reconcileCursorId: 77, reconcileCatchingUp: true });
+    expect(await s.returnPortal(scope)).toMatchObject({ reconcileCursorId: 77, reconcileCatchingUp: true });
+    // Compare-and-set on the fingerprint hash.
+    await s.setReturnPortal(scope, { fingerprintHash: "d".repeat(64) });
+    await s.setReturnPortal(scope, { fingerprintState: "mismatch" }, { fingerprintHash: "e".repeat(64) });
+    expect((await s.returnPortal(scope)).fingerprintState).not.toBe("mismatch");
+
+    await s.raiseFinding(scope, { kind: "crm_fingerprint_unverified", subjectKey: "portal", reraiseAfterMs: 6 * 3_600_000 }, now);
+    const t2 = new Date(now.getTime() + 7 * 3_600_000);
+    for (let h = 1; h <= 7; h++) await s.raiseFinding(scope, { kind: "crm_fingerprint_unverified", subjectKey: "portal", reraiseAfterMs: 6 * 3_600_000 }, new Date(now.getTime() + h * 3_600_000));
+    const f = await prisma.crmReturnFinding.findFirstOrThrow({ where: { portal: HOST, kind: "crm_fingerprint_unverified" } });
+    expect(f.raisedAt.getTime()).toBeGreaterThan(now.getTime());
+    expect(f.raisedAt.getTime()).toBeLessThanOrEqual(t2.getTime());
   });
 });

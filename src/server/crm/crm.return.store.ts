@@ -42,6 +42,7 @@ const LINK_SELECT = {
   lastFieldRestoreAt: true,
   holdUntil: true,
   missingSince: true,
+  recheckRequestedAt: true,
 } as const;
 
 type LinkRecord = {
@@ -68,6 +69,7 @@ type LinkRecord = {
   lastFieldRestoreAt: Date | null;
   holdUntil: Date | null;
   missingSince: Date | null;
+  recheckRequestedAt: Date | null;
 };
 
 function returnLinkOf(r: LinkRecord): CrmReturnLink {
@@ -95,6 +97,7 @@ function returnLinkOf(r: LinkRecord): CrmReturnLink {
     lastFieldRestoreAt: r.lastFieldRestoreAt,
     holdUntil: r.holdUntil,
     missingSince: r.missingSince,
+    recheckRequestedAt: r.recheckRequestedAt,
   };
 }
 
@@ -106,6 +109,8 @@ export const prismaCrmReturnStore: CrmReturnStore = {
       where: { environment_portal: where(scope) },
       select: {
         reconcileCursor: true,
+        reconcileCursorId: true,
+        reconcileCatchingUp: true,
         reconcileCheckedAt: true,
         fingerprintHash: true,
         fingerprintState: true,
@@ -119,6 +124,8 @@ export const prismaCrmReturnStore: CrmReturnStore = {
     });
     return {
       reconcileCursor: r?.reconcileCursor ?? null,
+      reconcileCursorId: r?.reconcileCursorId === null || r?.reconcileCursorId === undefined ? null : Number(r.reconcileCursorId),
+      reconcileCatchingUp: r?.reconcileCatchingUp === true,
       reconcileCheckedAt: r?.reconcileCheckedAt ?? null,
       fingerprintHash: r?.fingerprintHash ?? null,
       fingerprintState: (r?.fingerprintState ?? null) as CrmFingerprintState | null,
@@ -131,12 +138,37 @@ export const prismaCrmReturnStore: CrmReturnStore = {
     } satisfies CrmReturnPortalState;
   },
 
-  async setReturnPortal(scope, patch) {
-    const { sweepCursorId, ...rest } = patch;
+  async setReturnPortal(scope, patch, guard) {
+    const { sweepCursorId, reconcileCursorId, ...rest } = patch;
+    const big = (v: number | null) => (v === null ? null : BigInt(v));
     await prisma.crmPortalState.updateMany({
-      where: where(scope),
-      data: { ...rest, ...(sweepCursorId === undefined ? {} : { sweepCursorId: sweepCursorId === null ? null : BigInt(sweepCursorId) }) },
+      // Compare-and-set on the stored fingerprint (review C3-13): a run that read an older hash changes nothing.
+      where: { ...where(scope), ...(guard ? { fingerprintHash: guard.fingerprintHash } : {}) },
+      data: {
+        ...rest,
+        ...(sweepCursorId === undefined ? {} : { sweepCursorId: big(sweepCursorId) }),
+        ...(reconcileCursorId === undefined ? {} : { reconcileCursorId: big(reconcileCursorId) }),
+      },
     });
+  },
+
+  async recheckDue(scope, now, limit) {
+    const rows = await prisma.crmLink.findMany({
+      where: { ...where(scope), state: "active", crmId: { not: null }, recheckRequestedAt: { not: null }, OR: [{ holdUntil: null }, { holdUntil: { lte: now } }] },
+      select: { crmId: true },
+      orderBy: { recheckRequestedAt: "asc" },
+      take: limit,
+    });
+    return rows.map((r) => Number(r.crmId));
+  },
+
+  async requestRecheck(scope, crmId, at) {
+    await prisma.crmLink.updateMany({ where: { ...where(scope), crmId: BigInt(crmId), state: "active" }, data: { recheckRequestedAt: at } });
+  },
+
+  async clearRecheck(scope, crmIds) {
+    if (!crmIds.length) return;
+    await prisma.crmLink.updateMany({ where: { ...where(scope), crmId: { in: crmIds.map((i) => BigInt(i)) } }, data: { recheckRequestedAt: null } });
   },
 
   async returnLinkByCrmId(scope, crmId) {
@@ -231,6 +263,8 @@ export const prismaCrmReturnStore: CrmReturnStore = {
         detail = COALESCE(EXCLUDED.detail, crm_return_findings.detail),
         raised_at = CASE
           WHEN crm_return_findings.last_seen_at < ${repeatBefore} THEN ${f.alertOnRepeat ? new Date(0) : now}::timestamptz
+          WHEN ${f.reraiseAfterMs !== undefined} AND crm_return_findings.raised_at > 'epoch'::timestamptz
+               AND crm_return_findings.raised_at < ${new Date(now.getTime() - (f.reraiseAfterMs ?? 0))} THEN ${now}::timestamptz
           WHEN ${Boolean(f.alertOnRepeat)} AND crm_return_findings.raised_at = 'epoch'::timestamptz THEN ${now}::timestamptz
           ELSE crm_return_findings.raised_at END,
         last_seen_at = ${now},

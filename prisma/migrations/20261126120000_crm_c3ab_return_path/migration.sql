@@ -7,12 +7,15 @@
 -- every row it accepted before.
 --
 --   crm_portal_state      nullable columns: the poll cursor (a time the portal
---                         returned), the portal fingerprint (a sha256 hash, its
+--                         returned, and the deal id of a keyset position while
+--                         catching up after a burst), the portal fingerprint (a sha256 hash, its
 --                         state and check times; G13), the nightly sweep
 --                         cursor and times (G15), the drift cursor.
 --   crm_links             nullable columns: what the reconciler last saw on the
 --                         deal (update time, stage id, owner's Bitrix24 user
 --                         id), put-back counters and times, the per-deal hold,
+--                         a "look again" marker (after a hold, an observe-mode
+--                         finding or a failed check),
 --                         the sweep's "seen" time and "missing since".
 --   crm_timeline_comments the kind and key checks widened for the three fixed
 --                         return path notes (stage_reverted, move_refused,
@@ -35,6 +38,8 @@ SET LOCAL lock_timeout = '5s';
 
 ALTER TABLE "crm_portal_state" ADD COLUMN "reconcile_cursor" TIMESTAMPTZ(6);
 ALTER TABLE "crm_portal_state" ADD COLUMN "reconcile_checked_at" TIMESTAMPTZ(6);
+ALTER TABLE "crm_portal_state" ADD COLUMN "reconcile_cursor_id" BIGINT;
+ALTER TABLE "crm_portal_state" ADD COLUMN "reconcile_catching_up" BOOLEAN;
 ALTER TABLE "crm_portal_state" ADD COLUMN "fingerprint_hash" TEXT;
 ALTER TABLE "crm_portal_state" ADD COLUMN "fingerprint_state" TEXT;
 ALTER TABLE "crm_portal_state" ADD COLUMN "fingerprint_checked_at" TIMESTAMPTZ(6);
@@ -46,6 +51,7 @@ ALTER TABLE "crm_portal_state" ADD COLUMN "drift_cursor_link_id" UUID;
 ALTER TABLE "crm_portal_state" ADD CONSTRAINT "crm_portal_state_fingerprint_hash_check" CHECK ("fingerprint_hash" IS NULL OR "fingerprint_hash" ~ '^[0-9a-f]{64}$');
 ALTER TABLE "crm_portal_state" ADD CONSTRAINT "crm_portal_state_fingerprint_state_check" CHECK ("fingerprint_state" IS NULL OR "fingerprint_state" IN ('ok', 'mismatch', 'admin', 'unreadable'));
 ALTER TABLE "crm_portal_state" ADD CONSTRAINT "crm_portal_state_sweep_cursor_check" CHECK ("sweep_cursor_id" IS NULL OR "sweep_cursor_id" >= 0);
+ALTER TABLE "crm_portal_state" ADD CONSTRAINT "crm_portal_state_reconcile_cursor_id_check" CHECK ("reconcile_cursor_id" IS NULL OR "reconcile_cursor_id" >= 0);
 
 ALTER TABLE "crm_links" ADD COLUMN "crm_seen_updated_at" TIMESTAMPTZ(6);
 ALTER TABLE "crm_links" ADD COLUMN "crm_seen_stage_id" TEXT;
@@ -58,6 +64,7 @@ ALTER TABLE "crm_links" ADD COLUMN "last_field_restore_at" TIMESTAMPTZ(6);
 ALTER TABLE "crm_links" ADD COLUMN "hold_until" TIMESTAMPTZ(6);
 ALTER TABLE "crm_links" ADD COLUMN "missing_since" TIMESTAMPTZ(6);
 ALTER TABLE "crm_links" ADD COLUMN "sweep_seen_at" TIMESTAMPTZ(6);
+ALTER TABLE "crm_links" ADD COLUMN "recheck_requested_at" TIMESTAMPTZ(6);
 ALTER TABLE "crm_links" ADD CONSTRAINT "crm_links_seen_stage_check" CHECK ("crm_seen_stage_id" IS NULL OR "crm_seen_stage_id" ~ '^[A-Za-z0-9_:-]{1,60}$');
 ALTER TABLE "crm_links" ADD CONSTRAINT "crm_links_seen_owner_check" CHECK ("crm_seen_owner_id" IS NULL OR "crm_seen_owner_id" > 0);
 ALTER TABLE "crm_links" ADD CONSTRAINT "crm_links_revert_count_check" CHECK ("revert_count" IS NULL OR "revert_count" >= 0);

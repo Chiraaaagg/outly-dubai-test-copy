@@ -2323,6 +2323,8 @@ model CrmLink {
   /// The nightly sweep did not see the deal in the OUTLYY funnel since this time.
   missingSince        DateTime? @map("missing_since") @db.Timestamptz(6)
   sweepSeenAt         DateTime? @map("sweep_seen_at") @db.Timestamptz(6)
+  /// Read this deal again (after a hold, an observe-mode difference, or a failed check).
+  recheckRequestedAt  DateTime? @map("recheck_requested_at") @db.Timestamptz(6)
   createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt       DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
@@ -2380,6 +2382,10 @@ model CrmPortalState {
   /// Return path (C3ab, migration 20261126120000): the poll cursor, always a time the portal returned.
   reconcileCursor      DateTime? @map("reconcile_cursor") @db.Timestamptz(6)
   reconcileCheckedAt   DateTime? @map("reconcile_checked_at") @db.Timestamptz(6)
+  /// The keyset position of the last deal read (with `reconcile_cursor`, its time).
+  reconcileCursorId    BigInt?   @map("reconcile_cursor_id")
+  /// True while catching up after a burst (resume by keyset); false or null at the head (read with the overlap).
+  reconcileCatchingUp  Boolean?  @map("reconcile_catching_up")
   /// sha256 hex of host, webhook user, funnel id and name, and the funnel's stage list (G13).
   fingerprintHash      String?   @map("fingerprint_hash")
   /// ok | mismatch | admin | unreadable

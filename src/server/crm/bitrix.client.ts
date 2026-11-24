@@ -135,8 +135,13 @@ export type CrmStageKind = "process" | "success" | "failure" | "unknown";
 
 /** The return path reads (C3ab, doc 29e §3.2, §7, §8). Reads only. */
 export interface CrmReturnPort {
-  /** Deals of the OUTLYY funnel with `updatedTime` at or after `since`, oldest change first, 50 a page from `start`. */
-  listChangedDeals(opts: { since: Date; start: number }): Promise<{ items: DealSnapshot[]; more: boolean }>;
+  /**
+   * Deals of the OUTLYY funnel, 50 a page: `since`: `updatedTime` at or after it, oldest change first; `at` and
+   * `afterId`: `updatedTime` exactly `at` and an id above `afterId`, by id (drains one busy second).
+   */
+  listChangedDeals(opts: { since: Date } | { at: Date; afterId: number }): Promise<{ items: DealSnapshot[]; more: boolean }>;
+  /** These deals of the OUTLYY funnel (at most 50 ids), as the poll reads them; missing ones are not visible. */
+  readDeals(ids: number[]): Promise<DealSnapshot[]>;
   /** Deals of the OUTLYY funnel with an id above `afterId`, by id, 50 a page. */
   listFunnelDeals(afterId: number): Promise<{ items: FunnelDealRef[]; more: boolean }>;
   /** The webhook's own user: its id and whether it is a portal administrator. Nothing else is kept. */
@@ -387,11 +392,26 @@ export class BitrixRestClient implements CrmPort, CrmReturnPort {
   }
 
   /**
-   * The return path poll (doc 29e §3.2): one page of the funnel's deals changed at or after `since`, ordered by
-   * `updatedTime` then id, with the OUTLYY fields under their original codes. The funnel filter is the
+   * The return path poll (doc 29e §3.2): one page of the funnel's deals, changed at or after `since` (by
+   * `updatedTime` then id) or at exactly one time after an id (by id), with the OUTLYY fields under their
+   * original codes. Paging is by keyset in the reconciler, never by offset. The funnel filter is the
    * provider's; the answer is checked again here. Values are never logged.
    */
-  async listChangedDeals(opts: { since: Date; start: number }): Promise<{ items: DealSnapshot[]; more: boolean }> {
+  async listChangedDeals(opts: { since: Date } | { at: Date; afterId: number }): Promise<{ items: DealSnapshot[]; more: boolean }> {
+    const iso = (d: Date) => `${d.toISOString().slice(0, 19)}+00:00`;
+    const filter = "since" in opts ? { ">=updatedTime": iso(opts.since) } : { "=updatedTime": iso(opts.at), ">id": opts.afterId };
+    const order: Record<string, string> = "since" in opts ? { updatedTime: "ASC", id: "ASC" } : { id: "ASC" };
+    return this.snapshots(filter, order);
+  }
+
+  async readDeals(ids: number[]): Promise<DealSnapshot[]> {
+    const want = [...new Set(ids)].slice(0, BITRIX_PAGE);
+    if (!want.length) return [];
+    const { items } = await this.snapshots({ "@id": want }, { id: "ASC" });
+    return items.filter((i) => want.includes(i.id));
+  }
+
+  private async snapshots(filter: Record<string, unknown>, order: Record<string, string>): Promise<{ items: DealSnapshot[]; more: boolean }> {
     const codes = Object.values(this.config.fieldCodes ?? {});
     const body = await this.call(
       "crm.item.list",
@@ -399,9 +419,9 @@ export class BitrixRestClient implements CrmPort, CrmReturnPort {
         entityTypeId: DEAL_ENTITY_TYPE_ID,
         useOriginalUfNames: "Y",
         select: ["id", "categoryId", "stageId", "assignedById", "updatedBy", "updatedTime", "movedBy", "movedTime", "originatorId", "originId", "title", "opportunity", "currencyId", ...codes],
-        filter: { "=categoryId": this.config.categoryId, ">=updatedTime": `${opts.since.toISOString().slice(0, 19)}+00:00` },
-        order: { updatedTime: "ASC", id: "ASC" },
-        start: opts.start,
+        filter: { "=categoryId": this.config.categoryId, ...filter },
+        order,
+        start: 0,
       },
       snapshotBody,
     );
@@ -468,7 +488,8 @@ export class BitrixRestClient implements CrmPort, CrmReturnPort {
 
   /** `crm.status.list` for the configured funnel's stages (`DEAL_STAGE_<id>`). More than one page is refused. */
   async listStages(): Promise<{ statusId: string; kind: CrmStageKind }[]> {
-    const entityId = `DEAL_STAGE_${this.config.categoryId}`;
+    // The default funnel's stages are `DEAL_STAGE` (review C3-22); the configuration refuses funnel 0 anyway.
+    const entityId = this.config.categoryId === 0 ? "DEAL_STAGE" : `DEAL_STAGE_${this.config.categoryId}`;
     const body = await this.call("crm.status.list", { filter: { ENTITY_ID: entityId }, order: { SORT: "ASC" } }, stageBody);
     if (body.next !== undefined) throw new CrmCallError("invalid_response", "crm.status.list", { code: "stages_paged" });
     return body.result.filter((s) => s.ENTITY_ID === undefined || s.ENTITY_ID === entityId).map((s) => ({ statusId: s.STATUS_ID, kind: stageKind(s) }));

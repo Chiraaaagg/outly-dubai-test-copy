@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
-import { CrmCallError, type CrmPort, type CrmReturnPort, type CrmStageKind, type DealSnapshot } from "./bitrix.client";
+import { BITRIX_PAGE, CrmCallError, type CrmPort, type CrmReturnPort, type CrmStageKind, type DealSnapshot } from "./bitrix.client";
 import { CRM_FIELD_KEYS, CRM_STAGE_KEYS, type CrmConfig, type CrmFieldKey, type CrmScope, type CrmStageKey } from "./crm.config";
 import type { CrmReturnConfig } from "./crm.return.config";
 import { mapDeal, type CrmEntityType, type CrmSubject, type CrmSubjectState } from "./crm.mapping";
 import { sameValue } from "./crm.probe";
 import type { CrmReturnNoteKind } from "./crm.timeline";
-import { ROW_LOCK_MS, THROTTLE_PAUSE_MS, type CrmLimiter, type CrmLinkRow, type CrmRunContext, type CrmRunHooks, type CrmStore } from "./crm.worker";
+import { AUTH_PAUSE_MS, ROW_LOCK_MS, THROTTLE_PAUSE_MS, type CrmLimiter, type CrmLinkRow, type CrmRunContext, type CrmRunHooks, type CrmStore } from "./crm.worker";
 
 /**
  * The Bitrix24 return path (doc 29e; CRM batch C3ab; owner answers of 25
@@ -79,6 +79,8 @@ export const NIGHT_START_UTC = 22;
 export const NIGHT_END_UTC = 2;
 /** The drift cursor's "done for this sweep" marker. */
 export const DRIFT_DONE = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+/** A portal-level finding that holds is alerted again this often (review C3-14). */
+export const PORTAL_RERAISE_MS = 6 * 3_600_000;
 
 /** Stages staff may move a deal to (doc 29 §5.4 "staff may propose"; owner answer 2): up to Payment pending, and Lost. */
 const SALES_TARGET: Partial<Record<CrmStageKey, string>> = {
@@ -139,12 +141,18 @@ export interface CrmFindingInput {
   detail?: string | null;
   /** Raise the alert only from the second occurrence (within `TAMPER_WINDOW_MS`). */
   alertOnRepeat?: boolean;
+  /** While it keeps being seen, raise it again once its last raise is older than this. */
+  reraiseAfterMs?: number;
 }
 
 export type CrmFingerprintState = "ok" | "mismatch" | "admin" | "unreadable";
 
 export interface CrmReturnPortalState {
   reconcileCursor: Date | null;
+  /** Keyset position of the last deal read (with `reconcileCursor`, its time). */
+  reconcileCursorId: number | null;
+  /** Resume by keyset (a burst is being read); otherwise read with the overlap first. */
+  reconcileCatchingUp: boolean;
   reconcileCheckedAt: Date | null;
   fingerprintHash: string | null;
   fingerprintState: CrmFingerprintState | null;
@@ -167,6 +175,8 @@ export interface CrmReturnLinkState {
   lastFieldRestoreAt: Date | null;
   holdUntil: Date | null;
   missingSince: Date | null;
+  /** Read again: after a hold ends, after the switch from observe, after a failed check. */
+  recheckRequestedAt: Date | null;
 }
 
 export type CrmReturnLink = CrmLinkRow & CrmReturnLinkState;
@@ -186,7 +196,13 @@ export type CrmTwinCommentFinish = { status: "posted"; crmCommentId: number; at:
 
 export interface CrmReturnStore {
   returnPortal(scope: CrmScope): Promise<CrmReturnPortalState>;
-  setReturnPortal(scope: CrmScope, patch: Partial<CrmReturnPortalState>): Promise<void>;
+  /** With `guard`, only when the stored fingerprint hash is still the one given (compare-and-set). */
+  setReturnPortal(scope: CrmScope, patch: Partial<CrmReturnPortalState>, guard?: { fingerprintHash: string | null }): Promise<void>;
+  /** Deal ids of active links whose recheck is due (marker set, no hold running). */
+  recheckDue(scope: CrmScope, now: Date, limit: number): Promise<number[]>;
+  /** Mark the link of this deal id for a recheck (no lock: a column only the reconciler uses). */
+  requestRecheck(scope: CrmScope, crmId: number, at: Date): Promise<void>;
+  clearRecheck(scope: CrmScope, crmIds: number[]): Promise<void>;
   /** The link of this deal id in this scope, any state, with the return columns. No lock. */
   returnLinkByCrmId(scope: CrmScope, crmId: number): Promise<CrmReturnLink | null>;
   /** Links of these origin ids in this scope, with the return columns. No lock. */
@@ -253,8 +269,8 @@ export interface CrmReturnCommands {
   transition(actor: CrmStaffActor, inquiryId: string, to: string, via: CrmVia, opts: { reason?: string }): Promise<CrmCommandResult>;
   /** `system`: OUTLYY's own default-owner rule (owner answer 8). */
   assign(actor: CrmStaffActor | "system", inquiryId: string, agentId: string, via: CrmVia, note: string): Promise<CrmCommandResult>;
-  /** Audit row `crm.stage_reverted` / `crm.fields_restored` (system actor) and, for an inquiry, a `system` event. */
-  recordPutBack(subject: CrmSubject, info: { what: "stage" | "fields"; dealId: number; bitrixUserId: number | null; from?: string | null; to?: string | null; fields?: string[] }): Promise<void>;
+  /** Audit row `crm.stage_reverted` / `crm.fields_restored` / `crm.drift_pushed` (system actor) and, for an inquiry's stage, a `system` event. */
+  recordPutBack(subject: CrmSubject, info: { what: "stage" | "fields" | "drift"; dealId: number; bitrixUserId: number | null; from?: string | null; to?: string | null; fields?: string[] }): Promise<void>;
 }
 
 /* ---------------------------------------------------------------- deps */
@@ -421,11 +437,21 @@ export function crmReturnHooks(deps: CrmReturnDeps): CrmRunHooks {
       if (ret.mode === "off") return;
       const now = deps.now();
 
-      // G13: the portal fingerprint.
-      const fp = await fingerprintStep(deps, scope, now, counts);
+      // G13: the portal fingerprint. Only a stored fingerprint in enforce can stop the run (outbox included);
+      // observe and the time before the owner stores it never stop pushes or erasure deletes.
+      let fp: FingerprintVerdict;
+      try {
+        fp = await fingerprintStep(deps, scope, now, counts);
+      } catch (e) {
+        bump(counts, "fingerprint_failed");
+        emit("crm.return_failed", { step: "fingerprint", reason: e instanceof CrmCallError ? e.code : "internal" }, "error");
+        // A check that cannot even be evaluated never lets enforce run unchecked (review C3-12).
+        if (ret.mode === "enforce") return { refuse: "fingerprint_check_failed" };
+        return;
+      }
       if (fp.refuse) return { refuse: fp.refuse };
-      if (!fp.verified && ret.mode === "enforce") {
-        emit("crm.return_skipped", { reason: fp.reason ?? "fingerprint_not_stored" }, "warn");
+      if (fp.skip || (!fp.verified && ret.mode === "enforce")) {
+        emit("crm.return_skipped", { reason: fp.skip ?? "fingerprint_not_stored" }, "warn");
         return;
       }
 
@@ -436,7 +462,7 @@ export function crmReturnHooks(deps: CrmReturnDeps): CrmRunHooks {
         if (ids.some((id) => !known.has(id))) {
           accept = false;
           bump(counts, "staff_map_invalid");
-          await deps.store.raiseFinding(scope, { kind: "crm_staff_map_invalid", subjectKey: "portal" }, now);
+          await deps.store.raiseFinding(scope, { kind: "crm_staff_map_invalid", subjectKey: "portal", reraiseAfterMs: PORTAL_RERAISE_MS }, now);
           emit("crm.return_skipped", { reason: "staff_map_unknown_staff", accept: false }, "error");
         }
       }
@@ -459,20 +485,38 @@ export function crmReturnHooks(deps: CrmReturnDeps): CrmRunHooks {
 
 /* ---------------------------------------------------------------- fingerprint step */
 
-async function fingerprintStep(
-  deps: CrmReturnDeps,
-  scope: CrmScope,
-  now: Date,
-  counts: Record<string, number>,
-): Promise<{ refuse?: string; verified: boolean; reason?: string }> {
+interface FingerprintVerdict {
+  /** Stop the whole run (enforce with a stored fingerprint only). */
+  refuse?: string;
+  /** Skip the return path this run; the push runs as before. */
+  skip?: string;
+  verified: boolean;
+}
+
+/**
+ * The fingerprint check (doc 29e §7, owner answer 11, review C3-03/04/12/13/14). A run is refused only in enforce
+ * with a stored fingerprint: a latched mismatch, an administrator webhook, or no good check for 24 hours. In
+ * observe, or before the owner stores a fingerprint, every such state is an alert and skips the return path only.
+ * A structural problem before a store is reported, never latched. An unreadable check is retried every 10 minutes.
+ * State writes are compare-and-set on the stored hash, so a run that read an older hash never overwrites the
+ * owner's fresh store step.
+ */
+async function fingerprintStep(deps: CrmReturnDeps, scope: CrmScope, now: Date, counts: Record<string, number>): Promise<FingerprintVerdict> {
   const { store } = deps;
   const emit = deps.emit ?? (() => {});
   const p = await store.returnPortal(scope);
-  if (p.fingerprintState === "mismatch") {
-    // Nothing clears it but the owner's explicit store step.
-    return { refuse: "portal_fingerprint_mismatch", verified: false };
+  const stored = p.fingerprintHash !== null;
+  const gate = deps.ret.mode === "enforce" && stored;
+  const guard = { fingerprintHash: p.fingerprintHash };
+  const stop = (reason: string): FingerprintVerdict => (gate ? { refuse: reason, verified: false } : { skip: reason, verified: false });
+  const portalFinding = (kind: CrmFindingKind, detail?: string) => store.raiseFinding(scope, { kind, subjectKey: "portal", detail: detail ?? null, reraiseAfterMs: PORTAL_RERAISE_MS }, now);
+  if (p.fingerprintState === "mismatch" && stored) {
+    // Latched: nothing clears it but the owner's explicit store step.
+    await portalFinding("crm_portal_fingerprint_mismatch");
+    return stop("portal_fingerprint_mismatch");
   }
-  const every = p.fingerprintState === "admin" ? FINGERPRINT_ADMIN_RECHECK_MS : FINGERPRINT_EVERY_MS;
+  const quick = p.fingerprintState === "admin" || p.fingerprintState === "unreadable";
+  const every = quick ? FINGERPRINT_ADMIN_RECHECK_MS : FINGERPRINT_EVERY_MS;
   const due = !p.fingerprintCheckedAt || now.getTime() - p.fingerprintCheckedAt.getTime() >= every;
   let state = p.fingerprintState;
   let okAt = p.fingerprintOkAt;
@@ -481,40 +525,47 @@ async function fingerprintStep(
       const fp = await readCrmFingerprint(deps.port, deps.config, capped(deps.limiter, FINGERPRINT_CALLS));
       bump(counts, "fingerprint_checks");
       if (fp.admin) {
-        await store.setReturnPortal(scope, { fingerprintState: "admin", fingerprintCheckedAt: now });
-        await store.raiseFinding(scope, { kind: "crm_service_account_is_admin", subjectKey: "portal" }, now);
+        await store.setReturnPortal(scope, { fingerprintState: "admin", fingerprintCheckedAt: now }, guard);
+        await portalFinding("crm_service_account_is_admin");
         emit("crm.fingerprint", { outcome: "admin" }, "error");
-        return { refuse: "service_account_is_admin", verified: false };
+        return stop("service_account_is_admin");
       }
-      const mismatch = fp.problems.length > 0 || (p.fingerprintHash !== null && p.fingerprintHash !== fp.hash);
-      if (mismatch) {
-        await store.setReturnPortal(scope, { fingerprintState: "mismatch", fingerprintCheckedAt: now });
-        await store.raiseFinding(scope, { kind: "crm_portal_fingerprint_mismatch", subjectKey: "portal", detail: fp.problems.length ? safeDetail(fp.problems.join(",")) : "hash" }, now);
-        emit("crm.fingerprint", { outcome: "mismatch", problems: fp.problems.join(".").slice(0, 80) || "hash" }, "error");
-        return { refuse: "portal_fingerprint_mismatch", verified: false };
+      const problems = fp.problems.join(".").slice(0, 80);
+      if (stored && (fp.problems.length > 0 || p.fingerprintHash !== fp.hash)) {
+        await store.setReturnPortal(scope, { fingerprintState: "mismatch", fingerprintCheckedAt: now }, guard);
+        await portalFinding("crm_portal_fingerprint_mismatch", fp.problems.length ? safeDetail(fp.problems.join(",")) : "hash");
+        emit("crm.fingerprint", { outcome: "mismatch", problems: problems || "hash" }, "error");
+        return stop("portal_fingerprint_mismatch");
       }
-      state = p.fingerprintHash ? "ok" : null;
+      if (!stored && fp.problems.length) {
+        // Before the owner's store step: reported, never latched; the return path waits.
+        await store.setReturnPortal(scope, { fingerprintState: null, fingerprintCheckedAt: now }, guard);
+        await portalFinding("crm_portal_fingerprint_mismatch", safeDetail(fp.problems.join(",")));
+        emit("crm.fingerprint", { outcome: "problems_not_stored", problems, hashPrefix: fp.hash.slice(0, 12) }, "error");
+        return { skip: "fingerprint_problems", verified: false };
+      }
+      state = stored ? "ok" : null;
       okAt = now;
-      await store.setReturnPortal(scope, { fingerprintState: state, fingerprintCheckedAt: now, fingerprintOkAt: now });
+      await store.setReturnPortal(scope, { fingerprintState: state, fingerprintCheckedAt: now, fingerprintOkAt: now }, guard);
       // The prefix lets the owner compare with the store step's answer; the inputs are never logged.
-      emit("crm.fingerprint", { outcome: p.fingerprintHash ? "ok" : "not_stored", hashPrefix: fp.hash.slice(0, 12) });
+      emit("crm.fingerprint", { outcome: stored ? "ok" : "not_stored", hashPrefix: fp.hash.slice(0, 12) });
     } catch (e) {
       if (e instanceof ReturnBudget) {
         bump(counts, "fingerprint_deferred");
       } else {
         bump(counts, "fingerprint_unreadable");
         state = p.fingerprintState === "admin" ? "admin" : "unreadable";
-        await store.setReturnPortal(scope, { fingerprintState: state, fingerprintCheckedAt: now });
+        await store.setReturnPortal(scope, { fingerprintState: state, fingerprintCheckedAt: now }, guard);
         emit("crm.fingerprint", { outcome: "unreadable", reason: e instanceof CrmCallError ? e.code : "internal" }, "warn");
       }
     }
   }
-  if (state === "admin") return { refuse: "service_account_is_admin", verified: false };
-  if (!p.fingerprintHash) return { verified: false, reason: "fingerprint_not_stored" };
+  if (state === "admin") return stop("service_account_is_admin");
+  if (!stored) return { verified: false };
   const fresh = okAt !== null && now.getTime() - okAt.getTime() <= FINGERPRINT_GRACE_MS;
   if (!fresh) {
-    await store.raiseFinding(scope, { kind: "crm_fingerprint_unverified", subjectKey: "portal" }, now);
-    return { refuse: "fingerprint_unverified", verified: false };
+    await portalFinding("crm_fingerprint_unverified");
+    return stop("fingerprint_unverified");
   }
   return { verified: true };
 }
@@ -528,68 +579,127 @@ function safeDetail(s: string): string {
   return s.replace(/[^A-Za-z0-9_.:,>=-]/g, "_").slice(0, 200) || "none";
 }
 
+/** A deal's place in the poll's order: its portal time, then its id. */
+interface PollPos {
+  t: Date;
+  id: number;
+}
+
+const after = (d: DealSnapshot, pos: PollPos) => {
+  const t = portalTime(d.updatedTime)?.getTime() ?? 0;
+  return t > pos.t.getTime() || (t === pos.t.getTime() && d.id > pos.id);
+};
+
+const byPollOrder = (a: DealSnapshot, b: DealSnapshot) => (portalTime(a.updatedTime)?.getTime() ?? 0) - (portalTime(b.updatedTime)?.getTime() ?? 0) || a.id - b.id;
+
 /* ---------------------------------------------------------------- poll step */
 
+/**
+ * The poll (doc 29e §3.2; review C3-05, C3-16). At the head: one read from the cursor minus 120 s (late commits),
+ * deals already handled at their time are skipped. Further pages, and every run while catching up after a burst,
+ * read by keyset from the last deal handled (time, then id; a second of more than 50 deals is drained by id), so
+ * no burst can stall the cursor and no edit between two calls can skip a deal. Back at the head, the overlap
+ * read resumes. Rechecks (held deals whose hold ended, observe-mode differences after the switch to enforce,
+ * deals whose handling failed) take one call first in enforce.
+ */
 async function pollStep(deps: CrmReturnDeps, scope: CrmScope, ctx: CrmRunContext, accept: boolean, counts: Record<string, number>): Promise<{ paused?: "throttled" } | void> {
   const { store } = deps;
   const emit = deps.emit ?? (() => {});
   const now = deps.now();
   const p = await store.returnPortal(scope);
-  const base = p.reconcileCursor ?? new Date(now.getTime() - POLL_FIRST_LOOKBACK_MS);
-  const since = new Date(base.getTime() - POLL_OVERLAP_MS);
   const take = capped(deps.limiter, POLL_MAX_CALLS);
-  let cursor = p.reconcileCursor;
+  /** The furthest deal read so far, in poll order. */
+  const stored: PollPos | null = p.reconcileCursor ? { t: p.reconcileCursor, id: p.reconcileCursorId ?? 0 } : null;
+  let pos: PollPos | null = stored;
   let handled = 0;
   let blocked = false;
-  let start = 0;
-  let stuckPage = false;
+  let atHead = false;
+  const full = () => handled >= POLL_MAX_DEALS || deps.now().getTime() - ctx.started >= ctx.budgetMs;
+  const further = (a: PollPos | null, b: PollPos | null) => (!a ? b : !b ? a : b.t.getTime() > a.t.getTime() || (b.t.getTime() === a.t.getTime() && b.id > a.id) ? b : a);
+
+  /** One deal; false when the run must stop before it (cap, budget, busy link). */
+  const one = async (deal: DealSnapshot, force: boolean): Promise<boolean> => {
+    if (full()) return false;
+    const t = portalTime(deal.updatedTime);
+    if (!t) {
+      // Not a time: the answer is not what the design reads. Never acted on.
+      bump(counts, "no_time");
+      return true;
+    }
+    let r: DealOutcome;
+    try {
+      r = await handleDeal(deps, scope, ctx.holder, deal, t, accept, counts, force);
+    } catch (e) {
+      if (e instanceof ReturnBudget) throw e;
+      bump(counts, "deal_failed");
+      emit("crm.return_failed", { step: "deal", deal: deal.id, reason: e instanceof CrmCallError ? e.code : "internal" }, "warn");
+      // Never treated as handled: looked at again by the recheck (review C3-06).
+      await store.requestRecheck(scope, deal.id, now).catch(() => {});
+      r = "done";
+    }
+    if (r === "retry") return false;
+    if (r === "done") handled += 1;
+    if (!force) pos = further(pos, { t, id: deal.id });
+    return true;
+  };
+
   try {
-    for (let page = 0; page < POLL_MAX_CALLS && !blocked; page++) {
-      await take();
-      const res = await deps.port.listChangedDeals({ since, start });
-      bump(counts, "polled", res.items.length);
-      const items = [...res.items].sort((a, b) => (portalTime(a.updatedTime)?.getTime() ?? 0) - (portalTime(b.updatedTime)?.getTime() ?? 0) || a.id - b.id);
-      let moved = false;
-      for (const deal of items) {
-        if (handled >= POLL_MAX_DEALS || deps.now().getTime() - ctx.started >= ctx.budgetMs) {
-          blocked = true;
-          break;
-        }
-        const t = portalTime(deal.updatedTime);
-        if (!t) {
-          // Not a time: the answer is not what the design reads. Never acted on.
-          bump(counts, "no_time");
-          continue;
-        }
-        let r: DealOutcome;
-        try {
-          r = await handleDeal(deps, scope, ctx.holder, deal, t, accept, counts);
-        } catch (e) {
-          if (e instanceof ReturnBudget) throw e;
-          bump(counts, "deal_failed");
-          emit("crm.return_failed", { step: "deal", deal: deal.id, reason: e instanceof CrmCallError ? e.code : "internal" }, "warn");
-          r = "done";
-        }
-        if (r === "retry") {
-          blocked = true;
-          break;
-        }
-        // Deals already handled at this time (the overlap) do not count against the per-run cap.
-        if (r === "done") handled += 1;
-        if (!cursor || t.getTime() > cursor.getTime()) {
-          cursor = t;
-          moved = true;
+    if (deps.ret.mode === "enforce") {
+      const due = await store.recheckDue(scope, now, BITRIX_PAGE);
+      if (due.length) {
+        await take();
+        const res = await deps.port.readDeals(due);
+        bump(counts, "rechecked", res.length);
+        const found = new Set(res.map((d) => d.id));
+        // A deal that is not visible any more is the sweep's (not visible / twin); its marker goes.
+        await store.clearRecheck(scope, due.filter((id) => !found.has(id)));
+        for (const deal of res.sort(byPollOrder)) if (!(await one(deal, true))) break;
+      }
+    }
+    // At the head the first read goes back by the overlap (late commits); every further page, and every run while
+    // catching up, reads by keyset from the furthest deal read, so a window full of handled deals never stalls.
+    let overlap = !p.reconcileCatchingUp;
+    while (!blocked && !atHead) {
+      let items: DealSnapshot[];
+      let more: boolean;
+      let secondDone = false;
+      if (overlap || !pos) {
+        overlap = false;
+        await take();
+        const base = pos?.t ?? new Date(now.getTime() - POLL_FIRST_LOOKBACK_MS);
+        const res = await deps.port.listChangedDeals({ since: new Date(base.getTime() - POLL_OVERLAP_MS) });
+        items = [...res.items].sort(byPollOrder);
+        more = res.more;
+      } else {
+        const from: PollPos = pos;
+        await take();
+        const res = await deps.port.listChangedDeals({ since: from.t });
+        items = [...res.items].sort(byPollOrder).filter((d) => after(d, from));
+        more = res.more;
+        if (!items.length && res.more) {
+          // The whole page is one second at or before this position: drain that second by id.
+          await take();
+          const sec = await deps.port.listChangedDeals({ at: from.t, afterId: from.id });
+          items = [...sec.items].sort((a, b) => a.id - b.id);
+          more = true;
+          secondDone = !sec.more;
         }
       }
-      if (!res.more) break;
-      if (!moved && !blocked) stuckPage = true;
-      start += res.items.length;
+      bump(counts, "polled", items.length);
+      for (const deal of items) {
+        if (!(await one(deal, false))) {
+          blocked = true;
+          break;
+        }
+      }
+      if (blocked) break;
+      if (secondDone && pos) pos = { t: new Date((pos as PollPos).t.getTime() + 1_000), id: 0 };
+      if (!more) atHead = true;
     }
   } catch (e) {
     if (e instanceof CrmCallError && e.kind === "throttled") {
-      const at = deps.now().getTime();
-      await store.setPortalHealth(scope, { pausedUntil: new Date(at + THROTTLE_PAUSE_MS), pauseReason: "throttled" });
-      await store.setReturnPortal(scope, { reconcileCursor: cursor, reconcileCheckedAt: now });
+      await pause(deps, scope, "throttled");
+      await savePoll(store, scope, pos, !atHead, now);
       return { paused: "throttled" };
     }
     if (e instanceof CrmCallError && e.kind === "auth") {
@@ -600,19 +710,34 @@ async function pollStep(deps: CrmReturnDeps, scope: CrmScope, ctx: CrmRunContext
       emit("crm.return_failed", { step: "poll", reason: e instanceof CrmCallError ? e.code : "internal" }, "warn");
     }
   }
-  if (stuckPage) {
-    // A full page with nothing new: the time filter may be ignored by the portal (doc 29e §11).
-    await store.raiseFinding(scope, { kind: "crm_poll_stuck", subjectKey: "portal", alertOnRepeat: true }, now);
-    emit("crm.return_poll", { warning: "full_page_nothing_new" }, "warn");
+  const catchingUp = !atHead && !blocked && pos !== null;
+  if (catchingUp) {
+    // More changes than the pages a run may read: catching up by keyset; alerted while it lasts (doc 29e §11).
+    bump(counts, "catching_up");
+    await store.raiseFinding(scope, { kind: "crm_poll_stuck", subjectKey: "portal", alertOnRepeat: true, reraiseAfterMs: PORTAL_RERAISE_MS }, now);
   }
-  await store.setReturnPortal(scope, { reconcileCursor: cursor, reconcileCheckedAt: now });
+  await savePoll(store, scope, pos, catchingUp || (blocked && p.reconcileCatchingUp), now);
   emit("crm.return_poll", { mode: deps.ret.mode, handled, blocked, ...camel(counts) });
+}
+
+async function savePoll(store: CrmReturnStore, scope: CrmScope, pos: PollPos | null, catchingUp: boolean, now: Date) {
+  if (!pos) return store.setReturnPortal(scope, { reconcileCheckedAt: now });
+  await store.setReturnPortal(scope, { reconcileCursor: pos.t, reconcileCursorId: pos.id, reconcileCatchingUp: catchingUp, reconcileCheckedAt: now });
+}
+
+/** A throttle or auth answer pauses the portal exactly as a row's does (review C3-11). */
+async function pause(deps: CrmReturnDeps, scope: CrmScope, kind: "throttled" | "auth") {
+  const at = deps.now().getTime();
+  if (kind === "throttled") await deps.store.setPortalHealth(scope, { pausedUntil: new Date(at + THROTTLE_PAUSE_MS), pauseReason: "throttled" });
+  else await deps.store.setPortalHealth(scope, { pausedUntil: new Date(at + AUTH_PAUSE_MS), pauseReason: "auth" });
 }
 
 type DealOutcome = "done" | "seen" | "retry";
 
+type PutBack = { what: "stage" | "fields" | "drift"; note: CrmReturnNoteKind | null; from: string | null; to: string | null };
+
 /** One changed deal (doc 29e §3.4). The first rule that matches decides. */
-async function handleDeal(deps: CrmReturnDeps, scope: CrmScope, holder: string, deal: DealSnapshot, t: Date, accept: boolean, counts: Record<string, number>): Promise<DealOutcome> {
+async function handleDeal(deps: CrmReturnDeps, scope: CrmScope, holder: string, deal: DealSnapshot, t: Date, accept: boolean, counts: Record<string, number>, force = false): Promise<DealOutcome> {
   const { store, config, ret } = deps;
   const emit = deps.emit ?? (() => {});
   const now = deps.now();
@@ -622,7 +747,7 @@ async function handleDeal(deps: CrmReturnDeps, scope: CrmScope, holder: string, 
     await unlinkedDeal(deps, scope, deal, counts);
     return "done";
   }
-  if (link.crmSeenUpdatedAt && t.getTime() <= link.crmSeenUpdatedAt.getTime()) {
+  if (!force && link.crmSeenUpdatedAt && t.getTime() <= link.crmSeenUpdatedAt.getTime()) {
     bump(counts, "seen");
     return "seen";
   }
@@ -642,9 +767,20 @@ async function handleDeal(deps: CrmReturnDeps, scope: CrmScope, holder: string, 
   if (lock.kind === "missing") return "done";
   const l: CrmReturnLink = { ...link, ...lock.link };
   try {
+    const observe = ret.mode !== "enforce";
+    const ownerBase = l.crmSeenOwnerId ?? config.defaultOwnerId;
+    const ownerChanged = deal.assignedById !== null && deal.assignedById > 0 && deal.assignedById !== ownerBase;
+    const log = (action: string, extra: Record<string, unknown> = {}) =>
+      emit("crm.return_deal", { mode: ret.mode, deal: deal.id, entityType: subject.type, entityId: subject.id, action, bitrixUser: deal.updatedBy, ...extra });
+    const via = (user: number | null): CrmVia => ({ channel: "bitrix24", bitrixUserId: user, dealId: deal.id });
     if (l.localVersion > l.pushedVersion) {
-      // A push is about to write OUTLYY's state: it wins (doc 29e §3.4 rule 4).
+      // A push is about to write OUTLYY's state: it wins (doc 29e §3.4 rule 4). The owner is never pushed, so an
+      // owner change is handled now, before the push's echo hides who made it (review C3-09).
       bump(counts, "push_pending");
+      if (ownerChanged) {
+        await ownerRule(deps, scope, l, subject, deal, accept, counts, log, via);
+        if (!observe) await store.updateReturnLink(l.id, holder, { crmSeenOwnerId: deal.assignedById });
+      }
       return "done";
     }
     let state = await deps.loadState(subject);
@@ -653,9 +789,13 @@ async function handleDeal(deps: CrmReturnDeps, scope: CrmScope, holder: string, 
       bump(counts, "not_visible_locally");
       return "done";
     }
-    const seen: CrmReturnLinkPatch = { crmSeenUpdatedAt: t, crmSeenStageId: deal.stageId && /^[A-Za-z0-9_:-]{1,60}$/.test(deal.stageId) ? deal.stageId : null, crmSeenOwnerId: deal.assignedById && deal.assignedById > 0 ? deal.assignedById : null };
-    const ownerBase = l.crmSeenOwnerId ?? config.defaultOwnerId;
-    const ownerChanged = deal.assignedById !== null && deal.assignedById > 0 && deal.assignedById !== ownerBase;
+    const seen: CrmReturnLinkPatch = {
+      crmSeenUpdatedAt: t,
+      crmSeenStageId: deal.stageId && /^[A-Za-z0-9_:-]{1,60}$/.test(deal.stageId) ? deal.stageId : null,
+      // Observe keeps the baseline, so the change is still a change once enforce reads it again (review C3-06).
+      crmSeenOwnerId: observe && ownerChanged ? l.crmSeenOwnerId : deal.assignedById && deal.assignedById > 0 ? deal.assignedById : null,
+      recheckRequestedAt: null,
+    };
     let diff = dealDiff(deal, mapped, config);
     const service = deal.updatedBy !== null && String(deal.updatedBy) === config.webhookUserId;
     if (!diff.stage && !diff.fields.length && !ownerChanged) {
@@ -664,9 +804,8 @@ async function handleDeal(deps: CrmReturnDeps, scope: CrmScope, holder: string, 
       await store.updateReturnLink(l.id, holder, seen);
       return "done";
     }
-    const log = (action: string, extra: Record<string, unknown> = {}) =>
-      emit("crm.return_deal", { mode: ret.mode, deal: deal.id, entityType: subject.type, entityId: subject.id, action, bitrixUser: deal.updatedBy, ...extra });
-    const via = (user: number | null): CrmVia => ({ channel: "bitrix24", bitrixUserId: user, dealId: deal.id });
+    // Observe: a known difference is read again after the switch to enforce.
+    if (observe) seen.recheckRequestedAt = now;
 
     // Owner change (Bitrix24 → OUTLYY only, owner answer 7). OUTLYY never writes the deal owner after create.
     if (ownerChanged) {
@@ -682,7 +821,7 @@ async function handleDeal(deps: CrmReturnDeps, scope: CrmScope, holder: string, 
       }
     }
 
-    let putBack: { what: "stage" | "fields"; note: CrmReturnNoteKind | null; from: string | null; to: string | null } | null = null;
+    let putBack: PutBack | null = null;
     if (diff.stage) {
       const P = stageKeyOf(config, deal.stageId);
       const E = mapped.stage;
@@ -699,11 +838,16 @@ async function handleDeal(deps: CrmReturnDeps, scope: CrmScope, holder: string, 
       }
     }
     if (!putBack && diff.fields.length) putBack = { what: "fields", note: null, from: null, to: null };
+    // The service account was the last editor and the deal still differs: a lost enqueue, a push the portal did
+    // not apply, or a value format. A push repairs it, without a staff note, tamper alert or staff attribution
+    // (review C3-15); the loop hold still bounds a format loop.
+    if (putBack && service) putBack = { what: "drift", note: null, from: putBack.from, to: putBack.to };
 
     if (putBack) {
       if (ret.mode !== "enforce") {
-        bump(counts, putBack.what === "stage" ? "would_put_back_stage" : "would_restore_fields");
-        log(putBack.what === "stage" ? "would_put_back_stage" : "would_restore_fields", { from: putBack.from, to: putBack.to, fields: diff.fields.join(":").slice(0, 80) || null });
+        const action = putBack.what === "stage" ? "would_put_back_stage" : putBack.what === "drift" ? "would_push_drift" : "would_restore_fields";
+        bump(counts, action);
+        log(action, { from: putBack.from, to: putBack.to, fields: diff.fields.join(":").slice(0, 80) || null });
       } else {
         await doPutBack(deps, scope, holder, l, subject, deal, putBack, diff.fields, seen, counts, log);
       }
@@ -872,7 +1016,8 @@ async function ownerRule(
     changed = r.ok;
     if (!r.ok) log("owner_default_refused", { owner, refusal: r.code });
   }
-  await store.recordTimelineMoments(l.id, [{ key: `owner_unmapped:${dayNumber(now)}`, kind: "owner_unmapped", amountAedMinor: null }], now);
+  // The note says OUTLYY gave the inquiry to the sales lead: only when it did (review C3-10).
+  if (changed) await store.recordTimelineMoments(l.id, [{ key: `owner_unmapped:${dayNumber(now)}`, kind: "owner_unmapped", amountAedMinor: null }], now);
   bump(counts, "owner_unmapped");
   log("owner_unmapped", { owner, assigned: changed });
   return changed;
@@ -886,7 +1031,7 @@ async function doPutBack(
   l: CrmReturnLink,
   subject: CrmSubject,
   deal: DealSnapshot,
-  p: { what: "stage" | "fields"; note: CrmReturnNoteKind | null; from: string | null; to: string | null },
+  p: PutBack,
   fields: string[],
   seen: CrmReturnLinkPatch,
   counts: Record<string, number>,
@@ -896,7 +1041,9 @@ async function doPutBack(
   const now = deps.now();
   const at = now.getTime();
   if (l.holdUntil && l.holdUntil.getTime() > at) {
-    // A put-back loop: no more forced pushes until the hold ends. Ordinary pushes still run.
+    // A put-back loop: no more forced pushes until the hold ends. Ordinary pushes still run. The deal is read
+    // again once the hold has ended (review C3-06).
+    seen.recheckRequestedAt = now;
     bump(counts, "held");
     log("held", { what: p.what });
     return;
@@ -905,7 +1052,8 @@ async function doPutBack(
     bump(counts, "put_back_lost");
     return;
   }
-  const mover = deal.movedBy ?? deal.updatedBy;
+  const staff = p.what !== "drift";
+  const mover = staff ? (deal.movedBy ?? deal.updatedBy) : null;
   const second = l.lastRevertAt !== null && at - l.lastRevertAt.getTime() <= TAMPER_WINDOW_MS;
   const third = second && l.prevRevertAt !== null && at - l.prevRevertAt.getTime() <= LOOP_WINDOW_MS;
   Object.assign(seen, { revertCount: (l.revertCount ?? 0) + 1, prevRevertAt: l.lastRevertAt, lastRevertAt: now } satisfies CrmReturnLinkPatch);
@@ -914,21 +1062,22 @@ async function doPutBack(
     seen.holdUntil = new Date(at + HOLD_MS);
     await store.raiseFinding(scope, { kind: "crm_putback_loop", ...entity }, now);
     bump(counts, "loop_hold");
-  } else if (second && p.what === "stage") {
+  } else if (second && p.what === "stage" && staff) {
     await store.raiseFinding(scope, { kind: "crm_stage_tamper", ...entity, detail: p.from && p.to ? `${p.from}>${p.to}` : null }, now);
   }
-  if (fields.length && l.lastFieldRestoreAt !== null && at - l.lastFieldRestoreAt.getTime() <= TAMPER_WINDOW_MS && !third) {
+  if (staff && fields.length && l.lastFieldRestoreAt !== null && at - l.lastFieldRestoreAt.getTime() <= TAMPER_WINDOW_MS && !third) {
     await store.raiseFinding(scope, { kind: "crm_field_tamper", ...entity, detail: safeDetail(fields.join(",")) }, now);
   }
-  if (fields.length) seen.lastFieldRestoreAt = now;
+  if (staff && fields.length) seen.lastFieldRestoreAt = now;
   if (p.what === "stage" && p.note && (l.lastRevertCommentAt === null || at - l.lastRevertCommentAt.getTime() > COMMENT_EVERY_MS)) {
     // One fixed note a day per deal, through the C2b comment queue (posted after its quiet period).
     await store.recordTimelineMoments(l.id, [{ key: `${p.note}:${dayNumber(now)}`, kind: p.note, amountAedMinor: null }], now);
     seen.lastRevertCommentAt = now;
   }
   await deps.commands.recordPutBack(subject, { what: p.what, dealId: deal.id, bitrixUserId: mover, from: p.from, to: p.to, fields });
-  bump(counts, p.what === "stage" ? "put_back_stage" : "restored_fields");
-  log(p.what === "stage" ? "put_back_stage" : "restored_fields", { from: p.from, to: p.to, fields: fields.join(":").slice(0, 80) || null, hold: Boolean(third) });
+  const action = p.what === "stage" ? "put_back_stage" : p.what === "drift" ? "pushed_drift" : "restored_fields";
+  bump(counts, action);
+  log(action, { from: p.from, to: p.to, fields: fields.join(":").slice(0, 80) || null, hold: Boolean(third) });
 }
 
 /* ---------------------------------------------------------------- sweep (G15) */
@@ -987,6 +1136,7 @@ async function sweepStep(deps: CrmReturnDeps, scope: CrmScope, ctx: CrmRunContex
         }
       }
     } catch (e) {
+      if (e instanceof CrmCallError && (e.kind === "throttled" || e.kind === "auth")) await pause(deps, scope, e.kind);
       if (!(e instanceof ReturnBudget)) {
         bump(counts, "sweep_failed");
         emit("crm.return_failed", { step: "sweep", reason: e instanceof CrmCallError ? e.code : "internal" }, "warn");
@@ -1030,42 +1180,30 @@ async function sweepStep(deps: CrmReturnDeps, scope: CrmScope, ctx: CrmRunContex
 
 /**
  * End of a listing: links whose deal was not seen are "not visible" (moved to another funnel or deleted on the
- * portal), alerted now; a missing link with twins found keeps the oldest twin and is linked to it (enforce);
- * every other twin gets its one fixed comment queued, naming the deal OUTLYY keeps.
+ * portal), alerted now with any twin found; every other twin gets its one fixed comment queued, naming the deal
+ * OUTLYY keeps (the linked one).
  */
 async function completeSweep(deps: CrmReturnDeps, scope: CrmScope, holder: string, startedAt: Date, counts: Record<string, number>): Promise<void> {
   const { store, ret } = deps;
   const now = deps.now();
   const missing = await store.finishSweep(scope, startedAt, now);
   const twins = await store.twinFindingsSince(scope, startedAt);
-  const keep = new Map<string, number>();
+  const missingIds = new Set(missing.map((l) => l.id));
   for (const link of missing) {
-    const own = twins.filter((t) => t.linkId === link.id && t.crmId !== Number(link.crmId)).sort((a, b) => a.crmId - b.crmId);
-    if (own.length && ret.mode === "enforce") {
-      // The link points at none of the copies: keep the oldest and link it (doc 29e §8).
-      const kept = own[0];
-      const lock = await store.lockLink(scope, { type: link.entityType, id: link.entityId }, holder, now, new Date(now.getTime() + ROW_LOCK_MS));
-      if (lock.kind === "locked") {
-        try {
-          await store.updateReturnLink(link.id, holder, { crmId: BigInt(kept.crmId), missingSince: null, twinFlaggedAt: link.twinFlaggedAt ?? now });
-          await store.queuePush(scope, link.id, holder, { clearHash: true });
-        } finally {
-          await store.unlockLink(link.id, holder);
-        }
-        await store.dropFinding(kept.id);
-        keep.set(link.id, kept.crmId);
-        bump(counts, "relinked");
-        continue;
-      }
-    }
-    await store.raiseFinding(scope, { kind: "crm_deal_not_visible", subjectKey: `${link.entityType}:${link.entityId}`, crmId: link.crmId === null ? null : Number(link.crmId), linkId: link.id }, now);
+    // Never relinked to a twin automatically (review C3-02): the old deal may sit in another funnel with the
+    // customer's details, and the link keeps its id so an erasure still names it. The alert names both deals.
+    const own = twins.filter((t) => t.linkId === link.id && t.crmId !== Number(link.crmId)).map((t) => t.crmId).sort((a, b) => a - b);
+    const detail = own.length ? safeDetail(`prev=${link.crmId},twin=${own.join(",")}`) : null;
+    await store.raiseFinding(scope, { kind: "crm_deal_not_visible", subjectKey: `${link.entityType}:${link.entityId}`, crmId: link.crmId === null ? null : Number(link.crmId), linkId: link.id, detail }, now);
+    if (own.length) deps.emit?.("crm.return_deal", { mode: ret.mode, deal: Number(link.crmId), entityType: link.entityType, entityId: link.entityId, action: "not_visible_with_twin", keep: own[0] });
     bump(counts, "not_visible");
   }
   if (ret.mode !== "enforce") return;
   const flagged = new Set<string>();
   for (const t of twins) {
-    if (!t.link || keep.get(t.link.id) === t.crmId) continue;
-    const ref = keep.get(t.link.id) ?? t.link.crmId;
+    // A twin of a link whose own deal is not visible gets no comment: there is no live deal to name.
+    if (!t.link || missingIds.has(t.link.id)) continue;
+    const ref = t.link.crmId;
     if (ref === null || ref === t.crmId || t.link.state === "deleted") continue;
     await store.setTwinComment(t.id, ref);
     if (!t.link.twinFlaggedAt && !flagged.has(t.link.id)) {
@@ -1127,6 +1265,7 @@ async function twinCommentStep(deps: CrmReturnDeps, scope: CrmScope, ctx: CrmRun
       if (err.kind === "throttled" || err.kind === "auth") {
         stop = err.code;
         await store.finishTwinComment(c.id, ctx.holder, { status: "pending", code: err.code });
+        await pause(deps, scope, err.kind);
       } else if (err.kind === "not_found") {
         await store.finishTwinComment(c.id, ctx.holder, { status: "dropped", code: err.code });
       } else if (err.writeMayHaveHappened) {

@@ -27,7 +27,7 @@ describe("return path reads", () => {
     fake.seedDeal({ originId: "inq:c", categoryId: 0 });
     clock.advance(5_000);
     fake.actAs(31).moveStage(a.id, "C7:QUOTED");
-    const r = await client.listChangedDeals({ since: new Date(clock.ms() - 6_000), start: 0 });
+    const r = await client.listChangedDeals({ since: new Date(clock.ms() - 6_000) });
     expect(r.more).toBe(false);
     expect(r.items.map((i) => i.id)).toEqual([b.id, a.id]);
     expect(r.items[1]).toMatchObject({ stageId: "C7:QUOTED", updatedBy: 31, movedBy: 31, categoryId: 7 });
@@ -35,25 +35,27 @@ describe("return path reads", () => {
     expect(r.items[1].uf[fieldCode("payment_status")]).toBe("paid");
   });
 
-  it("pages at 50 and says when there is more; a missing movedBy is null; numbers sent as strings are read", async () => {
+  it("pages at 50 and says when there is more; one second is drained by id; a missing movedBy is null; numbers sent as strings are read", async () => {
     const { clock, fake, client } = fixture();
     for (let i = 0; i < 60; i++) fake.seedDeal({ originId: `inq:${i}` });
     fake.omitMovedBy = true;
     fake.stringNumbers = true;
-    const first = await client.listChangedDeals({ since: new Date(clock.ms() - 60_000), start: 0 });
+    const first = await client.listChangedDeals({ since: new Date(clock.ms() - 60_000) });
     expect(first.items).toHaveLength(50);
     expect(first.more).toBe(true);
     expect(first.items[0]).toMatchObject({ movedBy: null, updatedBy: Number(FAKE_USER) });
-    const second = await client.listChangedDeals({ since: new Date(clock.ms() - 60_000), start: 50 });
+    const second = await client.listChangedDeals({ at: new Date(clock.ms()), afterId: first.items[49].id });
     expect(second.items).toHaveLength(10);
     expect(second.more).toBe(false);
+    const some = await client.readDeals([first.items[0].id, second.items[9].id, 99_999]);
+    expect(some.map((d) => d.id)).toEqual([first.items[0].id, second.items[9].id]);
   });
 
   it("a deal of another funnel in the answer is dropped (the filter is the provider's)", async () => {
     const c = new BitrixRestClient(fakeConfig(), {
       fetchImpl: async () => json(200, { result: { items: [{ id: 5, categoryId: 0, updatedTime: "2026-11-22T08:00:00+00:00" }, { id: 6, categoryId: 7, updatedTime: "2026-11-22T08:00:00+00:00" }] } }),
     });
-    expect((await c.listChangedDeals({ since: new Date(0), start: 0 })).items.map((i) => i.id)).toEqual([6]);
+    expect((await c.listChangedDeals({ since: new Date(0) })).items.map((i) => i.id)).toEqual([6]);
     expect((await c.listFunnelDeals(0)).items.map((i) => i.id)).toEqual([6]);
   });
 
