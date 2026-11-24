@@ -1001,7 +1001,18 @@ async function ownerRule(
     log("assigned", { owner });
     return true;
   }
-  // Not mapped, or mapped but inactive / without two-factor (counts as unknown): OUTLYY's default owner.
+  // Not mapped, or mapped but inactive / without two-factor (counts as unknown): OUTLYY's default owner, but only
+  // when the person who made the change is a mapped, active staff member (owner answer, 25 November 2026). A
+  // change by anyone else alerts and changes nothing.
+  const editor = deal.updatedBy;
+  const editorStaff = editor !== null && String(editor) !== config.webhookUserId ? ret.staffMap.get(editor) : undefined;
+  if (!editorStaff || !(await commands.staff(editorStaff))) {
+    const code = editorStaff ? "editor_inactive" : "editor_unmapped";
+    await store.raiseFinding(scope, { kind: "crm_owner_change_refused", subjectKey: subjectKey(subject), crmId: deal.id, linkId: l.id, detail: `${code},user=${owner}` }, now);
+    bump(counts, "owner_refused");
+    log("owner_refused", { owner, refusal: code });
+    return false;
+  }
   const fallback = ret.staffMap.get(config.defaultOwnerId);
   const fallbackActor = fallback ? await commands.staff(fallback) : null;
   await store.raiseFinding(scope, { kind: "crm_owner_unmapped", subjectKey: subjectKey(subject), crmId: deal.id, linkId: l.id, detail: `user=${owner}`, alertOnRepeat: true }, now);
@@ -1223,11 +1234,12 @@ async function completeSweep(deps: CrmReturnDeps, scope: CrmScope, holder: strin
 
 /* ---------------------------------------------------------------- twin comments */
 
+/** The owner's fixed text (owner answer, 25 November 2026); N is the linked deal OUTLYY keeps. */
 export function twinCommentText(keptDealId: number): string {
-  return `OUTLYY: Duplicate of deal ${keptDealId} — safe to delete. Move any notes to deal ${keptDealId} first.`;
+  return `Duplicate of deal ${keptDealId}. Move any notes to deal ${keptDealId}, then delete this copy.`;
 }
 
-const TWIN_TEXT = /^OUTLYY: Duplicate of deal (\d{1,12}) — safe to delete\. Move any notes to deal \1 first\.$/;
+const TWIN_TEXT = /^Duplicate of deal (\d{1,12})\. Move any notes to deal \1, then delete this copy\.$/;
 
 /** The last check before the twin comment: exactly the fixed sentence with one deal id. */
 export function assertSafeTwinText(text: string): void {

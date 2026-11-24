@@ -382,7 +382,7 @@ describe("return path: nightly sweep (G15)", () => {
       expect({ ...now, updatedTime: 0 }).toEqual({ ...e, updatedTime: 0 });
       expect(h.fake.commentsOn(e.id).map((c) => c.text)).toEqual([twinCommentText(deal.id)]);
     }
-    expect(h.fake.commentsOn(deal.id).filter((c) => c.text.startsWith("OUTLYY: Duplicate"))).toEqual([]);
+    expect(h.fake.commentsOn(deal.id).filter((c) => c.text.startsWith("Duplicate of deal"))).toEqual([]);
   });
 
   it("a deal moved out of the funnel, a deleted deal, a hand-made deal, an orphan and another environment's deal each alert and are never written", async () => {
@@ -505,9 +505,9 @@ describe("return path: owner changes and the twin text", () => {
   });
 
   it("the twin comment is exactly the fixed sentence", () => {
-    expect(twinCommentText(1234)).toBe("OUTLYY: Duplicate of deal 1234 — safe to delete. Move any notes to deal 1234 first.");
+    expect(twinCommentText(1234)).toBe("Duplicate of deal 1234. Move any notes to deal 1234, then delete this copy.");
     expect(() => assertSafeTwinText(twinCommentText(5))).not.toThrow();
-    expect(() => assertSafeTwinText("OUTLYY: Duplicate of deal 5 — safe to delete. Move any notes to deal 6 first.")).toThrow();
+    expect(() => assertSafeTwinText("Duplicate of deal 5. Move any notes to deal 6, then delete this copy.")).toThrow();
     expect(() => assertSafeTwinText(`${twinCommentText(5)} ${TEST_CONTACT.email}`)).toThrow();
   });
 });
