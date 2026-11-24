@@ -15,6 +15,12 @@ import type { CrmConfig } from "./crm.config";
  *    is re-checked before the call; redirects are refused. The webhook
  *    secret comes only from the config (env) and is never logged, returned
  *    or put in an error.
+ *  - Custom fields are sent under their original codes (`UF_CRM_…`, as the
+ *    portal's field list shows them): `crm.item.add` and `crm.item.update`
+ *    pass `useOriginalUfNames: "Y"`. Without it `crm.item.*` expects the
+ *    camelCase names (`ufCrm…`) and ignores the others without an error
+ *    (review C2A-01). The synthetic probe (crm.probe.ts) reads every field
+ *    back before any personal data is pushed.
  *  - Every answer is validated with Zod; anything else is `invalid_response`.
  *  - Errors are classified into a short kind and code; a provider message
  *    (`error_description`) is never kept.
@@ -154,6 +160,7 @@ const listBody = z.object({
   total: z.number().int().nonnegative().optional(),
 });
 const itemBody = z.object({ result: z.object({ item: z.object({ id }) }) });
+const fieldsListBody = z.object({ result: z.object({ items: z.array(z.object({ id }).passthrough()) }) });
 const productRowsBody = z.object({ result: z.object({ productRows: z.array(z.unknown()) }) });
 // crm.item.delete answers an empty result; only its presence is checked.
 const deleteBody = z.custom<{ result: unknown }>((v) => typeof v === "object" && v !== null && "result" in v);
@@ -203,13 +210,27 @@ export class BitrixRestClient implements CrmPort {
     return i ? { id: i.id, originatorId: i.originatorId, originId: i.originId, categoryId: i.categoryId, updatedBy: i.updatedBy } : null;
   }
 
+  /**
+   * The given custom fields of one deal in the OUTLYY funnel, under their original codes, or null. For the
+   * synthetic probe only (crm.probe.ts): the values are compared there and never logged or returned.
+   */
+  async readDealFields(dealId: number, codes: readonly string[]): Promise<Record<string, unknown> | null> {
+    const body = await this.call(
+      "crm.item.list",
+      { entityTypeId: DEAL_ENTITY_TYPE_ID, useOriginalUfNames: "Y", select: ["id", "categoryId", ...codes], filter: { "=id": dealId, "=categoryId": this.config.categoryId } },
+      fieldsListBody,
+    );
+    const item = body.result.items.find((i) => i.id === dealId && Number((i as Record<string, unknown>).categoryId) === this.config.categoryId);
+    return item ? Object.fromEntries(codes.map((c) => [c, (item as Record<string, unknown>)[c]])) : null;
+  }
+
   async addDeal(fields: DealFields): Promise<{ id: number }> {
-    const body = await this.call("crm.item.add", { entityTypeId: DEAL_ENTITY_TYPE_ID, fields }, itemBody);
+    const body = await this.call("crm.item.add", { entityTypeId: DEAL_ENTITY_TYPE_ID, useOriginalUfNames: "Y", fields }, itemBody);
     return { id: body.result.item.id };
   }
 
   async updateDeal(dealId: number, fields: DealFields): Promise<void> {
-    await this.call("crm.item.update", { entityTypeId: DEAL_ENTITY_TYPE_ID, id: dealId, fields }, itemBody);
+    await this.call("crm.item.update", { entityTypeId: DEAL_ENTITY_TYPE_ID, id: dealId, useOriginalUfNames: "Y", fields }, itemBody);
   }
 
   async setProductRows(dealId: number, rows: ProductRow[]): Promise<void> {
@@ -226,7 +247,12 @@ export class BitrixRestClient implements CrmPort {
     }
   }
 
-  /** The request URL; refused unless it is the pinned host over https. Never logged or returned. */
+  /**
+   * The request URL; refused unless it is the pinned host over https. Never logged or returned.
+   * The webhook secret is part of the path (Bitrix24 inbound webhooks have no header auth). Do not add fetch
+   * instrumentation (OpenTelemetry, an APM agent, a logging wrapper) that records outbound URLs or paths
+   * without redacting `/rest/<user>/<secret>/` first (review C2A-13; doc 29d §6c).
+   */
   private urlFor(method: BitrixMethod): string {
     const { portal, webhookUserId, webhookSecret } = this.config;
     const url = new URL(`https://${portal}/rest/${encodeURIComponent(webhookUserId)}/${encodeURIComponent(webhookSecret)}/${method}.json`);

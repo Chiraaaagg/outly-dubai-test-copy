@@ -282,7 +282,7 @@ export function crmConfigProblems(env: CrmEnvSlice): string[] {
   const owner = env.CRM_BITRIX_DEFAULT_OWNER_ID?.trim();
   if (!owner) problems.push("CRM_BITRIX_DEFAULT_OWNER_ID is missing");
   else if (!/^[1-9]\d{0,8}$/.test(owner)) problems.push("CRM_BITRIX_DEFAULT_OWNER_ID must be the sales lead's numeric user id");
-  else if (owner === user) problems.push("CRM_BITRIX_DEFAULT_OWNER_ID must not be the service account");
+  else if (user && Number(owner) === Number(user)) problems.push("CRM_BITRIX_DEFAULT_OWNER_ID must not be the service account");
   problems.push(...adminBase(env).problems);
   const t = env.CRM_BITRIX_TIMEOUT_MS ?? CRM_DEFAULT_TIMEOUT_MS;
   if (!Number.isFinite(t) || t < CRM_MIN_TIMEOUT_MS || t > CRM_MAX_TIMEOUT_MS) {

@@ -9,6 +9,7 @@ import {
   enqueueCrmDelete,
   enqueueCrmErasure,
   enqueueCrmSync,
+  enqueueCrmSyncForContact,
   enqueueCrmSyncForOrders,
   isLockTimeout,
 } from "@/server/crm/crm.outbox";
@@ -182,7 +183,30 @@ describe("CRM outbox enqueue", () => {
     expect(bump.sql).not.toContain("state <> 'deleted'");
     vi.stubEnv("CRM_SYNC_ENABLED", "true");
     resetEnvCache();
+    // On, but not fully configured: still no new links (C2A-04).
+    expect(crmNewLinksAllowed()).toBe(false);
+  });
+
+  it("new links only while the sync is on AND the whole configuration validates (C2A-04)", async () => {
+    const { fakeEnv } = await import("./_memory-store");
+    const stub = (over: Record<string, string | undefined>) => {
+      for (const [k, v] of Object.entries({ ...fakeEnv(), ...over })) vi.stubEnv(k, v === undefined ? "" : String(v));
+      resetEnvCache();
+    };
+    stub({ CRM_SYNC_ENABLED: "true" });
     expect(crmNewLinksAllowed()).toBe(true);
+    stub({ CRM_SYNC_ENABLED: "true", CRM_BITRIX_FIELD_CODES: "reference=UF_CRM_REFERENCE" });
+    expect(crmNewLinksAllowed()).toBe(false);
+    stub({ CRM_SYNC_ENABLED: "false" });
+    expect(crmNewLinksAllowed()).toBe(false);
+  });
+
+  it("the boot check names what would block switch-on while the sync is still off (C2A-04)", async () => {
+    const { fakeEnv } = await import("./_memory-store");
+    const { assertBootEnv } = await import("@/server/lib/env");
+    for (const [k, v] of Object.entries({ ...fakeEnv(), CRM_SYNC_ENABLED: "false", CRM_BITRIX_DEFAULT_OWNER_ID: "" })) vi.stubEnv(k, v === undefined ? "" : String(v));
+    resetEnvCache();
+    expect(assertBootEnv().filter((p) => p.startsWith("CRM not ready for switch-on"))).toEqual(["CRM not ready for switch-on: CRM_BITRIX_DEFAULT_OWNER_ID is missing"]);
   });
 
   it("sync off: an unlinked subject takes no row; an already linked one is bumped and queued", async () => {
@@ -212,6 +236,37 @@ describe("CRM outbox enqueue", () => {
     const { tx, calls } = fakeTx();
     await expect(enqueueCrmErasure(tx, { inquiryIds: [A], orderIds: [] }, scope)).resolves.toBe(1);
     expect(calls.find((c) => c.sql.includes("INSERT INTO crm_outbox"))!.values).toContain("erasure");
+  });
+
+  it("a marketing consent change re-pushes the contact's linked deals, never links a new one (C2A-02)", async () => {
+    const { tx, calls } = fakeTx();
+    const t = tx as unknown as { $queryRaw: (s: TemplateStringsArray, ...v: unknown[]) => Promise<unknown> };
+    const orig = t.$queryRaw;
+    t.$queryRaw = async (strings, ...values) => {
+      const sql = strings.join("?");
+      if (sql.includes("FROM crm_links l")) {
+        calls.push({ op: "$queryRaw", sql, values });
+        return [
+          { entity_type: "order", entity_id: B },
+          { entity_type: "inquiry", entity_id: A },
+        ];
+      }
+      return orig(strings, ...values);
+    };
+    const phone = ["+971", "4", "0001234"].join("");
+    await expect(enqueueCrmSyncForContact(tx, { phoneE164: phone }, scope)).resolves.toBe(2);
+    const lookup = calls.find((c) => c.sql.includes("FROM crm_links l"))!;
+    expect(lookup.values).toContain(phone);
+    expect(lookup.sql).toContain("state <> 'deleted'");
+    expect(calls.some((c) => c.sql.includes("INSERT INTO crm_links"))).toBe(false);
+    expect(calls.filter((c) => c.sql.includes("INSERT INTO crm_outbox"))).toHaveLength(2);
+  });
+
+  it("a consent change with no portal, or with neither phone nor email, writes nothing", async () => {
+    const { tx, calls } = fakeTx();
+    expect(await enqueueCrmSyncForContact(tx, { phoneE164: "+97140001234" }, null)).toBe(0);
+    expect(await enqueueCrmSyncForContact(tx, { phoneE164: " ", email: null }, scope)).toBe(0);
+    expect(calls).toEqual([]);
   });
 
   it("dedupe keys name the kind, subject, version and scope", () => {

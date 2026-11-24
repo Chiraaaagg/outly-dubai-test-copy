@@ -161,7 +161,15 @@ export interface CrmWorkerDeps {
   emit?: (name: CrmWorkerEvent, fields: Record<string, unknown>, level?: "info" | "warn" | "error") => void;
 }
 
-export type CrmWorkerEvent = "crm.row_done" | "crm.row_failed" | "crm.dead_letter" | "crm.twin_detected" | "crm.circuit_open" | "crm.refused";
+export type CrmWorkerEvent =
+  | "crm.row_done"
+  | "crm.row_failed"
+  | "crm.dead_letter"
+  | "crm.twin_detected"
+  | "crm.circuit_open"
+  | "crm.refused"
+  | "crm.currency_mismatch"
+  | "crm.erasure_unverified";
 
 export interface CrmRunSummary {
   ok: true;
@@ -375,6 +383,10 @@ async function sync(deps: CrmWorkerDeps, port: CrmPort, holder: string, link: Cr
   const target = link.localVersion;
   const state = await deps.loadState({ type: link.entityType, id: link.entityId });
   const mapped = mapDeal(state, config, { now: deps.now() });
+  if (mapped.visible && state.order?.otherCurrencyPaid) {
+    // Staff recorded a payment in another currency than the order's: revenue shows 0 (review C2A-05).
+    deps.emit?.("crm.currency_mismatch", { entityType: link.entityType, entityId: link.entityId }, "warn");
+  }
 
   if (!mapped.visible) {
     if (mapped.reason === "erased" && (link.crmId !== null || link.state === "creating")) return deleteCopies(deps, port, holder, link, "erasure");
@@ -399,8 +411,13 @@ async function sync(deps: CrmWorkerDeps, port: CrmPort, holder: string, link: Cr
   let crmId = link.crmId === null ? null : Number(link.crmId);
   if (crmId === null) {
     assertSafeCrmPayload(mapped.createFields, mapped.rows, config, { create: true });
-    const created = await ensureCreated(deps, port, holder, link, mapped.createFields);
+    const created = await ensureCreated(deps, port, holder, link, mapped.createFields, mapped.createAllowed);
     if (created.type === "wait") return { type: "defer", delayMs: created.delayMs, code: "create_settle" };
+    if (created.type === "none") {
+      // A lost create answer, then the subject turned spam, and nothing landed: never create (review C2A-09).
+      await store.updateLink(link.id, holder, { state: "pending", creatingSince: null, pushedVersion: target });
+      return { type: "done", outcome: "not_created" };
+    }
     crmId = created.id;
     if (created.adopted) {
       // The adopted record may hold an older snapshot: write the current one (never the owner: it was set on create).
@@ -434,7 +451,8 @@ async function ensureCreated(
   holder: string,
   link: CrmLinkRow,
   fields: DealFields,
-): Promise<{ type: "id"; id: number; adopted: boolean } | { type: "wait"; delayMs: number }> {
+  createAllowed: boolean,
+): Promise<{ type: "id"; id: number; adopted: boolean } | { type: "wait"; delayMs: number } | { type: "none" }> {
   const found = await port.findDealsByOrigin(link.originatorId, link.originId);
   if (found.length > 0) {
     const keep = found[0];
@@ -450,6 +468,8 @@ async function ensureCreated(
     const waited = deps.now().getTime() - link.creatingSince.getTime();
     if (waited < CREATE_SETTLE_MS) return { type: "wait", delayMs: CREATE_SETTLE_MS - waited };
   }
+  // Only a found deal is adopted (to move it to Spam); spam never creates one.
+  if (!createAllowed) return { type: "none" };
   await deps.store.updateLink(link.id, holder, { state: "creating", creatingSince: deps.now() });
   const { id } = await port.addDeal(fields);
   await deps.store.updateLink(link.id, holder, { crmId: BigInt(id), state: "active" });
@@ -491,6 +511,14 @@ async function deleteCopies(deps: CrmWorkerDeps, port: CrmPort, holder: string, 
     if (own) targets.set(own.id, own);
   }
   const ids = [...targets.keys()].sort((a, b) => a - b);
+  if (link.crmId !== null && ids.length === 0) {
+    // The linked deal holds the customer's details but the service account cannot see it any more: moved to another
+    // funnel by staff, or deleted on the portal. Tombstone (never re-create), then dead-letter the row so the ops
+    // alert names it and an administrator checks the other funnels for this deal id (review C2A-08; doc 29d §5.4).
+    await deps.store.updateLink(link.id, holder, { state: "deleted", deletedAt: deps.now(), deleteReason: reason, pushedVersion: link.localVersion });
+    deps.emit?.("crm.erasure_unverified", { entityType: link.entityType, entityId: link.entityId, reason }, "error");
+    return { type: "error", error: new CrmCallError("refused", "crm.item.delete", { code: "linked_deal_not_visible" }) };
+  }
   for (const id of ids) assertDeleteTarget(targets.get(id)!, link, deps.config);
   for (const id of ids) await port.deleteDeal(id);
   await deps.store.updateLink(link.id, holder, { state: "deleted", deletedAt: deps.now(), deleteReason: reason, pushedVersion: link.localVersion });

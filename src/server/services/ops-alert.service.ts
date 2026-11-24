@@ -435,10 +435,10 @@ export async function catalogueStaleIncidents(environment: SupplierEnvironment, 
 export async function crmDeleteIncidents(since: Date, now: Date, limit = COLLECT_LIMIT): Promise<OpsIncident[]> {
   const rows = await prisma
     .$queryRaw<Row[]>`
-    SELECT entity_type, entity_id::text AS entity_id, reason, max(updated_at) AS raised_at
+    SELECT entity_type, entity_id::text AS entity_id, reason, (last_error_code = 'refused:linked_deal_not_visible') AS unverified, max(updated_at) AS raised_at
     FROM crm_outbox
     WHERE kind = 'delete' AND status = 'dead' AND updated_at >= ${since} AND updated_at <= ${now}
-    GROUP BY entity_type, entity_id, reason
+    GROUP BY entity_type, entity_id, reason, unverified
     ORDER BY raised_at DESC LIMIT ${limit}`
     .catch((e: unknown) => {
       // 42P01 undefined_table: the CRM migration is not applied yet.
@@ -449,7 +449,9 @@ export async function crmDeleteIncidents(since: Date, now: Date, limit = COLLECT
     kind: "crm_delete_failed" as const,
     entityKind: "crm_subject" as const,
     entityId: `${String(r.entity_type)}:${String(r.entity_id)}`,
-    reason: r.reason === "retention" ? "crm_retention_delete_dead" : "crm_erasure_delete_dead",
+    // Unverified (review C2A-08): the linked deal was not visible to the service account; an administrator must
+    // look for it in the other funnels.
+    reason: `crm_${r.reason === "retention" ? "retention" : "erasure"}_${r.unverified === true ? "deal_not_visible" : "delete_dead"}`,
     raisedAt: date(r.raised_at),
     orderId: null,
     orderReference: null,

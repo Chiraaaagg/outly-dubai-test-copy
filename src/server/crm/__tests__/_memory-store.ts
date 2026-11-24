@@ -328,7 +328,7 @@ export function inquiryState(
     },
     order: null,
     contact: over.contact === undefined ? { ...TEST_CONTACT } : over.contact,
-    consent: { marketingEmail: { granted: true, at: "2026-11-20T09:30:00.000Z" }, marketingWhatsapp: null },
+    consent: { marketingEmail: { granted: true, at: "2026-11-20T09:30:00+00:00" }, marketingWhatsapp: null },
   };
 }
 
@@ -354,6 +354,6 @@ export function directOrderState(
       marginAedMinor: over.marginAedMinor === undefined ? null : over.marginAedMinor,
     },
     contact: { ...TEST_CONTACT },
-    consent: { marketingEmail: null, marketingWhatsapp: { granted: false, at: "2026-11-21T10:00:00.000Z" } },
+    consent: { marketingEmail: null, marketingWhatsapp: { granted: false, at: "2026-11-21T10:00:00+00:00" } },
   };
 }

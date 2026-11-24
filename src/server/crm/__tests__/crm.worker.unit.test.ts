@@ -84,7 +84,7 @@ describe("CRM worker: deal push on the fake portal", () => {
       [fieldCode("customer_name")]: TEST_CONTACT.name,
       [fieldCode("customer_phone")]: TEST_CONTACT.phone,
       [fieldCode("customer_email")]: TEST_CONTACT.email,
-      [fieldCode("as_of")]: expect.stringMatching(/^2026-11-22T08:00:0\d\.000Z$/),
+      [fieldCode("as_of")]: expect.stringMatching(/^2026-11-22T08:00:0\d\+00:00$/),
     });
     const elsewhere = JSON.stringify({ title: deals[0].title, rows: deals[0].productRows });
     expect(elsewhere).not.toContain(TEST_CONTACT.name);
@@ -263,6 +263,45 @@ describe("CRM worker: deal push on the fake portal", () => {
     expect(h.store.link(h.scope, s)).toMatchObject({ state: "active", pushedVersion: 1n });
   });
 
+  it("a create that never landed, then the subject turned spam: no deal is ever created (C2A-09)", async () => {
+    const h = harness();
+    const s = inquiry();
+    h.put(inquiryState(s.id));
+    // The search answers; the add fails at the network, so the link stays `creating` with nothing on the portal.
+    h.fake.script = [];
+    const real = h.fake.fetch;
+    let calls = 0;
+    const port = new BitrixRestClient(h.config, {
+      fetchImpl: async (url, init) => {
+        calls += 1;
+        if (calls === 2) h.fake.script = ["network"];
+        return real(url, init);
+      },
+      now: h.clock.ms,
+    });
+    const deps = {
+      config: h.config,
+      store: h.store,
+      port,
+      loadState: h.book.load,
+      limiter: pacedLimiter({ minIntervalMs: 1_000, maxPerRun: 12, now: h.clock.ms, sleep: h.clock.sleep }),
+      now: h.clock.now,
+      random: () => 0.5,
+    };
+    await runCrmWorker({ ...deps, holder: "w1" });
+    expect(h.store.link(h.scope, s)).toMatchObject({ state: "creating", crmId: null });
+    h.put(inquiryState(s.id, { status: "spam" }));
+    h.clock.advance(2 * CREATE_SETTLE_MS);
+    for (let i = 0; i < 5; i++) {
+      await runCrmWorker({ ...deps, holder: `w${i + 2}` });
+      h.clock.advance(5 * 60_000);
+    }
+    expect(h.fake.dealsFor(originIdFor(s))).toHaveLength(0);
+    expect(h.fake.callsOf("crm.item.add").filter((c) => c.outcome === "ok")).toHaveLength(0);
+    expect(h.store.link(h.scope, s)).toMatchObject({ state: "pending", crmId: null, creatingSince: null });
+    expect(h.store.rows.some((r) => r.outcome === "not_created")).toBe(true);
+  });
+
   it("a create that may not have reached the portal waits the settle delay before creating", async () => {
     const h = harness();
     const s = inquiry();
@@ -343,11 +382,16 @@ describe("CRM worker: deal push on the fake portal", () => {
     h.put(inquiryState(s.id));
     await h.run();
     const manual = h.fake.seedDeal({ originId: null, originatorId: null, title: "made by hand" });
+    // Review C2A-14 (b): deals that share the subject's originId but are not OUTLYY's in this environment and funnel.
     const prod = h.fake.seedDeal({ originId: originIdFor(s), originatorId: "outlyy-production" });
+    const untagged = h.fake.seedDeal({ originId: originIdFor(s), originatorId: null, title: "copied by hand" });
+    const otherFunnel = h.fake.seedDeal({ originId: originIdFor(s), originatorId: "outlyy-staging", categoryId: 0, stageId: "C0:NEW" });
+    const ours = h.fake.dealsFor(originIdFor(s)).find((d) => d.categoryId === 7 && d.originatorId === "outlyy-staging")!;
     h.store.enqueue(h.scope, s, "delete", "erasure");
     h.clock.advance(1_000);
     await h.run();
-    expect(h.fake.dealsFor(originIdFor(s)).map((d) => d.id)).toEqual([prod.id]);
+    expect(h.fake.deals.has(ours.id)).toBe(false);
+    expect(h.fake.dealsFor(originIdFor(s)).map((d) => d.id).sort((a, b) => a - b)).toEqual([prod.id, untagged.id, otherFunnel.id].sort((a, b) => a - b));
     expect(h.fake.deals.has(manual.id)).toBe(true);
     expect(h.fake.callsOf("crm.item.delete")).toHaveLength(1);
   });
@@ -370,7 +414,14 @@ describe("CRM worker: deal push on the fake portal", () => {
     expect(h.fake.deals.has(da.id)).toBe(false);
     expect(h.fake.deals.has(db.id)).toBe(true);
     expect(h.store.link(h.scope, a)).toMatchObject({ state: "deleted", deleteReason: "erasure" });
-    expect(h.store.rows.filter((r) => r.kind === "delete").map((r) => r.outcome)).toEqual(["deleted", "nothing_to_delete"]);
+    // C2A-08: the deal still holds personal data somewhere the sync cannot see: tombstoned, dead-lettered, error event.
+    expect(h.store.rows.filter((r) => r.kind === "delete").map((r) => [r.outcome, r.lastErrorCode])).toEqual([
+      ["deleted", null],
+      ["dead", "refused:linked_deal_not_visible"],
+    ]);
+    expect(h.store.link(h.scope, b)).toMatchObject({ state: "deleted", deleteReason: "erasure" });
+    expect(h.events.find((e) => e.name === "crm.erasure_unverified")?.fields).toEqual({ entityType: "inquiry", entityId: b.id, reason: "erasure" });
+    expect(h.events.some((e) => e.name === "crm.dead_letter" && e.fields.reason === "refused:linked_deal_not_visible")).toBe(true);
   });
 
   it("the delete guard: only a deal in the OUTLYY funnel that is this link's record or carries its originator and originId", () => {
@@ -548,6 +599,17 @@ describe("CRM worker: deal push on the fake portal", () => {
     await h.run();
     expect(h.fake.dealsFor(originIdFor(o))[0]).toMatchObject({ stageId: "C7:REFUNDED", opportunity: 150 });
     expect(h.fake.dealsFor(originIdFor(o))[0].productRows).toEqual([{ productName: "Burj Khalifa At the Top (2026-12-02)", price: 250, quantity: 1 }]);
+  });
+
+  it("a staff payment in another currency: deal at 0 revenue with its own word, and a warning event (C2A-05)", async () => {
+    const h = harness();
+    const o: CrmSubject = { type: "order", id: subjectId() };
+    const s = directOrderState(o.id, { authorised: true, status: "paid" });
+    s.order!.otherCurrencyPaid = true;
+    h.put(s);
+    await h.run();
+    expect(h.fake.dealsFor(originIdFor(o))[0]).toMatchObject({ opportunity: 0, [fieldCode("payment_status")]: "paid_other_currency" });
+    expect(h.events.find((e) => e.name === "crm.currency_mismatch")?.fields).toEqual({ entityType: "order", entityId: o.id });
   });
 
   it("a single-flight lease: a second worker for the same portal does nothing while the first holds it", async () => {

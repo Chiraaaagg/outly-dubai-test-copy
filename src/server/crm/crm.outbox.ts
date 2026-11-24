@@ -3,7 +3,7 @@ import type { Tx } from "../lib/db";
 import { env } from "../lib/env";
 import { uuidv7 } from "../lib/ids";
 import { emitEvent } from "../lib/structured-events";
-import { crmScopeFrom, originatorIdFor, type CrmScope } from "./crm.config";
+import { crmConfigFrom, crmScopeFrom, originatorIdFor, type CrmScope } from "./crm.config";
 import { CRM_PAYLOAD_VERSION, originIdFor, type CrmSubject } from "./crm.mapping";
 
 /**
@@ -74,9 +74,24 @@ export function crmOutboxScope(): CrmScope | null {
   return crmScopeFrom(env());
 }
 
-/** Whether a change may link a subject not linked yet: only while the sync is switched on (no backfill, C2-12). */
+const deliverable = new WeakMap<object, boolean>();
+
+/**
+ * Whether a change may link a subject not linked yet: only while the sync is
+ * switched on AND the whole configuration validates, so links exist only
+ * when the worker can deliver (no backfill, C2-12; review C2A-04: a subject
+ * linked while a value was wrong would later be refused as "before
+ * switch-on"). Memoised per parsed environment.
+ */
 export function crmNewLinksAllowed(): boolean {
-  return env().CRM_SYNC_ENABLED === true;
+  const e = env();
+  if (e.CRM_SYNC_ENABLED !== true) return false;
+  let ok = deliverable.get(e);
+  if (ok === undefined) {
+    ok = crmConfigFrom(e) !== null;
+    deliverable.set(e, ok);
+  }
+  return ok;
 }
 
 function sorted(subjects: CrmSubject[]): CrmSubject[] {
@@ -270,13 +285,47 @@ export async function enqueueCrmSyncForOrders(tx: Tx, orderIds: string[], scope:
 }
 
 /**
+ * A consent change (review C2A-02): the deal shows the latest marketing
+ * consent, so every linked deal subject of this phone (WhatsApp) or email
+ * (email) gets a push in the consent's own transaction. Only subjects that
+ * already have a live link are touched (never a new link, whatever the
+ * switch); a converted inquiry matches through its order's traveller too.
+ * Bounded to 200 subjects.
+ */
+export async function enqueueCrmSyncForContact(tx: Tx, contact: { phoneE164?: string | null; email?: string | null }, scope: CrmScope | null = crmOutboxScope()): Promise<number> {
+  const phone = contact.phoneE164?.trim() || null;
+  const email = contact.email?.trim().toLowerCase() || null;
+  if (!scope || (!phone && !email)) return 0;
+  return guarded(tx, [], async () => {
+    const rows = await tx.$queryRaw<{ entity_type: "inquiry" | "order"; entity_id: string }[]>`
+      SELECT l.entity_type, l.entity_id::text AS entity_id FROM crm_links l
+      WHERE l.environment = ${scope.environment} AND l.portal = ${scope.portal} AND l.state <> 'deleted'
+        AND (
+          (l.entity_type = 'inquiry' AND EXISTS (
+            SELECT 1 FROM inquiries i LEFT JOIN orders o ON o.id = i.converted_order_id
+            WHERE i.id = l.entity_id
+              AND ((${phone}::text IS NOT NULL AND (i.lead_phone = ${phone} OR o.lead_phone = ${phone}))
+                OR (${email}::text IS NOT NULL AND (lower(i.lead_email) = ${email} OR lower(o.lead_email) = ${email})))))
+          OR (l.entity_type = 'order' AND EXISTS (
+            SELECT 1 FROM orders o WHERE o.id = l.entity_id
+              AND ((${phone}::text IS NOT NULL AND o.lead_phone = ${phone}) OR (${email}::text IS NOT NULL AND lower(o.lead_email) = ${email}))))
+        )
+      ORDER BY l.entity_type, l.entity_id LIMIT 200`;
+    let n = 0;
+    for (const s of sorted(rows.map((r) => ({ type: r.entity_type, id: r.entity_id })))) if (await writeOne(tx, scope, s, "sync", null, false)) n += 1;
+    return n;
+  });
+}
+
+/**
  * Erasure propagation (doc 29 §6.5): called in `privacyService.eraseContact`'s
  * transaction. Every erased inquiry, and every erased order (through its deal
  * subject), gets a `delete` of its CRM copies; only subjects that were ever
  * linked get a row, whether or not the sync is on (the delete waits for the
- * worker). A deal of an erased inquiry is deleted even when its order is
- * kept for an obligation: the CRM copy is a convenience copy (it carries the
- * customer's details since C2a), so deletion loses nothing the order needs.
+ * worker). A deal is deleted even when its order is kept for an obligation
+ * (dispute window, open refund): the CRM copy is a convenience copy that
+ * carries the customer's details since C2a, so deletion loses nothing the
+ * order needs (review C2A-07).
  */
 export async function enqueueCrmErasure(tx: Tx, records: { inquiryIds: string[]; orderIds: string[] }, scope: CrmScope | null = crmOutboxScope()): Promise<number> {
   if (!scope || records.inquiryIds.length + records.orderIds.length === 0) return 0;

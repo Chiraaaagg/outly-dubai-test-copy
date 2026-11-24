@@ -425,7 +425,10 @@ export function assertBootEnv(): string[] {
   if (e.CRM_SYNC_ENABLED) {
     for (const p of crmConfigProblems(e)) problems.push(`CRM sync on but unusable: ${p}`);
   } else if (e.CRM_BITRIX_PORTAL_HOST) {
-    for (const p of crmScopeProblems(e)) problems.push(`CRM portal refused, nothing is enqueued: ${p}`);
+    const scope = crmScopeProblems(e);
+    for (const p of scope) problems.push(`CRM portal refused, nothing is enqueued: ${p}`);
+    // Review C2A-04: show before switch-on what would keep the sync from running once it is on.
+    for (const p of crmConfigProblems(e)) if (!scope.includes(p)) problems.push(`CRM not ready for switch-on: ${p}`);
   }
   if (Object.keys(process.env).some((k) => k.startsWith("NEXT_PUBLIC_") && (k.includes("BITRIX") || k.includes("CRM_")))) {
     problems.push("A NEXT_PUBLIC_*BITRIX* or NEXT_PUBLIC_*CRM_* variable exists — CRM settings must never reach the browser");

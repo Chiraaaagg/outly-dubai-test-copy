@@ -136,8 +136,8 @@ describe("CRM deal mapping", () => {
     const a = mapDeal(inquiryState(id), cfg, { now: new Date("2026-11-24T10:00:00.000Z") });
     const b = mapDeal(inquiryState(id), cfg, { now: new Date("2026-11-25T11:30:00.000Z") });
     if (!a.visible || !b.visible) throw new Error("expected visible");
-    expect(uf(a.fields, "as_of")).toBe("2026-11-24T10:00:00.000Z");
-    expect(uf(b.fields, "as_of")).toBe("2026-11-25T11:30:00.000Z");
+    expect(uf(a.fields, "as_of")).toBe("2026-11-24T10:00:00+00:00");
+    expect(uf(b.fields, "as_of")).toBe("2026-11-25T11:30:00+00:00");
     expect(a.hash).toBe(b.hash);
   });
 });
@@ -163,11 +163,11 @@ describe("CRM custom fields (C2a: G3, G5, G6, G16)", () => {
       refund_amount: "",
       travel_date: "2026-12-01",
       item_summary: "1 requested",
-      as_of: "2026-11-24T10:00:00.000Z",
+      as_of: "2026-11-24T10:00:00+00:00",
       indicative_amount: 180,
       margin: "",
       consent_marketing_email: "Y",
-      consent_marketing_email_at: "2026-11-20T09:30:00.000Z",
+      consent_marketing_email_at: "2026-11-20T09:30:00+00:00",
       consent_marketing_whatsapp: "N",
       consent_marketing_whatsapp_at: "",
     });
@@ -219,8 +219,13 @@ describe("CRM custom fields (C2a: G3, G5, G6, G16)", () => {
     [{ authorised: true, capturedMinor: 25_000n }, "paid", "pending", "pending", "none"],
     [{ authorised: true, capturedMinor: 25_000n, refundPending: true }, "paid", "pending", "pending", "pending"],
     [{ authorised: true, status: "refunded", capturedMinor: 25_000n, refundedMinor: 25_000n }, "refunded", "pending", "pending", "refunded"],
+    // Staff recorded the payment in INR on an AED order (C2A-05): paid, but revenue 0 and the word says why.
+    [{ authorised: true, otherCurrencyPaid: true }, "paid_other_currency", "pending", "pending", "none"],
+    [{ authorised: true, capturedMinor: 25_000n, otherCurrencyPaid: true }, "paid", "pending", "pending", "none"],
   ])("order status words %#", (over, payment, supplier, ticket, refund) => {
-    const s = directOrderState(subjectId(), { status: "paid", ...over });
+    const { otherCurrencyPaid, ...rest } = over as typeof over & { otherCurrencyPaid?: boolean };
+    const s = directOrderState(subjectId(), { status: "paid", ...rest });
+    s.order!.otherCurrencyPaid = otherCurrencyPaid;
     const m = mapDeal(s, cfg);
     if (!m.visible) throw new Error("expected visible");
     expect([uf(m.fields, "payment_status"), uf(m.fields, "supplier_booking_status"), uf(m.fields, "ticket_status"), uf(m.fields, "refund_status")]).toEqual([payment, supplier, ticket, refund]);
@@ -235,6 +240,13 @@ describe("CRM custom fields (C2a: G3, G5, G6, G16)", () => {
     // A rejected line's unknown cost does not hide the margin of the lines that were sold.
     expect(marginAedMinor([line(), line({ status: "rejected", netCostAed: 0n })])).toBe(4_000n);
     expect(marginAedMinor([])).toBeNull();
+    // C2A-10, aligned with domain/margin.ts: the quote's recorded variable costs come off too.
+    expect(marginAedMinor([line({ marginSnapshot: { costLines: [{ name: "gateway fee", minor: "480" }, { name: "tax on fee", minor: 24 }] } } as never)])).toBe(4_000n - 504n);
+    // An assisted line: no snapshot, no recorded variable cost; it counts once its net cost is known.
+    expect(marginAedMinor([line({ marginSnapshot: null } as never)])).toBe(4_000n);
+    // An unreadable snapshot is unknown, never a guess.
+    expect(marginAedMinor([line({ marginSnapshot: { costLines: [{ minor: "-5" }] } } as never)])).toBeNull();
+    expect(marginAedMinor([line({ marginSnapshot: { grossMarginBps: 1500 } } as never)])).toBeNull();
     expect(lineTotalMinor({ totalAed: 25_000n, totalInr: 0n, chargedCurrency: null, chargedAmountMinor: null }, "AED")).toBe(25_000n);
   });
 
@@ -267,7 +279,7 @@ describe("CRM revenue (owner answer Q4, gap G12)", () => {
   });
 
   it("a payment recorded by staff in OUTLYY admin counts the same as a Stripe capture", () => {
-    expect(revenueFromPayments([pay({ source: "manual", amountMinor: 30_000n })], "AED")).toEqual({ capturedMinor: 30_000n, refundedMinor: 0n, authorised: true, refundPending: false });
+    expect(revenueFromPayments([pay({ source: "manual", amountMinor: 30_000n })], "AED")).toEqual({ capturedMinor: 30_000n, refundedMinor: 0n, authorised: true, refundPending: false, otherCurrencyPaid: false });
     expect(revenueFromPayments([pay({ capturedMinor: 30_000n })], "AED")).toMatchObject({ capturedMinor: 30_000n, authorised: true });
     expect(revenueFromPayments([pay({ capturedMinor: 10_000n }), pay({ source: "manual", amountMinor: 5_000n })], "AED").capturedMinor).toBe(15_000n);
   });
@@ -284,7 +296,9 @@ describe("CRM revenue (owner answer Q4, gap G12)", () => {
   it("never counts an unverified or untaken payment, or one in another currency", () => {
     expect(revenueFromPayments([pay({ source: "gateway", capturedMinor: 30_000n })], "AED")).toMatchObject({ capturedMinor: 0n, authorised: false });
     expect(revenueFromPayments([pay({ source: "manual", status: "failed", amountMinor: 30_000n })], "AED")).toMatchObject({ capturedMinor: 0n, authorised: false });
-    expect(revenueFromPayments([pay({ source: "manual", amountMinor: 30_000n, currency: "INR" })], "AED").capturedMinor).toBe(0n);
+    // C2A-05: a payment in another currency is never converted; it is reported instead.
+    expect(revenueFromPayments([pay({ source: "manual", amountMinor: 30_000n, currency: "INR" })], "AED")).toMatchObject({ capturedMinor: 0n, otherCurrencyPaid: true, authorised: true });
+    expect(revenueFromPayments([pay({ source: "manual", amountMinor: 30_000n })], "AED").otherCurrencyPaid).toBe(false);
     // A provider authorisation alone makes the deal visible at zero revenue.
     expect(revenueFromPayments([pay({ status: "authorized", authorizedAt: new Date() })], "AED")).toMatchObject({ capturedMinor: 0n, authorised: true });
   });
@@ -322,6 +336,8 @@ describe("CRM payload guard", () => {
     ["a stage of another funnel", { ...ok, stageId: "C9:NEW" }, "stage"],
     ["a bad origin id", { ...ok, originId: `inq:${["guest.one", "example.test"].join("@")}` }, "origin"],
     ["a foreign originator", { ...ok, originatorId: "someone" }, "originator"],
+    ["another environment's originator (C2A-11)", { ...ok, originatorId: "outlyy-production" }, "originator"],
+    ["another funnel, with matching stage ids (C2A-11)", { ...ok, categoryId: 9, stageId: "C9:NEW_INQUIRY" }, "category"],
     ["another currency", { ...ok, currencyId: "USD" }, "currency"],
     ["a negative amount", { ...ok, opportunity: -1 }, "opportunity"],
     ["a name in the title", { ...ok, title: `OUTLYY ${["guest.one", "example.test"].join("@")}` }, "title_email"],
@@ -395,7 +411,6 @@ describe.skipIf(!existsSync(SNAPSHOT))("CRM snapshot never reads the never-sent 
     "providerAccountId",
     "idempotencyKey",
     "failureReason",
-    "marginSnapshot",
     "evidence",
     "notes",
     "ticketCodes",
@@ -409,8 +424,8 @@ describe.skipIf(!existsSync(SNAPSHOT))("CRM snapshot never reads the never-sent 
     for (const k of ["leadName", "leadPhone", "leadEmail", "capturedMinor", "refunds"]) expect(selected.has(k), k).toBe(true);
   });
 
-  it("reads net cost only for the margin, never into a returned fact", () => {
+  it("reads net cost and the margin snapshot only for the margin, never into a returned fact", () => {
     expect(selected.has("netCostAed")).toBe(true);
-    expect(src).not.toMatch(/netCostAed: i\.netCostAed|netCost(?:Aed)?Minor:/);
+    expect(src).not.toMatch(/netCostAed: i\.netCostAed|netCost(?:Aed)?Minor:|marginSnapshot: i\.|costLines/);
   });
 });

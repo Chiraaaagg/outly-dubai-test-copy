@@ -1,6 +1,7 @@
 import "server-only";
 import { prisma } from "../lib/db";
 import {
+  bitrixInstant,
   lineTotalMinor,
   marginAedMinor,
   revenueFromPayments,
@@ -45,10 +46,12 @@ import {
  * refund rows for staff-recorded ones), never below zero. Provider and link
  * identifiers are never read.
  *
- * Margin (decision C2-9, Q8): one AED amount, the live lines' customer price
- * less their net cost, only for an order charged in AED whose every live
- * line has a known (positive) net cost; otherwise null (an empty field).
- * The net cost itself never leaves this function.
+ * Margin (decision C2-9, Q8, review C2A-10): one AED amount, the gross
+ * profit of `domain/margin.ts` over the live lines (customer price − net
+ * cost − the variable costs in the line's MarginSnapshot), only for an order
+ * charged in AED whose every live line has a known (positive) net cost;
+ * otherwise null (an empty field). The net cost and the snapshot never leave
+ * this function.
  */
 
 const ERASED = "[deleted-";
@@ -89,6 +92,7 @@ async function orderFacts(orderId: string): Promise<(CrmOrderFacts & { erased: b
           chargedAmountMinor: true,
           quoteLineIndex: true,
           netCostAed: true,
+          marginSnapshot: true,
           documents: { where: { status: "valid", customerVisible: true }, select: { id: true }, take: 1 },
         },
       },
@@ -110,7 +114,7 @@ async function orderFacts(orderId: string): Promise<(CrmOrderFacts & { erased: b
   });
   if (!o) return null;
   const currency = o.currency;
-  const { capturedMinor, refundedMinor, authorised, refundPending } = revenueFromPayments(o.payments, currency);
+  const { capturedMinor, refundedMinor, authorised, refundPending, otherCurrencyPaid } = revenueFromPayments(o.payments, currency);
   const items: CrmItemFacts[] = [...o.items]
     .sort((a, b) => (a.quoteLineIndex ?? 0) - (b.quoteLineIndex ?? 0) || a.id.localeCompare(b.id))
     .map((i) => ({
@@ -132,6 +136,7 @@ async function orderFacts(orderId: string): Promise<(CrmOrderFacts & { erased: b
     items,
     totalMinor: currency === "AED" ? o.totalAed : o.totalInr,
     refundPending,
+    otherCurrencyPaid,
     marginAedMinor: currency === "AED" ? marginAedMinor(o.items) : null,
     erased,
     contact: erased ? null : { name: o.leadName, phone: o.leadPhone, email: o.leadEmail },
@@ -140,7 +145,7 @@ async function orderFacts(orderId: string): Promise<(CrmOrderFacts & { erased: b
 }
 
 async function consentFor(contact: CrmContactFacts | null): Promise<CrmConsentFacts> {
-  const flag = (r: { granted: boolean; createdAt: Date } | null): CrmConsentFlag | null => (r ? { granted: r.granted, at: r.createdAt.toISOString() } : null);
+  const flag = (r: { granted: boolean; createdAt: Date } | null): CrmConsentFlag | null => (r ? { granted: r.granted, at: bitrixInstant(r.createdAt) } : null);
   if (!contact) return { marketingEmail: null, marketingWhatsapp: null };
   const select = { granted: true, createdAt: true } as const;
   const [email, whatsapp] = await Promise.all([

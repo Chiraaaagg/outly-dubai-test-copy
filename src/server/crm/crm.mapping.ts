@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { CrmCallError, type DealFields, type ProductRow } from "./bitrix.client";
 import type { CrmConfig, CrmFieldKey, CrmStageKey } from "./crm.config";
+import { evaluateMargin, type FixedCost } from "../domain/margin";
 
 /**
  * Local state → Bitrix24 deal (doc 29 §5.4, §5.5, §8.8; doc 29d; CRM batches
@@ -79,6 +80,8 @@ export interface CrmOrderFacts {
   refundPending?: boolean;
   /** Margin in AED minor units; null when a live line's cost is not known or the order is not charged in AED. */
   marginAedMinor?: bigint | null;
+  /** A counted payment exists in another currency than the order's (never converted; review C2A-05). */
+  otherCurrencyPaid?: boolean;
 }
 
 export interface CrmInquiryFacts {
@@ -240,11 +243,15 @@ const STAFF_COUNTED = new Set(["captured", "partially_refunded", "refunded"]);
  * per payment. An unverified gateway row (`source` anything else) never
  * counts.
  */
-export function revenueFromPayments(payments: CrmPaymentFacts[], currency: string): { capturedMinor: bigint; refundedMinor: bigint; authorised: boolean; refundPending: boolean } {
+export function revenueFromPayments(
+  payments: CrmPaymentFacts[],
+  currency: string,
+): { capturedMinor: bigint; refundedMinor: bigint; authorised: boolean; refundPending: boolean; otherCurrencyPaid: boolean } {
   let captured = 0n;
   let refunded = 0n;
   let authorised = false;
   let refundPending = false;
+  let otherCurrencyPaid = false;
   for (const p of payments) {
     let counted: bigint;
     let back: bigint;
@@ -260,11 +267,15 @@ export function revenueFromPayments(payments: CrmPaymentFacts[], currency: strin
       back = p.refundedMinor > settled ? p.refundedMinor : settled;
     } else continue;
     if (p.refunds.some((r) => OPEN_REFUND.has(r.status))) refundPending = true;
-    if (p.currency !== currency || counted <= 0n) continue;
+    if (counted <= 0n) continue;
+    if (p.currency !== currency) {
+      otherCurrencyPaid = true;
+      continue;
+    }
     captured += counted;
     refunded += back > counted ? counted : back < 0n ? 0n : back;
   }
-  return { capturedMinor: captured, refundedMinor: refunded > captured ? captured : refunded, authorised, refundPending };
+  return { capturedMinor: captured, refundedMinor: refunded > captured ? captured : refunded, authorised, refundPending, otherCurrencyPaid };
 }
 
 /** An order line as the snapshot reads it for money (customer price and net cost; the net cost never leaves the margin). */
@@ -275,6 +286,8 @@ export interface CrmLineMoney {
   chargedCurrency: string | null;
   chargedAmountMinor: bigint | null;
   netCostAed: bigint;
+  /** The quote's MarginSnapshot (instant lines): its `costLines` are the variable costs in the charged currency. */
+  marginSnapshot?: unknown;
 }
 
 /** The line's customer price in `currency`, minor units. */
@@ -282,11 +295,45 @@ export function lineTotalMinor(i: Omit<CrmLineMoney, "status" | "netCostAed">, c
   return i.chargedCurrency === currency && i.chargedAmountMinor !== null ? i.chargedAmountMinor : currency === "AED" ? i.totalAed : i.totalInr;
 }
 
-/** Margin in AED over the live lines (decision C2-9, Q8), or null when a live line's net cost is not known (0 = not recorded). */
+/** The variable costs a line's MarginSnapshot recorded, or null when the snapshot is there but unreadable. No snapshot: none recorded. */
+function variableCosts(snapshot: unknown): FixedCost[] | null {
+  if (snapshot === null || snapshot === undefined) return [];
+  const lines = (snapshot as { costLines?: unknown }).costLines;
+  if (!Array.isArray(lines)) return null;
+  const out: FixedCost[] = [];
+  for (const c of lines) {
+    const minor = (c as { minor?: unknown })?.minor;
+    if ((typeof minor !== "string" || !/^\d{1,15}$/.test(minor)) && !(typeof minor === "number" && Number.isSafeInteger(minor) && minor >= 0)) return null;
+    out.push({ label: "cost", amountMinor: BigInt(minor) });
+  }
+  return out;
+}
+
+/**
+ * Margin in AED (decision C2-9, Q8; review C2A-10): the gross profit of
+ * `domain/margin.ts` summed over the order's live lines, i.e. customer price
+ * (the charged amount) − supplier net − the variable costs the quote's
+ * MarginSnapshot recorded (gateway fee and the like). Assisted lines have no
+ * snapshot, so no variable cost is recorded for them; they count once their
+ * net cost is known. Null (an empty field) when any live line's net cost is
+ * not known (0 = not recorded) or a snapshot cannot be read. AED orders only.
+ */
 export function marginAedMinor(lines: CrmLineMoney[]): bigint | null {
   const l = lines.filter((i) => i.status !== "rejected" && i.status !== "cancelled");
   if (!l.length || l.some((i) => i.netCostAed <= 0n)) return null;
-  return l.reduce((n, i) => n + lineTotalMinor(i, "AED") - i.netCostAed, 0n);
+  let total = 0n;
+  for (const i of l) {
+    const costs = variableCosts(i.marginSnapshot);
+    const sell = lineTotalMinor(i, "AED");
+    if (costs === null || sell < 0n) return null;
+    total += evaluateMargin({ sellMinor: sell, supplierNetMinor: i.netCostAed, fixedCosts: costs }).grossProfitMinor;
+  }
+  return total;
+}
+
+/** A Bitrix24 Date/Time value: ISO 8601 in UTC with an explicit `+00:00` offset and whole seconds. */
+export function bitrixInstant(d: Date): string {
+  return `${d.toISOString().slice(0, 19)}+00:00`;
 }
 
 /** The hash of a pushed shape. `asOfCode`: the "as of" field, left out so an unchanged subject is not re-pushed. */
@@ -299,7 +346,7 @@ export function snapshotHash(fields: DealFields, rows: ProductRow[], asOfCode?: 
 
 const live = (i: CrmItemFacts) => i.status !== "rejected" && i.status !== "cancelled";
 
-export const PAYMENT_WORDS = ["", "not_paid", "authorised", "paid", "partially_refunded", "refunded"] as const;
+export const PAYMENT_WORDS = ["", "not_paid", "authorised", "paid", "paid_other_currency", "partially_refunded", "refunded"] as const;
 export const SUPPLIER_WORDS = ["", "pending", "confirmed", "partially_confirmed", "not_booked"] as const;
 export const TICKET_WORDS = ["", "not_needed", "pending", "partially_issued", "issued"] as const;
 export const REFUND_WORDS = ["", "none", "pending", "partially_refunded", "refunded"] as const;
@@ -308,6 +355,8 @@ export function paymentStatus(o: CrmOrderFacts | null): (typeof PAYMENT_WORDS)[n
   if (!o) return "";
   if (o.refundedMinor > 0n) return o.capturedMinor - o.refundedMinor > 0n ? "partially_refunded" : "refunded";
   if (o.capturedMinor > 0n) return "paid";
+  // Paid, but only in another currency: revenue stays 0 (no conversion is invented) and the word says why.
+  if (o.otherCurrencyPaid) return "paid_other_currency";
   return o.authorised ? "authorised" : "not_paid";
 }
 
@@ -423,7 +472,7 @@ export function mapDeal(state: CrmSubjectState, cfg: CrmMappingConfig, opts: { n
     refund_amount: order ? majorUnits(order.refundedMinor) : "",
     travel_date: travelDate(order ? order.items : inquiry!.items),
     item_summary: itemSummary(state),
-    as_of: (opts.now ?? new Date()).toISOString(),
+    as_of: bitrixInstant(opts.now ?? new Date()),
     indicative_amount: indicative !== null && indicative > 0n ? majorUnits(indicative) : "",
     margin: margin === null ? "" : majorUnits(margin),
     consent_marketing_email: consentValue(consent?.marketingEmail),
@@ -485,12 +534,13 @@ function checkText(text: string, field: string): void {
 }
 
 /** What the guard needs from the configuration. */
-export type CrmGuardConfig = Pick<CrmConfig, "environment" | "fieldCodes" | "defaultOwnerId" | "adminBaseUrl">;
+export type CrmGuardConfig = Pick<CrmConfig, "environment" | "categoryId" | "originatorId" | "fieldCodes" | "defaultOwnerId" | "adminBaseUrl">;
 
 const PHONE_E164 = /^\+[1-9]\d{6,14}$/;
 const EMAIL_STRICT = /^[a-z0-9._%+-]{1,64}@[a-z0-9-]{1,63}(?:\.[a-z0-9-]{1,63})*\.[a-z]{2,24}$/;
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
-const INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
+/** Bitrix24 Date/Time in ISO 8601 with an explicit offset and no fraction (`bitrixInstant`). */
+const INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00$/;
 const REFERENCES = /^(?:INQ|OUT)-\d{5,11}(?: \/ (?:INQ|OUT)-\d{5,11})?$/;
 const SUMMARY = /^\d{1,2} (?:requested|pending|confirmed|completed|not supplied|cancelled)(?:, \d{1,2} (?:pending|confirmed|completed|not supplied|cancelled))*$/;
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
@@ -575,9 +625,9 @@ export function assertSafeCrmPayload(fields: DealFields, rows: ProductRow[], cfg
   const expected = [...BASE_DEAL_KEYS, ...Object.values(codes), ...(opts.create ? ["assignedById"] : [])].sort().join(",");
   if (Object.keys(fields).sort().join(",") !== expected) refuse("deal_keys");
   if (opts.create && fields.assignedById !== cfg.defaultOwnerId) refuse("owner");
-  if (!/^outlyy-(development|staging|production)$/.test(fields.originatorId)) refuse("originator");
+  if (!/^outlyy-(development|staging|production)$/.test(fields.originatorId) || fields.originatorId !== cfg.originatorId) refuse("originator");
   if (!/^(inq|ord):[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(fields.originId)) refuse("origin");
-  if (!Number.isInteger(fields.categoryId) || fields.categoryId <= 0) refuse("category");
+  if (!Number.isInteger(fields.categoryId) || fields.categoryId <= 0 || fields.categoryId !== cfg.categoryId) refuse("category");
   if (!/^C\d{1,9}:[A-Z0-9_]{1,40}$/.test(fields.stageId) || !fields.stageId.startsWith(`C${fields.categoryId}:`)) refuse("stage");
   if (fields.currencyId !== "AED" && fields.currencyId !== "INR") refuse("currency");
   if (!Number.isFinite(fields.opportunity) || fields.opportunity < 0) refuse("opportunity");

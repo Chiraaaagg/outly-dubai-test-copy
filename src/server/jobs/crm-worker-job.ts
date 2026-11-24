@@ -1,6 +1,7 @@
 import "server-only";
 import { BitrixRestClient } from "../crm/bitrix.client";
 import { crmConfigFrom, crmConfigProblems } from "../crm/crm.config";
+import { deleteCrmProbe, runCrmProbe, type ProbeResult } from "../crm/crm.probe";
 import { loadSubjectState } from "../crm/crm.snapshot";
 import { prismaCrmStore, runCrmRetention, type CrmRetentionResult } from "../crm/crm.store";
 import { CRM_RUN_BUDGET_MS, pacedLimiter, runCrmWorker, type CrmRunSummary } from "../crm/crm.worker";
@@ -30,6 +31,35 @@ export const CRM_MAX_REQUESTS_PER_RUN = 12;
 export type CrmJobResult =
   | { ok: true; skipped: string; ranAt: string }
   | ({ ranAt: string; retention: CrmRetentionResult | null } & CrmRunSummary);
+
+export type CrmProbeJobResult = { ok: true; skipped: string; ranAt: string } | ({ ranAt: string } & ProbeResult) | { ok: true; ranAt: string; deleted: number };
+
+/**
+ * The synthetic probe (doc 29d §5.2a; review C2A-01), on request only: POST
+ * with CRON_SECRET and `x-crm-probe: synthetic` (or `delete`). It runs only
+ * while CRM_SYNC_ENABLED is off and the whole configuration validates: it is
+ * the check before switch-on. Field values never leave the probe; the answer
+ * names each field `ok`, `missing` or `different`.
+ */
+export async function runCrmProbeJob(mode: "synthetic" | "delete"): Promise<CrmProbeJobResult> {
+  const e = env();
+  const ranAt = new Date().toISOString();
+  if (e.CRM_SYNC_ENABLED === true) return { ok: true, skipped: "crm sync on: the probe runs only before switch-on", ranAt };
+  const config = crmConfigFrom(e);
+  if (!config) return { ok: true, skipped: "crm not configured", ranAt };
+  const port = new BitrixRestClient(config, {
+    onCall: (c) => emitEvent("crm.call", { method: c.method, status: c.status, durationMs: c.durationMs, outcome: c.outcome }, c.outcome === "ok" ? "info" : "warn"),
+  });
+  if (mode === "delete") {
+    const r = await deleteCrmProbe({ config, port });
+    emitEvent("crm.probe", { mode, deleted: r.deleted });
+    return { ok: true, ranAt, ...r };
+  }
+  const r = await runCrmProbe({ config, port, now: () => new Date() });
+  const bad = Object.entries(r.fields).filter(([, s]) => s !== "ok").map(([k, s]) => `${k}:${s}`);
+  emitEvent("crm.probe", { mode, ok: r.ok, dealId: r.dealId, created: r.created, notOk: bad.join(",") || null }, r.ok ? "info" : "error");
+  return { ...r, ranAt };
+}
 
 export async function runCrmWorkerJob(opts: { now?: () => Date; budgetMs?: number } = {}): Promise<CrmJobResult> {
   const e = env();

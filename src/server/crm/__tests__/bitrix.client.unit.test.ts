@@ -43,7 +43,7 @@ describe("Bitrix24 client", () => {
     expect(u.hostname).toBe(FAKE_HOST);
     expect(u.pathname).toBe(`/rest/${FAKE_USER}/${FAKE_SECRET}/crm.item.add.json`);
     expect(seen[0].init).toMatchObject({ method: "POST", redirect: "error", cache: "no-store" });
-    expect(JSON.parse(String(seen[0].init.body))).toEqual({ entityTypeId: 2, fields });
+    expect(JSON.parse(String(seen[0].init.body))).toEqual({ entityTypeId: 2, useOriginalUfNames: "Y", fields });
   });
 
   it("reads one deal by id in the OUTLYY funnel only, and re-checks the answer (the delete guard's read)", async () => {
@@ -60,6 +60,37 @@ describe("Bitrix24 client", () => {
     expect(await answer([{ ...row, categoryId: 0 }]).findDealById(5)).toBeNull();
     expect(await answer([{ ...row, id: 6 }]).findDealById(5)).toBeNull();
     expect(await answer([]).findDealById(5)).toBeNull();
+  });
+
+  it("sends custom fields under their original UF_CRM_ codes: add and update pass useOriginalUfNames=Y (C2A-01)", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const c = client(async (_url, init) => {
+      bodies.push(JSON.parse(String(init.body)));
+      return json(200, { result: { item: { id: 7 } } });
+    });
+    const withUf = { ...fields, UF_CRM_REFERENCE: "INQ-1048213" } as DealFields;
+    await c.addDeal(withUf);
+    await c.updateDeal(7, withUf);
+    expect(bodies.map((b) => b.useOriginalUfNames)).toEqual(["Y", "Y"]);
+    expect(bodies.every((b) => (b.fields as Record<string, unknown>).UF_CRM_REFERENCE === "INQ-1048213")).toBe(true);
+  });
+
+  it("the fake portal refuses a field that would not land: no flag, an unknown name, a camelCase name, a bad date-time or Yes/No (C2A-01)", async () => {
+    const fake = new FakeBitrix24({ host: FAKE_HOST, userId: FAKE_USER, secret: FAKE_SECRET, now: () => 0 });
+    const post = async (method: string, body: Record<string, unknown>) => {
+      const res = await fake.fetch(`https://${FAKE_HOST}/rest/${FAKE_USER}/${FAKE_SECRET}/${method}.json`, { method: "POST", body: JSON.stringify(body) });
+      return res.status;
+    };
+    const add = (f: Record<string, unknown>, flag: string | null = "Y") => post("crm.item.add", { entityTypeId: 2, ...(flag !== null ? { useOriginalUfNames: flag } : {}), fields: { ...fields, ...f } });
+    expect(await add({ UF_CRM_REFERENCE: "INQ-1048213" })).toBe(200);
+    expect(await add({ UF_CRM_REFERENCE: "INQ-1048213" }, null)).toBe(400);
+    expect(await add({ UF_CRM_REFERENCE: "INQ-1048213" }, "N")).toBe(400);
+    expect(await add({ ufCrmReference: "INQ-1048213" })).toBe(400);
+    expect(await add({ UF_CRM_NOT_ON_PORTAL: "x" })).toBe(400);
+    expect(await add({ UF_CRM_AS_OF: "2026-11-24T10:00:00.000Z" })).toBe(400);
+    expect(await add({ UF_CRM_AS_OF: "2026-11-24T10:00:00+00:00" })).toBe(200);
+    expect(await add({ UF_CRM_CONSENT_MARKETING_EMAIL: "true" })).toBe(400);
+    expect(await add({ UF_CRM_CONSENT_MARKETING_EMAIL: "N" })).toBe(200);
   });
 
   it("searches by originator, origin id and funnel, and re-checks the answer", async () => {

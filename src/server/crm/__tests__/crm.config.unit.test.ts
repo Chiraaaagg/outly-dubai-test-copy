@@ -90,11 +90,14 @@ describe("CRM config", () => {
 
   it("a default deal owner is required: a numeric user id that is not the service account (G4)", () => {
     expect(crmConfigFrom(fakeEnv())!.defaultOwnerId).toBe(Number(FAKE_OWNER));
+    expect(crmConfigProblems(fakeEnv({ CRM_BITRIX_WEBHOOK_USER_ID: `0${FAKE_OWNER}` })).join("; ")).toContain("must not be the service account");
     for (const [v, message] of [
       [undefined, "CRM_BITRIX_DEFAULT_OWNER_ID is missing"],
       ["lead", "numeric user id"],
       ["0", "numeric user id"],
       [FAKE_USER, "must not be the service account"],
+      // C2A-12: the same user written with a leading zero is still the service account.
+      [String(Number(FAKE_USER)), "must not be the service account"],
     ] as const) {
       expect(crmConfigFrom(fakeEnv({ CRM_BITRIX_DEFAULT_OWNER_ID: v })), String(v)).toBeNull();
       expect(crmConfigProblems(fakeEnv({ CRM_BITRIX_DEFAULT_OWNER_ID: v })).join("; ")).toContain(message);

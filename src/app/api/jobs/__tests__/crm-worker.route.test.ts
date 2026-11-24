@@ -69,6 +69,19 @@ describe("crm-worker job route", () => {
     expect(run).not.toHaveBeenCalled();
   });
 
+  it("the synthetic probe: POST only, cron secret, never while the sync is on, never half configured", async () => {
+    const { GET, POST } = await import("../crm-worker/route");
+    const probe = { authorization: `Bearer ${CRON}`, "x-crm-probe": "synthetic" };
+    expect((await POST(req("POST", { "x-crm-probe": "synthetic" }), undefined as never)).status).toBe(401);
+    expect(await (await POST(req("POST", probe), undefined as never)).json()).toMatchObject({ ok: true, skipped: "crm not configured" });
+    // GET ignores the header: the cron path is always the worker.
+    expect(await (await GET(req("GET", probe), undefined as never)).json()).toMatchObject({ skipped: "crm sync off" });
+    vi.stubEnv("CRM_SYNC_ENABLED", "true");
+    resetEnvCache();
+    expect(await (await POST(req("POST", probe), undefined as never)).json()).toMatchObject({ skipped: expect.stringContaining("only before switch-on") });
+    expect(run).not.toHaveBeenCalled();
+  });
+
   it("any value other than exactly \"true\" keeps it off", async () => {
     vi.stubEnv("CRM_SYNC_ENABLED", "TRUE");
     resetEnvCache();
