@@ -164,6 +164,8 @@ export class FakeBitrix24 {
   ignoreTimeFilter = false;
   omitMovedBy = false;
   listLagMs = 0;
+  /** The exact-time filter (`=updatedTime`) matches nothing, as a portal reading it in another format would. */
+  exactTimeEmpty = false;
   stringNumbers = false;
   readonly categories = new Map<number, { id: number; name: string; entityTypeId: number }>([[7, { id: 7, name: "OUTLYY", entityTypeId: 2 }]]);
   stages: FakeStage[] = CRM_STAGE_KEYS.map((k) => ({ STATUS_ID: `C7:${k.toUpperCase()}`, ENTITY_ID: "DEAL_STAGE_7", NAME: k, SEMANTICS: STAGE_SEMANTICS[k] ?? null }));
@@ -414,7 +416,7 @@ export class FakeBitrix24 {
               (f[">id"] === undefined || d.id > Number(f[">id"])) &&
               (ids === null || ids.includes(d.id)) &&
               (since === null || this.ignoreTimeFilter || sec(d) >= since) &&
-              (exact === null || this.ignoreTimeFilter || sec(d) === exact) &&
+              (exact === null || this.ignoreTimeFilter || (!this.exactTimeEmpty && sec(d) === exact)) &&
               (!this.listLagMs || (d.updatedTime ?? 0) <= now - this.listLagMs),
           )
           .sort((a, b) => (byTime ? sec(a) - sec(b) : 0) || a.id - b.id);

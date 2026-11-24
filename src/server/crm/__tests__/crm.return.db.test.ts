@@ -193,7 +193,16 @@ describe.skipIf(!dbEnabled)("CRM return path store (C3ab)", () => {
     const { prismaCrmReturnStore: s } = await import("@/server/crm/crm.return.store");
     const l = await link();
     const now = new Date();
-    await s.requestRecheck(scope, Number(l.crmId), now);
+    const policy = { baseMs: 60_000, capMs: 3_600_000, maxAttempts: 2 };
+    expect(await s.requestRecheck(scope, Number(l.crmId), now, policy)).toEqual({ gaveUp: false });
+    // Backed off: due after a minute, not at once.
+    expect(await s.recheckDue(scope, new Date(now.getTime() + 1_000), 50)).not.toContain(Number(l.crmId));
+    expect(await s.recheckDue(scope, new Date(now.getTime() + 61_000), 50)).toContain(Number(l.crmId));
+    expect(await s.requestRecheck(scope, Number(l.crmId), now, policy)).toEqual({ gaveUp: false });
+    expect((await prisma.crmLink.findUniqueOrThrow({ where: { id: l.id } })).recheckAttempts).toBe(2);
+    expect(await s.requestRecheck(scope, Number(l.crmId), now, policy)).toEqual({ gaveUp: true });
+    expect((await prisma.crmLink.findUniqueOrThrow({ where: { id: l.id } })).recheckRequestedAt).toBeNull();
+    await prisma.crmLink.update({ where: { id: l.id }, data: { recheckRequestedAt: now } });
     expect(await s.recheckDue(scope, new Date(now.getTime() + 1_000), 50)).toContain(Number(l.crmId));
     await prisma.crmLink.update({ where: { id: l.id }, data: { holdUntil: new Date(now.getTime() + 3_600_000) } });
     expect(await s.recheckDue(scope, new Date(now.getTime() + 1_000), 50)).not.toContain(Number(l.crmId));

@@ -43,6 +43,7 @@ const LINK_SELECT = {
   holdUntil: true,
   missingSince: true,
   recheckRequestedAt: true,
+  recheckAttempts: true,
 } as const;
 
 type LinkRecord = {
@@ -70,6 +71,7 @@ type LinkRecord = {
   holdUntil: Date | null;
   missingSince: Date | null;
   recheckRequestedAt: Date | null;
+  recheckAttempts: number | null;
 };
 
 function returnLinkOf(r: LinkRecord): CrmReturnLink {
@@ -98,6 +100,7 @@ function returnLinkOf(r: LinkRecord): CrmReturnLink {
     holdUntil: r.holdUntil,
     missingSince: r.missingSince,
     recheckRequestedAt: r.recheckRequestedAt,
+    recheckAttempts: r.recheckAttempts ?? 0,
   };
 }
 
@@ -154,7 +157,7 @@ export const prismaCrmReturnStore: CrmReturnStore = {
 
   async recheckDue(scope, now, limit) {
     const rows = await prisma.crmLink.findMany({
-      where: { ...where(scope), state: "active", crmId: { not: null }, recheckRequestedAt: { not: null }, OR: [{ holdUntil: null }, { holdUntil: { lte: now } }] },
+      where: { ...where(scope), state: "active", crmId: { not: null }, recheckRequestedAt: { lte: now }, OR: [{ holdUntil: null }, { holdUntil: { lte: now } }] },
       select: { crmId: true },
       orderBy: { recheckRequestedAt: "asc" },
       take: limit,
@@ -162,13 +165,23 @@ export const prismaCrmReturnStore: CrmReturnStore = {
     return rows.map((r) => Number(r.crmId));
   },
 
-  async requestRecheck(scope, crmId, at) {
-    await prisma.crmLink.updateMany({ where: { ...where(scope), crmId: BigInt(crmId), state: "active" }, data: { recheckRequestedAt: at } });
+  async requestRecheck(scope, crmId, now, policy, seenAt) {
+    const l = await prisma.crmLink.findFirst({ where: { ...where(scope), crmId: BigInt(crmId), state: "active" }, select: { id: true, recheckAttempts: true, crmSeenUpdatedAt: true } });
+    if (!l) return { gaveUp: false };
+    if (seenAt && (!l.crmSeenUpdatedAt || l.crmSeenUpdatedAt < seenAt)) await prisma.crmLink.updateMany({ where: { id: l.id }, data: { crmSeenUpdatedAt: seenAt } });
+    const attempts = (l.recheckAttempts ?? 0) + 1;
+    if (attempts > policy.maxAttempts) {
+      await prisma.crmLink.updateMany({ where: { id: l.id }, data: { recheckRequestedAt: null, recheckAttempts: null } });
+      return { gaveUp: true };
+    }
+    const delay = Math.min(policy.capMs, policy.baseMs * 2 ** (attempts - 1));
+    await prisma.crmLink.updateMany({ where: { id: l.id }, data: { recheckRequestedAt: new Date(now.getTime() + delay), recheckAttempts: attempts } });
+    return { gaveUp: false };
   },
 
   async clearRecheck(scope, crmIds) {
     if (!crmIds.length) return;
-    await prisma.crmLink.updateMany({ where: { ...where(scope), crmId: { in: crmIds.map((i) => BigInt(i)) } }, data: { recheckRequestedAt: null } });
+    await prisma.crmLink.updateMany({ where: { ...where(scope), crmId: { in: crmIds.map((i) => BigInt(i)) } }, data: { recheckRequestedAt: null, recheckAttempts: null } });
   },
 
   async returnLinkByCrmId(scope, crmId) {

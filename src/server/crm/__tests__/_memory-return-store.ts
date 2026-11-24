@@ -112,6 +112,7 @@ export class MemoryReturnStore extends MemoryCrmStore implements CrmReturnStore 
       holdUntil: l.holdUntil ?? null,
       missingSince: l.missingSince ?? null,
       recheckRequestedAt: l.recheckRequestedAt ?? null,
+      recheckAttempts: l.recheckAttempts ?? 0,
     };
   }
 
@@ -133,18 +134,27 @@ export class MemoryReturnStore extends MemoryCrmStore implements CrmReturnStore 
 
   async recheckDue(scope: CrmScope, now: Date, limit: number) {
     return (this.inScope(scope) as (CrmLinkRow & LinkExtra)[])
-      .filter((l) => l.state === "active" && l.crmId !== null && l.recheckRequestedAt && (!l.holdUntil || l.holdUntil.getTime() <= now.getTime()))
+      .filter((l) => l.state === "active" && l.crmId !== null && l.recheckRequestedAt && l.recheckRequestedAt.getTime() <= now.getTime() && (!l.holdUntil || l.holdUntil.getTime() <= now.getTime()))
       .sort((a, b) => a.recheckRequestedAt!.getTime() - b.recheckRequestedAt!.getTime())
       .slice(0, limit)
       .map((l) => Number(l.crmId));
   }
 
-  async requestRecheck(scope: CrmScope, crmId: number, at: Date) {
-    for (const l of this.inScope(scope)) if (l.crmId !== null && Number(l.crmId) === crmId && l.state === "active") Object.assign(l, { recheckRequestedAt: at });
+  async requestRecheck(scope: CrmScope, crmId: number, now: Date, policy: { baseMs: number; capMs: number; maxAttempts: number }, seenAt?: Date) {
+    const l = (this.inScope(scope) as (CrmLinkRow & LinkExtra)[]).find((x) => x.crmId !== null && Number(x.crmId) === crmId && x.state === "active");
+    if (!l) return { gaveUp: false };
+    if (seenAt && (!l.crmSeenUpdatedAt || l.crmSeenUpdatedAt.getTime() < seenAt.getTime())) l.crmSeenUpdatedAt = seenAt;
+    const attempts = (l.recheckAttempts ?? 0) + 1;
+    if (attempts > policy.maxAttempts) {
+      Object.assign(l, { recheckRequestedAt: null, recheckAttempts: 0 });
+      return { gaveUp: true };
+    }
+    Object.assign(l, { recheckRequestedAt: new Date(now.getTime() + Math.min(policy.capMs, policy.baseMs * 2 ** (attempts - 1))), recheckAttempts: attempts });
+    return { gaveUp: false };
   }
 
   async clearRecheck(scope: CrmScope, crmIds: number[]) {
-    for (const l of this.inScope(scope)) if (l.crmId !== null && crmIds.includes(Number(l.crmId))) Object.assign(l, { recheckRequestedAt: null });
+    for (const l of this.inScope(scope)) if (l.crmId !== null && crmIds.includes(Number(l.crmId))) Object.assign(l, { recheckRequestedAt: null, recheckAttempts: 0 });
   }
 
   async returnLinkByCrmId(scope: CrmScope, crmId: number) {

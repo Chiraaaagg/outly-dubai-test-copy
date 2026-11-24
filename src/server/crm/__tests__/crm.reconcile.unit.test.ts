@@ -317,7 +317,7 @@ describe("return path: portal fingerprint (G13)", () => {
     expect(h.fake.callsOf("profile")).toHaveLength(reads);
   });
 
-  it("an administrator webhook refuses every run in enforce with a stored fingerprint; in observe it alerts and skips the return path only", async () => {
+  it("an administrator webhook refuses every run in any return path mode, stored fingerprint or not, until a check shows it is not (N-04)", async () => {
     const h = returnHarness();
     await h.storeFingerprint();
     h.fake.admin = true;
@@ -333,10 +333,13 @@ describe("return path: portal fingerprint (G13)", () => {
     o.fake.admin = true;
     const s: CrmSubject = { type: "inquiry", id: subjectId() };
     o.put(inquiryState(s.id));
+    expect(await o.run()).toMatchObject({ outcome: "refused", reason: "service_account_is_admin" });
+    expect(o.fake.dealsFor(originIdFor(s))).toEqual([]);
+    expect((await o.run()).outcome).toBe("refused"); // still refused without another read
+    o.fake.admin = false;
+    o.clock.advance(11 * 60_000);
     expect((await o.run()).outcome).toBe("ran");
     expect(o.fake.dealsFor(originIdFor(s))).toHaveLength(1);
-    expect(o.store.findingsOf("crm_service_account_is_admin")).toHaveLength(1);
-    expect(o.ev("crm.return_skipped").at(-1)!.fields).toMatchObject({ reason: "service_account_is_admin" });
   });
 
   it("an unreadable check is tolerated for 24 hours, then the run is refused until a check succeeds", async () => {

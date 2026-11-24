@@ -243,3 +243,67 @@ describe("other fixes", () => {
     expect(h.store.findingsOf("crm_owner_change_refused")).toHaveLength(1);
   });
 });
+
+describe("re-review round (N-01, N-02)", () => {
+  it("an exact-time read that finds nothing keeps the position and alerts; nothing in that second is skipped", async () => {
+    const h = returnHarness();
+    await h.storeFingerprint();
+    await h.run();
+    const deals = Array.from({ length: 60 }, () => h.linked(inquiryState(subjectId())));
+    h.clock.advance(60_000);
+    for (const d of deals) h.fake.actAs(STAFF.a.bitrix).editField(d.id, "comments", "same second");
+    h.fake.exactTimeEmpty = true;
+    let handled = 0;
+    const tally = () => (handled += Number(h.ev("crm.return_poll").filter((e) => e.fields.mode).at(-1)!.fields.staffOwned ?? 0));
+    for (let i = 0; i < 6; i++) {
+      h.clock.advance(60_000);
+      await h.run();
+      tally();
+    }
+    expect(handled).toBe(50);
+    expect(h.store.findingsOf("crm_poll_stuck")[0].raisedAt.getTime()).toBeGreaterThan(0);
+    h.fake.exactTimeEmpty = false;
+    for (let i = 0; i < 3; i++) {
+      h.clock.advance(60_000);
+      await h.run();
+      tally();
+    }
+    expect(handled).toBe(60);
+  });
+
+  it("a deal whose check keeps failing backs off and is given up with an alert; it never takes every run's calls", async () => {
+    const h = returnHarness();
+    await h.storeFingerprint();
+    const { s, deal } = await h.newDeal();
+    await h.run();
+    h.fake.actAs(STAFF.a.bitrix).moveStage(deal.id, PAID);
+    h.clock.advance(1_000);
+    const load = h.book.load;
+    h.book.load = async (x) => {
+      if (x.id === s.id) throw new Error("always fails");
+      return load(x);
+    };
+    let rechecks = 0;
+    for (let i = 0; i < 40; i++) {
+      await h.run();
+      rechecks += Number(h.ev("crm.return_poll").filter((e) => e.fields.mode).at(-1)!.fields.rechecked ?? 0);
+      h.clock.advance(5 * 60_000);
+    }
+    expect(rechecks).toBeLessThanOrEqual(6);
+    expect(h.ev("crm.return_poll").reduce((n, e) => n + Number(e.fields.dealFailed ?? 0), 0)).toBeLessThanOrEqual(7);
+    expect(h.store.findingsOf("crm_recheck_gave_up")).toHaveLength(1);
+    expect(h.store.returnLinkOf(h.scope, s)!.recheckRequestedAt).toBeNull();
+  });
+
+  it("a recheck of a deal whose push is pending (for good, if its row is dead) drops the marker", async () => {
+    const h = returnHarness();
+    await h.storeFingerprint();
+    const { s, deal } = await h.newDeal();
+    await h.run();
+    h.store.enqueue(h.scope, s); // a push pending...
+    h.store.rows.filter((r) => r.entityId === s.id && r.status === "queued").forEach((r) => Object.assign(r, { status: "dead" })); // ...that never comes
+    await h.store.requestRecheck(h.scope, deal.id, new Date(h.clock.ms() - 120_000), { baseMs: 1, capMs: 1, maxAttempts: 6 });
+    await h.run();
+    expect(h.store.returnLinkOf(h.scope, s)!.recheckRequestedAt).toBeNull();
+  });
+});

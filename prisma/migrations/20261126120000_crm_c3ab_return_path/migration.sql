@@ -65,9 +65,11 @@ ALTER TABLE "crm_links" ADD COLUMN "hold_until" TIMESTAMPTZ(6);
 ALTER TABLE "crm_links" ADD COLUMN "missing_since" TIMESTAMPTZ(6);
 ALTER TABLE "crm_links" ADD COLUMN "sweep_seen_at" TIMESTAMPTZ(6);
 ALTER TABLE "crm_links" ADD COLUMN "recheck_requested_at" TIMESTAMPTZ(6);
+ALTER TABLE "crm_links" ADD COLUMN "recheck_attempts" INTEGER;
 ALTER TABLE "crm_links" ADD CONSTRAINT "crm_links_seen_stage_check" CHECK ("crm_seen_stage_id" IS NULL OR "crm_seen_stage_id" ~ '^[A-Za-z0-9_:-]{1,60}$');
 ALTER TABLE "crm_links" ADD CONSTRAINT "crm_links_seen_owner_check" CHECK ("crm_seen_owner_id" IS NULL OR "crm_seen_owner_id" > 0);
 ALTER TABLE "crm_links" ADD CONSTRAINT "crm_links_revert_count_check" CHECK ("revert_count" IS NULL OR "revert_count" >= 0);
+ALTER TABLE "crm_links" ADD CONSTRAINT "crm_links_recheck_attempts_check" CHECK ("recheck_attempts" IS NULL OR "recheck_attempts" >= 0);
 
 ALTER TABLE "crm_timeline_comments" DROP CONSTRAINT "crm_timeline_comments_kind_check";
 ALTER TABLE "crm_timeline_comments" ADD CONSTRAINT "crm_timeline_comments_kind_check" CHECK ("kind" IN ('paid', 'confirmed', 'tickets_sent', 'refund', 'handed_to_team', 'stage_reverted', 'move_refused', 'owner_unmapped'));
@@ -109,7 +111,7 @@ CREATE TABLE "crm_return_findings" (
       'crm_deal_not_visible', 'crm_twin', 'crm_stage_tamper', 'crm_field_tamper', 'crm_putback_loop',
       'crm_unknown_stage', 'crm_owner_unmapped', 'crm_owner_change_refused', 'crm_portal_fingerprint_mismatch',
       'crm_service_account_is_admin', 'crm_fingerprint_unverified', 'crm_staff_map_invalid', 'crm_return_config_invalid',
-      'crm_poll_stuck')),
+      'crm_poll_stuck', 'crm_recheck_gave_up')),
     CONSTRAINT "crm_return_findings_subject_check" CHECK ("subject_key" ~ '^(portal|deal:[1-9][0-9]{0,17}|(inquiry|order):[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'),
     CONSTRAINT "crm_return_findings_crm_id_check" CHECK ("crm_id" IS NULL OR "crm_id" > 0),
     CONSTRAINT "crm_return_findings_detail_check" CHECK ("detail" IS NULL OR "detail" ~ '^[A-Za-z0-9_.:,>=-]{1,200}$'),

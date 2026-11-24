@@ -2325,6 +2325,8 @@ model CrmLink {
   sweepSeenAt         DateTime? @map("sweep_seen_at") @db.Timestamptz(6)
   /// Read this deal again (after a hold, an observe-mode difference, or a failed check).
   recheckRequestedAt  DateTime? @map("recheck_requested_at") @db.Timestamptz(6)
+  /// Failed rechecks in a row; the marker is dropped (with an alert) after `RECHECK_MAX_ATTEMPTS`.
+  recheckAttempts     Int?      @map("recheck_attempts")
   createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt       DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 

@@ -79,6 +79,8 @@ export const NIGHT_START_UTC = 22;
 export const NIGHT_END_UTC = 2;
 /** The drift cursor's "done for this sweep" marker. */
 export const DRIFT_DONE = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+/** Failed rechecks back off from 1 minute, doubling to 1 hour, and are given up after 6 (re-review N-02). */
+export const RECHECK_POLICY = { baseMs: 60_000, capMs: 3_600_000, maxAttempts: 6 };
 /** A portal-level finding that holds is alerted again this often (review C3-14). */
 export const PORTAL_RERAISE_MS = 6 * 3_600_000;
 
@@ -128,6 +130,7 @@ export const CRM_FINDING_KINDS = [
   "crm_staff_map_invalid",
   "crm_return_config_invalid",
   "crm_poll_stuck",
+  "crm_recheck_gave_up",
 ] as const;
 export type CrmFindingKind = (typeof CRM_FINDING_KINDS)[number];
 
@@ -177,6 +180,8 @@ export interface CrmReturnLinkState {
   missingSince: Date | null;
   /** Read again: after a hold ends, after the switch from observe, after a failed check. */
   recheckRequestedAt: Date | null;
+  /** Failed rechecks in a row (backoff, then given up with an alert). */
+  recheckAttempts: number;
 }
 
 export type CrmReturnLink = CrmLinkRow & CrmReturnLinkState;
@@ -200,8 +205,12 @@ export interface CrmReturnStore {
   setReturnPortal(scope: CrmScope, patch: Partial<CrmReturnPortalState>, guard?: { fingerprintHash: string | null }): Promise<void>;
   /** Deal ids of active links whose recheck is due (marker set, no hold running). */
   recheckDue(scope: CrmScope, now: Date, limit: number): Promise<number[]>;
-  /** Mark the link of this deal id for a recheck (no lock: a column only the reconciler uses). */
-  requestRecheck(scope: CrmScope, crmId: number, at: Date): Promise<void>;
+  /**
+   * A failed check of this deal (no lock: columns only the reconciler uses): one more attempt, due after
+   * `min(capMs, baseMs × 2^attempts)`; past `maxAttempts` the marker is dropped and `gaveUp` is true. With
+   * `seenAt`, the deal's change at that time counts as read by the poll (only the recheck reads it again).
+   */
+  requestRecheck(scope: CrmScope, crmId: number, now: Date, policy: { baseMs: number; capMs: number; maxAttempts: number }, seenAt?: Date): Promise<{ gaveUp: boolean }>;
   clearRecheck(scope: CrmScope, crmIds: number[]): Promise<void>;
   /** The link of this deal id in this scope, any state, with the return columns. No lock. */
   returnLinkByCrmId(scope: CrmScope, crmId: number): Promise<CrmReturnLink | null>;
@@ -528,7 +537,9 @@ async function fingerprintStep(deps: CrmReturnDeps, scope: CrmScope, now: Date, 
         await store.setReturnPortal(scope, { fingerprintState: "admin", fingerprintCheckedAt: now }, guard);
         await portalFinding("crm_service_account_is_admin");
         emit("crm.fingerprint", { outcome: "admin" }, "error");
-        return stop("service_account_is_admin");
+        // A security rule, not an unproven reading (owner answer 11; lead decision on re-review N-04): an
+        // administrator webhook reaches the whole portal, so every push stops, in any mode, stored or not.
+        return { refuse: "service_account_is_admin", verified: false };
       }
       const problems = fp.problems.join(".").slice(0, 80);
       if (stored && (fp.problems.length > 0 || p.fingerprintHash !== fp.hash)) {
@@ -560,7 +571,10 @@ async function fingerprintStep(deps: CrmReturnDeps, scope: CrmScope, now: Date, 
       }
     }
   }
-  if (state === "admin") return stop("service_account_is_admin");
+  if (state === "admin") {
+    await portalFinding("crm_service_account_is_admin");
+    return { refuse: "service_account_is_admin", verified: false };
+  }
   if (!stored) return { verified: false };
   const fresh = okAt !== null && now.getTime() - okAt.getTime() <= FINGERPRINT_GRACE_MS;
   if (!fresh) {
@@ -614,6 +628,7 @@ async function pollStep(deps: CrmReturnDeps, scope: CrmScope, ctx: CrmRunContext
   let handled = 0;
   let blocked = false;
   let atHead = false;
+  let drainEmpty = false;
   const full = () => handled >= POLL_MAX_DEALS || deps.now().getTime() - ctx.started >= ctx.budgetMs;
   const further = (a: PollPos | null, b: PollPos | null) => (!a ? b : !b ? a : b.t.getTime() > a.t.getTime() || (b.t.getTime() === a.t.getTime() && b.id > a.id) ? b : a);
 
@@ -633,8 +648,10 @@ async function pollStep(deps: CrmReturnDeps, scope: CrmScope, ctx: CrmRunContext
       if (e instanceof ReturnBudget) throw e;
       bump(counts, "deal_failed");
       emit("crm.return_failed", { step: "deal", deal: deal.id, reason: e instanceof CrmCallError ? e.code : "internal" }, "warn");
-      // Never treated as handled: looked at again by the recheck (review C3-06).
-      await store.requestRecheck(scope, deal.id, now).catch(() => {});
+      // Never treated as handled: looked at again by the recheck (review C3-06), backing off, and given up with an
+      // alert after a few tries so a deal that always fails cannot take the poll's calls (re-review N-02).
+      const r2 = await store.requestRecheck(scope, deal.id, now, RECHECK_POLICY, t).catch(() => ({ gaveUp: false }));
+      if (r2.gaveUp) await store.raiseFinding(scope, { kind: "crm_recheck_gave_up", subjectKey: `deal:${deal.id}`, crmId: deal.id }, now).catch(() => {});
       r = "done";
     }
     if (r === "retry") return false;
@@ -644,7 +661,8 @@ async function pollStep(deps: CrmReturnDeps, scope: CrmScope, ctx: CrmRunContext
   };
 
   try {
-    if (deps.ret.mode === "enforce") {
+    // Rechecks wait while catching up after a burst: the keyset pages (and a busy second's drain) go first.
+    if (deps.ret.mode === "enforce" && !p.reconcileCatchingUp) {
       const due = await store.recheckDue(scope, now, BITRIX_PAGE);
       if (due.length) {
         await take();
@@ -682,6 +700,14 @@ async function pollStep(deps: CrmReturnDeps, scope: CrmScope, ctx: CrmRunContext
           const sec = await deps.port.listChangedDeals({ at: from.t, afterId: from.id });
           items = [...sec.items].sort((a, b) => a.id - b.id);
           more = true;
+          if (!items.length) {
+            // The portal said this second has more, but the exact-time read finds none: the filter is ignored or
+            // read in another format (doc 29e §14). Never skip the rest of the second silently: keep the position
+            // and alert (re-review N-01).
+            bump(counts, "drain_empty");
+            drainEmpty = true;
+            break;
+          }
           secondDone = !sec.more;
         }
       }
@@ -711,6 +737,7 @@ async function pollStep(deps: CrmReturnDeps, scope: CrmScope, ctx: CrmRunContext
     }
   }
   const catchingUp = !atHead && !blocked && pos !== null;
+  if (drainEmpty) emit("crm.return_poll", { warning: "exact_time_read_empty" }, "error");
   if (catchingUp) {
     // More changes than the pages a run may read: catching up by keyset; alerted while it lasts (doc 29e §11).
     bump(counts, "catching_up");
@@ -777,6 +804,8 @@ async function handleDeal(deps: CrmReturnDeps, scope: CrmScope, holder: string, 
       // A push is about to write OUTLYY's state: it wins (doc 29e §3.4 rule 4). The owner is never pushed, so an
       // owner change is handled now, before the push's echo hides who made it (review C3-09).
       bump(counts, "push_pending");
+      // The push (or its dead-letter alert) settles this deal: a recheck marker is dropped (re-review N-02).
+      if (force && !observe) await store.updateReturnLink(l.id, holder, { recheckRequestedAt: null, recheckAttempts: 0 });
       if (ownerChanged) {
         await ownerRule(deps, scope, l, subject, deal, accept, counts, log, via);
         if (!observe) await store.updateReturnLink(l.id, holder, { crmSeenOwnerId: deal.assignedById });
@@ -787,6 +816,7 @@ async function handleDeal(deps: CrmReturnDeps, scope: CrmScope, holder: string, 
     let mapped = mapDeal(state, config, { now });
     if (!mapped.visible) {
       bump(counts, "not_visible_locally");
+      if (l.recheckRequestedAt) await store.updateReturnLink(l.id, holder, { recheckRequestedAt: null, recheckAttempts: 0 });
       return "done";
     }
     const seen: CrmReturnLinkPatch = {
@@ -795,6 +825,7 @@ async function handleDeal(deps: CrmReturnDeps, scope: CrmScope, holder: string, 
       // Observe keeps the baseline, so the change is still a change once enforce reads it again (review C3-06).
       crmSeenOwnerId: observe && ownerChanged ? l.crmSeenOwnerId : deal.assignedById && deal.assignedById > 0 ? deal.assignedById : null,
       recheckRequestedAt: null,
+      recheckAttempts: 0,
     };
     let diff = dealDiff(deal, mapped, config);
     const service = deal.updatedBy !== null && String(deal.updatedBy) === config.webhookUserId;
