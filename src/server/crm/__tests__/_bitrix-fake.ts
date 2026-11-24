@@ -1,0 +1,203 @@
+import type { FetchLike } from "@/server/crm/bitrix.client";
+
+/**
+ * In-process fake Bitrix24 portal for the CRM tests (doc 29 §7.4 "a fake
+ * Bitrix24 server"). It answers the five `crm.item.*` methods the client may
+ * call (a list filters on `=id`, `=originatorId`, `=originId` and
+ * `=categoryId`; custom fields are stored as sent), over the inbound-webhook
+ * URL shape
+ * `https://<host>/rest/<user>/<secret>/<method>.json`, with the documented
+ * answer and error shapes, and refuses everything else. Synthetic data only;
+ * nothing leaves the process.
+ *
+ * Failure controls:
+ *  - `down`: every call fails at the network (an outage);
+ *  - `script`: the next calls' scripted failures, in order:
+ *      throttle503 (QUERY_LIMIT_EXCEEDED), throttle429 (OPERATION_TIME_LIMIT),
+ *      server_error (500), reject (400 with a provider error), bad_shape
+ *      (200 with an unexpected body), network (fails before the method
+ *      runs), lose_answer (the method runs, then the answer is lost);
+ *  - `revoked`: the webhook answers 401 INVALID_CREDENTIALS;
+ *  - a leaky bucket per portal (2 requests a second, burst 50, the
+ *    documented non-Enterprise limit): beyond it, 503 QUERY_LIMIT_EXCEEDED,
+ *    counted in `bucketRefusals`;
+ *  - `seedDeal` puts a record in place, e.g. a twin.
+ */
+
+export type FakeFailure = "throttle503" | "throttle429" | "server_error" | "reject" | "bad_shape" | "network" | "lose_answer";
+
+export interface FakeDeal {
+  /** OUTLYY custom fields (`UF_CRM_…`) and the responsible person land here as sent. */
+  [field: string]: unknown;
+  id: number;
+  title: string;
+  categoryId: number;
+  stageId: string;
+  opportunity: number;
+  currencyId: string;
+  isManualOpportunity: string;
+  originatorId: string | null;
+  originId: string | null;
+  updatedBy: number;
+  productRows: { productName: string; price: number; quantity: number }[];
+}
+
+export interface FakeCall {
+  method: string;
+  at: number;
+  outcome: "ok" | FakeFailure | "down" | "unauthorized" | "bucket" | "error";
+}
+
+const ALLOWED = new Set(["crm.item.list", "crm.item.add", "crm.item.update", "crm.item.delete", "crm.item.productrow.set"]);
+
+export class FakeBitrix24 {
+  readonly deals = new Map<number, FakeDeal>();
+  readonly calls: FakeCall[] = [];
+  /** Methods asked for that the fake does not offer (a contact or lead call would land here). */
+  readonly refusedMethods: string[] = [];
+  down = false;
+  revoked = false;
+  script: FakeFailure[] = [];
+  bucketRefusals = 0;
+  private nextId = 101;
+  private bucket = 0;
+  private bucketAt = 0;
+
+  constructor(private readonly opts: { host: string; userId: string; secret: string; now: () => number }) {}
+
+  seedDeal(d: Partial<FakeDeal> & Pick<FakeDeal, "originId">): FakeDeal {
+    const deal: FakeDeal = {
+      id: this.nextId++,
+      title: "seeded",
+      categoryId: 7,
+      stageId: "C7:NEW_INQUIRY",
+      opportunity: 0,
+      currencyId: "AED",
+      isManualOpportunity: "Y",
+      originatorId: "outlyy-staging",
+      updatedBy: Number(this.opts.userId),
+      productRows: [],
+      ...d,
+    };
+    this.deals.set(deal.id, deal);
+    return deal;
+  }
+
+  dealsFor(originId: string): FakeDeal[] {
+    return [...this.deals.values()].filter((d) => d.originId === originId).sort((a, b) => a.id - b.id);
+  }
+
+  callsOf(method: string): FakeCall[] {
+    return this.calls.filter((c) => c.method === method);
+  }
+
+  readonly fetch: FetchLike = async (url, init) => {
+    const u = new URL(url);
+    // Any other host does not resolve.
+    if (u.hostname !== this.opts.host || u.protocol !== "https:") throw new TypeError("fetch failed");
+    const m = /^\/rest\/([^/]+)\/([^/]+)\/([a-z.]+)\.json$/.exec(u.pathname);
+    const method = m?.[3] ?? "unknown";
+    const at = this.opts.now();
+    if (this.down) {
+      this.calls.push({ method, at, outcome: "down" });
+      throw new TypeError("fetch failed");
+    }
+    if (!this.takeBucket(at)) {
+      this.bucketRefusals += 1;
+      this.calls.push({ method, at, outcome: "bucket" });
+      return reply(503, { error: "QUERY_LIMIT_EXCEEDED", error_description: "Too many requests" });
+    }
+    if (!m || this.revoked || m[1] !== this.opts.userId || decodeURIComponent(m[2]) !== this.opts.secret) {
+      this.calls.push({ method, at, outcome: "unauthorized" });
+      return reply(401, { error: "INVALID_CREDENTIALS", error_description: "Invalid request credentials" });
+    }
+    if (!ALLOWED.has(method)) {
+      this.refusedMethods.push(method);
+      this.calls.push({ method, at, outcome: "error" });
+      return reply(404, { error: "ERROR_METHOD_NOT_FOUND", error_description: "Method not found!" });
+    }
+    const failure = this.script.shift();
+    if (failure) {
+      this.calls.push({ method, at, outcome: failure });
+      switch (failure) {
+        case "throttle503":
+          return reply(503, { error: "QUERY_LIMIT_EXCEEDED", error_description: "Too many requests" });
+        case "throttle429":
+          return reply(429, { error: "OPERATION_TIME_LIMIT", error_description: "Method is blocked due to operation time limit." });
+        case "server_error":
+          return reply(500, { error: "INTERNAL_SERVER_ERROR", error_description: "Internal server error" });
+        case "reject":
+          return reply(400, { error: "INVALID_ARG_VALUE", error_description: "Invalid value" });
+        case "bad_shape":
+          return reply(200, { result: { unexpected: true } });
+        case "network":
+          throw new TypeError("fetch failed");
+        case "lose_answer":
+          this.handle(method, JSON.parse(String(init.body ?? "{}")));
+          throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+      }
+    }
+    const res = this.handle(method, JSON.parse(String(init.body ?? "{}")));
+    this.calls.push({ method, at, outcome: res.status < 400 ? "ok" : "error" });
+    return reply(res.status, res.body);
+  };
+
+  /** Leaky bucket: drains 2 a second, holds 50. */
+  private takeBucket(at: number): boolean {
+    this.bucket = Math.max(0, this.bucket - ((at - this.bucketAt) / 1000) * 2);
+    this.bucketAt = at;
+    if (this.bucket + 1 > 50) return false;
+    this.bucket += 1;
+    return true;
+  }
+
+  private handle(method: string, p: Record<string, unknown>): { status: number; body: unknown } {
+    const notFound = { status: 400, body: { error: "NOT_FOUND", error_description: "Element not found" } };
+    if (method !== "crm.item.productrow.set" && p.entityTypeId !== 2) return { status: 400, body: { error: "INVALID_ARG_VALUE", error_description: "entityTypeId" } };
+    switch (method) {
+      case "crm.item.list": {
+        const f = (p.filter ?? {}) as Record<string, unknown>;
+        const items = [...this.deals.values()]
+          .filter(
+            (d) =>
+              (f["=id"] === undefined || d.id === Number(f["=id"])) &&
+              (f["=originatorId"] === undefined || d.originatorId === f["=originatorId"]) &&
+              (f["=originId"] === undefined || d.originId === f["=originId"]) &&
+              (f["=categoryId"] === undefined || d.categoryId === f["=categoryId"]),
+          )
+          .sort((a, b) => a.id - b.id)
+          .map((d) => ({ id: d.id, originatorId: d.originatorId, originId: d.originId, categoryId: d.categoryId, updatedBy: d.updatedBy }));
+        return { status: 200, body: { result: { items }, total: items.length, time: { start: 0, finish: 0 } } };
+      }
+      case "crm.item.add": {
+        const fields = p.fields as Record<string, unknown>;
+        const deal = { ...fields, id: this.nextId++, updatedBy: Number(this.opts.userId), productRows: [] } as unknown as FakeDeal;
+        this.deals.set(deal.id, deal);
+        return { status: 200, body: { result: { item: { id: deal.id, title: deal.title, stageId: deal.stageId } } } };
+      }
+      case "crm.item.update": {
+        const d = this.deals.get(Number(p.id));
+        if (!d) return notFound;
+        Object.assign(d, p.fields, { updatedBy: Number(this.opts.userId) });
+        return { status: 200, body: { result: { item: { id: d.id, title: d.title, stageId: d.stageId } } } };
+      }
+      case "crm.item.delete": {
+        if (!this.deals.delete(Number(p.id))) return notFound;
+        return { status: 200, body: { result: [] } };
+      }
+      case "crm.item.productrow.set": {
+        if (p.ownerType !== "D") return { status: 400, body: { error: "INVALID_ARG_VALUE", error_description: "ownerType" } };
+        const d = this.deals.get(Number(p.ownerId));
+        if (!d) return notFound;
+        d.productRows = (p.productRows as FakeDeal["productRows"]).map((r) => ({ ...r }));
+        return { status: 200, body: { result: { productRows: d.productRows.map((r, i) => ({ id: i + 1, ...r })) } } };
+      }
+      default:
+        return { status: 404, body: { error: "ERROR_METHOD_NOT_FOUND" } };
+    }
+  }
+}
+
+function reply(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+}
