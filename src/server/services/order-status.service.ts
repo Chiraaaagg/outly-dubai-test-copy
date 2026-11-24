@@ -7,7 +7,7 @@ import { documentService } from "./document.service";
 import { orderAccessService, type OrderAccess } from "./order-access.service";
 import { evaluateCancellation, loadCancellationFacts, serviceStartUtc, type CancellationFacts } from "./cancellation.service";
 import { ticketFactsForOrder } from "./ticket-facts.service";
-import { EXTERNAL_HOLD_UNUSABLE_CODE } from "../suppliers/external-confirmation";
+import { EXTERNAL_RELEASE_CODES } from "../suppliers/external-confirmation";
 import { inquiryHref } from "@/lib/inquiry-handoff";
 import type { CustomerTicketFacts } from "@/lib/ticket-validity";
 import { EXTERNAL_CONFIRMATION_STATEMENT, freeCancellationCopy, TICKET_NON_REFUNDABLE_STATEMENT } from "@/lib/utils";
@@ -723,7 +723,7 @@ export function projectCustomerStatus(s: StatusSnapshot, now: Date): CustomerOrd
     },
     items,
     canDownload: s.canDownload,
-    inquiryHref: ext.holdUnusable && ["payment_released", "refund_processing", "refunded"].includes(state) ? inquiryHref("external_hold", "booking") : null,
+    inquiryHref: ext.holdUnusable && ["payment_released", "refund_processing", "refunded"].includes(state) ? inquiryHref("external_hold", "booking", s.order.reference) : null,
     pollAfterMs: pollable ?? null,
   };
 }
@@ -821,7 +821,8 @@ export async function loadStatusSnapshot(access: Pick<OrderAccess, "orderId" | "
               // Doc 29 Batch 6: two booleans only; no internal code reaches the projection. Any flag on a waiting booking
               // means our team is on it (review 89 B6-06: a read dead-letter sets one without the hand-off code).
               externalHandedOff: booking.state === "awaiting_external" && booking.attentionRequiredAt !== null,
-              externalHoldUnusable: booking.externalRoute === true && booking.errorCode === EXTERNAL_HOLD_UNUSABLE_CODE,
+              // An unusable hold, or a reservation released while the provider was still making it (review 89 B6-15).
+              externalHoldUnusable: booking.externalRoute === true && booking.errorCode !== null && EXTERNAL_RELEASE_CODES.includes(booking.errorCode),
             }
           : null,
         pickupHotelName: item.pickupHotelNameSnapshot,

@@ -401,6 +401,29 @@ describe.skipIf(!dbEnabled)("B3 payment saga with the real engine and a scripted
     expect(c.gw.callsOf("capture")).toHaveLength(1);
   });
 
+  it("B6-13: five-minute hold, the confirm answer times out, recovery after the send-by reads it confirmed: fulfilled, no saga flag, no refund", async () => {
+    const e = await withEngine({ external: true });
+    e.td.deadlineMs = 5 * 60_000;
+    e.td.steps.confirm.push("applied_lost");
+    const c = await e.sold();
+    await deliver(e.h, c.gw, "payment.authorized", c.gw.pay(c.providerOrderId));
+    await e.work({}, 1);
+    const lost = await e.booking(c.orderItemId);
+    expect(lost.state).toBe("outcome_unknown");
+    expect(c.gw.callsOf("capture")).toHaveLength(1);
+    // Past the send-by (deadline − 60 s) before recovery reads it: the saga must not withdraw the evidence.
+    e.h.clock.advance(5 * 60_000);
+    await e.h.saga.advance(c.sagaId);
+    expect((await sagaState(e.h, c.sagaId)).attentionRequiredAt).toBeNull();
+    await waitWith(e, c.sagaId, 8);
+    expect(await e.booking(c.orderItemId)).toMatchObject({ state: "confirmed" });
+    const s = await sagaState(e.h, c.sagaId);
+    expect(s.state).toBe("fulfilled");
+    expect(s.attentionRequiredAt).toBeNull();
+    expect(await prisma.refund.count({ where: { paymentId: c.paymentId } })).toBe(0);
+    expect(e.td.calls.filter((x) => x === "confirm")).toHaveLength(1);
+  });
+
   it("a hold too short to confirm is released by the saga at once, without capture, and our team is told", async () => {
     const e = await withEngine({ external: true });
     e.td.deadlineMs = 3 * 60_000;

@@ -206,6 +206,8 @@ export function bookingReason(b: { state: string; errorCode: string | null; atte
   if (b.errorCode === "external_confirmation_handoff" && b.attention) return "external_confirmation_handoff";
   if (b.errorCode === "external_booking_failed" && b.attention) return "external_booking_failed";
   if (b.errorCode === "external_hold_unusable" && b.attention) return "external_hold_unusable";
+  if (b.errorCode === "external_reservation_released" && b.attention) return "external_reservation_released";
+  if (b.errorCode === "external_failed_after_confirm" && b.attention) return "external_failed_after_confirm";
   if (b.errorCode === "external_unconfirmed_at_start" && b.attention) return "external_unconfirmed_at_start";
   // Review 89 B6-06: any flag on an external-route booking still waiting on its supplier (a read dead-letter sets a
   // bare one). The query selects external-route rows only for this clause, so internal attempts alert as before.
@@ -216,6 +218,9 @@ export function bookingReason(b: { state: string; errorCode: string | null; atte
   if ((b.state === "outcome_unknown" && b.recoverySearches >= 1) || b.state === "not_found_unresolved") return "outcome_unknown";
   return null;
 }
+
+/** Doc 29 Batch 6: a failed external charge still unrefunded this long after the rejection raises an alert (within the 24 h funds window). */
+export const EXTERNAL_REFUND_ALERT_AFTER_MS = 3 * 3_600_000;
 
 export async function collectOpsIncidents(since: Date, now: Date, limit = COLLECT_LIMIT): Promise<OpsIncident[]> {
   const out: OpsIncident[] = [];
@@ -320,7 +325,7 @@ export async function collectOpsIncidents(since: Date, now: Date, limit = COLLEC
     FROM supplier_bookings b LEFT JOIN orders o ON o.id = b.order_id
     WHERE (
         (b.error_code IN ('late_acceptance', 'late_acceptance_duplicate', 'charged_amount_mismatch', 'funds_unverified',
-            'external_confirmation_handoff', 'external_booking_failed', 'external_hold_unusable', 'external_unconfirmed_at_start') AND b.attention_required_at IS NOT NULL)
+            'external_confirmation_handoff', 'external_booking_failed', 'external_hold_unusable', 'external_unconfirmed_at_start', 'external_reservation_released', 'external_failed_after_confirm') AND b.attention_required_at IS NOT NULL)
         OR (b.state = 'awaiting_external' AND b.attention_required_at IS NOT NULL AND b.external_route IS TRUE)
         OR b.state IN ('manual_review', 'cancel_refused', 'not_found_unresolved')
         OR (b.state = 'outcome_unknown' AND b.recovery_searches >= 1)
@@ -335,6 +340,31 @@ export async function collectOpsIncidents(since: Date, now: Date, limit = COLLEC
       entityKind: "supplier_booking",
       entityId: String(r.id),
       reason,
+      raisedAt: date(r.raised_at),
+      orderId: str(r.order_id),
+      orderReference: str(r.reference),
+      bookingId: String(r.id),
+      supplierBookingRef: str(r.supplier_booking_id),
+      adminPath: bookingPath(str(r.reference)),
+    });
+  }
+
+  // Doc 29 Batch 6 (review 89 B6-14): a failed external booking whose recorded charge has no matching refund in the
+  // wallet book `EXTERNAL_REFUND_ALERT_AFTER_MS` after it was rejected. Raised then, before the funds window closes.
+  const unrefunded = await prisma.$queryRaw<Row[]>`
+    SELECT b.id, b.supplier_booking_id, b.order_id, o.reference, b.closed_at + make_interval(secs => ${EXTERNAL_REFUND_ALERT_AFTER_MS / 1000}::double precision) AS raised_at
+    FROM supplier_bookings b LEFT JOIN orders o ON o.id = b.order_id
+    WHERE b.state = 'rejected' AND b.external_route IS TRUE AND b.closed_at IS NOT NULL
+      AND b.closed_at + make_interval(secs => ${EXTERNAL_REFUND_ALERT_AFTER_MS / 1000}::double precision) BETWEEN ${since} AND ${now}
+      AND EXISTS (SELECT 1 FROM ledger_entries l WHERE l.supplier_booking_id = b.id AND l.book = 'supplier_wallet' AND l.kind = 'charged')
+      AND (SELECT COALESCE(sum(l.amount_minor), 0) FROM ledger_entries l WHERE l.supplier_booking_id = b.id AND l.book = 'supplier_wallet') < 0
+    ORDER BY raised_at DESC LIMIT ${limit}`;
+  for (const r of unrefunded) {
+    out.push({
+      kind: "booking_attention",
+      entityKind: "supplier_booking",
+      entityId: String(r.id),
+      reason: "external_refund_not_seen",
       raisedAt: date(r.raised_at),
       orderId: str(r.order_id),
       orderReference: str(r.reference),

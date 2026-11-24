@@ -173,9 +173,14 @@ export class FakeEngine implements EngineSagaApi, BookingStateReader {
     return new Date(b.reservationDeadline.getTime() - CONFIRM_BUDGET_MS).toISOString();
   }
 
+  /** Doc 29 Batch 6: order items whose attempt is on the external-supplier route. */
+  external = new Set<string>();
+
   async current(orderItemId: string) {
     const b = this.bookings.get(orderItemId);
-    return b ? { id: b.id, state: b.state, reservationDeadline: b.reservationDeadline } : null;
+    if (!b) return null;
+    const ext = this.external.has(orderItemId) ? { externalRoute: true, confirmSent: b.confirmSent === true } : {};
+    return { id: b.id, state: b.state, reservationDeadline: b.reservationDeadline, ...ext };
   }
 
   count(op: EngineOp) {

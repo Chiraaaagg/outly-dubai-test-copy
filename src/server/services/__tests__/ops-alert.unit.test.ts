@@ -41,6 +41,8 @@ describe("which bookings need staff", () => {
     ["an external booking the supplier failed after the confirm", { state: "rejected", errorCode: "external_booking_failed", attention: true, recoverySearches: 0 }, "external_booking_failed"],
     ["an external booking the supplier failed at the reserve (nothing captured)", { state: "rejected", errorCode: "external_booking_failed", attention: false, recoverySearches: 0 }, null],
     ["an external hold too short to confirm, released", { state: "cancelled", errorCode: "external_hold_unusable", attention: true, recoverySearches: 0 }, "external_hold_unusable"],
+    ["review 89 B6-18: a confirmed external booking the provider later failed", { state: "confirmed", errorCode: "external_failed_after_confirm", attention: true, recoverySearches: 0 }, "external_failed_after_confirm"],
+    ["review 89 B6-15: an external reservation released while still in progress", { state: "cancelled", errorCode: "external_reservation_released", attention: true, recoverySearches: 0 }, "external_reservation_released"],
     ["an external booking still unconfirmed when the guest is affected", { state: "awaiting_external", errorCode: "external_unconfirmed_at_start", attention: true, recoverySearches: 0 }, "external_unconfirmed_at_start"],
     ["review 89 B6-06: a waiting external booking with a bare flag (read dead-letter)", { state: "awaiting_external", errorCode: null, attention: true, recoverySearches: 0 }, "external_confirmation_attention"],
   ])("%s", (_n, b, expected) => {

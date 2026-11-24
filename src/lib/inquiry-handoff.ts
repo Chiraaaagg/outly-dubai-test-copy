@@ -46,6 +46,26 @@ export function inquiryReasonForQuote(reasons: readonly string[]): InquiryReason
   return "unavailable";
 }
 
-export function inquiryHref(reason: InquiryReason, from: "checkout" | "booking" = "checkout"): string {
-  return `/inquiry?from=${from}&reason=${reason}`;
+export function inquiryHref(reason: InquiryReason, from: "checkout" | "booking" = "checkout", orderReference?: string | null): string {
+  // Doc 29 Batch 6 (review 89 B6-16): from the status page, the booking reference (no personal data) names the order,
+  // so the inquiry form can carry its activity, date and guests; the cart is already empty there.
+  const order = from === "booking" && orderReference && /^[A-Z0-9-]{4,40}$/.test(orderReference) ? `&order=${orderReference}` : "";
+  return `/inquiry?from=${from}&reason=${reason}${order}`;
+}
+
+/** What the inquiry form needs from a booking the status page sent here (review 89 B6-16): no personal data. */
+export interface InquiryFromBooking {
+  reference: string;
+  items: ReadonlyArray<{ title: string; serviceDate: string; timeslot: string | null; paxLabel: string }>;
+}
+
+/**
+ * The note filled into the inquiry form for a booking the status page sent
+ * here, so our team sees the activity, date, time and guests without the
+ * customer retyping them. Null when the booking has no item.
+ */
+export function inquiryNotesFromBooking(b: InquiryFromBooking): string | null {
+  if (!b.items.length) return null;
+  const lines = b.items.map((i) => `${i.title}, ${i.serviceDate}${i.timeslot ? ` at ${i.timeslot}` : ""}, ${i.paxLabel}`);
+  return `Booking ${b.reference} could not be booked online. Please book: ${lines.join("; ")}.`;
 }

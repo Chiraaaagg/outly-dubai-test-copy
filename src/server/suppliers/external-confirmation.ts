@@ -23,7 +23,10 @@
  *     minute, so the scheduled worker waits inside its run for a poll due
  *     within 15 s, at most `EXTERNAL_POLL_WAITS_PER_RUN` (3) times: up to four
  *     reads a minute, spaced by the queue, bounded by the run's time budget
- *     and the read budget. After the hand-off the interval is a quarter of the
+ *     and the read budget. Only the `EXTERNAL_FAST_POLL_MAX` (8)
+ *     longest-waiting bookings of an account poll at 15 s; the others are
+ *     read once a minute, so the fast cadence takes at most 32 of the
+ *     engine's 90 reads a minute. After the hand-off the interval is a quarter of the
  *     time since the hand-off, from one minute up to `EXTERNAL_POLL_MAX_MS`
  *     (10 min); polling goes on until the supplier shows an end state.
  *
@@ -63,7 +66,10 @@
  *     `isExternalConfirmationInProgress` is true is no usable hold yet: the
  *     booking stays `reserved` (the saga does not capture), is re-read every
  *     15 s, and is released `EXTERNAL_IN_PROGRESS_RELEASE_LEAD_MS` (2 min, the
- *     saga's capture budget) before its send-by if it is still in progress.
+ *     saga's capture budget) before its send-by if it is still in progress;
+ *     like an unusable hold, our team is then told
+ *     (`external_reservation_released`) and the customer is offered "Send it
+ *     to our team".
  *
  *  5. A failed booking after its charge (review 89 B6-05) counts as an open
  *     hold of the wallet for `EXTERNAL_REJECTED_HELD_MS` (24 h) while no refund
@@ -79,6 +85,16 @@ export const EXTERNAL_POLL_INTERVAL_MS = 15_000;
 export const EXTERNAL_POLL_MIN_MS = 10_000;
 /** How many times one scheduled worker run waits for a poll due within the interval (rule 1): up to four reads a minute. */
 export const EXTERNAL_POLL_WAITS_PER_RUN = 3;
+/**
+ * Review 89 B6-17: at most this many waiting external bookings per account
+ * are polled at the 15 s cadence, the longest-waiting first; the others are
+ * read once a minute (`EXTERNAL_POLL_SLOW_MS`) until a fast place frees up.
+ * 8 × 4 = 32 reads a minute at most from the engine's 90-a-minute reserve,
+ * plus one a minute for each further waiting booking.
+ */
+export const EXTERNAL_FAST_POLL_MAX = 8;
+/** Cadence of a waiting external booking outside the fast set. */
+export const EXTERNAL_POLL_SLOW_MS = 60_000;
 /** Shortest interval after the hand-off. */
 export const EXTERNAL_POLL_AFTER_HANDOFF_MS = 60_000;
 /** Longest interval between polls. */
@@ -104,10 +120,16 @@ export const EXTERNAL_HANDOFF_CODE = "external_confirmation_handoff";
 export const EXTERNAL_PAST_START_CODE = "external_unconfirmed_at_start";
 /** `supplier_bookings.error_code` of a booking the external supplier failed (`isExternalBookingFailed`). */
 export const EXTERNAL_FAILED_CODE = "external_booking_failed";
+/** `supplier_bookings.error_code` of a confirmed external booking that reconciliation finds failed or in progress again (review 89 B6-18). */
+export const EXTERNAL_FAILED_AFTER_CONFIRM_CODE = "external_failed_after_confirm";
 /** `supplier_bookings.error_code` of an external hold too short (or of unknown length) to confirm safely. */
 export const EXTERNAL_HOLD_UNUSABLE_CODE = "external_hold_unusable";
 /** `supplier_bookings.error_code` of an external reservation the provider is still making (rule 4). */
 export const EXTERNAL_HOLD_IN_PROGRESS_CODE = "external_reservation_in_progress";
+/** `supplier_bookings.error_code` of a reservation released while the provider was still making it (rule 4; review 89 B6-15). */
+export const EXTERNAL_RESERVATION_RELEASED_CODE = "external_reservation_released";
+/** Codes kept through the release that follows, for the ops alert and the "Send it to our team" offer. */
+export const EXTERNAL_RELEASE_CODES: readonly string[] = [EXTERNAL_HOLD_UNUSABLE_CODE, EXTERNAL_RESERVATION_RELEASED_CODE];
 
 /** Asia/Dubai is UTC+4 all year. */
 const DUBAI_OFFSET_MS = 4 * 3_600_000;

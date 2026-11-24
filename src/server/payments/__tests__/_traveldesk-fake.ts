@@ -13,7 +13,8 @@ import { TravelDeskApiError } from "../../suppliers/traveldesk/traveldesk.http";
  */
 
 /** `in_progress` and `external_failed` (doc 29 Batch 6): the confirm answers an external confirmation still running, or failed (201 with the flag). */
-type Step = "ok" | "lost" | "in_progress" | "external_failed" | TravelDeskApiError;
+/** `applied_lost` (review 89 B6-13): the confirm goes through at TravelDesk, but its answer times out. */
+type Step = "ok" | "lost" | "applied_lost" | "in_progress" | "external_failed" | TravelDeskApiError;
 
 export class ScriptedTravelDesk implements TravelDeskBookingTransport {
   calls: string[] = [];
@@ -111,6 +112,7 @@ export class ScriptedTravelDesk implements TravelDeskBookingTransport {
     if (held.status !== 7) throw new TravelDeskApiError("bad_request", "bookings.confirm", { status: 400, reason: "The reservation is no longer active" });
     const b = { ...held, status: 1, reservationDeadline: null, externalInProgress: s === "in_progress", externalFailed: s === "external_failed" };
     this.store.set(id, b);
+    if (s === "applied_lost") throw new TravelDeskApiError("timeout", "bookings.confirm");
     return b;
   }
 

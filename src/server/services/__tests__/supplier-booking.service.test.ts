@@ -856,6 +856,18 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
     expect(td.calls).not.toContain("cancel");
   });
 
+  it("review 89 B6-19: with every read failing, the hand-off is raised within a minute of the wait limit, not after the error backoff", async () => {
+    const td = new FakeTravelDesk(now);
+    td.steps.confirm.push("in_progress");
+    const b = await create(ext({ serviceDate: "2030-03-01" }));
+    await drain(td, 0);
+    const since = (await booking(b.id)).confirmedAt!.getTime();
+    td.outageUntil = since + 3 * 3_600_000;
+    await drain(td, since + 31 * 60_000 - clock, 10_000);
+    const reasons = (await events(b.id)).filter((e) => e.kind === "attention").map((e) => (e.detail as { reason?: string }).reason);
+    expect(reasons).toContain("external_confirmation_handoff");
+  });
+
   it("review 89 B6-12: still unconfirmed when the guest is affected, our team is told again", async () => {
     const td = new FakeTravelDesk(now);
     td.steps.confirm.push("in_progress");
@@ -892,6 +904,29 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
     const none: number[] = [];
     await svc.runDueJobs(deps(td, { sleep: async (ms) => void none.push(ms) }), { budgetMs: 200_000 });
     expect(none).toEqual([]);
+  });
+
+  it("review 89 B6-17: only the eight longest-waiting external bookings of an account poll every 15 s; the rest once a minute", async () => {
+    const td = new FakeTravelDesk(now);
+    // Earlier tests may have left waiting rows on this account: close them out of the count.
+    await prisma.supplierBooking.updateMany({ where: { supplierId, state: "awaiting_external" }, data: { externalRoute: null } });
+    const ids: string[] = [];
+    for (let i = 0; i < 10; i++) {
+      td.steps.confirm.push("in_progress");
+      const b = await create(ext({ serviceDate: "2030-03-01" }));
+      await drain(td, 0, 1_000);
+      ids.push(b.id);
+    }
+    // One poll round for all: each re-queues its next read.
+    clock += 61_000;
+    await svc.runDueJobs(deps(td), { budgetMs: 60_000 });
+    const gaps = [];
+    for (const id of ids) {
+      const job = await prisma.supplierJob.findUniqueOrThrow({ where: { dedupeKey: `poll:${id}` } });
+      gaps.push(job.runAfter.getTime() - clock);
+    }
+    expect(gaps.slice(0, 8).every((g) => g <= 15_000)).toBe(true);
+    expect(gaps.slice(8).every((g) => g === 60_000)).toBe(true);
   });
 
   it("201 with the failed flag: a confirm the external supplier rejected is `rejected`, our team is told, and nothing is cancelled", async () => {
@@ -953,6 +988,9 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
     expect(td.calls).not.toContain("confirm");
     expect(["cancelled", "expired"]).toContain(released.state);
     expect((await events(b.id)).some((e) => e.kind === "release_requested")).toBe(true);
+    // Review 89 B6-15: told like an unusable hold, and the code outlives the release.
+    expect(released.errorCode).toBe("external_reservation_released");
+    expect(released.attentionRequiredAt).not.toBeNull();
     const td2 = new FakeTravelDesk(now);
     td2.steps.reserve.push("external_failed");
     const failed = await create(ext());
@@ -981,7 +1019,9 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
     const held = await booking(b.id);
     expect(held.externalRoute).toBe(true);
     expect(held.reservationDeadline!.getTime()).toBe(sent + 5 * 60_000);
-    expect((await svc.confirmSendByFor(b.id, { mutationTimeoutMs: 1_000 }))!.getTime()).toBe(sent + 4 * 60_000);
+    // On the worker's (test) clock: `confirmSendByFor` answers on the database clock, which the test clock is years from.
+    expect(engine.confirmSendBy(held, { mutationTimeoutMs: 1_000 })!.getTime()).toBe(sent + 4 * 60_000);
+    expect(await svc.confirmSendByFor(b.id, { mutationTimeoutMs: 1_000 })).not.toBeNull();
     await drain(td, 0);
     expect(await booking(b.id)).toMatchObject({ state: "confirmed", errorCode: null });
   });
@@ -1009,6 +1049,34 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
     expect(held.reservationDeadline).toBeNull();
     expect(held).toMatchObject({ state: "reserved", errorCode: "external_hold_unusable" });
     expect(td.calls).not.toContain("confirm");
+  });
+
+  it("review 89 B6-14: a failed external charge counts as held for 24 h from its rejection, less any refund, and alerts after 3 h unrefunded", async () => {
+    const t = new Date();
+    const probe = { id: uuidv7(), supplierId, environment: "test" as const, accountId: "default" };
+    const before = await engine.openHoldsMinor(probe, t);
+    async function failedCharge(closedAgoMs: number, entries: Array<["charged" | "refunded", bigint]>) {
+      const b = await create(ext());
+      await prisma.supplierBooking.update({ where: { id: b.id }, data: { state: "rejected", closedAt: new Date(t.getTime() - closedAgoMs), errorCode: "external_booking_failed" } });
+      for (const [kind, amountMinor] of entries) {
+        await prisma.ledgerEntry.create({
+          data: { id: uuidv7(), book: "supplier_wallet", supplierBookingId: b.id, currency: "AED", amountMinor, kind, evidenceRef: `zz-td-${RUN}:b6-14`, occurredAt: t },
+        });
+      }
+      return b;
+    }
+    const inside = await failedCharge(4 * 3_600_000, [["charged", -10_000n]]);
+    await failedCharge(25 * 3_600_000, [["charged", -7_000n]]);
+    await failedCharge(3_600_000, [["charged", -9_000n], ["refunded", 4_000n]]);
+    await failedCharge(3_600_000, [["charged", -3_000n], ["refunded", 3_000n]]);
+    // Inside the window 10,000; after it nothing; a partial refund holds the remainder only; a full one nothing.
+    expect((await engine.openHoldsMinor(probe, t)) - before).toBe(15_000n);
+    // A later write to the row does not restart the window (keyed on closed_at).
+    await prisma.supplierBooking.updateMany({ where: { supplierId, state: "rejected", closedAt: { lt: new Date(t.getTime() - 24 * 3_600_000) } }, data: { attentionRequiredAt: null } });
+    expect((await engine.openHoldsMinor(probe, t)) - before).toBe(15_000n);
+    const { collectOpsIncidents } = await import("../ops-alert.service");
+    const incidents = await collectOpsIncidents(new Date(t.getTime() - 2 * 3_600_000), t);
+    expect(incidents.filter((i) => i.entityId === inside.id).map((i) => i.reason)).toEqual(["external_refund_not_seen"]);
   });
 
   it("an internal drill keeps the 15-minute rule when the answer gives no deadline", async () => {
@@ -2173,6 +2241,11 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
 
   describe("wallet funds (doc 29 §4.5, D1)", () => {
     const prodKey = () => bookingControlKeyFor(CODE, "production", "777");
+    // The Batch 6 cases above leave failed external charges on this account, which the funds cross-check counts as
+    // open holds for 24 h (review 89 B6-05, B6-14). These Batch 0 cases model an account with none: age them out.
+    beforeEach(async () => {
+      await prisma.supplierBooking.updateMany({ where: { supplierId, state: "rejected", externalRoute: true }, data: { closedAt: new Date(Date.now() - 48 * 3_600_000) } });
+    });
     afterAll(async () => {
       await prisma.setting.deleteMany({ where: { key: prodKey() } });
     });
@@ -2458,6 +2531,22 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
       expect(r.issues.filter((i) => i.bookingId === b.id).map((i) => i.kind)).toEqual(["refund_not_seen"]);
       expect(r.reblocked).toBe(0);
       expect((await booking(b.id)).state).toBe("rejected");
+    });
+
+    it("review 89 B6-18: a confirmed external booking the provider later fails is reported and told to our team; no money moves, no state change", async () => {
+      await onlyRecent();
+      const td = new FakeTravelDesk(now);
+      const b = await create(intent({ externalRoute: true }));
+      await drain(td, 0);
+      const done = await booking(b.id);
+      expect(done.state).toBe("confirmed");
+      td.store.set(done.supplierBookingId!, { ...td.store.get(done.supplierBookingId!)!, externalInProgress: false, externalFailed: true });
+      const r = await reconcile(td);
+      expect(r.issues.filter((i) => i.bookingId === b.id).map((i) => i.kind)).toEqual(["status_mismatch"]);
+      const flagged = await booking(b.id);
+      expect(flagged).toMatchObject({ state: "confirmed", errorCode: "external_failed_after_confirm" });
+      expect(flagged.attentionRequiredAt).not.toBeNull();
+      expect(td.calls).not.toContain("cancel");
     });
 
     it("a booking closed as never created that TravelDesk shows live is re-blocked at once, with an alert (late acceptance)", async () => {

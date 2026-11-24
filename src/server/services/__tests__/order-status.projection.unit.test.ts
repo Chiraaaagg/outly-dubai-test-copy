@@ -695,10 +695,10 @@ describe("external-supplier items: fix round (review 89, owner decisions of 24 N
     expect(released.state).toBe("payment_released");
     expect(released.headline).toContain("Nothing was charged");
     expect(released.nextStep).toContain("Send it to our team");
-    expect(released.inquiryHref).toBe("/inquiry?from=booking&reason=external_hold");
+    expect(released.inquiryHref).toBe("/inquiry?from=booking&reason=external_hold&order=OUT-10000017");
     // Capture-first gateway: refunded instead, same offer.
     const refunded = projectCustomerStatus(snap("refunded", { captured: true, item: { booking: ext("cancelled", { externalHoldUnusable: true, confirmedAt: null }), refunds: [{ status: "succeeded", createdAt: T0, updatedAt: T0 }] } }), NOW);
-    expect(refunded.inquiryHref).toBe("/inquiry?from=booking&reason=external_hold");
+    expect(refunded.inquiryHref).toBe("/inquiry?from=booking&reason=external_hold&order=OUT-10000017");
     // Any other release offers nothing new.
     expect(projectCustomerStatus(snap("released", { item: { booking: ext("cancelled", { confirmedAt: null }) } }), NOW).inquiryHref).toBeNull();
     expect(forbiddenKeys(released)).toEqual([]);

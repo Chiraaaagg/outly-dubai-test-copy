@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { Suspense, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { Sparkles } from "lucide-react";
 import { useApp } from "@/components/providers/app-provider";
@@ -14,7 +14,8 @@ import { Scene } from "@/components/ui/scene";
 import { siteConfig } from "@/lib/site-config";
 import { formatDateKey, paxLabel, priceIn } from "@/lib/utils";
 import { readCheckoutDraft } from "@/lib/checkout-draft";
-import { inquiryReasonText, parseInquiryReason, type InquiryReason } from "@/lib/inquiry-handoff";
+import { inquiryNotesFromBooking, inquiryReasonText, parseInquiryReason, type InquiryReason } from "@/lib/inquiry-handoff";
+import { fetchOrderStatus } from "@/lib/api/order-status";
 
 /**
  * INQUIRY PAGE — replaces checkout as the cart's terminal step in inquiry mode.
@@ -58,12 +59,29 @@ function InquiryInner() {
     return draft ? { name: draft.fullName, phone: draft.phone, countryCode: draft.countryCode, email: draft.email } : undefined;
   });
   const fromCheckout: { reason: InquiryReason | null; initial?: typeof draftInitial } = { reason, initial: draftInitial };
+  // Doc 29 Batch 6 (review 89 B6-16): from the status page, the released booking's activity, date and guests are read
+  // through the access-checked status API (this browser must already see the order) and filled into the form.
+  const orderRef = from === "booking" ? params.get("order") : null;
+  const [fromBooking, setFromBooking] = useState<{ notes: string; date: string } | null | undefined>(orderRef ? undefined : null);
+  useEffect(() => {
+    if (!orderRef) return;
+    let live = true;
+    fetchOrderStatus(orderRef)
+      .then((s) => {
+        const notes = s ? inquiryNotesFromBooking({ reference: s.reference, items: s.items }) : null;
+        if (live) setFromBooking(s && notes ? { notes, date: s.items[0].serviceDate } : null);
+      })
+      .catch(() => live && setFromBooking(null));
+    return () => {
+      live = false;
+    };
+  }, [orderRef]);
   const total = cart.reduce(
     (sum, i) => ({ inr: sum.inr + i.total.inr, aed: sum.aed + i.total.aed }),
     { inr: 0, aed: 0 },
   );
 
-  if (!hydrated) {
+  if (!hydrated || fromBooking === undefined) {
     return (
       <div className="container-page py-10">
         <Skeleton className="h-96 w-full rounded-[var(--radius-tile)]" />
@@ -95,6 +113,7 @@ function InquiryInner() {
           <Alert tone="info" title="Why this trip is with our team">
             {inquiryReasonText(fromCheckout.reason)} Nothing has been charged.
             {fromCheckout.initial ? " The details you typed at checkout are filled in below." : ""}
+            {fromBooking ? " The activity, date and guests of your booking are filled in below." : ""}
           </Alert>
         </div>
       )}
@@ -102,12 +121,14 @@ function InquiryInner() {
       {cart.length === 0 ? (
         <div className="grid grid-safe gap-8 lg:grid-cols-[1.4fr_1fr] lg:items-start">
           <Card className="p-5 sm:p-6">
-            <p className="mb-4 flex items-center gap-2 rounded-[var(--radius-control)] bg-shell p-3 text-sm text-ink-700">
-              <Sparkles className="h-4 w-4 shrink-0 text-sun-500" aria-hidden="true" />
-              Nothing picked yet? That&apos;s fine, tell us your dates and group and we&apos;ll
-              suggest a plan.
-            </p>
-            <InquiryForm items={[]} initial={fromCheckout.initial} />
+            {!fromBooking && (
+              <p className="mb-4 flex items-center gap-2 rounded-[var(--radius-control)] bg-shell p-3 text-sm text-ink-700">
+                <Sparkles className="h-4 w-4 shrink-0 text-sun-500" aria-hidden="true" />
+                Nothing picked yet? That&apos;s fine, tell us your dates and group and we&apos;ll
+                suggest a plan.
+              </p>
+            )}
+            <InquiryForm items={[]} initial={fromCheckout.initial} initialNotes={fromBooking?.notes} initialDate={fromBooking?.date} />
           </Card>
           <Sidebar />
         </div>

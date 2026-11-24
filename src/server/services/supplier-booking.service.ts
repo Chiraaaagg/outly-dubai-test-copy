@@ -43,6 +43,7 @@ import { checkOfferCapability } from "../suppliers/capability-gate";
 import { bookingKindSellable, parseClassKey } from "../suppliers/traveldesk/traveldesk.capability";
 import {
   EXTERNAL_CONFIRM_MARGIN_MS,
+  EXTERNAL_FAILED_AFTER_CONFIRM_CODE,
   EXTERNAL_FAILED_CODE,
   EXTERNAL_HANDOFF_CODE,
   EXTERNAL_HOLD_IN_PROGRESS_CODE,
@@ -51,7 +52,11 @@ import {
   EXTERNAL_PAST_START_CODE,
   EXTERNAL_POLL_INTERVAL_MS,
   EXTERNAL_POLL_MIN_MS,
+  EXTERNAL_FAST_POLL_MAX,
+  EXTERNAL_POLL_SLOW_MS,
   EXTERNAL_REJECTED_HELD_MS,
+  EXTERNAL_RELEASE_CODES,
+  EXTERNAL_RESERVATION_RELEASED_CODE,
   externalHandoffAt,
   externalHoldUsable,
   externalPollDelayMs,
@@ -1453,22 +1458,31 @@ export const WALLET_DIRECTION_PAUSE_REASON = "wallet_direction_auto";
 const OPEN_HOLD_STATES: SupplierBookingState[] = ["reserving", "reserved", "awaiting_payment", "confirming"];
 
 /** Outly's own open holds on the booking's supplier account, other than the booking itself. */
-async function openHoldsMinor(b: Pick<SupplierBooking, "id" | "supplierId" | "environment" | "accountId">, now: Date = new Date()): Promise<bigint> {
+export async function openHoldsMinor(b: Pick<SupplierBooking, "id" | "supplierId" | "environment" | "accountId">, now: Date = new Date()): Promise<bigint> {
   const scope = { supplierId: b.supplierId, environment: b.environment, accountId: b.accountId, id: { not: b.id } };
   const rows = await prisma.supplierBooking.findMany({ where: { ...scope, state: { in: OPEN_HOLD_STATES } }, select: { expectedNetMinor: true, chargedNetMinor: true } });
-  // Doc 29 Batch 6 (review 89 B6-05): an external booking the supplier failed after a recorded charge, with no refund
-  // recorded yet, may still tie up its money for a while; it counts as held for `EXTERNAL_REJECTED_HELD_MS`.
+  const held = rows.reduce((sum, x) => sum + (x.chargedNetMinor !== null && x.chargedNetMinor > x.expectedNetMinor ? x.chargedNetMinor : x.expectedNetMinor), 0n);
+  return held + (await failedExternalHeldMinor(scope, now));
+}
+
+/**
+ * Doc 29 Batch 6 (review 89 B6-05, B6-14): what failed external bookings may
+ * still tie up in the wallet. A `rejected` external-route booking closed in
+ * the last `EXTERNAL_REJECTED_HELD_MS` (keyed on `closed_at`, set once when it
+ * was rejected, so a later write does not restart it) counts with its
+ * recorded charge less what the book shows refunded; a partial refund lowers
+ * it by the refunded amount only. From the wallet book, never from a price.
+ */
+async function failedExternalHeldMinor(scope: { supplierId: string; environment: SupplierEnvironment; accountId: string; id: { not: string } }, now: Date): Promise<bigint> {
   const failed = await prisma.supplierBooking.findMany({
-    where: {
-      ...scope,
-      state: "rejected",
-      externalRoute: true,
-      updatedAt: { gt: new Date(now.getTime() - EXTERNAL_REJECTED_HELD_MS) },
-      ledgerEntries: { some: { book: SUPPLIER_WALLET_BOOK, kind: "charged" }, none: { book: SUPPLIER_WALLET_BOOK, kind: "refunded" } },
-    },
-    select: { expectedNetMinor: true, chargedNetMinor: true },
+    where: { ...scope, state: "rejected", externalRoute: true, closedAt: { gt: new Date(now.getTime() - EXTERNAL_REJECTED_HELD_MS) }, ledgerEntries: { some: { book: SUPPLIER_WALLET_BOOK, kind: "charged" } } },
+    select: { ledgerEntries: { where: { book: SUPPLIER_WALLET_BOOK }, select: { amountMinor: true } } },
   });
-  return [...rows, ...failed].reduce((sum, x) => sum + (x.chargedNetMinor !== null && x.chargedNetMinor > x.expectedNetMinor ? x.chargedNetMinor : x.expectedNetMinor), 0n);
+  // Entries are signed: charges negative, refunds positive. What is still out is minus their sum.
+  return failed.reduce((sum, x) => {
+    const out = -x.ledgerEntries.reduce((a, e) => a + e.amountMinor, 0n);
+    return out > 0n ? sum + out : sum;
+  }, 0n);
 }
 
 /**
@@ -1580,6 +1594,7 @@ export const supplierBookingService = {
     const byRef = new Map(theirs.filter((t) => t.bookingReference).map((t) => [t.bookingReference!, t]));
     const issues: ReconcileIssue[] = [];
     const lateAccepted: { b: SupplierBooking; t: SupplierSnapshot }[] = [];
+    const failedAfterConfirm: SupplierBooking[] = [];
     const matched = new Set<string>();
     const issue = (kind: ReconcileIssueKind, b: SupplierBooking | null, t: SupplierSnapshot | null) =>
       issues.push({ kind, bookingId: b?.id ?? null, supplierBookingId: t?.ref ?? b?.supplierBookingId ?? null, reference: t?.bookingReference ?? b?.clientRef ?? null, ours: b?.state ?? null, theirs: t?.status ?? null });
@@ -1603,6 +1618,13 @@ export const supplierBookingService = {
         if (back === null || back < t.chargedNetMinor) issue("refund_not_seen", b, t);
       }
       if (b.state === "not_created" || b.state === "rejected") continue;
+      // Review 89 B6-18: the window list reads every row with the Batch 0–5 mapping, so a confirmed external booking
+      // the provider later failed (or reopened) is found on its own flags. Reported and told to our team; no money moves.
+      if (b.state === "confirmed" && b.externalRoute === true && (externalFailedSnapshot(t) || t.externalInProgress === true)) {
+        issue("status_mismatch", b, t);
+        failedAfterConfirm.push(b);
+        continue;
+      }
       if (UNCERTAIN.includes(b.state)) {
         issue("uncertain_state", b, t);
         continue;
@@ -1638,6 +1660,15 @@ export const supplierBookingService = {
     const flagged = issues.map((i) => i.bookingId).filter((id): id is string => id !== null);
     const moved = new Set((await prisma.supplierBooking.findMany({ where: { id: { in: flagged }, updatedAt: { gt: readAt } }, select: { id: true } })).map((b) => b.id));
     const settled = issues.filter((i) => !i.bookingId || !moved.has(i.bookingId));
+
+    for (const b of failedAfterConfirm) {
+      if (moved.has(b.id) || b.attentionRequiredAt) continue;
+      const flagged = await prisma.supplierBooking.updateMany({
+        where: { id: b.id, state: "confirmed", attentionRequiredAt: null },
+        data: { attentionRequiredAt: now, errorCode: EXTERNAL_FAILED_AFTER_CONFIRM_CODE, errorMessage: "The external provider shows a confirmed booking as failed or in progress" },
+      });
+      if (flagged.count) await writeEvent(prisma, b.id, "attention", { detail: { via: "reconcile", reason: EXTERNAL_FAILED_AFTER_CONFIRM_CODE } });
+    }
 
     let reblocked = 0;
     for (const { b, t } of lateAccepted) {
@@ -2195,7 +2226,13 @@ export const supplierBookingService = {
       if (job.supplier_booking_id) await writeEvent(prisma, job.supplier_booking_id, "alert", { detail: { reason: "mutation_job_failed", jobKind: job.kind } });
       return;
     }
-    const delay = Math.min(RECOVERY_DELAY_MS * 2 ** Math.min(errors - 1, 10), READ_RETRY_MAX_MS);
+    let delay = Math.min(RECOVERY_DELAY_MS * 2 ** Math.min(errors - 1, 10), READ_RETRY_MAX_MS);
+    // Review 89 B6-19: a failing poll of a waiting external booking retries no later than its next time-based alert,
+    // so the hand-off and the at-start alert (decided before the read) are not held back by the error backoff.
+    if (job.kind === "poll" && job.supplier_booking_id) {
+      const due = await this.nextExternalAlertAt(job.supplier_booking_id);
+      if (due) delay = Math.min(delay, Math.max(RECOVERY_DELAY_MS, due.getTime() - deps.now().getTime()));
+    }
     await prisma.supplierJob.updateMany({
       where: { id: job.id, lockedBy: deps.holder },
       data: { status: "queued", attempts: errors, lastError: msg, runAfter: new Date(deps.now().getTime() + delay), lockedBy: null, lockedUntil: null },
@@ -3052,7 +3089,9 @@ export const supplierBookingService = {
         // back only once the supplier shows it failed or gone.
         const polls = b.pollCount + 1;
         await prisma.supplierBooking.updateMany({ where: { id: b.id, state: b.state }, data: { ...responseData(s), pollCount: polls } });
-        const interval = externalPollDelayMs(wait?.due ? t.getTime() - wait.handoffAt.getTime() : null);
+        let interval = externalPollDelayMs(wait?.due ? t.getTime() - wait.handoffAt.getTime() : null);
+        // Review 89 B6-17: only the longest-waiting few of the account poll at the fast cadence.
+        if (!wait?.due && !(await this.inFastPollSet(b))) interval = Math.max(interval, EXTERNAL_POLL_SLOW_MS);
         await enqueue(prisma, "poll", b.id, new Date(t.getTime() + interval), deps.holder);
         return wait?.handedOffNow ? "handed_off" : "still_in_progress";
       }
@@ -3064,6 +3103,12 @@ export const supplierBookingService = {
       if (s.externalInProgress !== true) return this.applySupplierState(b, s, deps, "poll");
       const sendBy = confirmSendBy(b, deps);
       if (!sendBy || t.getTime() >= sendBy.getTime() - EXTERNAL_IN_PROGRESS_RELEASE_LEAD_MS) {
+        // Review 89 B6-15: told like an unusable hold (ops alert, "Send it to our team"); the code outlives the release.
+        await prisma.supplierBooking.updateMany({
+          where: { id: b.id, state: b.state },
+          data: { ...responseData(s), errorCode: EXTERNAL_RESERVATION_RELEASED_CODE, errorMessage: "The external provider was still making the reservation at its release point", attentionRequiredAt: b.attentionRequiredAt ?? t },
+        });
+        await writeEvent(prisma, b.id, "attention", { detail: { reason: EXTERNAL_RESERVATION_RELEASED_CODE } });
         await this.releaseHold(b.id, EXTERNAL_HOLD_IN_PROGRESS_CODE, { now: deps.now, saga: deps.saga });
         return "reservation_in_progress_released";
       }
@@ -3078,6 +3123,47 @@ export const supplierBookingService = {
       return "still_reserved";
     }
     return this.applySupplierState(b, s, deps, "watchdog");
+  },
+
+  /**
+   * Review 89 B6-19: the next time-based alert of a waiting external-route
+   * booking not raised yet (the hand-off, then the at-start alert), or null.
+   */
+  async nextExternalAlertAt(bookingId: string): Promise<Date | null> {
+    const b = await prisma.supplierBooking.findUnique({ where: { id: bookingId } });
+    if (!b || b.state !== "awaiting_external" || b.externalRoute !== true) return null;
+    const date = isoDate(b.serviceDate);
+    const startMinutes = externalWaitStartMinutes(b.startMinutes, b.pickupTimeMinutes);
+    const pending: number[] = [];
+    for (const [reason, at] of [
+      [EXTERNAL_HANDOFF_CODE, externalHandoffAt({ since: b.confirmedAt ?? b.reservedAt ?? b.createdAt, serviceDate: date, startMinutes }).getTime()],
+      [EXTERNAL_PAST_START_CODE, serviceStartMs(date, startMinutes)],
+    ] as const) {
+      const raised = await prisma.supplierBookingEvent.count({ where: { supplierBookingId: b.id, kind: "attention", detail: { path: ["reason"], equals: reason } } });
+      if (!raised) pending.push(at);
+    }
+    return pending.length ? new Date(Math.min(...pending)) : null;
+  },
+
+  /**
+   * Review 89 B6-17: whether this waiting external booking is among the
+   * `EXTERNAL_FAST_POLL_MAX` longest-waiting ones of its account (earliest
+   * `confirmed_at`, then id), which poll at 15 s.
+   */
+  async inFastPollSet(b: SupplierBooking): Promise<boolean> {
+    const since = b.confirmedAt ?? b.createdAt;
+    const ahead = await prisma.supplierBooking.count({
+      where: {
+        supplierId: b.supplierId,
+        environment: b.environment,
+        accountId: b.accountId,
+        state: "awaiting_external",
+        externalRoute: true,
+        id: { not: b.id },
+        OR: [{ confirmedAt: { lt: since } }, { confirmedAt: since, id: { lt: b.id } }],
+      },
+    });
+    return ahead < EXTERNAL_FAST_POLL_MAX;
   },
 
   /**
@@ -3241,10 +3327,11 @@ export const supplierBookingService = {
       return moved ? "manual_review" : "lost_race";
     }
     // PAY-1: a customer booking is never confirmed without captured payment, whatever the supplier reports.
-    // Doc 29 Batch 6 (review 89 B6-01): a booking waiting on its external supplier had its confirm sent under evidence;
-    // its late answer is accepted while the payment that backed that confirm is still captured and not refunded,
-    // whatever flag the saga has raised meanwhile.
-    if ((to === "confirmed" || to === "awaiting_external") && needsPayment(b) && !(await this.paymentEvidence(b, deps)) && !(b.state === "awaiting_external" && b.externalRoute === true && (await this.sentEvidenceHolds(b)))) {
+    // Doc 29 Batch 6 (review 89 B6-01, B6-13): an external booking whose confirm was sent under evidence (waiting on its
+    // supplier, or in recovery after a lost confirm answer) has its late answer accepted while the payment that backed
+    // that confirm is still captured and not refunded, whatever flag the saga has raised meanwhile.
+    // Review 89 B6-13: whatever state the answer finds it in (a lost or timed-out confirm leaves it in recovery).
+    if ((to === "confirmed" || to === "awaiting_external") && needsPayment(b) && !(await this.paymentEvidence(b, deps)) && !(b.externalRoute === true && (await this.sentEvidenceHolds(b)))) {
       return this.holdUnpaid(b, s, deps, via);
     }
     if (to === "confirmed") {
@@ -3277,10 +3364,12 @@ export const supplierBookingService = {
       else note = failed;
     }
     if (reservationInProgress && !problem) note = { errorCode: EXTERNAL_HOLD_IN_PROGRESS_CODE, errorMessage: "The external provider is still making the reservation" };
-    // The unusable-hold code outlives the release that follows, so the ops alert still sees it.
-    const kept = b.errorCode === EXTERNAL_HOLD_UNUSABLE_CODE ? { errorCode: b.errorCode, errorMessage: b.errorMessage ?? "" } : null;
+    // The unusable-hold and released-reservation codes outlive the release that follows, so the ops alert and the
+    // status page still see them.
+    const kept = b.errorCode !== null && EXTERNAL_RELEASE_CODES.includes(b.errorCode) ? { errorCode: b.errorCode, errorMessage: b.errorMessage ?? "" } : null;
     const lateHeld = !problem && b.attentionRequiredAt !== null && (await this.wasLateAccepted(b.id));
-    const code = problem ?? note ?? kept;
+    // A kept release code wins over a note (a re-read of a released reservation still in progress keeps it).
+    const code = problem ?? kept ?? note;
     const extra: Prisma.SupplierBookingUpdateManyMutationInput = lateHeld ? { ...responseData(s) } : { ...responseData(s), errorCode: code?.errorCode ?? null, errorMessage: code?.errorMessage ?? null };
     if (problem) extra.attentionRequiredAt = b.attentionRequiredAt ?? t;
     else if (!lateHeld && (holding || to === "confirmed" || to === "awaiting_external")) extra.attentionRequiredAt = null;
