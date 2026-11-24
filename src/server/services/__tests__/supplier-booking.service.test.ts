@@ -36,6 +36,12 @@ const enabled = Boolean(process.env.DATABASE_URL);
 const RUN = uuidv7().slice(-8);
 const CODE = `zz-td-${RUN}`;
 const OFFER = 777_001;
+/**
+ * Review 89 B6-23: a block that needs a wallet account of its own (no rows of
+ * other cases on it) sets this; `create`, `deps` and new fakes then act for
+ * that agency id instead of the shared `default` account.
+ */
+let ownAccount: number | null = null;
 
 type Step = "ok" | "lost" | "in_progress" | "still_reserved" | "external_failed" | "wrong_date" | TravelDeskApiError;
 
@@ -57,7 +63,7 @@ class FakeTravelDesk implements TravelDeskBookingTransport {
   fundsMinor: bigint | null = 10_000_000n;
   /** When set, the three raw wallet figures the balance read reports instead of a credit account built from `fundsMinor` (doc 29 §4.5). */
   wallet: { balanceMinor: bigint; creditFacilityMinor: bigint; payableBalanceMinor: bigint } | null = null;
-  agencyId = 1;
+  agencyId = ownAccount ?? 1;
   balanceReads = 0;
   /** Runs inside the balance read, i.e. after the job was claimed and just before the send. */
   onBalance: (() => Promise<void>) | null = null;
@@ -253,7 +259,7 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
   }
 
   function create(i: CreateIntentInput, opts: Record<string, unknown> = {}) {
-    return svc.createIntent(null, i, { supplierCode: CODE, now, ...opts });
+    return svc.createIntent(null, i, { supplierCode: CODE, now, ...(ownAccount !== null ? { accountId: String(ownAccount) } : {}), ...opts });
   }
 
   function adapterFor(td: FakeTravelDesk) {
@@ -261,7 +267,16 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
   }
 
   function deps(td: FakeTravelDesk, over: Partial<EngineDeps> = {}): EngineDeps {
-    return { adapter: adapterFor(td), environment: "test", supplierCode: CODE, mutationTimeoutMs: 1_000, now, readLimits: readLimits(1_000_000), ...over };
+    return {
+      adapter: adapterFor(td),
+      environment: "test",
+      supplierCode: CODE,
+      mutationTimeoutMs: 1_000,
+      now,
+      readLimits: readLimits(1_000_000),
+      ...(ownAccount !== null ? { accountId: String(ownAccount) } : {}),
+      ...over,
+    };
   }
 
   /** Run jobs, advancing the clock between rounds, until nothing is due within `maxMs`. */
@@ -927,6 +942,27 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
     }
     expect(gaps.slice(0, 8).every((g) => g <= 15_000)).toBe(true);
     expect(gaps.slice(8).every((g) => g === 60_000)).toBe(true);
+  });
+
+  it("review 89 B6-22: handed-off waits take no fast place: with eight of them, a new wait still polls every 15 s", async () => {
+    const td = new FakeTravelDesk(now);
+    await prisma.supplierBooking.updateMany({ where: { supplierId, state: "awaiting_external" }, data: { externalRoute: null } });
+    const old: string[] = [];
+    for (let i = 0; i < 8; i++) {
+      td.steps.confirm.push("in_progress");
+      const b = await create(ext({ serviceDate: "2030-03-01" }));
+      await drain(td, 0, 1_000);
+      old.push(b.id);
+    }
+    // All eight handed to our team.
+    await prisma.supplierBooking.updateMany({ where: { id: { in: old } }, data: { attentionRequiredAt: now(), errorCode: "external_confirmation_handoff" } });
+    td.steps.confirm.push("in_progress");
+    const fresh = await create(ext({ serviceDate: "2030-03-01" }));
+    await drain(td, 0, 1_000);
+    clock += 20_000;
+    await svc.runDueJobs(deps(td), { budgetMs: 60_000 });
+    const job = await prisma.supplierJob.findUniqueOrThrow({ where: { dedupeKey: `poll:${fresh.id}` } });
+    expect(job.runAfter.getTime() - clock).toBeLessThanOrEqual(15_000);
   });
 
   it("201 with the failed flag: a confirm the external supplier rejected is `rejected`, our team is told, and nothing is cancelled", async () => {
@@ -2241,13 +2277,60 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
 
   describe("wallet funds (doc 29 §4.5, D1)", () => {
     const prodKey = () => bookingControlKeyFor(CODE, "production", "777");
-    // The Batch 6 cases above leave failed external charges on this account, which the funds cross-check counts as
-    // open holds for 24 h (review 89 B6-05, B6-14). These Batch 0 cases model an account with none: age them out.
-    beforeEach(async () => {
-      await prisma.supplierBooking.updateMany({ where: { supplierId, state: "rejected", externalRoute: true }, data: { closedAt: new Date(Date.now() - 48 * 3_600_000) } });
+    // Review 89 B6-23: these cases run on a test wallet account of their own, so rows other cases leave on the shared
+    // account (failed external charges count as open holds for 24 h, B6-05/B6-14) never change their outcome.
+    beforeAll(() => {
+      ownAccount = 600_000 + Math.floor(Math.random() * 99_999);
     });
     afterAll(async () => {
+      ownAccount = null;
       await prisma.setting.deleteMany({ where: { key: prodKey() } });
+    });
+
+    it("review 89 B6-23: a failed external charge explains a payable figure below the derived one, by at most its unrefunded charge, for at most 24 h", async () => {
+      const td = new FakeTravelDesk(now);
+      const t = new Date();
+      async function failedCharge(closedAgoMs: number, refundedMinor = 0n) {
+        const f = await create(intent({ externalRoute: true }));
+        await prisma.supplierJob.updateMany({ where: { supplierBookingId: f.id }, data: { status: "cancelled" } });
+        await prisma.supplierBooking.update({ where: { id: f.id }, data: { state: "rejected", closedAt: new Date(t.getTime() - closedAgoMs), errorCode: "external_booking_failed" } });
+        const entry = (kind: string, amountMinor: bigint) => ({ id: uuidv7(), book: "supplier_wallet", supplierBookingId: f.id, currency: "AED" as const, amountMinor, kind, evidenceRef: `zz-td-${RUN}:b6-23`, occurredAt: t });
+        await prisma.ledgerEntry.create({ data: entry("charged", -5_000n) });
+        if (refundedMinor > 0n) await prisma.ledgerEntry.create({ data: entry("refunded", refundedMinor) });
+        return f;
+      }
+      async function reserveWith(wallet: FakeTravelDesk["wallet"]) {
+        td.wallet = wallet;
+        // Held, not confirmed: the only job due is this reserve.
+        const b = await create(intent({ afterReserve: "hold" }));
+        const r = await svc.runDueJobs(deps(td), { budgetMs: 60_000 });
+        const outcomes = r.processed.map((p) => p.outcome);
+        // A hold taken here is closed again, so it never explains the next case's gap.
+        await prisma.supplierJob.updateMany({ where: { supplierBookingId: b.id }, data: { status: "cancelled" } });
+        await prisma.supplierBooking.updateMany({ where: { id: b.id, state: { in: ["reserved", "awaiting_payment"] } }, data: { state: "cancelled", closedAt: new Date() } });
+        return { b, outcomes };
+      }
+      // Payable 350.00 against a derived 400.00: a gap of 50.00, the failed external charge still out.
+      const gap = { balanceMinor: -40_000n, creditFacilityMinor: 0n, payableBalanceMinor: 35_000n };
+      const failed = await failedCharge(3_600_000);
+      const inside = await reserveWith(gap);
+      expect(inside.outcomes.some((o) => o.startsWith("funds_unverified"))).toBe(false);
+      expect(inside.outcomes).toContain("reserved");
+      expect((await booking(inside.b.id)).reservedAt).not.toBeNull();
+      // It spends the lower figure.
+      expect(await walletEvents(inside.b.id, "funds_check")).toEqual([{ fundsMinor: 35_000, runningMinor: null }]);
+      // Never a payable figure above the derived one.
+      const above = await reserveWith({ balanceMinor: -40_000n, creditFacilityMinor: 0n, payableBalanceMinor: 45_000n });
+      expect(above.outcomes).toContain("funds_unverified:funds_mismatch");
+      // Never more than the unrefunded charge: with 20.00 of it refunded, a 50.00 gap is no longer explained.
+      await prisma.ledgerEntry.create({ data: { id: uuidv7(), book: "supplier_wallet", supplierBookingId: failed.id, currency: "AED", amountMinor: 2_000n, kind: "refunded", evidenceRef: `zz-td-${RUN}:b6-23`, occurredAt: t } });
+      const partial = await reserveWith(gap);
+      expect(partial.outcomes).toContain("funds_unverified:funds_mismatch");
+      // Never after 24 h: the same gap, explained only by a charge rejected 25 hours ago, is refused.
+      await prisma.supplierBooking.update({ where: { id: failed.id }, data: { closedAt: new Date(t.getTime() - 25 * 3_600_000) } });
+      await failedCharge(25 * 3_600_000);
+      const after = await reserveWith(gap);
+      expect(after.outcomes).toContain("funds_unverified:funds_mismatch");
     });
 
     async function walletEvents(id: string, kind: string) {

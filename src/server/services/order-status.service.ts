@@ -723,7 +723,7 @@ export function projectCustomerStatus(s: StatusSnapshot, now: Date): CustomerOrd
     },
     items,
     canDownload: s.canDownload,
-    inquiryHref: ext.holdUnusable && ["payment_released", "refund_processing", "refunded"].includes(state) ? inquiryHref("external_hold", "booking", s.order.reference) : null,
+    inquiryHref: ext.holdUnusable && ["payment_released", "refund_processing", "refunded"].includes(state) ? inquiryHref("external_hold", "booking") : null,
     pollAfterMs: pollable ?? null,
   };
 }

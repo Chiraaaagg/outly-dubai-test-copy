@@ -54,6 +54,7 @@ import {
   EXTERNAL_POLL_MIN_MS,
   EXTERNAL_FAST_POLL_MAX,
   EXTERNAL_POLL_SLOW_MS,
+  EXTERNAL_WAIT_LIMIT_MS,
   EXTERNAL_REJECTED_HELD_MS,
   EXTERNAL_RELEASE_CODES,
   EXTERNAL_RESERVATION_RELEASED_CODE,
@@ -3091,7 +3092,7 @@ export const supplierBookingService = {
         await prisma.supplierBooking.updateMany({ where: { id: b.id, state: b.state }, data: { ...responseData(s), pollCount: polls } });
         let interval = externalPollDelayMs(wait?.due ? t.getTime() - wait.handoffAt.getTime() : null);
         // Review 89 B6-17: only the longest-waiting few of the account poll at the fast cadence.
-        if (!wait?.due && !(await this.inFastPollSet(b))) interval = Math.max(interval, EXTERNAL_POLL_SLOW_MS);
+        if (!wait?.due && !(await this.inFastPollSet(b, t))) interval = Math.max(interval, EXTERNAL_POLL_SLOW_MS);
         await enqueue(prisma, "poll", b.id, new Date(t.getTime() + interval), deps.holder);
         return wait?.handedOffNow ? "handed_off" : "still_in_progress";
       }
@@ -3148,9 +3149,11 @@ export const supplierBookingService = {
   /**
    * Review 89 B6-17: whether this waiting external booking is among the
    * `EXTERNAL_FAST_POLL_MAX` longest-waiting ones of its account (earliest
-   * `confirmed_at`, then id), which poll at 15 s.
+   * `confirmed_at`, then id), which poll at 15 s. Bookings past their hand-off
+   * (flagged, or waiting longer than the normal limit) poll slowly already and
+   * take no fast place (review 89 B6-22).
    */
-  async inFastPollSet(b: SupplierBooking): Promise<boolean> {
+  async inFastPollSet(b: SupplierBooking, now: Date): Promise<boolean> {
     const since = b.confirmedAt ?? b.createdAt;
     const ahead = await prisma.supplierBooking.count({
       where: {
@@ -3159,8 +3162,9 @@ export const supplierBookingService = {
         accountId: b.accountId,
         state: "awaiting_external",
         externalRoute: true,
+        attentionRequiredAt: null,
         id: { not: b.id },
-        OR: [{ confirmedAt: { lt: since } }, { confirmedAt: since, id: { lt: b.id } }],
+        AND: [{ confirmedAt: { gt: new Date(now.getTime() - EXTERNAL_WAIT_LIMIT_MS) } }, { OR: [{ confirmedAt: { lt: since } }, { confirmedAt: since, id: { lt: b.id } }] }],
       },
     });
     return ahead < EXTERNAL_FAST_POLL_MAX;

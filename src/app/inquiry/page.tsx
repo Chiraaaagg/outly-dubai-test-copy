@@ -14,7 +14,7 @@ import { Scene } from "@/components/ui/scene";
 import { siteConfig } from "@/lib/site-config";
 import { formatDateKey, paxLabel, priceIn } from "@/lib/utils";
 import { readCheckoutDraft } from "@/lib/checkout-draft";
-import { inquiryNotesFromBooking, inquiryReasonText, parseInquiryReason, type InquiryReason } from "@/lib/inquiry-handoff";
+import { inquiryNotesFromBooking, inquiryReasonText, parseInquiryReason, forgetBookingForInquiry, readBookingForInquiry, type InquiryReason } from "@/lib/inquiry-handoff";
 import { fetchOrderStatus } from "@/lib/api/order-status";
 
 /**
@@ -59,12 +59,14 @@ function InquiryInner() {
     return draft ? { name: draft.fullName, phone: draft.phone, countryCode: draft.countryCode, email: draft.email } : undefined;
   });
   const fromCheckout: { reason: InquiryReason | null; initial?: typeof draftInitial } = { reason, initial: draftInitial };
-  // Doc 29 Batch 6 (review 89 B6-16): from the status page, the released booking's activity, date and guests are read
-  // through the access-checked status API (this browser must already see the order) and filled into the form.
-  const orderRef = from === "booking" ? params.get("order") : null;
+  // Doc 29 Batch 6 (review 89 B6-16, B6-21): from the status page, the released booking's reference comes through this
+  // tab's sessionStorage (never the URL), and its activity, date and guests are read through the access-checked status
+  // API (this browser must already see the order) and filled into the form.
+  const [orderRef] = useState<string | null>(() => (from === "booking" && typeof window !== "undefined" ? readBookingForInquiry() : null));
   const [fromBooking, setFromBooking] = useState<{ notes: string; date: string } | null | undefined>(orderRef ? undefined : null);
   useEffect(() => {
     if (!orderRef) return;
+    forgetBookingForInquiry();
     let live = true;
     fetchOrderStatus(orderRef)
       .then((s) => {

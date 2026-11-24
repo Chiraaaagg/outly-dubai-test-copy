@@ -46,11 +46,54 @@ export function inquiryReasonForQuote(reasons: readonly string[]): InquiryReason
   return "unavailable";
 }
 
-export function inquiryHref(reason: InquiryReason, from: "checkout" | "booking" = "checkout", orderReference?: string | null): string {
-  // Doc 29 Batch 6 (review 89 B6-16): from the status page, the booking reference (no personal data) names the order,
-  // so the inquiry form can carry its activity, date and guests; the cart is already empty there.
-  const order = from === "booking" && orderReference && /^[A-Z0-9-]{4,40}$/.test(orderReference) ? `&order=${orderReference}` : "";
-  return `/inquiry?from=${from}&reason=${reason}${order}`;
+export function inquiryHref(reason: InquiryReason, from: "checkout" | "booking" = "checkout"): string {
+  // Review 89 B6-21 (PRV-4): never a booking reference in this URL. `/inquiry` is a measured page, and its URL reaches
+  // analytics. The status page hands the reference over in this tab's sessionStorage instead (`rememberBookingForInquiry`).
+  return `/inquiry?from=${from}&reason=${reason}`;
+}
+
+/** sessionStorage key of the booking the status page hands to the inquiry form (review 89 B6-16, B6-21). */
+export const INQUIRY_BOOKING_KEY = "outly.inquiry.booking.v1";
+const BOOKING_REFERENCE = /^[A-Z0-9-]{4,40}$/;
+
+type HandoffStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">;
+
+function tabStorage(): HandoffStorage | null {
+  try {
+    return typeof window === "undefined" ? null : window.sessionStorage;
+  } catch {
+    return null;
+  }
+}
+
+/** The status page, on "Send it to our team": keep the booking reference for the inquiry form in this tab only. */
+export function rememberBookingForInquiry(reference: string, storage: HandoffStorage | null = tabStorage()): void {
+  if (!storage || !BOOKING_REFERENCE.test(reference)) return;
+  try {
+    storage.setItem(INQUIRY_BOOKING_KEY, reference);
+  } catch {
+    /* ignore: the form then opens without the booking */
+  }
+}
+
+/** The inquiry page: the handed-over booking reference, or null when there is none. `forgetBookingForInquiry` removes it. */
+export function readBookingForInquiry(storage: HandoffStorage | null = tabStorage()): string | null {
+  if (!storage) return null;
+  try {
+    const ref = storage.getItem(INQUIRY_BOOKING_KEY);
+    return ref && BOOKING_REFERENCE.test(ref) ? ref : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Removes the handed-over booking reference once the inquiry page has read it. */
+export function forgetBookingForInquiry(storage: HandoffStorage | null = tabStorage()): void {
+  try {
+    storage?.removeItem(INQUIRY_BOOKING_KEY);
+  } catch {
+    /* ignore */
+  }
 }
 
 /** What the inquiry form needs from a booking the status page sent here (review 89 B6-16): no personal data. */
