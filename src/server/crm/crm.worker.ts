@@ -739,12 +739,16 @@ async function flushTimeline(
           stop = { code: err.code, error: err };
           await back(err.code);
         } else if (err.kind === "auth") {
-          stop = { code: err.code, error: err };
-          // The portal answered other calls in this run: the refusal is this deal's, so it counts (no endless retry).
-          if (portalAnswered || posted > 0) {
+          if (portalAnswered || probed || posted > 0) {
+            // Other calls in this run were answered, so the credential is fine: the refusal is this deal's. It counts an
+            // attempt (no endless retry) and opens no circuit, so it neither pauses the sync nor raises crm_auth_refused (R-02).
             if (attempts >= TIMELINE_MAX_ATTEMPTS) await settle({ status: "failed", code: err.code, attempts }, "failed");
             else await back(err.code, attempts, backoffMs(attempts, random));
-          } else await back(err.code);
+          } else {
+            // Nothing else answered: treat it as the portal's, like a row's auth answer.
+            stop = { code: err.code, error: err };
+            await back(err.code);
+          }
         } else if (err.kind === "not_found") {
           await settle({ status: "dropped", code: err.code }, "dropped");
         } else if (err.writeMayHaveHappened) {

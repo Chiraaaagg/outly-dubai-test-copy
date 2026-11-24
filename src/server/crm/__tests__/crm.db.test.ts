@@ -492,20 +492,35 @@ describe.skipIf(!dbEnabled)("CRM outbox, links and worker (C1)", () => {
     const linkId = uuidv7();
     await prisma.crmLink.create({ data: { id: linkId, environment: "development", portal: HOST, entityType: "order", entityId: o.id, crmId: 777_002n, originatorId: "outlyy-development", originId: `ord:${o.id}`, state: "active", localVersion: 1n, pushedVersion: 1n } });
     const now = new Date();
+    let sagaId: string | null = null;
     try {
-      // Not flagged yet; then flagged but no paid moment: nothing.
+      // Not flagged yet; then a hand-off but no paid moment: nothing.
       expect(await store.recordHandoffMoments!(scope, now)).toBe(0);
       expect((await loadSubjectState({ type: "order", id: o.id })).order?.handedToTeam).toBe(false);
       await prisma.supplierBooking.update({ where: { id: booking.id }, data: { attentionRequiredAt: now, errorCode: "external_confirmation_handoff" } });
-      expect((await loadSubjectState({ type: "order", id: o.id })).order?.handedToTeam).toBe(true);
       expect(await store.recordHandoffMoments!(scope, now)).toBe(0);
       await store.recordTimelineMoments(linkId, [{ key: "paid", kind: "paid", amountAedMinor: 1000n }], now);
+      // R-01: staff flags that are not a supplier-confirmation hand-off never count (snapshot and sweep alike).
+      for (const errorCode of ["account_mismatch", "late_acceptance", "late_acceptance_duplicate", "funds_unverified", "charged_amount_mismatch", "external_booking_failed"]) {
+        await prisma.supplierBooking.update({ where: { id: booking.id }, data: { attentionRequiredAt: now, errorCode } });
+        expect((await loadSubjectState({ type: "order", id: o.id })).order?.handedToTeam, errorCode).toBe(false);
+        expect(await store.recordHandoffMoments!(scope, now), errorCode).toBe(0);
+      }
+      // A payment-saga flag (refund failed, gateway mismatch or error) is never a hand-off.
+      await prisma.supplierBooking.update({ where: { id: booking.id }, data: { attentionRequiredAt: null, errorCode: null } });
+      sagaId = uuidv7();
+      await prisma.paymentSaga.create({ data: { id: sagaId, orderId: o.id, orderItemId: item.id, rail: "aed_card", state: "attention", attentionRequiredAt: now } });
+      expect((await loadSubjectState({ type: "order", id: o.id })).order?.handedToTeam).toBe(false);
+      expect(await store.recordHandoffMoments!(scope, now)).toBe(0);
+      await prisma.supplierBooking.update({ where: { id: booking.id }, data: { attentionRequiredAt: now, errorCode: "external_confirmation_handoff" } });
+      expect((await loadSubjectState({ type: "order", id: o.id })).order?.handedToTeam).toBe(true);
       expect(await store.recordHandoffMoments!(scope, now)).toBe(1);
       expect(await store.recordHandoffMoments!(scope, now)).toBe(0);
       expect(await prisma.crmTimelineComment.findFirstOrThrow({ where: { linkId, momentKey: "handed_to_team" } })).toMatchObject({ kind: "handed_to_team", status: "pending", amountAedMinor: null });
     } finally {
       await prisma.crmTimelineComment.deleteMany({ where: { linkId } });
       await prisma.crmLink.deleteMany({ where: { id: linkId } });
+      if (sagaId) await prisma.paymentSaga.deleteMany({ where: { id: sagaId } });
       await prisma.supplierBooking.deleteMany({ where: { id: booking.id } });
       await prisma.orderItem.deleteMany({ where: { id: item.id } });
       await prisma.order.deleteMany({ where: { id: o.id } });

@@ -6,6 +6,7 @@ import type { CrmScope } from "@/server/crm/crm.config";
 import { originIdFor, type CrmSubjectState } from "@/server/crm/crm.mapping";
 import {
   aedAmount,
+  isHandoffBooking,
   assertSafeTimelineText,
   dubaiTime,
   momentsFor,
@@ -100,6 +101,17 @@ describe("timeline moments (pure)", () => {
     expect(momentsFor({ ...unpaid, order: { ...unpaid.order!, handedToTeam: true } })).toEqual([]);
     expect(momentsFor(inquiryState(id, { status: "assigned" }))).toEqual([]);
     expect(momentsFor({ ...paid(id), erased: true })).toEqual([]);
+  });
+
+  it("hand-off allowlist (R-01): supplier-confirmation hand-offs only, never payment, account or late-acceptance flags", () => {
+    for (const errorCode of ["external_confirmation_handoff", "external_unconfirmed_at_start", "external_failed_after_confirm"]) {
+      expect(isHandoffBooking({ state: "awaiting_external", errorCode, attention: true }), errorCode).toBe(true);
+      expect(isHandoffBooking({ state: "awaiting_external", errorCode, attention: false }), `${errorCode} cleared`).toBe(false);
+    }
+    for (const state of ["manual_review", "not_found_unresolved"]) expect(isHandoffBooking({ state, errorCode: null, attention: false }), state).toBe(true);
+    for (const errorCode of ["account_mismatch", "late_acceptance", "late_acceptance_duplicate", "funds_unverified", "charged_amount_mismatch", "reservation_slot_mismatch", "external_booking_failed", "external_hold_unusable", null]) {
+      expect(isHandoffBooking({ state: "confirmed", errorCode, attention: true }), String(errorCode)).toBe(false);
+    }
   });
 
   it("amounts only in AED: an INR order's moments carry none", () => {
@@ -462,10 +474,12 @@ describe("timeline comments meet a failing portal like a row does (C2B-01, C2B-0
       h.clock.advance(2 * 3_600_000);
       h.put(inquiryState(subjectId(), { reference: `INQ-3000${i}01` })); // a row the portal answers
       h.fake.methodScript.push({ method: "crm.timeline.comment.add", failure: "access_denied" });
-      await h.run();
-      // The circuit opens each time (the refusal could be the portal's), so wait it out before the next try.
-      await h.store.setPortalHealth(h.scope, { pausedUntil: null, pauseReason: null });
+      const r = await h.run();
+      // R-02: the credential is fine (the row was answered): no pause, no circuit, no auth alert source.
+      expect(r).toMatchObject({ breakerOpen: false, pushed: 1 });
+      expect([...h.store.portals.values()][0].pauseReason).not.toBe("auth");
     }
+    expect(h.events.some((e) => e.name === "crm.circuit_open")).toBe(false);
     expect(h.store.timelineOf(h.scope, s.subject)[0]).toMatchObject({ status: "failed", attempts: TIMELINE_MAX_ATTEMPTS, lastErrorCode: "auth:ACCESS_DENIED" });
   });
 });

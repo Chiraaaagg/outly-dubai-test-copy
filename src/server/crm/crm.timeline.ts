@@ -17,12 +17,14 @@ import { supplierStatus, ticketStatus, type CrmSubjectState } from "./crm.mappin
  *  - `refund:<total refunded>`: each new refunded total, with that total for
  *    an AED order;
  *  - `handed_to_team`: a paid order that our team took over because a
- *    supplier could not confirm an item: a supplier booking or the payment
- *    saga flagged for staff (the Batch 6 external-confirmation hand-off, a
- *    booking needing staff, a saga needing attention). Owner answer, 25
- *    November 2026 (review C2B-03). A rejected line that goes to the
- *    automatic refund is not one. The hand-off sets no deal field, so the
- *    worker also records it from the flags directly (crm.store.ts
+ *    supplier could not confirm an item (owner answer, 25 November 2026;
+ *    review C2B-03, R-01). Only the supplier-confirmation hand-offs of
+ *    `HANDOFF_ERROR_CODES` (with the staff flag) or `HANDOFF_STATES` count:
+ *    never a payment, refund, gateway, account or late-acceptance flag, a
+ *    payment-saga flag (the saga stores no reason, so its confirmation flags
+ *    cannot be told from its payment ones), or a rejected line that goes to
+ *    the automatic refund. The hand-off sets no deal field, so the worker
+ *    also records it from recent booking flags (crm.store.ts
  *    `recordHandoffMoments`), once the deal has its `paid` moment.
  * Inquiries have no moment: their stage already says where they are.
  *
@@ -79,6 +81,21 @@ export function momentsFor(state: CrmSubjectState): CrmMoment[] {
   if (o.refundedMinor > 0n) out.push({ key: `refund:${o.refundedMinor}`, kind: "refund", amountAedMinor: aed(o.refundedMinor) });
   if (o.capturedMinor > 0n && o.handedToTeam === true) out.push({ key: "handed_to_team", kind: "handed_to_team", amountAedMinor: null });
   return out;
+}
+
+/**
+ * Supplier booking codes that mean "the supplier could not confirm, our team takes over" when the staff flag is
+ * set (Batch 6, external-confirmation.ts): the hand-off at the wait limit, still unconfirmed at the start, and a
+ * confirmed external booking the provider later failed. `external_booking_failed` is left out: the saga refunds it.
+ */
+export const HANDOFF_ERROR_CODES = ["external_confirmation_handoff", "external_unconfirmed_at_start", "external_failed_after_confirm"] as const;
+/** Booking states that are with staff whatever the code: the engine could not settle the confirmation. */
+export const HANDOFF_STATES = ["manual_review", "not_found_unresolved"] as const;
+
+/** Whether one supplier booking is a hand-off to our team (R-01). Pure; the snapshot and the store use the same lists. */
+export function isHandoffBooking(b: { state: string; errorCode: string | null; attention: boolean }): boolean {
+  if ((HANDOFF_STATES as readonly string[]).includes(b.state)) return true;
+  return b.attention && b.errorCode !== null && (HANDOFF_ERROR_CODES as readonly string[]).includes(b.errorCode);
 }
 
 export const TIMELINE_HEADER = "OUTLYY update (Dubai time)";

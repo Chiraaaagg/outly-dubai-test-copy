@@ -4,7 +4,8 @@ import { uuidv7 } from "../lib/ids";
 import type { CrmScope } from "./crm.config";
 import { CRM_PAYLOAD_VERSION, type CrmEntityType, type CrmSubject } from "./crm.mapping";
 import { enqueueCrmDelete, type CrmDeleteReason } from "./crm.outbox";
-import type { CrmTimelineKind } from "./crm.timeline";
+import { Prisma } from "@prisma/client";
+import { HANDOFF_ERROR_CODES, HANDOFF_STATES, type CrmTimelineKind } from "./crm.timeline";
 import type { CrmLinkPatch, CrmLinkRow, CrmOutboxRow, CrmPortalStateRow, CrmStore, CrmTimelineGroup, LockLinkResult } from "./crm.worker";
 
 /**
@@ -240,22 +241,26 @@ export const prismaCrmStore: CrmStore = {
   },
 
   async recordHandoffMoments(scope, now) {
-    // Same lookback as the ops alerts: a flag older than that is not news. Ids and flags only, no personal data.
+    // Driven by recent booking flags (R-03), not by every active link: the lookback is the ops alerts' (a flag
+    // older than that is not news). The same lists as the snapshot (R-01). Ids and flags only, no personal data.
     const since = new Date(now.getTime() - HANDOFF_LOOKBACK_MS);
     return prisma.$executeRaw`
+      WITH flagged AS (
+        SELECT DISTINCT b.order_id FROM supplier_bookings b
+        WHERE b.order_id IS NOT NULL AND (
+          (b.error_code IN (${Prisma.join([...HANDOFF_ERROR_CODES])}) AND b.attention_required_at >= ${since})
+          OR (b.state::text IN (${Prisma.join([...HANDOFF_STATES])}) AND b.updated_at >= ${since})
+        )
+      )
       INSERT INTO crm_timeline_comments (id, link_id, moment_key, kind, noticed_at, next_attempt_at, created_at, updated_at)
       SELECT gen_random_uuid(), l.id, 'handed_to_team', 'handed_to_team', ${now}, ${now}, now(), now()
-      FROM crm_links l
-      LEFT JOIN inquiries q ON l.entity_type = 'inquiry' AND q.id = l.entity_id
-      JOIN orders o ON o.id = (CASE WHEN l.entity_type = 'order' THEN l.entity_id ELSE q.converted_order_id END)
-      WHERE l.environment = ${scope.environment} AND l.portal = ${scope.portal} AND l.state = 'active' AND l.crm_id IS NOT NULL
+      FROM flagged f
+      LEFT JOIN inquiries q ON q.converted_order_id = f.order_id
+      JOIN crm_links l ON l.environment = ${scope.environment} AND l.portal = ${scope.portal}
+        AND ((l.entity_type = 'order' AND l.entity_id = f.order_id) OR (l.entity_type = 'inquiry' AND l.entity_id = q.id))
+      WHERE l.state = 'active' AND l.crm_id IS NOT NULL
         AND EXISTS (SELECT 1 FROM crm_timeline_comments p WHERE p.link_id = l.id AND p.kind = 'paid')
         AND NOT EXISTS (SELECT 1 FROM crm_timeline_comments h WHERE h.link_id = l.id AND h.moment_key = 'handed_to_team')
-        AND (
-          EXISTS (SELECT 1 FROM supplier_bookings b WHERE b.order_id = o.id
-                  AND (b.attention_required_at >= ${since} OR (b.state::text IN ('manual_review', 'not_found_unresolved') AND b.updated_at >= ${since})))
-          OR EXISTS (SELECT 1 FROM payment_sagas s WHERE s.order_id = o.id AND s.attention_required_at >= ${since})
-        )
       ON CONFLICT (link_id, moment_key) DO NOTHING`;
   },
 };
