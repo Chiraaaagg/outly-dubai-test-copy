@@ -1,0 +1,186 @@
+{
+  "id": 5,
+  "name": "Dinner Cruise in Dubai Marina",
+  "languageId": 1,
+  "language": "English",
+  "isExternal": false,
+  "cancellationPolicy": [
+    {
+      "hours": 24,
+      "percents": 50
+    },
+    {
+      "hours": 48,
+      "percents": 75
+    },
+    {
+      "hours": 72,
+      "percents": 100
+    }
+  ],
+  "categories": [
+    {
+      "name": null,
+      "url": null,
+      "heroImageId": null,
+      "heroImage": null,
+      "id": 3
+    }
+  ],
+  "notesToAgent": null,
+  "videoUrl": "https://www.youtube.com/watch?v=9ElCO_uNJ_k&t=2s",
+  "termsAndConditions": "(trimmed)",
+  "salesDescription": "<p>(trimmed)</p>",
+  "faqList": [],
+  "itineraries": [],
+  "photos": [
+    {
+      "caption": null,
+      "description": null,
+      "relatedId": 5,
+      "isSharedStorage": false,
+      "srcSet": [
+        {
+          "type": "image/webp",
+          "sizes": [
+            {
+              "src": "https://traveldeskuaetests.blob.core.windows.net/photos/35-fhd.webp",
+              "width": 1920,
+              "height": 1080
+            },
+            {
+              "src": "https://traveldeskuaetests.blob.core.windows.net/photos/35-hd.webp",
+              "width": 1280,
+              "height": 720
+            },
+            {
+              "src": "https://traveldeskuaetests.blob.core.windows.net/photos/35-sd.webp",
+              "width": 640,
+              "height": 360
+            },
+            {
+              "src": "https://traveldeskuaetests.blob.core.windows.net/photos/35-s.webp",
+              "width": 320,
+              "height": 180
+            },
+            {
+              "src": "https://traveldeskuaetests.blob.core.windows.net/photos/35-xs.webp",
+              "width": 160,
+              "height": 90
+            }
+          ]
+        },
+        {
+          "type": "image/jpeg",
+          "sizes": [
+            {
+              "src": "https://traveldeskuaetests.blob.core.windows.net/photos/35-fhd.jpg",
+              "width": 1920,
+              "height": 1080
+            },
+            {
+              "src": "https://traveldeskuaetests.blob.core.windows.net/photos/35-hd.jpg",
+              "width": 1280,
+              "height": 720
+            },
+            {
+              "src": "https://traveldeskuaetests.blob.core.windows.net/photos/35-sd.jpg",
+              "width": 640,
+              "height": 360
+            },
+            {
+              "src": "https://traveldeskuaetests.blob.core.windows.net/photos/35-s.jpg",
+              "width": 320,
+              "height": 180
+            },
+            {
+              "src": "https://traveldeskuaetests.blob.core.windows.net/photos/35-xs.jpg",
+              "width": 160,
+              "height": 90
+            }
+          ]
+        }
+      ],
+      "id": 35
+    }
+  ],
+  "offers": [
+    {
+      "id": 62,
+      "name": "Dinner Cruise (9.00pm - 10.45pm), Direct Reporting To Boat",
+      "code": "DHOW MARINA",
+      "daysOffered": 0,
+      "numberOfHours": 2,
+      "minNumOfPeople": 1,
+      "maxNumOfPeople": 30,
+      "minNumberOfAdult": null,
+      "maxNumberOfAdult": null,
+      "minNumberOfChild": null,
+      "maxNumberOfChild": null,
+      "minNumberOfInfant": null,
+      "maxNumberOfInfant": null,
+      "minimumAdvancedPayment": 0,
+      "privateType": 0,
+      "childrenAllowed": true,
+      "childAge": 12,
+      "infantsAllowed": true,
+      "infantAge": 5,
+      "pricingPeriods": [
+        {
+          "id": 1094,
+          "widgetPricing": null,
+          "dateStart": "2024-10-01T00:00:00",
+          "dateEnd": "2027-02-11T00:00:00",
+          "offerId": 62,
+          "currency": "AED",
+          "recPricePerAdult": 125,
+          "recPricePerAdultUsd": 34.25,
+          "recPricePerChild": 100,
+          "recPricePerChildUsd": 27.4,
+          "recPricePerTrip": 0,
+          "recPricePerTripUsd": 0,
+          "pricePerAdult": 100,
+          "pricePerChild": 80,
+          "pricePerTrip": 0,
+          "pricePerAdultUsd": 27.25,
+          "pricePerChildUsd": 21.8,
+          "pricePerTripUsd": 0,
+          "discountPercent": null,
+          "hasWidgetDiscount": false,
+          "hasDiscount": false,
+          "pricePerAdultBeforeDiscountUsd": 27.25,
+          "pricePerChildBeforeDiscountUsd": 21.8,
+          "pricePerTripBeforeDiscountUsd": 0,
+          "pricePerAdultBeforeDiscount": 100,
+          "pricePerChildBeforeDiscount": 80,
+          "pricePerTripBeforeDiscount": 0,
+          "isBookable": true,
+          "supplierCurrencyId": null,
+          "supplierCurrencyCode": null,
+          "conversionRate": 3.65,
+          "vat": 5
+        }
+      ],
+      "isDirectReporting": true,
+      "isAppendTransactionFeeB2b": false,
+      "isDirectCollection": false,
+      "timeSlots": [
+        {
+          "name": "Dinner Cruise",
+          "startTime": 1260,
+          "endTime": 1365,
+          "daysOffered": 0,
+          "isAnyTime": false,
+          "isOnRequest": false,
+          "offerId": 62,
+          "minimumAdvancedBooking": 12,
+          "isExternal": false,
+          "id": 18
+        }
+      ],
+      "bookingType": 1,
+      "isExternal": false,
+      "tripUnit": ""
+    }
+  ]
+}
