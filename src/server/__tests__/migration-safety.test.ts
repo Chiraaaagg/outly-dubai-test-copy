@@ -85,6 +85,8 @@ const NEW_TABLES_ONLY = [
   "20261122130000_crm_c1_outbox_links",
   // supplier_sync_runs (doc 29 Batch 1b): a standalone table, no foreign key.
   "20261123120000_b1b_supplier_sync_runs",
+  // crm_timeline_comments (doc 29d G7, CRM C2b): a standalone table, no foreign key (link_id is not a reference).
+  "20261125120000_crm_c2b_timeline_comments",
 ];
 /**
  * Migrations that only add nullable columns, with no default, to existing

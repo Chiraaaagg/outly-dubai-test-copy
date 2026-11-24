@@ -1,5 +1,6 @@
 import "server-only";
 import { prisma } from "../lib/db";
+import { HANDOFF_ERROR_CODES, HANDOFF_STATES } from "./crm.timeline";
 import {
   bitrixInstant,
   lineTotalMinor,
@@ -96,6 +97,13 @@ async function orderFacts(orderId: string): Promise<(CrmOrderFacts & { erased: b
           documents: { where: { status: "valid", customerVisible: true }, select: { id: true }, take: 1 },
         },
       },
+      // Supplier-confirmation hand-offs only (C2B-03, R-01; crm.timeline.ts lists): whether one exists, never a code,
+      // message or note leaves this read.
+      supplierBookings: {
+        where: { OR: [{ attentionRequiredAt: { not: null }, errorCode: { in: [...HANDOFF_ERROR_CODES] } }, { state: { in: [...HANDOFF_STATES] } }] },
+        select: { id: true },
+        take: 1,
+      },
       payments: {
         where: { source: { in: ["gateway_verified", "manual"] } },
         select: {
@@ -137,6 +145,7 @@ async function orderFacts(orderId: string): Promise<(CrmOrderFacts & { erased: b
     totalMinor: currency === "AED" ? o.totalAed : o.totalInr,
     refundPending,
     otherCurrencyPaid,
+    handedToTeam: o.supplierBookings.length > 0,
     marginAedMinor: currency === "AED" ? marginAedMinor(o.items) : null,
     erased,
     contact: erased ? null : { name: o.leadName, phone: o.leadPhone, email: o.leadEmail },

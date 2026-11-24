@@ -2,6 +2,10 @@ import "server-only";
 import { BitrixRestClient } from "../crm/bitrix.client";
 import { crmConfigFrom, crmConfigProblems } from "../crm/crm.config";
 import { deleteCrmProbe, runCrmProbe, type ProbeResult } from "../crm/crm.probe";
+import { crmReturnHooks, storeCrmFingerprint } from "../crm/crm.reconcile";
+import { crmReturnConfigFrom, crmReturnProblems } from "../crm/crm.return.config";
+import { crmReturnCommands } from "../crm/crm.return.commands";
+import { prismaCrmReturnStore, prismaCrmStoreWithReturn } from "../crm/crm.return.store";
 import { loadSubjectState } from "../crm/crm.snapshot";
 import { prismaCrmStore, runCrmRetention, type CrmRetentionResult } from "../crm/crm.store";
 import { CRM_RUN_BUDGET_MS, pacedLimiter, runCrmWorker, type CrmRunSummary } from "../crm/crm.worker";
@@ -32,7 +36,7 @@ export type CrmJobResult =
   | { ok: true; skipped: string; ranAt: string }
   | ({ ranAt: string; retention: CrmRetentionResult | null } & CrmRunSummary);
 
-export type CrmProbeJobResult = { ok: true; skipped: string; ranAt: string } | ({ ranAt: string } & ProbeResult) | { ok: true; ranAt: string; deleted: number };
+export type CrmProbeJobResult = { ok: true; skipped: string; ranAt: string } | ({ ranAt: string } & ProbeResult) | { ok: true; ranAt: string; deleted: number; failed: string[] };
 
 /**
  * The synthetic probe (doc 29d §5.2a; review C2A-01), on request only: POST
@@ -52,13 +56,35 @@ export async function runCrmProbeJob(mode: "synthetic" | "delete"): Promise<CrmP
   });
   if (mode === "delete") {
     const r = await deleteCrmProbe({ config, port });
-    emitEvent("crm.probe", { mode, deleted: r.deleted });
+    emitEvent("crm.probe", { mode, deleted: r.deleted, failed: r.failed.join(",") || null }, r.failed.length ? "error" : "info");
     return { ok: true, ranAt, ...r };
   }
   const r = await runCrmProbe({ config, port, now: () => new Date() });
   const bad = Object.entries(r.fields).filter(([, s]) => s !== "ok").map(([k, s]) => `${k}:${s}`);
   emitEvent("crm.probe", { mode, ok: r.ok, dealId: r.dealId, created: r.created, notOk: bad.join(",") || null }, r.ok ? "info" : "error");
   return { ...r, ranAt };
+}
+
+export type CrmFingerprintJobResult = { ok: true; skipped: string; ranAt: string } | { ok: true; ranAt: string; stored: boolean; reason?: string; hashPrefix: string };
+
+/**
+ * The explicit owner step that stores the portal fingerprint (doc 29e §7, §15 step 6), and the reset after a
+ * mismatch: POST with CRON_SECRET, `x-crm-fingerprint: store` and CRM_PROBE_SECRET. Three reads (`profile`,
+ * `crm.category.get`, `crm.status.list`), no write to the portal. Refused for an administrator webhook or when
+ * the configured funnel or a stage is not what the portal shows; nothing is stored then.
+ */
+export async function runCrmFingerprintJob(): Promise<CrmFingerprintJobResult> {
+  const e = env();
+  const ranAt = new Date().toISOString();
+  const config = crmConfigFrom(e);
+  if (!config) return { ok: true, skipped: "crm not configured", ranAt };
+  const port = new BitrixRestClient(config, {
+    onCall: (c) => emitEvent("crm.call", { method: c.method, status: c.status, durationMs: c.durationMs, outcome: c.outcome }, c.outcome === "ok" ? "info" : "warn"),
+  });
+  await prismaCrmStore.ensurePortal(config, { categoryId: config.categoryId, originatorId: config.originatorId });
+  const r = await storeCrmFingerprint({ config, store: prismaCrmReturnStore, port, now: () => new Date() });
+  emitEvent("crm.fingerprint_store", { stored: r.stored, reason: r.reason ? r.reason.replace(/,/g, ".").slice(0, 80) : null, hashPrefix: r.hashPrefix }, r.stored ? "info" : "error");
+  return { ok: true, ranAt, ...r };
 }
 
 export async function runCrmWorkerJob(opts: { now?: () => Date; budgetMs?: number } = {}): Promise<CrmJobResult> {
@@ -87,8 +113,28 @@ export async function runCrmWorkerJob(opts: { now?: () => Date; budgetMs?: numbe
       return r.allowed && !r.storeUnavailable;
     },
   });
+  // The return path (C3ab, doc 29e): inside this run and lease, off unless CRM_RETURN_PATH says otherwise.
+  const ret = crmReturnConfigFrom(e, config);
+  if (crmReturnProblems(e, config).length) {
+    emitEvent("crm.refused", { reason: "return_config_invalid" }, "error");
+    await prismaCrmReturnStore.raiseFinding(config, { kind: "crm_return_config_invalid", subjectKey: "portal" }, now()).catch(() => {});
+  }
+  const hooks =
+    ret.mode === "off"
+      ? undefined
+      : crmReturnHooks({
+          config,
+          ret,
+          store: prismaCrmStoreWithReturn,
+          port,
+          commands: crmReturnCommands,
+          loadState: loadSubjectState,
+          limiter,
+          now,
+          emit: (name, fields, level) => emitEvent(name, fields, level),
+        });
   const summary = await runCrmWorker(
-    { config, store: prismaCrmStore, port, loadState: loadSubjectState, limiter, now, emit: (name, fields, level) => emitEvent(name, fields, level) },
+    { config, store: prismaCrmStore, port, loadState: loadSubjectState, limiter, now, hooks, emit: (name, fields, level) => emitEvent(name, fields, level) },
     { budgetMs },
   );
   let retention: CrmRetentionResult | null = null;
@@ -101,11 +147,13 @@ export async function runCrmWorkerJob(opts: { now?: () => Date; budgetMs?: numbe
     reason: summary.reason ?? null,
     processed: summary.processed,
     pushed: summary.pushed,
+    comments: summary.comments,
     failed: summary.failed,
     dead: summary.dead,
     throttled: summary.throttled,
     breakerOpen: summary.breakerOpen,
     foreignDue: summary.foreignDue,
+    returnMode: ret.mode,
     durationMs: summary.durationMs,
   });
   return { ...summary, retention, ranAt };

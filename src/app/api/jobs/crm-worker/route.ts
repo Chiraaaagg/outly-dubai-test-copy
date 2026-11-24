@@ -1,6 +1,6 @@
 import type { NextRequest } from "next/server";
 import { handle, json, requireCron, requireCrmProbeSecret } from "@/server/lib/http";
-import { runCrmProbeJob, runCrmWorkerJob } from "@/server/jobs/crm-worker-job";
+import { runCrmFingerprintJob, runCrmProbeJob, runCrmWorkerJob } from "@/server/jobs/crm-worker-job";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -22,6 +22,11 @@ export const maxDuration = 60;
  * It needs CRM_PROBE_SECRET in `x-crm-probe-secret` besides CRON_SECRET
  * (SEC-8 b, re-review R-02), as the manual supplier run needs its job secret:
  * the cron secret alone never runs the probe.
+ *
+ * POST with `x-crm-fingerprint: store` (and the same two secrets) stores the
+ * Bitrix24 portal fingerprint for the return path (CRM batch C3ab, doc 29e
+ * §7): three reads, no portal write. It is the owner's explicit step after
+ * the observe week, and the reset after a fingerprint mismatch.
  */
 async function run(req: NextRequest) {
   requireCron(req);
@@ -29,6 +34,10 @@ async function run(req: NextRequest) {
   if (probe === "synthetic" || probe === "delete") {
     requireCrmProbeSecret(req);
     return json(await runCrmProbeJob(probe));
+  }
+  if (req.method === "POST" && req.headers.get("x-crm-fingerprint") === "store") {
+    requireCrmProbeSecret(req);
+    return json(await runCrmFingerprintJob());
   }
   return json(await runCrmWorkerJob());
 }

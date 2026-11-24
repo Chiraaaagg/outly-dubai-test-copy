@@ -632,3 +632,102 @@ describe("CRM worker: deal push on the fake portal", () => {
     expect(h.fake.calls).toHaveLength(0);
   });
 });
+
+describe("CRM worker: a not-found answer is believed only when the deal is gone (gap G14)", () => {
+  it("an update answered not-found while the deal is still in the OUTLYY funnel retries; the link is never tombstoned", async () => {
+    const h = harness();
+    const s = inquiry();
+    h.put(inquiryState(s.id));
+    await h.run();
+    h.put(inquiryState(s.id, { status: "contacted" }));
+    h.fake.methodScript.push({ method: "crm.item.update", failure: "phantom_not_found" });
+    h.clock.advance(1_000);
+    const r = await h.run();
+    expect(r).toMatchObject({ failed: 1, pushed: 0 });
+    expect(h.store.link(h.scope, s)).toMatchObject({ state: "active" });
+    expect(h.store.rows[1]).toMatchObject({ status: "queued", lastErrorCode: "rejected:update_not_found_visible", attempts: 1 });
+    // The next attempt pushes normally.
+    h.clock.advance(10 * 60_000);
+    await h.run();
+    expect(h.fake.dealsFor(originIdFor(s))[0]).toMatchObject({ stageId: "C7:CONTACTED" });
+  });
+
+  it.each(["code", "empty_code_text", "core_text", "core_text_ru", "http404"] as const)("a deal really deleted on the portal (not-found shaped %s) is tombstoned, not re-created", async (shape) => {
+    const h = harness();
+    const s = inquiry();
+    h.put(inquiryState(s.id));
+    await h.run();
+    h.fake.notFoundShape = shape;
+    h.fake.deals.clear();
+    h.put(inquiryState(s.id, { status: "contacted" }));
+    h.clock.advance(1_000);
+    await h.run();
+    expect(h.store.link(h.scope, s)).toMatchObject({ state: "deleted", deleteReason: "crm_deleted" });
+    expect(h.fake.deals.size).toBe(0);
+  });
+
+  it("an erasure delete answered not-found while the deal is still visible is never counted as deleted: it retries, then dead-letters", async () => {
+    const h = harness();
+    const s = inquiry();
+    h.put(inquiryState(s.id));
+    await h.run();
+    for (let i = 0; i < 8; i++) h.fake.methodScript.push({ method: "crm.item.delete", failure: "phantom_not_found" });
+    h.store.enqueue(h.scope, s, "delete", "erasure");
+    await h.drain(30, 3_600_000);
+    const del = h.store.rows.find((r) => r.kind === "delete")!;
+    expect(del).toMatchObject({ status: "dead", lastErrorCode: "rejected:delete_not_found_visible", attempts: 8 });
+    expect(h.store.link(h.scope, s)?.state).toBe("active");
+    expect(h.fake.dealsFor(originIdFor(s))).toHaveLength(1);
+  });
+
+  it("an erasure delete with an unknown answer shape is retried, never tombstoned on that answer", async () => {
+    const h = harness();
+    const s = inquiry();
+    h.put(inquiryState(s.id));
+    await h.run();
+    h.fake.deleteAnswer = "object";
+    h.store.enqueue(h.scope, s, "delete", "erasure");
+    h.clock.advance(1_000);
+    await h.run();
+    const del = h.store.rows.find((r) => r.kind === "delete")!;
+    expect(del).toMatchObject({ status: "queued", lastErrorCode: "invalid_response:delete_result_object", attempts: 1 });
+    expect(h.store.link(h.scope, s)?.state).toBe("active");
+    // The fake did delete it (only the answer was odd): the retry cannot see the deal, so the link is tombstoned and
+    // the row dead-lettered for a human check (the C2A-08 alert), never silently counted as deleted.
+    h.fake.deleteAnswer = "true";
+    h.clock.advance(10 * 60_000);
+    await h.run();
+    expect(h.store.link(h.scope, s)).toMatchObject({ state: "deleted", deleteReason: "erasure" });
+    expect(del).toMatchObject({ status: "dead", lastErrorCode: "refused:linked_deal_not_visible" });
+  });
+});
+
+describe("CRM worker and the G11 alert read the same pause (review C2B-06)", () => {
+  it("the stored portal row after a real breaker opening, re-opening and auth refusal gives the exact opening time", async () => {
+    const { crmPortalIncident } = await import("@/server/services/ops-alert.service");
+    const h = harness();
+    for (let i = 0; i < 6; i++) h.put(inquiryState(subjectId()));
+    h.fake.down = true;
+    const openedAt = () => h.fake.calls[h.fake.calls.length - 1].at;
+    await h.run();
+    const row = () => [...h.store.portals.values()][0];
+    const since = new Date(0);
+    let first = openedAt();
+    expect(crmPortalIncident({ environment: "staging", ...row() }, since, h.clock.now())).toMatchObject({ reason: "crm_breaker_open", raisedAt: new Date(first) });
+    // The pause ends, the half-open probe fails: a new opening, again exact.
+    h.clock.t = row().pausedUntil!.getTime() + 1_000;
+    await h.run();
+    first = openedAt();
+    expect(crmPortalIncident({ environment: "staging", ...row() }, since, h.clock.now())).toMatchObject({ reason: "crm_breaker_open", raisedAt: new Date(first) });
+    // Recovery resets the failures: no incident.
+    h.fake.down = false;
+    h.clock.t = row().pausedUntil!.getTime() + 1_000;
+    await h.run();
+    expect(crmPortalIncident({ environment: "staging", ...row() }, since, h.clock.now())).toBeNull();
+    // A refused credential.
+    h.put(inquiryState(subjectId()));
+    h.fake.revoked = true;
+    await h.run();
+    expect(crmPortalIncident({ environment: "staging", ...row() }, since, h.clock.now())).toMatchObject({ reason: "crm_auth_refused", raisedAt: new Date(openedAt()) });
+  });
+});

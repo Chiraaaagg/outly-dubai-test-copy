@@ -175,6 +175,21 @@ function forActor<T extends InquirySummary>(actor: Actor, s: T): T {
   return hasPermission(actor, "customers.view_pii") ? s : redactSummary(s);
 }
 
+/**
+ * A change that came from the Bitrix24 return path (CRM batch C3ab, doc 29e §3.5, §4.3): the staff member's own
+ * move or owner change on the portal, applied with their OUTLYY permissions. Ids only; recorded on the inquiry
+ * event and the audit row as "via Bitrix24".
+ */
+export interface InquiryChangeVia {
+  channel: "bitrix24";
+  bitrixUserId: number | null;
+  dealId: number;
+}
+
+function viaMeta(via: InquiryChangeVia | undefined): Record<string, unknown> {
+  return via ? { via: via.channel, bitrixUserId: via.bitrixUserId, dealId: via.dealId } : {};
+}
+
 /** Scope for the create-inquiry idempotency rows (`src/server/lib/idempotency.ts`). */
 const INQUIRY_IDEMPOTENCY_SCOPE = "inquiry_create";
 
@@ -584,7 +599,7 @@ export const inquiryService = {
     return inquiryService.assign(actor, id, actor.id, "Claimed from queue");
   },
 
-  async assign(actor: Actor, id: string, agentId: string, reason?: string) {
+  async assign(actor: Actor, id: string, agentId: string, reason?: string, opts: { via?: InquiryChangeVia } = {}) {
     const d = await inquiryRepo.findById(id);
     if (!d) throw Errors.notFound("Inquiry");
     const selfClaim = agentId === actor.id && !d.assignedAgent;
@@ -598,8 +613,8 @@ export const inquiryService = {
     const to: InquiryStatus = d.status === "new" ? "assigned" : d.status;
     await prisma.$transaction(async (tx) => {
       await tx.inquiry.update({ where: { id }, data: { assignedAgentId: agentId, assignedAt: now, status: to, escalatedAt: null } });
-      await addEvent(tx, id, { kind: "assignment", from, to, actor, note: reason, meta: { agentId, agentName: target.fullName, previousAgentId: d.assignedAgent?.id, previousAgentName: d.assignedAgent?.name } });
-      await audit(actor, "inquiry.assign", { type: "inquiry", id }, { before: { agentId: d.assignedAgent?.id, status: from }, after: { agentId, status: to }, reason }, tx);
+      await addEvent(tx, id, { kind: "assignment", from, to, actor, note: reason, meta: { agentId, agentName: target.fullName, previousAgentId: d.assignedAgent?.id, previousAgentName: d.assignedAgent?.name, ...viaMeta(opts.via) } });
+      await audit(actor, "inquiry.assign", { type: "inquiry", id }, { before: { agentId: d.assignedAgent?.id, status: from }, after: { agentId, status: to, ...viaMeta(opts.via) }, reason }, tx);
       await enqueueCrmSync(tx, [{ type: "inquiry", id }]);
     }, TX_OPTIONS);
 
@@ -717,7 +732,7 @@ export const inquiryService = {
 
   /* ========================================================= transitions */
 
-  async transition(actor: Actor, id: string, to: InquiryStatus, opts: { reason?: string; note?: string } = {}): Promise<InquiryDetail> {
+  async transition(actor: Actor, id: string, to: InquiryStatus, opts: { reason?: string; note?: string; via?: InquiryChangeVia } = {}): Promise<InquiryDetail> {
     const d = await inquiryRepo.findById(id);
     if (!d) throw Errors.notFound("Inquiry");
     assertCanUpdate(actor, d);
@@ -760,8 +775,8 @@ export const inquiryService = {
 
     await prisma.$transaction(async (tx) => {
       await tx.inquiry.update({ where: { id }, data });
-      await addEvent(tx, id, { kind: "status", from, to, actor, note: opts.note ?? (to === "lost" ? opts.reason : undefined) });
-      await audit(actor, "inquiry.transition", { type: "inquiry", id }, { before: { status: from }, after: { status: to }, reason: opts.reason }, tx);
+      await addEvent(tx, id, { kind: "status", from, to, actor, note: opts.note ?? (to === "lost" ? opts.reason : undefined), meta: opts.via ? viaMeta(opts.via) : undefined });
+      await audit(actor, "inquiry.transition", { type: "inquiry", id }, { before: { status: from }, after: { status: to, ...viaMeta(opts.via) }, reason: opts.reason }, tx);
       await enqueueCrmSync(tx, [{ type: "inquiry", id }]);
     }, TX_OPTIONS);
 

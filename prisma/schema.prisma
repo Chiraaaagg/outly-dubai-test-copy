@@ -2308,12 +2308,62 @@ model CrmLink {
   deletedAt       DateTime? @map("deleted_at") @db.Timestamptz(6)
   /// erasure | retention | crm_deleted
   deleteReason    String?   @map("delete_reason")
+  /// Return path (C3ab, migration 20261126120000): what the reconciler last saw on the deal.
+  crmSeenUpdatedAt    DateTime? @map("crm_seen_updated_at") @db.Timestamptz(6)
+  crmSeenStageId      String?   @map("crm_seen_stage_id")
+  /// The deal owner's Bitrix24 user id as last seen (a staff identifier).
+  crmSeenOwnerId      BigInt?   @map("crm_seen_owner_id")
+  revertCount         Int?      @map("revert_count")
+  lastRevertAt        DateTime? @map("last_revert_at") @db.Timestamptz(6)
+  prevRevertAt        DateTime? @map("prev_revert_at") @db.Timestamptz(6)
+  lastRevertCommentAt DateTime? @map("last_revert_comment_at") @db.Timestamptz(6)
+  lastFieldRestoreAt  DateTime? @map("last_field_restore_at") @db.Timestamptz(6)
+  /// No forced put-back push before this time (a put-back loop).
+  holdUntil           DateTime? @map("hold_until") @db.Timestamptz(6)
+  /// The nightly sweep did not see the deal in the OUTLYY funnel since this time.
+  missingSince        DateTime? @map("missing_since") @db.Timestamptz(6)
+  sweepSeenAt         DateTime? @map("sweep_seen_at") @db.Timestamptz(6)
+  /// Read this deal again (after a hold, an observe-mode difference, or a failed check).
+  recheckRequestedAt  DateTime? @map("recheck_requested_at") @db.Timestamptz(6)
+  /// Failed rechecks in a row; the marker is dropped (with an alert) after `RECHECK_MAX_ATTEMPTS`.
+  recheckAttempts     Int?      @map("recheck_attempts")
   createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt       DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   @@unique([environment, portal, entityType, entityId], map: "crm_links_entity_key")
   @@index([environment, portal, state, pushedAt], map: "crm_links_state_pushed_idx")
   @@map("crm_links")
+}
+
+/// A key moment of one CRM deal (doc 29 §8.8 C2-11, doc 29d G7; CRM batch C2b) and
+/// whether its timeline comment was posted. Unique per (link, moment key): a moment
+/// posts at most once per deal. `link_id` is crm_links.id without a foreign key.
+/// Codes, an AED amount and times only: never the comment text or contact data.
+model CrmTimelineComment {
+  id             String    @id @db.Uuid
+  linkId         String    @map("link_id") @db.Uuid
+  /// The kind, or `refund:<total refunded in minor units>`.
+  momentKey      String    @map("moment_key")
+  /// paid | confirmed | tickets_sent | refund | handed_to_team | stage_reverted | move_refused | owner_unmapped (C3ab)
+  kind           String
+  amountAedMinor BigInt?   @map("amount_aed_minor")
+  noticedAt      DateTime  @map("noticed_at") @db.Timestamptz(6)
+  /// pending | posting | posted | unknown | failed | dropped
+  status         String    @default("pending")
+  attempts       Int       @default(0)
+  nextAttemptAt  DateTime  @default(now()) @map("next_attempt_at") @db.Timestamptz(6)
+  postingBy      String?   @map("posting_by")
+  postingSince   DateTime? @map("posting_since") @db.Timestamptz(6)
+  postedAt       DateTime? @map("posted_at") @db.Timestamptz(6)
+  crmCommentId   BigInt?   @map("crm_comment_id")
+  /// A short code (at most 64 characters), never a provider message.
+  lastErrorCode  String?   @map("last_error_code")
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([linkId, momentKey], map: "crm_timeline_comments_link_moment_key")
+  @@index([status, nextAttemptAt], map: "crm_timeline_comments_due_idx")
+  @@map("crm_timeline_comments")
 }
 
 /// Per portal and environment: the stored portal identity the worker checks
@@ -2331,9 +2381,63 @@ model CrmPortalState {
   consecutiveFailures Int       @default(0) @map("consecutive_failures")
   leaseHolder         String?   @map("lease_holder")
   leaseUntil          DateTime? @map("lease_until") @db.Timestamptz(6)
+  /// Return path (C3ab, migration 20261126120000): the poll cursor, always a time the portal returned.
+  reconcileCursor      DateTime? @map("reconcile_cursor") @db.Timestamptz(6)
+  reconcileCheckedAt   DateTime? @map("reconcile_checked_at") @db.Timestamptz(6)
+  /// The keyset position of the last deal read (with `reconcile_cursor`, its time).
+  reconcileCursorId    BigInt?   @map("reconcile_cursor_id")
+  /// True while catching up after a burst (resume by keyset); false or null at the head (read with the overlap).
+  reconcileCatchingUp  Boolean?  @map("reconcile_catching_up")
+  /// sha256 hex of host, webhook user, funnel id and name, and the funnel's stage list (G13).
+  fingerprintHash      String?   @map("fingerprint_hash")
+  /// ok | mismatch | admin | unreadable
+  fingerprintState     String?   @map("fingerprint_state")
+  fingerprintCheckedAt DateTime? @map("fingerprint_checked_at") @db.Timestamptz(6)
+  fingerprintOkAt      DateTime? @map("fingerprint_ok_at") @db.Timestamptz(6)
+  sweepCursorId        BigInt?   @map("sweep_cursor_id")
+  sweepStartedAt       DateTime? @map("sweep_started_at") @db.Timestamptz(6)
+  sweepCompletedAt     DateTime? @map("sweep_completed_at") @db.Timestamptz(6)
+  driftCursorLinkId    String?   @map("drift_cursor_link_id") @db.Uuid
   createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt           DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   @@id([environment, portal])
   @@map("crm_portal_state")
+}
+
+/// Return path findings (CRM batch C3ab, doc 29e §3.4, §7, §8): one row per (scope, kind, subject) for the
+/// ops alert, and the at-most-once state of the one fixed comment on an extra twin deal. `subject_key` is
+/// `deal:<id>`, `inquiry:<id>`, `order:<id>` or `portal`. Ids and codes only: never a value, a name, a title
+/// or a comment text. `link_id` is crm_links.id without a foreign key. Checks in migration 20261126120000.
+model CrmReturnFinding {
+  id                  String    @id @db.Uuid
+  environment         String
+  portal              String
+  kind                String
+  subjectKey          String    @map("subject_key")
+  crmId               BigInt?   @map("crm_id")
+  linkId              String?   @map("link_id") @db.Uuid
+  /// Codes only (field keys, stage keys, a Bitrix24 user id).
+  detail              String?
+  occurrences         Int       @default(1)
+  firstSeenAt         DateTime  @map("first_seen_at") @db.Timestamptz(6)
+  lastSeenAt          DateTime  @map("last_seen_at") @db.Timestamptz(6)
+  /// When the ops alert is raised; moved on only for a repeat after the re-raise window.
+  raisedAt            DateTime  @map("raised_at") @db.Timestamptz(6)
+  /// Twin comment: pending | posting | posted | unknown | failed | dropped
+  commentState        String?   @map("comment_state")
+  /// The deal OUTLYY keeps ("Duplicate of deal N").
+  commentRefCrmId     BigInt?   @map("comment_ref_crm_id")
+  commentPostingBy    String?   @map("comment_posting_by")
+  commentPostingSince DateTime? @map("comment_posting_since") @db.Timestamptz(6)
+  commentPostedAt     DateTime? @map("comment_posted_at") @db.Timestamptz(6)
+  crmCommentId        BigInt?   @map("crm_comment_id")
+  commentErrorCode    String?   @map("comment_error_code")
+  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([environment, portal, kind, subjectKey], map: "crm_return_findings_subject_key")
+  @@index([raisedAt], map: "crm_return_findings_raised_idx")
+  @@index([environment, portal, commentState], map: "crm_return_findings_comment_idx")
+  @@map("crm_return_findings")
 }

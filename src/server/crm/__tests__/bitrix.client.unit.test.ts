@@ -27,9 +27,11 @@ function client(fetchImpl: (url: string, init: RequestInit) => Promise<Response>
 const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
 describe("Bitrix24 client", () => {
-  it("allows the five deal methods only: no contact, lead, duplicate, task or batch method", () => {
-    expect([...BITRIX_METHODS]).toEqual(["crm.item.list", "crm.item.add", "crm.item.update", "crm.item.delete", "crm.item.productrow.set"]);
-    for (const m of BITRIX_METHODS) expect(m).not.toMatch(/contact|lead|duplicate|task|batch|user|timeline/);
+  it("allows the five deal methods, the timeline comment and the three C3ab fingerprint reads only: no contact, lead, duplicate, task or batch method", () => {
+    expect([...BITRIX_METHODS]).toEqual(["crm.item.list", "crm.item.add", "crm.item.update", "crm.item.delete", "crm.item.productrow.set", "crm.timeline.comment.add", "profile", "crm.category.get", "crm.status.list"]);
+    for (const m of BITRIX_METHODS) expect(m).not.toMatch(/contact|lead|duplicate|task|batch|user/);
+    // C2b (decision C2-11): the one timeline method adds a comment; it can neither read, change nor delete one.
+    expect(BITRIX_METHODS.filter((m) => m.includes("timeline"))).toEqual(["crm.timeline.comment.add"]);
   });
 
   it("posts JSON to the pinned host's webhook URL, refuses redirects, and checks the answer", async () => {
@@ -189,5 +191,75 @@ describe("Bitrix24 client", () => {
     expect(isOwnEcho({ updatedBy: 3 }, "17")).toBe(false);
     expect(isOwnEcho({ updatedBy: 3 }, "17", { reReadHash: "a".repeat(64), pushedHash: "a".repeat(64) })).toBe(true);
     expect(isOwnEcho({ updatedBy: null }, "17", { reReadHash: null, pushedHash: null })).toBe(false);
+  });
+});
+
+describe("Bitrix24 client: delete and not-found answers (gap G14)", () => {
+  const fakeClient = () => {
+    const clock = new FakeClock();
+    const fake = new FakeBitrix24({ host: FAKE_HOST, userId: FAKE_USER, secret: FAKE_SECRET, now: clock.ms });
+    return { fake, c: new BitrixRestClient(fakeConfig(), { fetchImpl: fake.fetch }) };
+  };
+
+  it.each(["true", "empty_array", "empty_object"] as const)("delete answered %s counts as deleted", async (shape) => {
+    const { fake, c } = fakeClient();
+    fake.deleteAnswer = shape;
+    const d = fake.seedDeal({ originId: fields.originId });
+    expect(await c.deleteDeal(d.id)).toBe("deleted");
+  });
+
+  it.each([
+    ["false", "invalid_response:delete_result_false"],
+    ["null", "invalid_response:delete_result_null"],
+    ["object", "invalid_response:delete_result_object"],
+    ["string", "invalid_response:delete_result_string"],
+  ] as const)("delete answered %s is never deleted: invalid_response naming the shape, a write may have happened", async (shape, code) => {
+    const { fake, c } = fakeClient();
+    fake.deleteAnswer = shape;
+    const d = fake.seedDeal({ originId: fields.originId });
+    const e = await c.deleteDeal(d.id).then(() => null, (x: CrmCallError) => x);
+    expect(e).toMatchObject({ kind: "invalid_response", code, writeMayHaveHappened: true });
+  });
+
+  it.each(["code", "empty_code_text", "core_text", "core_text_ru", "http404"] as const)("a not-found answer shaped %s is not_found", async (shape) => {
+    const { fake, c } = fakeClient();
+    fake.notFoundShape = shape;
+    expect(await c.deleteDeal(4242)).toBe("not_found");
+    await expect(c.updateDeal(4242, fields)).rejects.toMatchObject({ kind: "not_found" });
+  });
+
+  it("classify: a missing method or a field 'not found' is never a missing record", () => {
+    expect(classify(404, "ERROR_METHOD_NOT_FOUND", "Method not found!")).toBe("rejected");
+    expect(classify(400, "INVALID_ARG_VALUE", "Field UF_CRM_X not found")).toBe("rejected");
+    expect(classify(400, "ERROR_CORE", "Access to the entity is denied")).toBe("rejected");
+    expect(classify(400, "", "Not found")).toBe("not_found");
+    expect(classify(400, "ENTITY_NOT_FOUND")).toBe("not_found");
+    expect(classify(400, "ACCESS_DENIED", "not found")).toBe("auth");
+  });
+
+  it("the provider's description is never kept in the error", async () => {
+    const c = client(async () => json(400, { error: "ERROR_CORE", error_description: `Element 77 not found for ${["a.customer", "example.invalid"].join("@")}` }));
+    const e = await c.deleteDeal(77).then(() => null, (x: unknown) => x);
+    expect(e).toBeNull(); // not_found is an answer, not an error
+    const e2 = await c.updateDeal(77, fields).then(() => null, (x: CrmCallError) => x);
+    expect(e2).toMatchObject({ kind: "not_found", code: "not_found:ERROR_CORE" });
+    expect(JSON.stringify({ m: e2!.message, c: e2!.code })).not.toMatch(/example|77|customer/);
+  });
+});
+
+describe("Bitrix24 client: timeline comments (gap G7)", () => {
+  it("adds one comment to a deal with exactly ENTITY_ID, ENTITY_TYPE deal and COMMENT; the answer is the comment id", async () => {
+    const clock = new FakeClock();
+    const fake = new FakeBitrix24({ host: FAKE_HOST, userId: FAKE_USER, secret: FAKE_SECRET, now: clock.ms });
+    const c = new BitrixRestClient(fakeConfig(), { fetchImpl: fake.fetch });
+    const d = fake.seedDeal({ originId: fields.originId });
+    const r = await c.addTimelineComment(d.id, "OUTLYY update (Dubai time)\n22 Nov 2026 12:00 - Supplier booking confirmed");
+    expect(r.id).toBeGreaterThan(0);
+    expect(fake.commentsOn(d.id).map((x) => x.text)).toEqual(["OUTLYY update (Dubai time)\n22 Nov 2026 12:00 - Supplier booking confirmed"]);
+    expect(fake.refusedMethods).toEqual([]);
+    // A deal that is gone: not_found. A bad answer shape: invalid_response, a write may have happened.
+    await expect(c.addTimelineComment(99_999, "x")).rejects.toMatchObject({ kind: "not_found" });
+    const bad = client(async () => json(200, { result: { id: 1 } }));
+    await expect(bad.addTimelineComment(5, "x")).rejects.toMatchObject({ kind: "invalid_response", writeMayHaveHappened: true });
   });
 });

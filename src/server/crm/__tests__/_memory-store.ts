@@ -1,14 +1,16 @@
 import { crmConfigFrom, CRM_FIELD_KEYS, CRM_STAGE_KEYS, type CrmConfig, type CrmEnvSlice, type CrmScope } from "@/server/crm/crm.config";
 import { CRM_PAYLOAD_VERSION, originIdFor, type CrmContactFacts, type CrmSubject, type CrmSubjectState } from "@/server/crm/crm.mapping";
-import type { CrmLinkPatch, CrmLinkRow, CrmOutboxRow, CrmPortalStateRow, CrmStore, LockLinkResult } from "@/server/crm/crm.worker";
+import type { CrmMoment, CrmTimelineKind } from "@/server/crm/crm.timeline";
+import type { CrmLinkPatch, CrmLinkRow, CrmOutboxRow, CrmPortalStateRow, CrmStore, CrmTimelineFinish, CrmTimelineGroup, LockLinkResult } from "@/server/crm/crm.worker";
 
 /**
  * In-memory `CrmStore` with the same rules as the Postgres one
  * (crm.store.ts) and the same enqueue rules as crm.outbox.ts: link upsert
  * with a version bump, a delete never creates a link, a tombstone takes no
  * new row, claims are oldest-first within one scope, every row and link
- * update is fenced by the holder. The Postgres store is covered by the db
- * suite (crm.db.test.ts).
+ * update is fenced by the holder, and timeline moments are unique per link
+ * and moment key (C2b). The Postgres store is covered by the db suite
+ * (crm.db.test.ts).
  */
 
 export const T0 = Date.parse("2026-11-22T08:00:00.000Z");
@@ -49,6 +51,23 @@ interface MemLink extends CrmLinkRow {
   deleteReason: string | null;
 }
 
+export interface MemTimeline {
+  id: string;
+  linkId: string;
+  momentKey: string;
+  kind: CrmTimelineKind;
+  amountAedMinor: bigint | null;
+  noticedAt: Date;
+  status: "pending" | "posting" | "posted" | "unknown" | "failed" | "dropped";
+  attempts: number;
+  nextAttemptAt: number;
+  postingBy: string | null;
+  postingSince: number | null;
+  postedAt: Date | null;
+  crmCommentId: number | null;
+  lastErrorCode: string | null;
+}
+
 interface MemPortal extends CrmPortalStateRow {
   leaseHolder: string | null;
   leaseUntil: number | null;
@@ -65,6 +84,9 @@ export class MemoryCrmStore implements CrmStore {
   readonly rows: MemRow[] = [];
   readonly links: MemLink[] = [];
   readonly portals = new Map<string, MemPortal>();
+  readonly timeline: MemTimeline[] = [];
+  /** Test hook: make `recordTimelineMoments` throw. */
+  failTimelineRecord = false;
   private seq = 0;
 
   constructor(private readonly clock: FakeClock) {}
@@ -250,6 +272,78 @@ export class MemoryCrmStore implements CrmStore {
       l.lockedBy = null;
       l.lockedUntil = null;
     }
+  }
+
+  async recordTimelineMoments(linkId: string, moments: CrmMoment[], noticedAt: Date) {
+    if (this.failTimelineRecord) throw new Error("timeline store down");
+    let n = 0;
+    for (const m of moments) {
+      if (this.timeline.some((t) => t.linkId === linkId && t.momentKey === m.key)) continue;
+      this.timeline.push({
+        id: uuid(),
+        linkId,
+        momentKey: m.key,
+        kind: m.kind,
+        amountAedMinor: m.amountAedMinor,
+        noticedAt,
+        status: "pending",
+        attempts: 0,
+        nextAttemptAt: noticedAt.getTime(),
+        postingBy: null,
+        postingSince: null,
+        postedAt: null,
+        crmCommentId: null,
+        lastErrorCode: null,
+      });
+      n += 1;
+    }
+    return n;
+  }
+
+  async claimTimeline(scope: CrmScope, holder: string, now: Date, opts: { quietBefore: Date; maxWaitBefore: Date; staleBefore: Date; limit: number; perLink: number }): Promise<CrmTimelineGroup[]> {
+    const inScope = (linkId: string) => this.links.find((l) => l.id === linkId && l.environment === scope.environment && l.portal === scope.portal);
+    for (const t of this.timeline) {
+      const l = inScope(t.linkId);
+      if (!l) continue;
+      if (t.status === "posting" && (t.postingSince ?? 0) < opts.staleBefore.getTime()) Object.assign(t, { status: "unknown", lastErrorCode: "posting_lapsed", postingBy: null, postingSince: null });
+      if (t.status === "pending" && l.state === "deleted") Object.assign(t, { status: "dropped", lastErrorCode: "link_deleted" });
+    }
+    const due = new Map<string, MemTimeline[]>();
+    for (const t of this.timeline) {
+      const l = inScope(t.linkId);
+      if (!l || l.state !== "active" || l.crmId === null || t.status !== "pending" || t.nextAttemptAt > now.getTime()) continue;
+      due.set(t.linkId, [...(due.get(t.linkId) ?? []), t]);
+    }
+    const picked = [...due.entries()]
+      .filter(([, ts]) => Math.max(...ts.map((t) => t.noticedAt.getTime())) <= opts.quietBefore.getTime() || Math.min(...ts.map((t) => t.noticedAt.getTime())) <= opts.maxWaitBefore.getTime())
+      .sort((a, b) => Math.min(...a[1].map((t) => t.noticedAt.getTime())) - Math.min(...b[1].map((t) => t.noticedAt.getTime())) || (a[0] < b[0] ? -1 : 1))
+      .slice(0, opts.limit);
+    return picked.map(([linkId, all]) => {
+      const ts = [...all].sort((a, b) => a.noticedAt.getTime() - b.noticedAt.getTime() || (a.id < b.id ? -1 : 1)).slice(0, opts.perLink);
+      for (const t of ts) Object.assign(t, { status: "posting", postingBy: holder, postingSince: now.getTime() });
+      return {
+        linkId,
+        crmId: Number(this.links.find((l) => l.id === linkId)!.crmId),
+        attempts: Math.max(...ts.map((t) => t.attempts)),
+        entries: ts.map((t) => ({ id: t.id, kind: t.kind, amountAedMinor: t.amountAedMinor, noticedAt: t.noticedAt })),
+      };
+    });
+  }
+
+  async finishTimeline(ids: string[], holder: string, r: CrmTimelineFinish) {
+    for (const t of this.timeline) {
+      if (!ids.includes(t.id) || t.postingBy !== holder || t.status !== "posting") continue;
+      Object.assign(t, { postingBy: null, postingSince: null });
+      if (r.status === "posted") Object.assign(t, { status: "posted", postedAt: r.at, crmCommentId: r.crmCommentId, lastErrorCode: null });
+      else if (r.status === "pending") Object.assign(t, { status: "pending", nextAttemptAt: r.nextAttemptAt.getTime(), attempts: r.attempts, lastErrorCode: r.code });
+      else if (r.status === "failed") Object.assign(t, { status: "failed", attempts: r.attempts, lastErrorCode: r.code });
+      else Object.assign(t, { status: r.status, lastErrorCode: r.code });
+    }
+  }
+
+  timelineOf(scope: CrmScope, s: CrmSubject): MemTimeline[] {
+    const l = this.findLink(scope, s);
+    return l ? this.timeline.filter((t) => t.linkId === l.id) : [];
   }
 }
 

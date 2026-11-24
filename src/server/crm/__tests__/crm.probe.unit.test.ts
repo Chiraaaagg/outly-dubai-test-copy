@@ -105,8 +105,21 @@ describe("CRM synthetic probe", () => {
     await runCrmProbe({ config: h.config, port: h.port, now: h.clock.now });
     const other = h.fake.seedDeal({ originId: "inq:00000000-0000-7000-8000-000000000123" });
     const foreign = h.fake.seedDeal({ originId: originIdFor(PROBE_SUBJECT), originatorId: "outlyy-production" });
-    expect(await deleteCrmProbe({ config: h.config, port: h.port })).toEqual({ deleted: 1 });
+    expect(await deleteCrmProbe({ config: h.config, port: h.port })).toEqual({ deleted: 1, failed: [] });
     expect(h.fake.dealsFor(originIdFor(PROBE_SUBJECT)).map((d) => d.id)).toEqual([foreign.id]);
     expect(h.fake.deals.has(other.id)).toBe(true);
+  });
+
+  it("W12b is the first proof of the real delete answer (G14): an unknown shape is named by a code, never counted as deleted", async () => {
+    const h = harness();
+    await runCrmProbe({ config: h.config, port: h.port, now: h.clock.now });
+    h.fake.deleteAnswer = "object";
+    expect(await deleteCrmProbe({ config: h.config, port: h.port })).toEqual({ deleted: 0, failed: ["invalid_response:delete_result_object"] });
+    // Each documented success shape counts.
+    for (const shape of ["true", "empty_array", "empty_object"] as const) {
+      await runCrmProbe({ config: h.config, port: h.port, now: h.clock.now });
+      h.fake.deleteAnswer = shape;
+      expect(await deleteCrmProbe({ config: h.config, port: h.port })).toEqual({ deleted: 1, failed: [] });
+    }
   });
 });

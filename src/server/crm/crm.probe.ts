@@ -127,13 +127,27 @@ export async function runCrmProbe(deps: { config: CrmConfig; port: ProbePort; no
   return { ok: Object.values(fields).every((s) => s === "ok"), dealId, created, fields };
 }
 
-/** Delete the probe deal(s) of this environment, through the erasure delete guard. */
-export async function deleteCrmProbe(deps: { config: CrmConfig; port: ProbePort }): Promise<{ deleted: number }> {
+/**
+ * Delete the probe deal(s) of this environment, through the erasure delete guard. The first real deletion
+ * (W12b) is also the proof of the portal's delete answer (gap G14): a deal not deleted is named in `failed`
+ * by a short code (`not_found`, or the client's code such as `invalid_response:delete_result_object`), never
+ * by a provider message, so the owner can report it.
+ */
+export async function deleteCrmProbe(deps: { config: CrmConfig; port: ProbePort }): Promise<{ deleted: number; failed: string[] }> {
   const { config, port } = deps;
   const link = { crmId: null, originatorId: config.originatorId, originId: originIdFor(PROBE_SUBJECT) };
   const found = await port.findDealsByOrigin(link.originatorId, link.originId);
   for (const d of found) assertDeleteTarget(d, link, config);
   let deleted = 0;
-  for (const d of found) if ((await port.deleteDeal(d.id)) === "deleted") deleted += 1;
-  return { deleted };
+  const failed: string[] = [];
+  for (const d of found) {
+    try {
+      if ((await port.deleteDeal(d.id)) === "deleted") deleted += 1;
+      else failed.push("not_found");
+    } catch (e) {
+      if (!(e instanceof CrmCallError) || e.kind === "throttled" || e.kind === "auth") throw e;
+      failed.push(e.code);
+    }
+  }
+  return { deleted, failed };
 }

@@ -2,7 +2,8 @@ import "server-only";
 import { z } from "zod";
 import { stripeConfigProblems } from "../payments/stripe/stripe.config";
 import { traveldeskConfigProblems } from "../suppliers/traveldesk/traveldesk.config";
-import { crmConfigProblems, crmScopeProblems } from "../crm/crm.config";
+import { crmConfigFrom, crmConfigProblems, crmScopeProblems } from "../crm/crm.config";
+import { crmReturnProblems } from "../crm/crm.return.config";
 import { keyRingProblems } from "./crypto";
 import { log } from "./logger";
 
@@ -345,6 +346,14 @@ const schema = z.object({
   /** The synthetic probe's own secret (doc 29d §5.2a; SEC-8), at least 32 characters. Unset ⇒ the probe is refused. */
   CRM_PROBE_SECRET: optionalStr,
   CRM_BITRIX_TIMEOUT_MS: int(5_000),
+  // Return path (CRM batch C3ab, doc 29e; src/server/crm/crm.return.config.ts). Ignored while CRM_SYNC_ENABLED
+  // is not "true". Production scope only.
+  /** `off` (default), `observe` or `enforce`. Any other value keeps the return path off (fail closed). */
+  CRM_RETURN_PATH: optionalStr,
+  /** Exactly "true": `enforce` accepts staff sales-stage moves and Bitrix24 owner changes (owner answer 3). */
+  CRM_RETURN_ACCEPT: strictBool("CRM_RETURN_ACCEPT"),
+  /** `bitrixUserId=outlyyStaffId` pairs, comma-separated (owner answer 4). Ids only. */
+  CRM_BITRIX_STAFF_MAP: optionalStr,
 
   // Photography — Pexels search for any catalogue image without a curated id (src/lib/images/manifest.ts).
   PEXELS_API_KEY: optionalStr,
@@ -427,6 +436,8 @@ export function assertBootEnv(): string[] {
   for (const p of stripeConfigProblems(e)) problems.push(`Stripe refused: ${p}`);
   if (e.CRM_SYNC_ENABLED) {
     for (const p of crmConfigProblems(e)) problems.push(`CRM sync on but unusable: ${p}`);
+    const crm = crmConfigFrom(e);
+    if (crm) for (const p of crmReturnProblems(e, crm)) problems.push(`CRM return path refused, it stays off: ${p}`);
   } else if (e.CRM_BITRIX_PORTAL_HOST) {
     const scope = crmScopeProblems(e);
     for (const p of scope) problems.push(`CRM portal refused, nothing is enqueued: ${p}`);

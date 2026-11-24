@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { bookingReason, catalogueStaleIncident, incidentContext, latestPerKey, OPS_INCIDENT_TITLES, reasonCode, type OpsIncident } from "../ops-alert.service";
+import { bookingReason, catalogueStaleIncident, crmPortalIncident, crmSyncDeadReason, isCrmDeleteCode, incidentContext, latestPerKey, OPS_INCIDENT_TITLES, reasonCode, type OpsIncident } from "../ops-alert.service";
+import { AUTH_PAUSE_MS, BREAKER_THRESHOLD, breakerPauseMs } from "@/server/crm/crm.worker";
 import { renderTemplate } from "@/server/notifications/templates";
 
 /** Ops alert emails (doc 22 §32.24): the pure parts. Synthetic ids only. */
@@ -142,5 +143,62 @@ describe("stale catalogue alert (doc 29 Batch 1b, review 81 R7)", () => {
     expect(r.text).toContain("Reason: catalogue_stale");
     expect(r.text).toContain("Entity: supplier_account:traveldesk.catalogue.test");
     expect(r.text).toContain("Admin: https://outlyy.com/admin/suppliers/traveldesk");
+  });
+});
+
+describe("CRM sync alerts (doc 29d G11, CRM C2b)", () => {
+  const H = 3_600_000;
+  const now = new Date("2026-11-25T10:00:00.000Z");
+  const since = new Date(now.getTime() - 72 * H);
+
+  it("a dead sync row: one reason per error kind, codes only", () => {
+    expect(crmSyncDeadReason("unavailable:timeout")).toBe("crm_sync_dead_unavailable");
+    expect(crmSyncDeadReason("refused:uf_customer_email")).toBe("crm_sync_dead_refused");
+    expect(crmSyncDeadReason("rejected:INVALID_ARG_VALUE")).toBe("crm_sync_dead_rejected");
+    expect(crmSyncDeadReason("something else")).toBe("crm_sync_dead_other");
+    expect(crmSyncDeadReason(null)).toBe("crm_sync_dead_other");
+  });
+
+  it("a sync row that died deleting an erased subject's deal is a delete incident, never 'sync gave up' (C2B-05)", () => {
+    for (const c of ["refused:linked_deal_not_visible", "rejected:delete_not_found_visible", "refused:delete_target", "invalid_response:delete_result_object"]) expect(isCrmDeleteCode(c)).toBe(true);
+    for (const c of ["unavailable:timeout", "refused:uf_customer_email", "invalid_response:schema", null]) expect(isCrmDeleteCode(c)).toBe(false);
+  });
+
+  it("an open breaker is raised at the moment it opened, exactly, and again at each re-open", () => {
+    const openedAt = new Date(now.getTime() - 2 * 60_000);
+    const failures = BREAKER_THRESHOLD;
+    const row = { environment: "production", pauseReason: "breaker", pausedUntil: new Date(openedAt.getTime() + breakerPauseMs(failures)), consecutiveFailures: failures };
+    const i = crmPortalIncident(row, since, now)!;
+    expect(i).toMatchObject({ kind: "crm_sync_paused", entityKind: "crm_subject", entityId: "portal:production", reason: "crm_breaker_open", orderReference: null, adminPath: "/admin" });
+    expect(i.raisedAt).toEqual(openedAt);
+    // A failed half-open probe re-opens it, longer: a new raise (the 6-hour dedup still limits the emails).
+    const reopenedAt = new Date(now.getTime() - 30_000);
+    const again = crmPortalIncident({ ...row, consecutiveFailures: failures + 1, pausedUntil: new Date(reopenedAt.getTime() + breakerPauseMs(failures + 1)) }, since, now)!;
+    expect(again.raisedAt).toEqual(reopenedAt);
+    // Recovered (failures reset by a success), a throttle pause, or no pause: no incident.
+    expect(crmPortalIncident({ ...row, consecutiveFailures: 0 }, since, now)).toBeNull();
+    expect(crmPortalIncident({ ...row, pauseReason: "throttled" }, since, now)).toBeNull();
+    expect(crmPortalIncident({ ...row, pausedUntil: null }, since, now)).toBeNull();
+  });
+
+  it("a refused credential is raised at its opening, stays one raise after recovery, and ages out of the window", () => {
+    const openedAt = new Date(now.getTime() - 10 * 60_000);
+    const row = { environment: "production", pauseReason: "auth", pausedUntil: new Date(openedAt.getTime() + AUTH_PAUSE_MS), consecutiveFailures: 0 };
+    expect(crmPortalIncident(row, since, now)).toMatchObject({ reason: "crm_auth_refused", raisedAt: openedAt });
+    // Long after the pause ended the stored row still names the same opening: the ops_alerts row already handled it.
+    expect(crmPortalIncident(row, since, new Date(now.getTime() + 5 * H))!.raisedAt).toEqual(openedAt);
+    expect(crmPortalIncident(row, new Date(now.getTime() + 73 * H - 72 * H + H), new Date(now.getTime() + 73 * H))).toBeNull();
+  });
+
+  it("the CRM alert emails carry codes and ids only", () => {
+    const dead: OpsIncident = { kind: "crm_sync_dead", entityKind: "crm_subject", entityId: `order:${ID}`, reason: "crm_sync_dead_unavailable", raisedAt: T, orderId: ID, orderReference: "OUT-100001", bookingId: null, supplierBookingRef: null, adminPath: "/admin/bookings/OUT-100001" };
+    const r = renderTemplate("OPS_INCIDENT_ALERT", "email", incidentContext(dead, "https://outlyy.com") as never);
+    expect(r.subject).toBe(`[OUTLY ALERT] ${OPS_INCIDENT_TITLES.crm_sync_dead} — OUT-100001`);
+    expect(r.text).toContain("Reason: crm_sync_dead_unavailable");
+    const paused = crmPortalIncident({ environment: "production", pauseReason: "auth", pausedUntil: new Date(T.getTime() + AUTH_PAUSE_MS), consecutiveFailures: 0 }, new Date(0), new Date(T.getTime() + 1))!;
+    const p = renderTemplate("OPS_INCIDENT_ALERT", "email", incidentContext(paused, "https://outlyy.com") as never);
+    expect(p.subject).toBe(`[OUTLY ALERT] ${OPS_INCIDENT_TITLES.crm_sync_paused}`);
+    expect(p.text).toContain("Entity: crm_subject:portal:production");
+    expect(p.text).not.toMatch(/bitrix|rest\/|secret/i);
   });
 });

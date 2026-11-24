@@ -82,6 +82,12 @@ export interface CrmOrderFacts {
   marginAedMinor?: bigint | null;
   /** A counted payment exists in another currency than the order's (never converted; review C2A-05). */
   otherCurrencyPaid?: boolean;
+  /**
+   * Our team took the order over because a supplier could not confirm an item: a supplier booking that is a
+   * hand-off (crm.timeline.ts `isHandoffBooking`, R-01). Drives the timeline's "handed to the team" moment only
+   * (C2B-03); never a deal field.
+   */
+  handedToTeam?: boolean;
 }
 
 export interface CrmInquiryFacts {

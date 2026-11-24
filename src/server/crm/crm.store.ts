@@ -1,13 +1,16 @@
 import "server-only";
 import { prisma, TX_OPTIONS } from "../lib/db";
+import { uuidv7 } from "../lib/ids";
 import type { CrmScope } from "./crm.config";
 import { CRM_PAYLOAD_VERSION, type CrmEntityType, type CrmSubject } from "./crm.mapping";
 import { enqueueCrmDelete, type CrmDeleteReason } from "./crm.outbox";
-import type { CrmLinkPatch, CrmLinkRow, CrmOutboxRow, CrmPortalStateRow, CrmStore, LockLinkResult } from "./crm.worker";
+import { Prisma } from "@prisma/client";
+import { HANDOFF_ERROR_CODES, HANDOFF_STATES, type CrmTimelineKind } from "./crm.timeline";
+import type { CrmLinkPatch, CrmLinkRow, CrmOutboxRow, CrmPortalStateRow, CrmStore, CrmTimelineGroup, LockLinkResult } from "./crm.worker";
 
 /**
  * Postgres `CrmStore` (crm_outbox, crm_links, crm_portal_state; migration
- * 20261122120000). Every write is one statement, outside any long
+ * 20261122130000; crm_timeline_comments, migration 20261125120000, C2b). Every write is one statement, outside any long
  * transaction: no transaction is ever held open across a CRM call.
  *
  *  - Claim: `FOR UPDATE SKIP LOCKED`, due rows of this scope only, oldest
@@ -167,6 +170,99 @@ export const prismaCrmStore: CrmStore = {
   async unlockLink(linkId, holder) {
     await prisma.crmLink.updateMany({ where: { id: linkId, lockedBy: holder }, data: { lockedBy: null, lockedUntil: null } });
   },
+
+  async recordTimelineMoments(linkId, moments, noticedAt) {
+    if (!moments.length) return 0;
+    const r = await prisma.crmTimelineComment.createMany({
+      data: moments.map((m) => ({ id: uuidv7(), linkId, momentKey: m.key, kind: m.kind, amountAedMinor: m.amountAedMinor, noticedAt, nextAttemptAt: noticedAt })),
+      skipDuplicates: true,
+    });
+    return r.count;
+  },
+
+  async claimTimeline(scope, holder, now, opts) {
+    // Never re-posted: a claim whose holder vanished may have reached the portal.
+    await prisma.$executeRaw`
+      UPDATE crm_timeline_comments c SET status = 'unknown', last_error_code = 'posting_lapsed', posting_by = NULL, posting_since = NULL, updated_at = now()
+      FROM crm_links l
+      WHERE c.link_id = l.id AND l.environment = ${scope.environment} AND l.portal = ${scope.portal}
+        AND c.status = 'posting' AND c.posting_since < ${opts.staleBefore}`;
+    await prisma.$executeRaw`
+      UPDATE crm_timeline_comments c SET status = 'dropped', last_error_code = 'link_deleted', updated_at = now()
+      FROM crm_links l
+      WHERE c.link_id = l.id AND l.environment = ${scope.environment} AND l.portal = ${scope.portal}
+        AND c.status = 'pending' AND l.state = 'deleted'`;
+    const rows = await prisma.$queryRaw<{ id: string; link_id: string; crm_id: bigint; kind: CrmTimelineKind; amount_aed_minor: bigint | null; noticed_at: Date; attempts: number }[]>`
+      WITH due AS (
+        SELECT c.link_id
+        FROM crm_timeline_comments c JOIN crm_links l ON l.id = c.link_id
+        WHERE l.environment = ${scope.environment} AND l.portal = ${scope.portal} AND l.state = 'active' AND l.crm_id IS NOT NULL
+          AND c.status = 'pending' AND c.next_attempt_at <= ${now}
+        GROUP BY c.link_id
+        HAVING max(c.noticed_at) <= ${opts.quietBefore} OR min(c.noticed_at) <= ${opts.maxWaitBefore}
+        ORDER BY min(c.noticed_at), c.link_id
+        LIMIT ${opts.limit}
+      ), picked AS (
+        -- At most perLink moments per deal, oldest first: the rest wait for the next comment (review C2B-04).
+        SELECT id FROM (
+          SELECT c.id, row_number() OVER (PARTITION BY c.link_id ORDER BY c.noticed_at, c.id) AS n
+          FROM crm_timeline_comments c JOIN due ON due.link_id = c.link_id
+          WHERE c.status = 'pending' AND c.next_attempt_at <= ${now}
+        ) ranked WHERE n <= ${opts.perLink}
+      )
+      UPDATE crm_timeline_comments c SET status = 'posting', posting_by = ${holder}, posting_since = ${now}, updated_at = now()
+      FROM picked, crm_links l
+      -- Re-checked under the row lock: a moment another claim took meanwhile is not taken twice.
+      WHERE c.id = picked.id AND l.id = c.link_id AND c.status = 'pending'
+      RETURNING c.id, c.link_id, l.crm_id, c.kind, c.amount_aed_minor, c.noticed_at, c.attempts`;
+    const groups = new Map<string, CrmTimelineGroup>();
+    for (const r of rows) {
+      const g = groups.get(r.link_id) ?? { linkId: r.link_id, crmId: Number(r.crm_id), attempts: 0, entries: [] };
+      g.attempts = Math.max(g.attempts, r.attempts);
+      g.entries.push({ id: r.id, kind: r.kind, amountAedMinor: r.amount_aed_minor === null ? null : BigInt(r.amount_aed_minor), noticedAt: r.noticed_at });
+      groups.set(r.link_id, g);
+    }
+    return [...groups.values()];
+  },
+
+  async finishTimeline(ids, holder, r) {
+    if (!ids.length) return;
+    const where = { id: { in: ids }, postingBy: holder, status: "posting" };
+    const release = { postingBy: null, postingSince: null };
+    if (r.status === "posted") {
+      await prisma.crmTimelineComment.updateMany({ where, data: { ...release, status: "posted", postedAt: r.at, crmCommentId: BigInt(r.crmCommentId), lastErrorCode: null } });
+    } else if (r.status === "pending") {
+      await prisma.crmTimelineComment.updateMany({ where, data: { ...release, status: "pending", nextAttemptAt: r.nextAttemptAt, attempts: r.attempts, lastErrorCode: r.code } });
+    } else if (r.status === "failed") {
+      await prisma.crmTimelineComment.updateMany({ where, data: { ...release, status: "failed", attempts: r.attempts, lastErrorCode: r.code } });
+    } else {
+      await prisma.crmTimelineComment.updateMany({ where, data: { ...release, status: r.status, lastErrorCode: r.code } });
+    }
+  },
+
+  async recordHandoffMoments(scope, now) {
+    // Driven by recent booking flags (R-03), not by every active link: the lookback is the ops alerts' (a flag
+    // older than that is not news). The same lists as the snapshot (R-01). Ids and flags only, no personal data.
+    const since = new Date(now.getTime() - HANDOFF_LOOKBACK_MS);
+    return prisma.$executeRaw`
+      WITH flagged AS (
+        SELECT DISTINCT b.order_id FROM supplier_bookings b
+        WHERE b.order_id IS NOT NULL AND (
+          (b.error_code IN (${Prisma.join([...HANDOFF_ERROR_CODES])}) AND b.attention_required_at >= ${since})
+          OR (b.state::text IN (${Prisma.join([...HANDOFF_STATES])}) AND b.updated_at >= ${since})
+        )
+      )
+      INSERT INTO crm_timeline_comments (id, link_id, moment_key, kind, noticed_at, next_attempt_at, created_at, updated_at)
+      SELECT gen_random_uuid(), l.id, 'handed_to_team', 'handed_to_team', ${now}, ${now}, now(), now()
+      FROM flagged f
+      LEFT JOIN inquiries q ON q.converted_order_id = f.order_id
+      JOIN crm_links l ON l.environment = ${scope.environment} AND l.portal = ${scope.portal}
+        AND ((l.entity_type = 'order' AND l.entity_id = f.order_id) OR (l.entity_type = 'inquiry' AND l.entity_id = q.id))
+      WHERE l.state = 'active' AND l.crm_id IS NOT NULL
+        AND EXISTS (SELECT 1 FROM crm_timeline_comments p WHERE p.link_id = l.id AND p.kind = 'paid')
+        AND NOT EXISTS (SELECT 1 FROM crm_timeline_comments h WHERE h.link_id = l.id AND h.moment_key = 'handed_to_team')
+      ON CONFLICT (link_id, moment_key) DO NOTHING`;
+  },
 };
 
 /* ---------------------------------------------------------------------------
@@ -184,6 +280,8 @@ export const CRM_OUTBOX_DEAD_DAYS = 90;
 export const CRM_TOMBSTONE_DAYS = 730;
 
 const DAY = 86_400_000;
+/** A staff hand-off flag older than this is not recorded as a new moment (the ops-alert lookback, 72 h). */
+const HANDOFF_LOOKBACK_MS = 72 * 3_600_000;
 
 export interface CrmRetentionResult {
   scheduled: number;
@@ -225,8 +323,10 @@ export async function runCrmRetention(scope: CrmScope, now: Date, limit = 200): 
   const outboxDead = await prisma.crmOutbox.deleteMany({
     where: { environment: scope.environment, portal: scope.portal, status: "dead", updatedAt: { lt: new Date(now.getTime() - CRM_OUTBOX_DEAD_DAYS * DAY) } },
   });
-  const links = await prisma.crmLink.deleteMany({
-    where: { environment: scope.environment, portal: scope.portal, state: "deleted", deletedAt: { lt: new Date(now.getTime() - CRM_TOMBSTONE_DAYS * DAY) } },
-  });
+  const purgeLinks = { environment: scope.environment, portal: scope.portal, state: "deleted", deletedAt: { lt: new Date(now.getTime() - CRM_TOMBSTONE_DAYS * DAY) } };
+  // A purged tombstone's timeline record goes with it (no foreign key, C2b): the deal itself is long gone.
+  const gone = await prisma.crmLink.findMany({ where: purgeLinks, select: { id: true }, take: 1_000 });
+  if (gone.length) await prisma.crmTimelineComment.deleteMany({ where: { linkId: { in: gone.map((l) => l.id) } } });
+  const links = await prisma.crmLink.deleteMany({ where: { ...purgeLinks, id: { in: gone.map((l) => l.id) } } });
   return { scheduled, purgedOutbox: outboxDone.count + outboxDead.count, purgedLinks: links.count };
 }

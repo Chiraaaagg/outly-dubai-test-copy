@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupplierEnvironment } from "@prisma/client";
+import { Prisma, type SupplierEnvironment } from "@prisma/client";
 import { prisma, TX_OPTIONS } from "../lib/db";
 import { env } from "../lib/env";
 import { traveldeskConfigFrom } from "../suppliers/traveldesk/traveldesk.config";
@@ -10,6 +10,8 @@ import type { OpsAlertContext, OpsAlertDigestContext, TemplateContext } from "..
 import { notificationService, type DispatchResult } from "./notification.service";
 import { urgentAt, visitDeadlineLevel } from "./document.service";
 import { quoteBudgetIncidents } from "./quote-budget-alert";
+import { AUTH_PAUSE_MS, BREAKER_THRESHOLD, breakerPauseMs } from "../crm/crm.worker";
+import { crmReturnIncidents } from "../crm/crm.return.alerts";
 
 /**
  * Ops alert emails for instant-path incidents (doc 22 §32.24: alerts by
@@ -49,8 +51,25 @@ import { quoteBudgetIncidents } from "./quote-budget-alert";
  *    existing F12 thresholds (urgent is its own reason);
  *  - `crm_delete_failed`: a CRM copy that could not be deleted (a
  *    dead-lettered `delete` row in `crm_outbox`, reason `erasure` or
- *    `retention`; doc 29 §6.5, review R13). Ids only. Read only when the CRM
- *    tables exist: a missing table yields no incident, never a failed sweep;
+ *    `retention`; doc 29 §6.5, review R13), or an erased subject's sync row
+ *    that died because the linked deal was not visible (review C2A-08). Ids
+ *    only. Read only when the CRM tables exist: a missing table yields no
+ *    incident, never a failed sweep;
+ *  - `crm_sync_dead` (doc 29d G11, C2b): a CRM sync row dead-lettered (eight
+ *    failed attempts, or refused by the payload guard), so the deal no longer
+ *    follows OUTLYY. One incident per subject and error kind, reason
+ *    `crm_sync_dead_<kind>`; the order reference when the subject is an
+ *    order. Ids and codes only;
+ *  - `crm_sync_paused` (doc 29d G11, C2b): the CRM worker's circuit opened,
+ *    after five consecutive outage answers (`crm_breaker_open`, raised again
+ *    at each re-open while the portal stays down) or on a refused credential
+ *    (`crm_auth_refused`). Entity `crm_subject:portal:<environment>`; read
+ *    from crm_portal_state, so its opening time is exact;
+ *  - `crm_return_path` (CRM batch C3ab, doc 29e): a Bitrix24 return path
+ *    finding (crm.return.alerts.ts): a hand-made, orphan, foreign, twin,
+ *    reappeared or no longer visible deal, repeated put-backs or a loop
+ *    hold, an unknown stage, an owner change OUTLYY could not follow, a
+ *    portal fingerprint refusal. Reason = the finding kind; ids only;
  *  - `catalogue_stale`: the TravelDesk catalogue of this deployment's
  *    environment has had no complete sync for `CATALOGUE_STALE_AFTER_MS`
  *    (48 h; doc 29 Batch 1b, review 81 R7). Raised at the moment it turned
@@ -103,9 +122,15 @@ export type OpsIncidentKind =
   | "booking_attention"
   | "document_attention"
   | "crm_delete_failed"
+  | "crm_sync_dead"
+  | "crm_sync_paused"
+  | "crm_return_path"
   | "catalogue_stale"
   | "quote_budget_refused";
-/** `crm_subject` needs migration 20261122140000 (ops_alerts_entity_kind_check). */
+/**
+ * `crm_subject` needs migration 20261122140000 (ops_alerts_entity_kind_check). Its entity id is `inquiry:<id>`
+ * or `order:<id>`, or `portal:<environment>` for the CRM worker's own pause (C2b, no new entity kind).
+ */
 export type OpsEntityKind = "supplier_account" | "payment_saga" | "order_item" | "supplier_booking" | "supplier_document" | "crm_subject";
 
 export interface OpsIncident {
@@ -134,6 +159,9 @@ export const OPS_INCIDENT_TITLES: Record<OpsIncidentKind, string> = {
   booking_attention: "Booking needs staff",
   document_attention: "Tickets need staff",
   crm_delete_failed: "CRM copy could not be deleted",
+  crm_sync_dead: "CRM deal no longer updated: sync gave up",
+  crm_sync_paused: "CRM sync paused: portal not answering or credential refused",
+  crm_return_path: "CRM return path: a Bitrix24 change needs a look",
   catalogue_stale: "Supplier catalogue not synced for 48 hours",
   quote_budget_refused: "Quote read budget spent: customers sent to inquiry",
 };
@@ -418,6 +446,9 @@ export async function collectOpsIncidents(since: Date, now: Date, limit = COLLEC
   }
 
   out.push(...(await crmDeleteIncidents(since, now, limit)));
+  out.push(...(await crmSyncDeadIncidents(since, now, limit)));
+  out.push(...(await crmPortalIncidents(since, now)));
+  out.push(...(await crmReturnIncidents(since, now, limit)));
   const tdEnvironment = traveldeskConfigFrom(env())?.environment;
   if (tdEnvironment) out.push(...(await catalogueStaleIncidents(tdEnvironment, since, now)));
   out.push(...(await quoteBudgetIncidents(since, now, limit)));
@@ -481,7 +512,7 @@ export async function crmDeleteIncidents(since: Date, now: Date, limit = COLLECT
     .$queryRaw<Row[]>`
     SELECT entity_type, entity_id::text AS entity_id, reason, (last_error_code = 'refused:linked_deal_not_visible') AS unverified, max(updated_at) AS raised_at
     FROM crm_outbox
-    WHERE kind = 'delete' AND status = 'dead' AND updated_at >= ${since} AND updated_at <= ${now}
+    WHERE (kind = 'delete' OR ${CRM_DELETE_CODES_SQL}) AND status = 'dead' AND updated_at >= ${since} AND updated_at <= ${now}
     GROUP BY entity_type, entity_id, reason, unverified
     ORDER BY raised_at DESC LIMIT ${limit}`
     .catch((e: unknown) => {
@@ -503,6 +534,129 @@ export async function crmDeleteIncidents(since: Date, now: Date, limit = COLLECT
     supplierBookingRef: null,
     adminPath: "/admin",
   }));
+}
+
+/**
+ * Codes a sync row can only die with while deleting an erased subject's deal (crm.worker.ts deleteCopies): such a
+ * row is the delete incident, never "sync gave up", because customer data may still be on the portal (C2B-05).
+ */
+export const CRM_DELETE_ERROR_CODES = ["refused:linked_deal_not_visible", "rejected:delete_not_found_visible", "refused:delete_target"] as const;
+export const CRM_DELETE_ERROR_PREFIX = "invalid_response:delete_result_";
+const deleteCodesSql = (col: Prisma.Sql) =>
+  Prisma.sql`(${col} IN (${Prisma.join([...CRM_DELETE_ERROR_CODES])}) OR ${col} LIKE ${`${CRM_DELETE_ERROR_PREFIX}%`})`;
+const CRM_DELETE_CODES_SQL = deleteCodesSql(Prisma.raw("last_error_code"));
+const CRM_DELETE_CODES_SQL_C = deleteCodesSql(Prisma.raw("c.last_error_code"));
+/** Pure, for tests: whether a dead row's code is a delete code. */
+export function isCrmDeleteCode(code: string | null): boolean {
+  return code !== null && ((CRM_DELETE_ERROR_CODES as readonly string[]).includes(code) || code.startsWith(CRM_DELETE_ERROR_PREFIX));
+}
+
+const isMissingTable = (e: unknown, table: string) =>
+  new RegExp(`42P01|${table}.*does not exist`).test(String((e as { message?: unknown })?.message ?? "")) || (e as { meta?: { code?: unknown } })?.meta?.code === "42P01";
+
+/** The error kinds a dead CRM row's `last_error_code` starts with (bitrix.client.ts CrmErrorKind). */
+const CRM_ERROR_KINDS = new Set(["throttled", "unavailable", "auth", "not_found", "rejected", "invalid_response", "refused"]);
+
+/** `crm_sync_dead_<kind>` from a stored `kind:CODE`; an unknown or missing kind is `other`. Pure, for tests. */
+export function crmSyncDeadReason(lastErrorCode: string | null): string {
+  const kind = (lastErrorCode ?? "").split(":")[0];
+  return `crm_sync_dead_${CRM_ERROR_KINDS.has(kind) ? kind : "other"}`;
+}
+
+/**
+ * Dead-lettered CRM sync rows (doc 29d G11): the deal stopped following OUTLYY. A sync row that died because an
+ * erased subject's deal was not visible is the delete incident above, not this one. Guarded like the delete read.
+ */
+export async function crmSyncDeadIncidents(since: Date, now: Date, limit = COLLECT_LIMIT): Promise<OpsIncident[]> {
+  const rows = await prisma
+    .$queryRaw<Row[]>`
+    SELECT c.entity_type, c.entity_id::text AS entity_id, c.last_error_code, max(c.updated_at) AS raised_at, max(o.reference) AS reference
+    FROM crm_outbox c LEFT JOIN orders o ON c.entity_type = 'order' AND o.id = c.entity_id
+    WHERE c.kind = 'sync' AND c.status = 'dead' AND c.updated_at >= ${since} AND c.updated_at <= ${now}
+      AND (c.last_error_code IS NULL OR NOT (${CRM_DELETE_CODES_SQL_C}))
+    GROUP BY c.entity_type, c.entity_id, c.last_error_code
+    ORDER BY raised_at DESC LIMIT ${limit}`
+    .catch((e: unknown) => {
+      if (isMissingTable(e, "crm_outbox")) return [] as Row[];
+      throw e;
+    });
+  return rows.map((r) => {
+    const reference = str(r.reference);
+    const inquiry = r.entity_type === "inquiry";
+    return {
+      kind: "crm_sync_dead" as const,
+      entityKind: "crm_subject" as const,
+      entityId: `${String(r.entity_type)}:${String(r.entity_id)}`,
+      reason: crmSyncDeadReason(str(r.last_error_code)),
+      raisedAt: date(r.raised_at),
+      // Only an order that exists (the join found its reference) is named.
+      orderId: inquiry || !reference ? null : String(r.entity_id),
+      orderReference: inquiry ? null : reference,
+      bookingId: null,
+      supplierBookingRef: null,
+      adminPath: inquiry ? `/admin/inquiries/${encodeURIComponent(String(r.entity_id))}` : bookingPath(reference),
+    };
+  });
+}
+
+/** The CRM worker's pause as crm_portal_state stores it. */
+export interface CrmPortalPause {
+  environment: string;
+  pauseReason: string | null;
+  pausedUntil: Date | null;
+  consecutiveFailures: number;
+}
+
+/**
+ * The open-circuit incident of one CRM portal row (doc 29d G11), raised at the moment the circuit opened: the
+ * worker sets `paused_until` to that moment plus `AUTH_PAUSE_MS` (auth) or `breakerPauseMs(failures)` (breaker),
+ * so the opening time is exact and stays the same until the next re-open. A breaker row whose failures were reset
+ * by a success, a throttle pause, or an opening outside the sweep window is no incident. Pure, for tests.
+ */
+export function crmPortalIncident(row: CrmPortalPause, since: Date, now: Date): OpsIncident | null {
+  if (!row.pausedUntil) return null;
+  let openedAt: number;
+  let reason: string;
+  if (row.pauseReason === "auth") {
+    openedAt = row.pausedUntil.getTime() - AUTH_PAUSE_MS;
+    reason = "crm_auth_refused";
+  } else if (row.pauseReason === "breaker" && row.consecutiveFailures >= BREAKER_THRESHOLD) {
+    openedAt = row.pausedUntil.getTime() - breakerPauseMs(row.consecutiveFailures);
+    reason = "crm_breaker_open";
+  } else return null;
+  if (openedAt > now.getTime() || openedAt < since.getTime()) return null;
+  return {
+    kind: "crm_sync_paused",
+    entityKind: "crm_subject",
+    entityId: `portal:${row.environment}`,
+    reason,
+    raisedAt: new Date(openedAt),
+    orderId: null,
+    orderReference: null,
+    bookingId: null,
+    supplierBookingRef: null,
+    adminPath: "/admin",
+  };
+}
+
+export async function crmPortalIncidents(since: Date, now: Date): Promise<OpsIncident[]> {
+  const rows = await prisma
+    .$queryRaw<Row[]>`
+    SELECT environment, pause_reason, paused_until, consecutive_failures FROM crm_portal_state
+    WHERE pause_reason IN ('breaker', 'auth') AND paused_until IS NOT NULL`
+    .catch((e: unknown) => {
+      if (isMissingTable(e, "crm_portal_state")) return [] as Row[];
+      throw e;
+    });
+  return rows
+    .map((r) =>
+      crmPortalIncident(
+        { environment: String(r.environment), pauseReason: str(r.pause_reason), pausedUntil: r.paused_until ? date(r.paused_until) : null, consecutiveFailures: Number(r.consecutive_failures) },
+        since,
+        now,
+      ),
+    )
+    .filter((i): i is OpsIncident => i !== null);
 }
 
 /* ---------------------------------------------------------------------------
