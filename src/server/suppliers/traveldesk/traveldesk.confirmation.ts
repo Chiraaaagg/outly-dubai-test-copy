@@ -1,6 +1,6 @@
 import type { ConfirmationFailure, ConfirmationSnapshot, ConfirmationVerdict, ExpectedBooking } from "../booking-port";
 import type { TravelDeskBooking } from "./traveldesk.booking";
-import { DATE_ONLY_CLASS_KEYS } from "./traveldesk.capability";
+import { DATE_ONLY_CLASS_KEYS, deriveCapabilities } from "./traveldesk.capability";
 
 /**
  * When a TravelDesk answer counts as a confirmed booking (SUP-1, doc 22 §23 B1a).
@@ -142,4 +142,19 @@ export function reservationSlotDiffers(sentTimeSlotId: string | null, answer: Pi
  */
 export function reservationSlotHeld(classKey: string | null, sentTimeSlotId: string | null, answer: Pick<ConfirmationSnapshot, "timeSlotId">): boolean {
   return classKey !== null && DATE_ONLY_CLASS_KEYS.includes(classKey) && reservationSlotDiffers(sentTimeSlotId, answer);
+}
+
+/**
+ * The class key of a booking's stored offer for `reservationSlotHeld`
+ * (review 92 B7-17). `read` loads the stored offer row. No row, and any
+ * failure of the read, give null ("not date only"), so a failed read never
+ * throws on this path and a Batch 0–6 booking behaves as before Batch 7.
+ */
+export async function storedOfferClassKey(read: () => Promise<{ payload: unknown } | null>): Promise<string | null> {
+  try {
+    const row = await read();
+    return row ? deriveCapabilities(row.payload).classKey : null;
+  } catch {
+    return null;
+  }
 }

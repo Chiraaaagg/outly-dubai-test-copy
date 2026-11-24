@@ -36,11 +36,11 @@ import { documentService, reportPersisted, type PersistResult } from "./document
 import { buildBookingRequest } from "../suppliers/traveldesk/traveldesk.booking";
 import { type BrowseRoute, READ_BUDGET, type ReadClass, type ReadLimits } from "../suppliers/read-budget";
 import { mutationHealth, READ_BUDGET_REASON, type ReadGate } from "../suppliers/traveldesk/traveldesk.booking-adapter";
-import { isConfirmedSnapshot, RESERVATION_SLOT_MISMATCH_CODE, reservationSlotDiffers, reservationSlotHeld, withinChargeTolerance } from "../suppliers/traveldesk/traveldesk.confirmation";
+import { isConfirmedSnapshot, RESERVATION_SLOT_MISMATCH_CODE, reservationSlotDiffers, reservationSlotHeld, storedOfferClassKey, withinChargeTolerance } from "../suppliers/traveldesk/traveldesk.confirmation";
 import { SUPPLIER_WALLET_BOOK, type SupplierRefundFigure, walletEntriesFor, walletPhaseOf } from "../suppliers/wallet-ledger";
 import { bookingAccountId, DEFAULT_BOOKING_ACCOUNT_ID } from "../suppliers/control-account";
 import { checkOfferCapability } from "../suppliers/capability-gate";
-import { bookingKindSellable, deriveCapabilities, parseClassKey } from "../suppliers/traveldesk/traveldesk.capability";
+import { bookingKindSellable, parseClassKey } from "../suppliers/traveldesk/traveldesk.capability";
 import {
   EXTERNAL_CONFIRM_MARGIN_MS,
   EXTERNAL_FAILED_AFTER_CONFIRM_CODE,
@@ -3298,13 +3298,14 @@ export const supplierBookingService = {
     return n > 0;
   },
 
-  /** The capability class key of a booking's stored offer (doc 29 Batch 7), or null when it is not stored or unreadable. */
+  /** The capability class key of a booking's stored offer (doc 29 Batch 7); null when not stored, unreadable, or the read fails (B7-17). */
   async storedClassKey(b: Pick<SupplierBooking, "supplierId" | "environment" | "offerExternalId">): Promise<string | null> {
-    const row = await prisma.supplierCatalogueItem.findUnique({
-      where: { supplierId_environment_kind_externalId: { supplierId: b.supplierId, environment: b.environment, kind: "offer", externalId: b.offerExternalId } },
-      select: { payload: true },
-    });
-    return row ? deriveCapabilities(row.payload).classKey : null;
+    return storedOfferClassKey(() =>
+      prisma.supplierCatalogueItem.findUnique({
+        where: { supplierId_environment_kind_externalId: { supplierId: b.supplierId, environment: b.environment, kind: "offer", externalId: b.offerExternalId } },
+        select: { payload: true },
+      }),
+    );
   },
 
   /** Keep a booking blocking in outcome_unknown with attention set, and queue a re-read with backoff — in one transaction. */

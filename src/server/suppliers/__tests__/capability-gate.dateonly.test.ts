@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { storedOffer } from "./fixtures/traveldesk-terms";
 import { gateVerdict, loadCapabilityGate, type CapabilityGateContext } from "../capability-gate";
-import { RESERVATION_SLOT_MISMATCH_CODE, reservationSlotDiffers, reservationSlotHeld } from "../traveldesk/traveldesk.confirmation";
+import { RESERVATION_SLOT_MISMATCH_CODE, reservationSlotDiffers, reservationSlotHeld, storedOfferClassKey } from "../traveldesk/traveldesk.confirmation";
 import { bookingReason } from "../../services/ops-alert.service";
 
 /**
@@ -71,6 +71,17 @@ describe("reservation slot check (review 92 B7-12)", () => {
     expect(reservationSlotHeld("live.date_only_no_slot_metadata.pickup_required.internal.per_person", "0", { timeSlotId: "5" })).toBe(true);
     expect(reservationSlotHeld(SELF, "0", { timeSlotId: "0" })).toBe(false);
     expect(reservationSlotHeld(SELF, "0", { timeSlotId: null })).toBe(false);
+  });
+
+  it("a failed read of the stored offer is 'not date only' and never throws (B7-17): a mismatched Batch 0-6 booking is not held", async () => {
+    const failing = await storedOfferClassKey(async () => {
+      throw new Error("connect ECONNREFUSED");
+    });
+    expect(failing).toBeNull();
+    expect(reservationSlotHeld(failing, "9", { timeSlotId: "10" })).toBe(false);
+    expect(await storedOfferClassKey(async () => null)).toBeNull();
+    expect(await storedOfferClassKey(async () => ({ payload: { not: "an offer" } }))).toBe("unknown");
+    expect(await storedOfferClassKey(async () => ({ payload }))).toBe(SELF);
   });
 
   it("is an ops-alert reason while it needs staff", () => {
