@@ -275,6 +275,25 @@ export function requireJobSecret(req: NextRequest) {
 }
 
 /**
+ * The CRM synthetic probe (doc 29d §5.2a; re-review R-02, SEC-8 b, as the
+ * manual supplier run): a manual live-portal write, so besides the cron
+ * secret (the job-route contract) it needs its own, `x-crm-probe-secret:
+ * $CRM_PROBE_SECRET`. The cron secret alone never runs it. A probe secret
+ * equal to the cron, supplier-job or health secret is refused. Unset or
+ * shorter than 32 characters ⇒ 503, never open.
+ */
+export function requireCrmProbeSecret(req: NextRequest) {
+  const e = env();
+  const secret = e.CRM_PROBE_SECRET;
+  if (!secret || secret.length < 32) throw Errors.notConfigured("CRM_PROBE_SECRET");
+  for (const other of [e.CRON_SECRET, e.SUPPLIER_JOB_SECRET, e.HEALTH_DETAIL_TOKEN]) {
+    if (other && safeEqual(secret, other)) throw Errors.notConfigured("CRM_PROBE_SECRET");
+  }
+  const got = req.headers.get("x-crm-probe-secret") ?? "";
+  if (!(got && safeEqual(got, secret))) throw Errors.unauthorized("Invalid probe secret");
+}
+
+/**
  * True when the request carries HEALTH_DETAIL_TOKEN (`Authorization: Bearer`
  * or `x-health-token`). Never the cron secret (SEC-8 a); false when the token
  * is unset or equals CRON_SECRET.

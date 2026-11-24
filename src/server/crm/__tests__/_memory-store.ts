@@ -40,6 +40,7 @@ interface MemRow extends CrmOutboxRow {
 }
 
 interface MemLink extends CrmLinkRow {
+  createdAt: number;
   environment: string;
   portal: string;
   lockedBy: string | null;
@@ -85,6 +86,7 @@ export class MemoryCrmStore implements CrmStore {
     if (!link) {
       if (kind === "delete" || !newLinks) return null;
       link = {
+        createdAt: this.clock.ms(),
         id: uuid(),
         environment: scope.environment,
         portal: scope.portal,
@@ -143,7 +145,9 @@ export class MemoryCrmStore implements CrmStore {
   async ensurePortal(scope: CrmScope, identity: { categoryId: number; originatorId: string }): Promise<CrmPortalStateRow> {
     let p = this.portals.get(this.key(scope));
     if (!p) {
-      p = { ...identity, createdAt: this.clock.now(), pausedUntil: null, pauseReason: null, consecutiveFailures: 0, leaseHolder: null, leaseUntil: null };
+      // As crm.store.ts: the earlier of this first run and the first link of the scope (re-review R-03).
+      const first = Math.min(this.clock.ms(), ...this.links.filter((l) => l.environment === scope.environment && l.portal === scope.portal).map((l) => l.createdAt));
+      p = { ...identity, createdAt: new Date(first), pausedUntil: null, pauseReason: null, consecutiveFailures: 0, leaseHolder: null, leaseUntil: null };
       this.portals.set(this.key(scope), p);
     }
     return { createdAt: p.createdAt, categoryId: p.categoryId, originatorId: p.originatorId, pausedUntil: p.pausedUntil, pauseReason: p.pauseReason, consecutiveFailures: p.consecutiveFailures };
@@ -231,7 +235,7 @@ export class MemoryCrmStore implements CrmStore {
     if (l.lockedUntil !== null && l.lockedUntil >= now.getTime() && l.lockedBy !== holder) return { kind: "busy" };
     l.lockedBy = holder;
     l.lockedUntil = until.getTime();
-    const { environment: _e, portal: _p, lockedBy: _b, lockedUntil: _u, deletedAt: _d, deleteReason: _r, ...row } = l;
+    const { environment: _e, portal: _p, lockedBy: _b, lockedUntil: _u, deletedAt: _d, deleteReason: _r, createdAt: _c, ...row } = l;
     return { kind: "locked", link: { ...row } };
   }
 

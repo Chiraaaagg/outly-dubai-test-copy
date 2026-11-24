@@ -10,7 +10,7 @@ import { assertDeleteTarget } from "./crm.worker";
  * any real customer's data is pushed. It proves on the real portal that the
  * 20 field codes, the value formats and the funnel are right.
  *
- *  - Synthetic data only: reference `INQ-0000000`, the all-zero subject id,
+ *  - Synthetic data only: reference `OUT-0000000`, the all-zero subject id,
  *    a placeholder name, a landline-shaped placeholder number and an
  *    `.invalid` address. No database row is read or written; no link exists,
  *    so the worker never sees the probe deal.
@@ -21,28 +21,48 @@ import { assertDeleteTarget } from "./crm.worker";
  *    the OUTLYY funnel only).
  */
 
-export const PROBE_SUBJECT: CrmSubject = { type: "inquiry", id: "00000000-0000-7000-8000-000000000000" };
-export const PROBE_REFERENCE = "INQ-0000000";
+/**
+ * Order-shaped, so that every one of the 20 OUTLYY fields carries a distinct,
+ * non-empty value (re-review R-01): a dropped write shows as `missing` or
+ * `different`, and a swap of two field codes shows as `different` on both.
+ */
+export const PROBE_SUBJECT: CrmSubject = { type: "order", id: "00000000-0000-7000-8000-000000000000" };
+export const PROBE_REFERENCE = "OUT-0000000";
 
 export function probeState(now: Date): CrmSubjectState {
-  const at = bitrixInstant(new Date(now.getTime() - 60_000));
+  const day = (n: number) => new Date(now.getTime() + n * 86_400_000).toISOString().slice(0, 10);
   return {
     subject: PROBE_SUBJECT,
     exists: true,
     erased: false,
-    inquiry: {
+    inquiry: null,
+    order: {
       reference: PROBE_REFERENCE,
-      status: "new",
-      source: "inquiry_form",
+      status: "partially_confirmed",
       currency: "AED",
-      indicativeMinor: 100n,
-      items: [{ title: "OUTLYY TEST - delete me", serviceDate: now.toISOString().slice(0, 10), totalMinor: null }],
+      authorised: true,
+      // Payment "partially_refunded", refund "pending" (an open refund), refund amount 0.01.
+      capturedMinor: 400n,
+      refundedMinor: 1n,
+      refundPending: true,
+      // Indicative amount 0.03, margin 0.02: distinct from each other and from the refund amount.
+      totalMinor: 3n,
+      marginAedMinor: 2n,
+      // Supplier "partially_confirmed" (a line not supplied), tickets "partially_issued", summary "2 confirmed, 1 not supplied".
+      items: [
+        { title: "OUTLYY TEST - delete me", serviceDate: day(1), totalMinor: 100n, status: "confirmed", needsDocument: true, documentReady: true },
+        { title: "OUTLYY TEST - delete me", serviceDate: day(2), totalMinor: 100n, status: "confirmed", needsDocument: true, documentReady: false },
+        { title: "OUTLYY TEST - delete me", serviceDate: day(3), totalMinor: 100n, status: "rejected", needsDocument: true, documentReady: false },
+      ],
     },
-    order: null,
     createdAt: now,
     // Assembled at runtime: a placeholder, never a real person's details.
     contact: { name: "OUTLYY Test Customer", phone: ["+971", "4", "0000000"].join(""), email: ["outlyy.probe", "example.invalid"].join("@") },
-    consent: { marketingEmail: { granted: true, at }, marketingWhatsapp: { granted: false, at } },
+    // Two different times, so a swap of the two "as of" codes shows.
+    consent: {
+      marketingEmail: { granted: true, at: bitrixInstant(new Date(now.getTime() - 2 * 3_600_000)) },
+      marketingWhatsapp: { granted: false, at: bitrixInstant(new Date(now.getTime() - 3_600_000)) },
+    },
   };
 }
 
@@ -71,7 +91,8 @@ export function sameValue(sent: CrmFieldValue, read: unknown): boolean {
   if (typeof sent === "number") return read !== null && read !== "" && Number(read) === sent;
   if (sent === "Y" || sent === "N") {
     const yes = read === "Y" || read === true || read === "1" || read === 1;
-    return sent === "Y" ? yes : !yes && read !== undefined;
+    const no = read === "N" || read === false || read === "0" || read === 0;
+    return sent === "Y" ? yes : no;
   }
   if (/^\d{4}-\d{2}-\d{2}T/.test(sent)) return typeof read === "string" && Date.parse(read) === Date.parse(sent);
   if (/^\d{4}-\d{2}-\d{2}$/.test(sent)) return typeof read === "string" && read.slice(0, 10) === sent;

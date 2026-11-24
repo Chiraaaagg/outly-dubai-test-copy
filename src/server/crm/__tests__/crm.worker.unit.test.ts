@@ -468,6 +468,17 @@ describe("CRM worker: deal push on the fake portal", () => {
     expect(h.store.rows.find((r) => r.entityId === old.id)?.outcome).toBe("before_switch_on");
   });
 
+  it("switch-on is the first link when the first worker run comes late: no subject of that window is lost (R-03)", async () => {
+    const h = harness();
+    const s = inquiry();
+    // Switched on at T0: the first inquiry is linked at once, but the cron does not run for half an hour.
+    h.put({ ...inquiryState(s.id), createdAt: new Date(h.clock.t + 60_000) });
+    h.clock.advance(30 * 60_000);
+    await h.run();
+    expect(h.fake.dealsFor(originIdFor(s))).toHaveLength(1);
+    expect(h.store.rows[0].outcome).toBe("pushed");
+  });
+
   it("a delete for a subject never pushed writes no row and calls nothing", async () => {
     const h = harness();
     expect(h.store.enqueue(h.scope, inquiry(), "delete", "erasure")).toBeNull();

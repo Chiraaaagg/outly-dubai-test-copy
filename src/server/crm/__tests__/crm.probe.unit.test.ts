@@ -30,7 +30,7 @@ describe("CRM synthetic probe", () => {
     expect(Object.values(r.fields).every((s) => s === "ok")).toBe(true);
     const deal = h.fake.dealsFor(originIdFor(PROBE_SUBJECT));
     expect(deal).toHaveLength(1);
-    expect(deal[0]).toMatchObject({ categoryId: 7, title: "OUTLYY INQ-0000000", [fieldCode("customer_name")]: "OUTLYY Test Customer" });
+    expect(deal[0]).toMatchObject({ categoryId: 7, title: "OUTLYY OUT-0000000", [fieldCode("customer_name")]: "OUTLYY Test Customer" });
     // The answer carries statuses only, never a value.
     expect(JSON.stringify(r)).not.toContain("example.invalid");
   });
@@ -54,17 +54,41 @@ describe("CRM synthetic probe", () => {
       setProductRows: h.port.setProductRows.bind(h.port),
       readDealFields: h.port.readDealFields.bind(h.port),
       deleteDeal: h.port.deleteDeal.bind(h.port),
-      addDeal: (f: DealFields) => h.port.addDeal({ ...f, [fieldCode("margin")]: "", [fieldCode("reference")]: "INQ-0000001" }),
+      addDeal: (f: DealFields) => h.port.addDeal({ ...f, [fieldCode("margin")]: "", [fieldCode("reference")]: "OUT-0000001" }),
     };
     const r = await runCrmProbe({ config: h.config, port: dropping, now: h.clock.now });
     expect(r.ok).toBe(false);
     expect(r.fields.reference).toBe("different");
-    expect(r.fields.margin).toBe("ok");
+    // R-01: margin is sent non-empty, so a dropped margin write shows.
+    expect(r.fields.margin).toBe("different");
+    expect(r.fields.customer_name).toBe("ok");
     const missing = { ...dropping, readDealFields: async () => ({}) };
     expect(Object.values((await runCrmProbe({ config: h.config, port: missing, now: h.clock.now })).fields).every((s) => s === "missing")).toBe(true);
   });
 
-  it("compares the portal's own encodings", () => {
+  it("every field carries a distinct non-empty value, so any swap of two field codes shows (R-01)", async () => {
+    const h = harness();
+    await runCrmProbe({ config: h.config, port: h.port, now: h.clock.now });
+    const deal = h.fake.dealsFor(originIdFor(PROBE_SUBJECT))[0];
+    const values = CRM_FIELD_KEYS.map((k) => deal[fieldCode(k)]);
+    expect(values.every((v) => v !== "" && v !== null && v !== undefined)).toBe(true);
+    // Y and N are the only repeat-free pair of flags; every other value is unique.
+    const others = CRM_FIELD_KEYS.filter((k) => k !== "consent_marketing_email" && k !== "consent_marketing_whatsapp").map((k) => JSON.stringify(deal[fieldCode(k)]));
+    expect(new Set(others).size).toBe(others.length);
+    expect(deal[fieldCode("consent_marketing_email")]).not.toBe(deal[fieldCode("consent_marketing_whatsapp")]);
+    // Swap every pair on the way in: both sides of each pair read back as different.
+    for (let i = 0; i < CRM_FIELD_KEYS.length; i++) {
+      for (let j = i + 1; j < CRM_FIELD_KEYS.length; j++) {
+        const [a, b] = [fieldCode(CRM_FIELD_KEYS[i]), fieldCode(CRM_FIELD_KEYS[j])];
+        const swapped = { ...h.port, findDealsByOrigin: async () => [], setProductRows: async () => {}, deleteDeal: async () => "deleted" as const, addDeal: async () => ({ id: 1 }), updateDeal: async () => {} };
+        const read = { ...Object.fromEntries(CRM_FIELD_KEYS.map((k) => [fieldCode(k), deal[fieldCode(k)]])), [a]: deal[b], [b]: deal[a] };
+        const r = await runCrmProbe({ config: h.config, port: { ...swapped, readDealFields: async () => read }, now: h.clock.now });
+        expect([r.fields[CRM_FIELD_KEYS[i]], r.fields[CRM_FIELD_KEYS[j]]], `${a}<->${b}`).toEqual(["different", "different"]);
+      }
+    }
+  });
+
+    it("compares the portal's own encodings", () => {
     expect(sameValue(1, "1.00")).toBe(true);
     expect(sameValue("Y", true)).toBe(true);
     expect(sameValue("N", "N")).toBe(true);

@@ -59,7 +59,8 @@ describe.skipIf(!dbEnabled)("CRM outbox, links and worker (C1)", () => {
     if (!dbEnabled) return;
     await prisma.crmOutbox.deleteMany({ where: { portal: { in: [HOST, `other-${HOST}`] } } });
     await prisma.crmLink.deleteMany({ where: { portal: { in: [HOST, `other-${HOST}`] } } });
-    await prisma.crmPortalState.deleteMany({ where: { portal: HOST } });
+    await prisma.crmPortalState.deleteMany({ where: { portal: { in: [HOST, `r03-${HOST}`] } } });
+    await prisma.crmLink.deleteMany({ where: { portal: `r03-${HOST}` } });
     await cleanupBusinessRows(run);
     process.env = saved;
     resetEnvCache();
@@ -116,6 +117,21 @@ describe.skipIf(!dbEnabled)("CRM outbox, links and worker (C1)", () => {
     await recordConsent({ phoneE164: leadPhone, channel: "whatsapp", purpose: "transactional", granted: false, source: "stop_keyword" });
     expect(await rowsFor(q.id)).toHaveLength(3);
     await prisma.crmOutbox.updateMany({ where: { portal: HOST, entityId: q.id }, data: { nextAttemptAt: new Date(Date.now() + 3_600_000) } });
+  });
+
+  it("the switch-on time is the earlier of the first worker run and the first link (R-03)", async () => {
+    const { prismaCrmStore: store } = await import("@/server/crm/crm.store");
+    const { enqueueCrmSync } = await import("@/server/crm/crm.outbox");
+    const q = await makeInquiry(run, { leadPhone: syntheticPhone(run, 15), product });
+    const late: CrmScope = { environment: "development", portal: `r03-${HOST}` };
+    await prisma.$transaction((tx) => enqueueCrmSync(tx, [{ type: "inquiry", id: q.id }], late, true));
+    const linkedAt = new Date(Date.now() - 45 * 60_000);
+    await prisma.crmLink.updateMany({ where: { portal: late.portal, entityId: q.id }, data: { createdAt: linkedAt } });
+    const portal = await store.ensurePortal(late, { categoryId: 7, originatorId: "outlyy-development" });
+    expect(portal.createdAt.getTime()).toBe(linkedAt.getTime());
+    // Later runs keep it.
+    expect((await store.ensurePortal(late, { categoryId: 7, originatorId: "outlyy-development" })).createdAt.getTime()).toBe(linkedAt.getTime());
+    await prisma.crmOutbox.deleteMany({ where: { portal: late.portal } });
   });
 
   it("a rolled-back domain transaction leaves neither a link nor a row", async () => {

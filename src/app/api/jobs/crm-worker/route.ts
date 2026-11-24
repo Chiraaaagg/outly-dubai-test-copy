@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { handle, json, requireCron } from "@/server/lib/http";
+import { handle, json, requireCron, requireCrmProbeSecret } from "@/server/lib/http";
 import { runCrmProbeJob, runCrmWorkerJob } from "@/server/jobs/crm-worker-job";
 
 export const runtime = "nodejs";
@@ -19,11 +19,17 @@ export const maxDuration = 60;
  * POST with `x-crm-probe: synthetic` (or `delete`) runs the synthetic probe
  * instead (doc 29d §5.2a): only while the sync is off, one made-up deal, its
  * 20 fields read back. A live portal write: the owner runs it as a WRITE step.
+ * It needs CRM_PROBE_SECRET in `x-crm-probe-secret` besides CRON_SECRET
+ * (SEC-8 b, re-review R-02), as the manual supplier run needs its job secret:
+ * the cron secret alone never runs the probe.
  */
 async function run(req: NextRequest) {
   requireCron(req);
   const probe = req.method === "POST" ? req.headers.get("x-crm-probe") : null;
-  if (probe === "synthetic" || probe === "delete") return json(await runCrmProbeJob(probe));
+  if (probe === "synthetic" || probe === "delete") {
+    requireCrmProbeSecret(req);
+    return json(await runCrmProbeJob(probe));
+  }
   return json(await runCrmWorkerJob());
 }
 

@@ -262,6 +262,30 @@ describe("CRM outbox enqueue", () => {
     expect(calls.filter((c) => c.sql.includes("INSERT INTO crm_outbox"))).toHaveLength(2);
   });
 
+  it("a consent change matching the limit of linked deals emits a warning (R-04)", async () => {
+    const { CRM_CONTACT_FANOUT_LIMIT } = await import("@/server/crm/crm.outbox");
+    const lines: string[] = [];
+    const spy = vi.spyOn(process.stdout, "write").mockImplementation((c) => (lines.push(String(c)), true));
+    const spyErr = vi.spyOn(process.stderr, "write").mockImplementation((c) => (lines.push(String(c)), true));
+    const spyLog = vi.spyOn(console, "warn").mockImplementation((...a) => void lines.push(a.map(String).join(" ")));
+    const spyLog2 = vi.spyOn(console, "log").mockImplementation((...a) => void lines.push(a.map(String).join(" ")));
+    try {
+      const { tx } = fakeTx();
+      const t = tx as unknown as { $queryRaw: (s: TemplateStringsArray, ...v: unknown[]) => Promise<unknown> };
+      const orig = t.$queryRaw;
+      const many = Array.from({ length: CRM_CONTACT_FANOUT_LIMIT }, (_, i) => ({ entity_type: "inquiry", entity_id: `00000000-0000-7000-8000-${i.toString(16).padStart(12, "0")}` }));
+      t.$queryRaw = async (strings, ...values) => (strings.join("?").includes("FROM crm_links l") ? many : orig(strings, ...values));
+      await enqueueCrmSyncForContact(tx, { email: ["a", "b.invalid"].join("@") }, scope);
+    } finally {
+      spy.mockRestore();
+      spyErr.mockRestore();
+      spyLog.mockRestore();
+      spyLog2.mockRestore();
+    }
+    expect(lines.some((l) => l.includes("crm.contact_fanout_capped") && l.includes(`"limit":${CRM_CONTACT_FANOUT_LIMIT}`) && l.includes('"channel":"email"'))).toBe(true);
+    expect(lines.join("")).not.toContain("b.invalid");
+  });
+
   it("a consent change with no portal, or with neither phone nor email, writes nothing", async () => {
     const { tx, calls } = fakeTx();
     expect(await enqueueCrmSyncForContact(tx, { phoneE164: "+97140001234" }, null)).toBe(0);

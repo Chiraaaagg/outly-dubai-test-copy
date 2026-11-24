@@ -342,6 +342,8 @@ const schema = z.object({
   CRM_BITRIX_FIELD_CODES: optionalStr,
   /** Bitrix24 user id of the Dubai sales lead who owns every new deal (decision C2-8). */
   CRM_BITRIX_DEFAULT_OWNER_ID: optionalStr,
+  /** The synthetic probe's own secret (doc 29d §5.2a; SEC-8), at least 32 characters. Unset ⇒ the probe is refused. */
+  CRM_PROBE_SECRET: optionalStr,
   CRM_BITRIX_TIMEOUT_MS: int(5_000),
 
   // Photography — Pexels search for any catalogue image without a curated id (src/lib/images/manifest.ts).
@@ -418,6 +420,7 @@ export function assertBootEnv(): string[] {
   if (e.CRON_SECRET && e.SUPPLIER_JOB_SECRET === e.CRON_SECRET) problems.push("SUPPLIER_JOB_SECRET equals CRON_SECRET — set a distinct value");
   if (e.CRON_SECRET && e.HEALTH_DETAIL_TOKEN === e.CRON_SECRET) problems.push("HEALTH_DETAIL_TOKEN equals CRON_SECRET — set a distinct value");
   if (e.SUPPLIER_JOB_SECRET && e.HEALTH_DETAIL_TOKEN === e.SUPPLIER_JOB_SECRET) problems.push("HEALTH_DETAIL_TOKEN equals SUPPLIER_JOB_SECRET — set a distinct value");
+  if (e.CRM_PROBE_SECRET && [e.CRON_SECRET, e.SUPPLIER_JOB_SECRET, e.HEALTH_DETAIL_TOKEN].includes(e.CRM_PROBE_SECRET)) problems.push("CRM_PROBE_SECRET equals another job secret — set a distinct value");
   if (e.SUPPLIER_ADAPTER_TRAVELDESK === "live") {
     for (const p of traveldeskConfigProblems(e)) problems.push(`TravelDesk live but unusable: ${p}`);
   }

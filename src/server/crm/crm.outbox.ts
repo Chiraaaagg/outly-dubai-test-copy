@@ -290,8 +290,12 @@ export async function enqueueCrmSyncForOrders(tx: Tx, orderIds: string[], scope:
  * (email) gets a push in the consent's own transaction. Only subjects that
  * already have a live link are touched (never a new link, whatever the
  * switch); a converted inquiry matches through its order's traveller too.
- * Bounded to 200 subjects.
+ * Bounded to `CRM_CONTACT_FANOUT_LIMIT` subjects; reaching it emits
+ * `crm.contact_fanout_capped` (warn, ids-free), and the C3 reconciler is the
+ * backstop for the rest (re-review R-04).
  */
+export const CRM_CONTACT_FANOUT_LIMIT = 200;
+
 export async function enqueueCrmSyncForContact(tx: Tx, contact: { phoneE164?: string | null; email?: string | null }, scope: CrmScope | null = crmOutboxScope()): Promise<number> {
   const phone = contact.phoneE164?.trim() || null;
   const email = contact.email?.trim().toLowerCase() || null;
@@ -310,7 +314,10 @@ export async function enqueueCrmSyncForContact(tx: Tx, contact: { phoneE164?: st
             SELECT 1 FROM orders o WHERE o.id = l.entity_id
               AND ((${phone}::text IS NOT NULL AND o.lead_phone = ${phone}) OR (${email}::text IS NOT NULL AND lower(o.lead_email) = ${email}))))
         )
-      ORDER BY l.entity_type, l.entity_id LIMIT 200`;
+      ORDER BY l.entity_type, l.entity_id LIMIT ${CRM_CONTACT_FANOUT_LIMIT}`;
+    if (rows.length >= CRM_CONTACT_FANOUT_LIMIT) {
+      emitEvent("crm.contact_fanout_capped", { limit: CRM_CONTACT_FANOUT_LIMIT, channel: phone ? "whatsapp" : "email" }, "warn");
+    }
     let n = 0;
     for (const s of sorted(rows.map((r) => ({ type: r.entity_type, id: r.entity_id })))) if (await writeOne(tx, scope, s, "sync", null, false)) n += 1;
     return n;

@@ -127,6 +127,7 @@ export const STRUCTURED_EVENTS = {
   "crm.probe": ["mode", "ok", "dealId", "created", "notOk", "deleted"],
   "crm.currency_mismatch": ["entityType", "entityId"],
   "crm.erasure_unverified": ["entityType", "entityId", "reason"],
+  "crm.contact_fanout_capped": ["limit", "channel"],
   // Retention purge (doc 26 §2; doc 29 Batch 1c). Counts, a table name and a reason code only.
   "retention.purged": [
     "otpChallenges",
