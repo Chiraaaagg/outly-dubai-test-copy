@@ -6,14 +6,16 @@ import { ROLE_PERMISSIONS } from "@/server/lib/permissions";
 import type { Actor } from "@/server/lib/actor";
 import type { CrmScope } from "@/server/crm/crm.config";
 import { FakeBitrix24 } from "./_bitrix-fake";
-import { FAKE_SECRET, FAKE_USER, fakeConfig } from "./_memory-store";
+import { FAKE_SECRET, FAKE_USER, fakeConfig, fakeEnv, fieldCode } from "./_memory-store";
 
 /**
- * CRM batch C1 on the disposable database (doc 29 §6.4, §6.5, §7.4): the
- * outbox written inside the domain transaction, versions in commit order, a
- * failing enqueue that never fails the domain write, the Postgres store's
- * claim and link lock, an end-to-end push to the fake portal with no
- * personal data, erasure propagation and the 2-year retention path.
+ * CRM batches C1 and C2a on the disposable database (doc 29 §6.4, §6.5,
+ * §7.4): the outbox written inside the domain transaction, versions in
+ * commit order, a failing enqueue that never fails the domain write, no new
+ * link while the sync is off (no backfill), the Postgres store's claim and
+ * link lock, an end-to-end push to the fake portal with the customer's
+ * details in their own deal fields only, erasure propagation and the 2-year
+ * retention path.
  *
  * Each run uses its own portal host (`crm-<run>.bitrix24.test`), so its rows
  * never meet another run's. All data is synthetic; the fake portal is in
@@ -41,10 +43,11 @@ describe.skipIf(!dbEnabled)("CRM outbox, links and worker (C1)", () => {
   beforeAll(async () => {
     assertDisposableDb();
     forbidNetwork();
-    process.env.APP_ENV = "development";
-    process.env.CRM_BITRIX_ENV = "test";
-    process.env.CRM_BITRIX_PORTAL_HOST = HOST;
-    process.env.CRM_SYNC_ENABLED = "false";
+    // On and fully configured (synthetic values), so enqueues link new subjects: since C2a, while off or not
+    // deliverable only linked subjects queue (review C2A-04). The worker is run directly below with its own
+    // config; the job route is not called here.
+    for (const [k, v] of Object.entries(fakeEnv({ APP_ENV: "development", CRM_BITRIX_PORTAL_HOST: HOST }))) if (v !== undefined) process.env[k] = String(v);
+    process.env.CRM_SYNC_ENABLED = "true";
     resetEnvCache();
     prisma = await db();
     product = await publishedProduct();
@@ -56,7 +59,8 @@ describe.skipIf(!dbEnabled)("CRM outbox, links and worker (C1)", () => {
     if (!dbEnabled) return;
     await prisma.crmOutbox.deleteMany({ where: { portal: { in: [HOST, `other-${HOST}`] } } });
     await prisma.crmLink.deleteMany({ where: { portal: { in: [HOST, `other-${HOST}`] } } });
-    await prisma.crmPortalState.deleteMany({ where: { portal: HOST } });
+    await prisma.crmPortalState.deleteMany({ where: { portal: { in: [HOST, `r03-${HOST}`] } } });
+    await prisma.crmLink.deleteMany({ where: { portal: `r03-${HOST}` } });
     await cleanupBusinessRows(run);
     process.env = saved;
     resetEnvCache();
@@ -75,6 +79,59 @@ describe.skipIf(!dbEnabled)("CRM outbox, links and worker (C1)", () => {
     }
     expect(await prisma.crmOutbox.count({ where: { entityId: q.id } })).toBe(0);
     expect(await prisma.crmLink.count({ where: { entityId: q.id } })).toBe(0);
+  });
+
+  it("sync off: a new subject gets no link and no row (no backfill); a linked one keeps queueing", async () => {
+    const { enqueueCrmSync } = await import("@/server/crm/crm.outbox");
+    const q = await makeInquiry(run, { leadPhone: syntheticPhone(run, 12), product });
+    process.env.CRM_SYNC_ENABLED = "false";
+    resetEnvCache();
+    try {
+      expect(await prisma.$transaction((tx) => enqueueCrmSync(tx, [{ type: "inquiry", id: q.id }]))).toBe(0);
+      expect(await prisma.crmLink.count({ where: { portal: HOST, entityId: q.id } })).toBe(0);
+      expect(await rowsFor(q.id)).toHaveLength(0);
+      // Linked while on: later changes queue while off, and wait.
+      expect(await prisma.$transaction((tx) => enqueueCrmSync(tx, [{ type: "inquiry", id: q.id }], scope, true))).toBe(1);
+      expect(await prisma.$transaction((tx) => enqueueCrmSync(tx, [{ type: "inquiry", id: q.id }]))).toBe(1);
+      expect((await rowsFor(q.id)).map((r) => r.version)).toEqual([1n, 2n]);
+    } finally {
+      process.env.CRM_SYNC_ENABLED = "true";
+      resetEnvCache();
+    }
+    await prisma.crmOutbox.updateMany({ where: { portal: HOST, entityId: q.id }, data: { nextAttemptAt: new Date(Date.now() + 3_600_000) } });
+  });
+
+  it("a WhatsApp STOP re-pushes the linked deal, and the snapshot shows the withdrawal with its time (C2A-02)", async () => {
+    const { enqueueCrmSync } = await import("@/server/crm/crm.outbox");
+    const { recordConsent } = await import("@/server/repositories/consent.repo");
+    const { loadSubjectState } = await import("@/server/crm/crm.snapshot");
+    const leadPhone = syntheticPhone(run, 13);
+    const q = await makeInquiry(run, { leadPhone, product });
+    await prisma.$transaction((tx) => enqueueCrmSync(tx, [{ type: "inquiry", id: q.id }]));
+    await recordConsent({ phoneE164: leadPhone, channel: "whatsapp", purpose: "marketing", granted: true, source: "profile" });
+    await recordConsent({ phoneE164: leadPhone, channel: "whatsapp", purpose: "marketing", granted: false, source: "stop_keyword" });
+    expect((await rowsFor(q.id)).map((r) => r.version)).toEqual([1n, 2n, 3n]);
+    const state = await loadSubjectState({ type: "inquiry", id: q.id });
+    expect(state.consent?.marketingWhatsapp).toMatchObject({ granted: false, at: expect.stringMatching(/\+00:00$/) });
+    // A transactional consent does not touch the CRM.
+    await recordConsent({ phoneE164: leadPhone, channel: "whatsapp", purpose: "transactional", granted: false, source: "stop_keyword" });
+    expect(await rowsFor(q.id)).toHaveLength(3);
+    await prisma.crmOutbox.updateMany({ where: { portal: HOST, entityId: q.id }, data: { nextAttemptAt: new Date(Date.now() + 3_600_000) } });
+  });
+
+  it("the switch-on time is the earlier of the first worker run and the first link (R-03)", async () => {
+    const { prismaCrmStore: store } = await import("@/server/crm/crm.store");
+    const { enqueueCrmSync } = await import("@/server/crm/crm.outbox");
+    const q = await makeInquiry(run, { leadPhone: syntheticPhone(run, 15), product });
+    const late: CrmScope = { environment: "development", portal: `r03-${HOST}` };
+    await prisma.$transaction((tx) => enqueueCrmSync(tx, [{ type: "inquiry", id: q.id }], late, true));
+    const linkedAt = new Date(Date.now() - 45 * 60_000);
+    await prisma.crmLink.updateMany({ where: { portal: late.portal, entityId: q.id }, data: { createdAt: linkedAt } });
+    const portal = await store.ensurePortal(late, { categoryId: 7, originatorId: "outlyy-development" });
+    expect(portal.createdAt.getTime()).toBe(linkedAt.getTime());
+    // Later runs keep it.
+    expect((await store.ensurePortal(late, { categoryId: 7, originatorId: "outlyy-development" })).createdAt.getTime()).toBe(linkedAt.getTime());
+    await prisma.crmOutbox.deleteMany({ where: { portal: late.portal } });
   });
 
   it("a rolled-back domain transaction leaves neither a link nor a row", async () => {
@@ -198,7 +255,7 @@ describe.skipIf(!dbEnabled)("CRM outbox, links and worker (C1)", () => {
     for (const r of claimed) await store.deferRow(r.id, "h1", { nextAttemptAt: new Date(now.getTime() + 3_600_000), code: "test" });
   });
 
-  it("pushes a deal to the fake portal with no personal data, then erasure deletes it and tombstones the link", async () => {
+  it("pushes a deal to the fake portal with the customer's details in their own fields only, then erasure deletes it and tombstones the link", async () => {
     const { prismaCrmStore: store } = await import("@/server/crm/crm.store");
     const { loadSubjectState } = await import("@/server/crm/crm.snapshot");
     const { runCrmWorker, pacedLimiter } = await import("@/server/crm/crm.worker");
@@ -230,11 +287,23 @@ describe.skipIf(!dbEnabled)("CRM outbox, links and worker (C1)", () => {
     expect(deal).toHaveLength(1);
     expect(deal[0]).toMatchObject({ title: `OUTLYY ${q.reference}`, stageId: "C7:QUOTED", categoryId: 7, opportunity: 0 });
     expect(deal[0].productRows.map((r) => r.productName)).toEqual([`${product.title} (2027-01-15)`, `${product.title} (2027-01-15)`]);
+    // C2a (decision C2-4): name, phone and email on the deal's own fields; nowhere else; no Contact record.
+    const leadEmail = (await prisma.inquiry.findUniqueOrThrow({ where: { id: q.id } })).leadEmail;
+    expect(deal[0]).toMatchObject({ [fieldCode("customer_name")]: lead, [fieldCode("customer_phone")]: leadPhone, [fieldCode("customer_email")]: leadEmail, [fieldCode("environment")]: "development" });
+    const rest = JSON.stringify(
+      [...fake.deals.values()].map((d) =>
+        Object.fromEntries(Object.entries(d).filter(([k]) => ![fieldCode("customer_name"), fieldCode("customer_phone"), fieldCode("customer_email")].includes(k as never))),
+      ),
+    );
+    expect(rest).not.toContain(leadPhone);
+    expect(rest).not.toContain("@outlyy.test");
+    expect(rest).not.toContain(`zz-sec-${run}`);
+    // Never sent: the hotel, the special requests, the attribution.
     const sent = JSON.stringify([...fake.deals.values()]);
-    expect(sent).not.toContain(leadPhone);
-    expect(sent).not.toContain("@outlyy.test");
-    expect(sent).not.toContain(`zz-sec-${run}`);
-    expect(sent).not.toContain(lead);
+    expect(sent).not.toContain("Hotel lead");
+    expect(sent).not.toContain("requests lead");
+    expect(sent).not.toContain(`fb-${run}`);
+    expect(fake.refusedMethods).toEqual([]);
     expect(await prisma.crmLink.findFirstOrThrow({ where: { portal: HOST, entityId: q.id } })).toMatchObject({ state: "active", crmId: BigInt(deal[0].id), pushedVersion: 1n });
 
     const erasure = await privacyService.eraseContact({ type: "admin", id: ops.id, roles: ["admin"], permissions: new Set(["privacy.anonymise"]) }, { phoneE164: leadPhone });
@@ -245,6 +314,20 @@ describe.skipIf(!dbEnabled)("CRM outbox, links and worker (C1)", () => {
     expect(await prisma.crmLink.findFirstOrThrow({ where: { portal: HOST, entityId: q.id } })).toMatchObject({ state: "deleted", deleteReason: "erasure" });
     // A later change of the erased inquiry takes no row and never re-creates the deal.
     expect(await prisma.$transaction((tx) => enqueueCrmSync(tx, [{ type: "inquiry", id: q.id }]))).toBe(0);
+  });
+
+  it("erasure deletes the deal of an order kept for an obligation too (C2A-07)", async () => {
+    const { makeOrder } = await import("@/server/__tests__/security/_mercury-fixtures");
+    const { enqueueCrmSync } = await import("@/server/crm/crm.outbox");
+    const { privacyService } = await import("@/server/services/privacy.service");
+    const leadPhone = syntheticPhone(run, 14);
+    // Captured just now: inside the dispute window, so the order is deferred, not erased.
+    const o = await makeOrder(run, { leadPhone, label: "deferred" });
+    await prisma.$transaction((tx) => enqueueCrmSync(tx, [{ type: "order", id: o.id }]));
+    const erasure = await privacyService.eraseContact({ type: "admin", id: ops.id, roles: ["admin"], permissions: new Set(["privacy.anonymise"]) }, { phoneE164: leadPhone });
+    expect(erasure.status).not.toBe("completed");
+    expect((await rowsFor(o.id)).map((r) => [r.kind, r.reason])).toContainEqual(["delete", "erasure"]);
+    await prisma.crmOutbox.updateMany({ where: { portal: HOST, entityId: o.id }, data: { nextAttemptAt: new Date(Date.now() + 3_600_000) } });
   });
 
   it("retention: a copy last pushed over two years ago gets a delete; old finished rows are purged", async () => {
@@ -281,7 +364,11 @@ describe.skipIf(!dbEnabled)("CRM outbox, links and worker (C1)", () => {
     const alertId = uuidv7();
     await prisma.$executeRaw`INSERT INTO ops_alerts (id, entity_kind, entity_id, reason, incident_at, handled_at, updated_at) VALUES (${alertId}::uuid, 'crm_subject', ${found[0].entityId}, ${found[0].reason}, now(), now(), now())`;
     await prisma.$executeRaw`DELETE FROM ops_alerts WHERE id = ${alertId}::uuid`;
-    // A sync row that died, or a delete still queued, is not this incident.
+    // C2A-08: a delete whose linked deal was not visible is its own reason, so an administrator checks other funnels.
+    await prisma.crmOutbox.update({ where: { id }, data: { lastErrorCode: "refused:linked_deal_not_visible" } });
+    const unverified = (await crmDeleteIncidents(since, new Date(Date.now() + 60_000))).filter((i) => i.entityId === `inquiry:${q.id}`);
+    expect(unverified.map((i) => i.reason)).toEqual(["crm_erasure_deal_not_visible"]);
+        // A sync row that died, or a delete still queued, is not this incident.
     await prisma.crmOutbox.update({ where: { id }, data: { status: "queued" } });
     expect((await crmDeleteIncidents(since, new Date(Date.now() + 60_000))).filter((i) => i.entityId === `inquiry:${q.id}`)).toHaveLength(0);
     await prisma.crmOutbox.update({ where: { id }, data: { nextAttemptAt: new Date(Date.now() + 3_600_000) } });

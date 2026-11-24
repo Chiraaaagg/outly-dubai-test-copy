@@ -11,6 +11,8 @@ export type StartTimeMark = "available" | "limited" | "sold_out" | "unavailable"
 
 export type StartTimesAnswer =
   | { source: "supplier"; checkedAt: string; stale: boolean; times: { time: string; status: StartTimeMark }[] }
+  /** Doc 29 Batch 7: a date-only offer with one start on the date; `startsAt` is shown as text when it is a real time. */
+  | { source: "date_only"; checkedAt: string; stale: boolean; startsAt: string | null; status: StartTimeMark }
   | { source: "stored"; reason: "not_listed" | "busy" | "unavailable" };
 
 const MARKS: readonly StartTimeMark[] = ["available", "limited", "sold_out", "unavailable"];
@@ -22,6 +24,12 @@ export function parseStartTimes(body: unknown): StartTimesAnswer | null {
   if (!b || typeof b !== "object") return null;
   if (b.source === "stored") {
     return b.reason === "not_listed" || b.reason === "busy" || b.reason === "unavailable" ? { source: "stored", reason: b.reason } : null;
+  }
+  if (b.source === "date_only") {
+    if (typeof b.checkedAt !== "string" || Number.isNaN(Date.parse(b.checkedAt))) return null;
+    if (b.startsAt !== null && (typeof b.startsAt !== "string" || !TIME.test(b.startsAt))) return null;
+    if (!MARKS.includes(b.status as StartTimeMark)) return null;
+    return { source: "date_only", checkedAt: b.checkedAt, stale: b.stale === true, startsAt: b.startsAt, status: b.status as StartTimeMark };
   }
   if (b.source !== "supplier" || typeof b.checkedAt !== "string" || Number.isNaN(Date.parse(b.checkedAt)) || !Array.isArray(b.times)) return null;
   const times: { time: string; status: StartTimeMark }[] = [];

@@ -1,5 +1,5 @@
-import { crmConfigFrom, CRM_STAGE_KEYS, type CrmConfig, type CrmEnvSlice, type CrmScope } from "@/server/crm/crm.config";
-import { CRM_PAYLOAD_VERSION, originIdFor, type CrmSubject, type CrmSubjectState } from "@/server/crm/crm.mapping";
+import { crmConfigFrom, CRM_FIELD_KEYS, CRM_STAGE_KEYS, type CrmConfig, type CrmEnvSlice, type CrmScope } from "@/server/crm/crm.config";
+import { CRM_PAYLOAD_VERSION, originIdFor, type CrmContactFacts, type CrmSubject, type CrmSubjectState } from "@/server/crm/crm.mapping";
 import type { CrmLinkPatch, CrmLinkRow, CrmOutboxRow, CrmPortalStateRow, CrmStore, LockLinkResult } from "@/server/crm/crm.worker";
 
 /**
@@ -40,6 +40,7 @@ interface MemRow extends CrmOutboxRow {
 }
 
 interface MemLink extends CrmLinkRow {
+  createdAt: number;
   environment: string;
   portal: string;
   lockedBy: string | null;
@@ -76,12 +77,16 @@ export class MemoryCrmStore implements CrmStore {
     return this.links.find((l) => l.environment === scope.environment && l.portal === scope.portal && l.entityType === s.type && l.entityId === s.id);
   }
 
-  /** The domain-transaction enqueue (crm.outbox.ts writeOne). Returns the row, or null when nothing was written. */
-  enqueue(scope: CrmScope, s: CrmSubject, kind: "sync" | "delete" = "sync", reason: "erasure" | "retention" | null = null): MemRow | null {
+  /**
+   * The domain-transaction enqueue (crm.outbox.ts writeOne). Returns the row, or null when nothing was written.
+   * `newLinks` false = the sync is switched off: only an already linked subject takes a row (no backfill).
+   */
+  enqueue(scope: CrmScope, s: CrmSubject, kind: "sync" | "delete" = "sync", reason: "erasure" | "retention" | null = null, newLinks = true): MemRow | null {
     let link = this.findLink(scope, s);
     if (!link) {
-      if (kind === "delete") return null;
+      if (kind === "delete" || !newLinks) return null;
       link = {
+        createdAt: this.clock.ms(),
         id: uuid(),
         environment: scope.environment,
         portal: scope.portal,
@@ -140,10 +145,12 @@ export class MemoryCrmStore implements CrmStore {
   async ensurePortal(scope: CrmScope, identity: { categoryId: number; originatorId: string }): Promise<CrmPortalStateRow> {
     let p = this.portals.get(this.key(scope));
     if (!p) {
-      p = { ...identity, pausedUntil: null, pauseReason: null, consecutiveFailures: 0, leaseHolder: null, leaseUntil: null };
+      // As crm.store.ts: the earlier of this first run and the first link of the scope (re-review R-03).
+      const first = Math.min(this.clock.ms(), ...this.links.filter((l) => l.environment === scope.environment && l.portal === scope.portal).map((l) => l.createdAt));
+      p = { ...identity, createdAt: new Date(first), pausedUntil: null, pauseReason: null, consecutiveFailures: 0, leaseHolder: null, leaseUntil: null };
       this.portals.set(this.key(scope), p);
     }
-    return { categoryId: p.categoryId, originatorId: p.originatorId, pausedUntil: p.pausedUntil, pauseReason: p.pauseReason, consecutiveFailures: p.consecutiveFailures };
+    return { createdAt: p.createdAt, categoryId: p.categoryId, originatorId: p.originatorId, pausedUntil: p.pausedUntil, pauseReason: p.pauseReason, consecutiveFailures: p.consecutiveFailures };
   }
 
   async acquireLease(scope: CrmScope, holder: string, now: Date, until: Date) {
@@ -228,7 +235,7 @@ export class MemoryCrmStore implements CrmStore {
     if (l.lockedUntil !== null && l.lockedUntil >= now.getTime() && l.lockedBy !== holder) return { kind: "busy" };
     l.lockedBy = holder;
     l.lockedUntil = until.getTime();
-    const { environment: _e, portal: _p, lockedBy: _b, lockedUntil: _u, deletedAt: _d, deleteReason: _r, ...row } = l;
+    const { environment: _e, portal: _p, lockedBy: _b, lockedUntil: _u, deletedAt: _d, deleteReason: _r, createdAt: _c, ...row } = l;
     return { kind: "locked", link: { ...row } };
   }
 
@@ -262,10 +269,32 @@ export function fakeEnv(over: Partial<CrmEnvSlice> = {}): CrmEnvSlice {
     CRM_BITRIX_WEBHOOK_SECRET: FAKE_SECRET,
     CRM_BITRIX_DEAL_CATEGORY_ID: "7",
     CRM_BITRIX_STAGE_IDS: CRM_STAGE_KEYS.map((k) => `${k}=C7:${k.toUpperCase()}`).join(","),
+    CRM_BITRIX_FIELD_CODES: CRM_FIELD_KEYS.map((k) => `${k}=${fieldCode(k)}`).join(","),
+    CRM_BITRIX_DEFAULT_OWNER_ID: FAKE_OWNER,
     CRM_BITRIX_TIMEOUT_MS: 5_000,
+    NEXT_PUBLIC_SITE_URL: FAKE_SITE,
     ...over,
   };
 }
+
+/** The synthetic field code of an OUTLYY field on the fake portal. */
+export function fieldCode(key: (typeof CRM_FIELD_KEYS)[number]): `UF_CRM_${string}` {
+  return `UF_CRM_${key.toUpperCase()}`;
+}
+
+/** The sales lead who owns new deals on the fake portal. */
+export const FAKE_OWNER = "23";
+export const FAKE_SITE = "https://admin.outlyy.test";
+
+/**
+ * A synthetic customer: a landline-style placeholder number and an
+ * `.invalid` address, both assembled at runtime.
+ */
+export const TEST_CONTACT: CrmContactFacts = {
+  name: "Test Customer",
+  phone: ["+971", "4", "0001234"].join(""),
+  email: ["test.customer", "example.invalid"].join("@"),
+};
 
 export function fakeConfig(over: Partial<CrmEnvSlice> = {}): CrmConfig {
   const c = crmConfigFrom(fakeEnv(over));
@@ -285,7 +314,10 @@ export class StateBook {
   load = async (s: CrmSubject): Promise<CrmSubjectState> => structuredClone(this.get(s) ?? { subject: s, exists: false, erased: false, inquiry: null, order: null });
 }
 
-export function inquiryState(id: string, over: { status?: string; reference?: string; source?: string; items?: { title: string | null; serviceDate: string | null }[] } = {}): CrmSubjectState {
+export function inquiryState(
+  id: string,
+  over: { status?: string; reference?: string; source?: string; items?: { title: string | null; serviceDate: string | null }[]; contact?: CrmContactFacts | null } = {},
+): CrmSubjectState {
   return {
     subject: { type: "inquiry", id },
     exists: true,
@@ -295,15 +327,18 @@ export function inquiryState(id: string, over: { status?: string; reference?: st
       status: over.status ?? "new",
       source: over.source ?? "inquiry_form",
       currency: "AED",
+      indicativeMinor: 18_000n,
       items: (over.items ?? [{ title: "Desert safari", serviceDate: "2026-12-01" }]).map((i) => ({ ...i, totalMinor: null })),
     },
     order: null,
+    contact: over.contact === undefined ? { ...TEST_CONTACT } : over.contact,
+    consent: { marketingEmail: { granted: true, at: "2026-11-20T09:30:00+00:00" }, marketingWhatsapp: null },
   };
 }
 
 export function directOrderState(
   id: string,
-  over: { status?: string; authorised?: boolean; capturedMinor?: bigint; refundedMinor?: bigint; reference?: string } = {},
+  over: { status?: string; authorised?: boolean; capturedMinor?: bigint; refundedMinor?: bigint; reference?: string; marginAedMinor?: bigint | null; refundPending?: boolean } = {},
 ): CrmSubjectState {
   return {
     subject: { type: "order", id },
@@ -318,6 +353,11 @@ export function directOrderState(
       capturedMinor: over.capturedMinor ?? 0n,
       refundedMinor: over.refundedMinor ?? 0n,
       items: [{ title: "Burj Khalifa At the Top", serviceDate: "2026-12-02", totalMinor: 25_000n, status: "pending", needsDocument: true, documentReady: false }],
+      totalMinor: 25_000n,
+      refundPending: over.refundPending ?? false,
+      marginAedMinor: over.marginAedMinor === undefined ? null : over.marginAedMinor,
     },
+    contact: { ...TEST_CONTACT },
+    consent: { marketingEmail: null, marketingWhatsapp: { granted: false, at: "2026-11-21T10:00:00+00:00" } },
   };
 }

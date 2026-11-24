@@ -87,12 +87,18 @@ export function InquiryForm({
   source = "inquiry_form",
   className,
   initial,
+  initialNotes,
+  initialDate,
 }: {
   items: CartItem[];
   source?: "inquiry_form" | "quote_request";
   className?: string;
   /** Details the customer already typed at checkout in this tab (CO-07), so they are not asked twice. */
   initial?: { name: string; phone: string; countryCode: string; email: string };
+  /** Doc 29 Batch 6 (review 89 B6-16): a released booking's activity, date and guests, for our team. */
+  initialNotes?: string;
+  /** Its service date (YYYY-MM-DD). */
+  initialDate?: string;
 }) {
   const router = useRouter();
   const { currency, clearCart, removeFromCart } = useApp();
@@ -103,14 +109,14 @@ export function InquiryForm({
   const [phone, setPhone] = useState(initial?.phone ?? "");
   const [countryCode, setCountryCode] = useState(initial?.countryCode === "+971" ? "+971" : "+91");
   const [email, setEmail] = useState(initial?.email ?? "");
-  const [date, setDate] = useState(firstItem?.date ?? toDateKey(new Date()));
-  const [flexible, setFlexible] = useState(!firstItem);
+  const [date, setDate] = useState(firstItem?.date ?? initialDate ?? toDateKey(new Date()));
+  const [flexible, setFlexible] = useState(!firstItem && !initialDate);
   const [pax, setPax] = useState<PaxCount>(firstItem?.pax ?? EMPTY_PAX);
   const [dietary, setDietary] = useState<Dietary | undefined>(undefined);
   // A pickup hotel chosen or typed at checkout comes with the trip (doc 29 Batch 3): in the form, never the URL.
   const [hotel, setHotel] = useState(() => hotelForInquiry(items));
   const [budget, setBudget] = useState<BudgetBand | undefined>(undefined);
-  const [notes, setNotes] = useState("");
+  const [notes, setNotes] = useState(initialNotes ?? "");
   // Unticked by default: WhatsApp messaging is a separate, affirmative
   // choice, not something bundled into sending the form. A pre-ticked box is
   // not consent under the GDPR, the UAE PDPL or India's DPDP Act.

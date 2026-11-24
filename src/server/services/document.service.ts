@@ -8,6 +8,7 @@ import { prisma, TX_OPTIONS, type Tx } from "../lib/db";
 import { Errors } from "../lib/errors";
 import { uuidv7 } from "../lib/ids";
 import { emitEvent } from "../lib/structured-events";
+import { enqueueCrmSyncForOrders } from "../crm/crm.outbox";
 import { analyticsService } from "./analytics.service";
 import type { Tristate } from "../suppliers/booking-port";
 import { travelDeskExternalRefSchema } from "../suppliers/traveldesk/traveldesk.adapter";
@@ -445,6 +446,8 @@ export const documentService = {
         },
       });
     }
+    // The deal's ticket status and the Fulfilled stage read document readiness (review C2A-03). Last, same transaction.
+    if (booking.orderId) await enqueueCrmSyncForOrders(tx, [booking.orderId]);
     return { documentId: doc.id, version: doc.version, status, count: set.count, source: set.source, expected, issued, superseded };
   },
 
@@ -919,6 +922,8 @@ export const documentService = {
           },
         });
         if (n.count === 0) throw new Error("row_moved");
+        // A valid PDF can move the deal to Fulfilled / tickets issued (review C2A-03).
+        if (booking.orderId) await enqueueCrmSyncForOrders(tx, [booking.orderId]);
         return true;
       }, TX_OPTIONS);
     } catch {
@@ -1029,6 +1034,8 @@ export const documentService = {
       await lockBooking(tx, doc.supplierBookingId);
       const n = await tx.supplierDocument.updateMany({ where: { id: doc.id, status: "valid" }, data: { status: "quarantined", quarantineReason: reason, invalidatedAt: now, attentionRequiredAt: now } });
       if (n.count === 0) return null;
+      // The document is no longer valid: the deal's ticket status goes back (review C2A-03).
+      if (doc.orderId) await enqueueCrmSyncForOrders(tx, [doc.orderId]);
       const pending = await tx.supplierDocument.findFirst({ where: { supplierBookingId: doc.supplierBookingId, kind: doc.kind, status: "pending" }, select: { id: true } });
       if (pending) {
         // Only the due time: a run that holds the row keeps its lock and finishes (no second get-by-id).

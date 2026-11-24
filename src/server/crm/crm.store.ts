@@ -55,12 +55,19 @@ function linkOf(r: LinkSqlRow): CrmLinkRow {
 
 export const prismaCrmStore: CrmStore = {
   async ensurePortal(scope, identity) {
-    await prisma.$executeRaw`
-      INSERT INTO crm_portal_state (environment, portal, category_id, originator_id, updated_at)
-      VALUES (${scope.environment}, ${scope.portal}, ${identity.categoryId}, ${identity.originatorId}, now())
-      ON CONFLICT (environment, portal) DO NOTHING`;
-    const row = await prisma.crmPortalState.findUniqueOrThrow({ where: { environment_portal: { environment: scope.environment, portal: scope.portal } } });
+    const where = { environment_portal: { environment: scope.environment, portal: scope.portal } };
+    if (!(await prisma.crmPortalState.findUnique({ where, select: { environment: true } }))) {
+      // The switch-on time (no backfill) is the earlier of this first run and the first link: links exist only while
+      // the sync is on and configured, so a first cron run that came late loses no subject (re-review R-03).
+      await prisma.$executeRaw`
+        INSERT INTO crm_portal_state (environment, portal, category_id, originator_id, created_at, updated_at)
+        VALUES (${scope.environment}, ${scope.portal}, ${identity.categoryId}, ${identity.originatorId},
+                LEAST(now(), (SELECT min(created_at) FROM crm_links WHERE environment = ${scope.environment} AND portal = ${scope.portal})), now())
+        ON CONFLICT (environment, portal) DO NOTHING`;
+    }
+    const row = await prisma.crmPortalState.findUniqueOrThrow({ where });
     return {
+      createdAt: row.createdAt,
       categoryId: row.categoryId,
       originatorId: row.originatorId,
       pausedUntil: row.pausedUntil,

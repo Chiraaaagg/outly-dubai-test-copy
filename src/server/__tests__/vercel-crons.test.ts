@@ -12,6 +12,9 @@ import { describe, expect, it } from "vitest";
  *    supplier-reconcile every 15 minutes; the three older crons unchanged;
  *    the catalogue sync once a day at 03:00 Dubai time (doc 29 Batch 1b);
  *    the retention purge once a day at 02:45 UTC (doc 26 §2, Batch 1c);
+ *    the CRM outbox worker every minute on its own route (doc 29 §6.4, CRM
+ *    batch C2a gap G8), a no-op while CRM_SYNC_ENABLED is off (tested in
+ *    src/app/api/jobs/__tests__/crm-worker.route.test.ts);
  *  - payments-tick and supplier-worker are not also scheduled on their own
  *    (they would fire beside the booking tick, undoing its order);
  *  - every cron path is a job route that exists, exports GET and checks
@@ -41,6 +44,8 @@ const REQUIRED: Record<string, string> = {
   // Doc 29 Batch 1b: the daily read-only catalogue sync, 23:00 UTC = 03:00 in Dubai.
   "/api/jobs/catalogue-sync": "0 23 * * *",
   "/api/jobs/retention-purge": "45 2 * * *",
+  // CRM batch C2a (G8): the Bitrix24 outbox worker, its own route, never a step of the booking tick.
+  "/api/jobs/crm-worker": "* * * * *",
 };
 
 describe("vercel.json crons", () => {

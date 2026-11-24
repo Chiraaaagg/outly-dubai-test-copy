@@ -1,4 +1,4 @@
-import { CrmCallError, type CrmPort, type DealFields } from "./bitrix.client";
+import { CrmCallError, type CrmPort, type DealFields, type DealRef } from "./bitrix.client";
 import type { CrmConfig, CrmScope } from "./crm.config";
 import { assertSafeCrmPayload, mapDeal, type CrmEntityType, type CrmSubject, type CrmSubjectState } from "./crm.mapping";
 
@@ -20,7 +20,9 @@ import { assertSafeCrmPayload, mapDeal, type CrmEntityType, type CrmSubject, typ
  *     another environment or portal are never claimed (`foreignDue`).
  *  5. Per row, the subject's link lock (the create lock): a row at or below
  *     the pushed version is a no-op (`stale`); otherwise the current state is
- *     read, mapped, checked by the payload guard, compared with the last
+ *     read, mapped (a subject created before switch-on, the portal row's
+ *     first run less `SWITCH_ON_SLACK_MS`, never gets a new deal: no
+ *     backfill, C2-12), checked by the payload guard, compared with the last
  *     pushed hash (`unchanged`), and pushed. Before every create the portal is
  *     searched by originId: one match is adopted, several are a twin (the
  *     oldest is kept and the link flagged; nothing is deleted automatically),
@@ -42,7 +44,14 @@ import { assertSafeCrmPayload, mapDeal, type CrmEntityType, type CrmSubject, typ
  *    failed probe counts no attempt (the portal, not the row, is at fault),
  *    so an outage of any length dead-letters nothing and catches up in
  *    order once the portal answers;
- *  - refused (payload guard): dead at once, never retried.
+ *  - refused (payload guard, delete guard): dead at once, never retried.
+ *
+ * Deletes (erasure, 2-year retention; owner answer Q1: the service account
+ * may delete in the OUTLYY funnel only): `deleteCopies` deletes only a deal
+ * that the portal shows in the configured funnel AND that is this
+ * environment's link (its `crmId`) or carries this link's originator and
+ * originId. A deal OUTLYY did not create, or one in another funnel, is
+ * never a delete target (`assertDeleteTarget`).
  */
 
 export const CRM_RUN_BUDGET_MS = 10_000;
@@ -57,6 +66,13 @@ export const THROTTLE_PAUSE_MS = 60_000;
 export const CREATE_SETTLE_MS = 60_000;
 export const ROW_LOCK_MS = 120_000;
 export const LINK_BUSY_RETRY_MS = 5_000;
+/**
+ * No backfill (decision C2-12): a subject created before the sync was first
+ * switched on never gets a new deal. Switch-on is taken as the first worker
+ * run for the portal (the portal row's `createdAt`), less this slack, which
+ * covers the minute between the switch-on deploy and the first cron call.
+ */
+export const SWITCH_ON_SLACK_MS = 10 * 60_000;
 
 export type CrmOp = "sync" | "delete";
 export type CrmLinkState = "pending" | "creating" | "active" | "deleted";
@@ -94,6 +110,8 @@ export type CrmLinkPatch = Partial<Pick<CrmLinkRow, "crmId" | "state" | "creatin
 };
 
 export interface CrmPortalStateRow {
+  /** First worker run for this portal: when the sync was switched on (no backfill before it). */
+  createdAt: Date;
   categoryId: number;
   originatorId: string;
   pausedUntil: Date | null;
@@ -143,7 +161,15 @@ export interface CrmWorkerDeps {
   emit?: (name: CrmWorkerEvent, fields: Record<string, unknown>, level?: "info" | "warn" | "error") => void;
 }
 
-export type CrmWorkerEvent = "crm.row_done" | "crm.row_failed" | "crm.dead_letter" | "crm.twin_detected" | "crm.circuit_open" | "crm.refused";
+export type CrmWorkerEvent =
+  | "crm.row_done"
+  | "crm.row_failed"
+  | "crm.dead_letter"
+  | "crm.twin_detected"
+  | "crm.circuit_open"
+  | "crm.refused"
+  | "crm.currency_mismatch"
+  | "crm.erasure_unverified";
 
 export interface CrmRunSummary {
   ok: true;
@@ -186,6 +212,7 @@ function gate(port: CrmPort, limiter: CrmLimiter): CrmPort {
   };
   return {
     findDealsByOrigin: async (a, b) => (await take(), port.findDealsByOrigin(a, b)),
+    findDealById: async (id) => (await take(), port.findDealById(id)),
     addDeal: async (f) => (await take(), port.addDeal(f)),
     updateDeal: async (id, f) => (await take(), port.updateDeal(id, f)),
     setProductRows: async (id, r) => (await take(), port.setProductRows(id, r)),
@@ -233,6 +260,7 @@ export async function runCrmWorker(deps: CrmWorkerDeps, opts: { budgetMs?: numbe
   if (!(await store.acquireLease(scope, holder, deps.now(), leaseUntil))) return { ...finish(), outcome: "busy" };
 
   let failures = portal.consecutiveFailures;
+  const notBefore = new Date(portal.createdAt.getTime() - SWITCH_ON_SLACK_MS);
   try {
     await store.releaseStaleRows(scope, deps.now());
     while (deps.now().getTime() - started < budgetMs) {
@@ -240,7 +268,7 @@ export async function runCrmWorker(deps: CrmWorkerDeps, opts: { budgetMs?: numbe
       const row = await store.claimNext(scope, holder, now, new Date(now.getTime() + ROW_LOCK_MS));
       if (!row) break;
       summary.processed += 1;
-      const result = await processRow(deps, port, scope, holder, row);
+      const result = await processRow(deps, port, scope, holder, row, notBefore);
       const at = deps.now().getTime();
 
       if (result.type === "done") {
@@ -328,7 +356,7 @@ export async function runCrmWorker(deps: CrmWorkerDeps, opts: { budgetMs?: numbe
   return finish();
 }
 
-async function processRow(deps: CrmWorkerDeps, port: CrmPort, scope: CrmScope, holder: string, row: CrmOutboxRow): Promise<RowResult> {
+async function processRow(deps: CrmWorkerDeps, port: CrmPort, scope: CrmScope, holder: string, row: CrmOutboxRow, notBefore: Date): Promise<RowResult> {
   const subject: CrmSubject = { type: row.entityType, id: row.entityId };
   const now = deps.now();
   const lock = await deps.store.lockLink(scope, subject, holder, now, new Date(now.getTime() + ROW_LOCK_MS));
@@ -337,7 +365,7 @@ async function processRow(deps: CrmWorkerDeps, port: CrmPort, scope: CrmScope, h
   const link = lock.link;
   try {
     if (row.kind === "delete") return await deleteCopies(deps, port, holder, link, row.reason === "retention" ? "retention" : "erasure");
-    return await sync(deps, port, holder, link, row);
+    return await sync(deps, port, holder, link, row, notBefore);
   } catch (e) {
     if (e instanceof BudgetExhausted) return { type: "defer", delayMs: 0, code: "budget" };
     if (e instanceof CrmCallError) return { type: "error", error: e };
@@ -347,14 +375,18 @@ async function processRow(deps: CrmWorkerDeps, port: CrmPort, scope: CrmScope, h
   }
 }
 
-async function sync(deps: CrmWorkerDeps, port: CrmPort, holder: string, link: CrmLinkRow, row: CrmOutboxRow): Promise<RowResult> {
+async function sync(deps: CrmWorkerDeps, port: CrmPort, holder: string, link: CrmLinkRow, row: CrmOutboxRow, notBefore: Date): Promise<RowResult> {
   const { store, config } = deps;
   if (link.state === "deleted") return { type: "done", outcome: "tombstoned" };
   if (row.version <= link.pushedVersion) return { type: "done", outcome: "stale" };
   // Everything up to this version is committed: the link lock was taken after it.
   const target = link.localVersion;
   const state = await deps.loadState({ type: link.entityType, id: link.entityId });
-  const mapped = mapDeal(state, config);
+  const mapped = mapDeal(state, config, { now: deps.now() });
+  if (mapped.visible && state.order?.otherCurrencyPaid) {
+    // Staff recorded a payment in another currency than the order's: revenue shows 0 (review C2A-05).
+    deps.emit?.("crm.currency_mismatch", { entityType: link.entityType, entityId: link.entityId }, "warn");
+  }
 
   if (!mapped.visible) {
     if (mapped.reason === "erased" && (link.crmId !== null || link.state === "creating")) return deleteCopies(deps, port, holder, link, "erasure");
@@ -365,19 +397,30 @@ async function sync(deps: CrmWorkerDeps, port: CrmPort, holder: string, link: Cr
     await store.updateLink(link.id, holder, { pushedVersion: target });
     return { type: "done", outcome: "not_created" };
   }
+  if (link.crmId === null && link.state !== "creating" && state.createdAt && state.createdAt.getTime() < notBefore.getTime()) {
+    // Created before switch-on: never a new deal (no backfill, C2-12). A deal that already exists keeps updating.
+    await store.updateLink(link.id, holder, { pushedVersion: target });
+    return { type: "done", outcome: "before_switch_on" };
+  }
   if (link.crmId !== null && mapped.hash === link.pushedHash) {
     await store.updateLink(link.id, holder, { pushedVersion: target });
     return { type: "done", outcome: "unchanged" };
   }
-  assertSafeCrmPayload(mapped.fields, mapped.rows);
+  assertSafeCrmPayload(mapped.fields, mapped.rows, config);
 
   let crmId = link.crmId === null ? null : Number(link.crmId);
   if (crmId === null) {
-    const created = await ensureCreated(deps, port, holder, link, mapped.fields);
+    assertSafeCrmPayload(mapped.createFields, mapped.rows, config, { create: true });
+    const created = await ensureCreated(deps, port, holder, link, mapped.createFields, mapped.createAllowed);
     if (created.type === "wait") return { type: "defer", delayMs: created.delayMs, code: "create_settle" };
+    if (created.type === "none") {
+      // A lost create answer, then the subject turned spam, and nothing landed: never create (review C2A-09).
+      await store.updateLink(link.id, holder, { state: "pending", creatingSince: null, pushedVersion: target });
+      return { type: "done", outcome: "not_created" };
+    }
     crmId = created.id;
     if (created.adopted) {
-      // The adopted record may hold an older snapshot: write the current one.
+      // The adopted record may hold an older snapshot: write the current one (never the owner: it was set on create).
       await port.updateDeal(crmId, mapped.fields);
     }
   } else {
@@ -408,7 +451,8 @@ async function ensureCreated(
   holder: string,
   link: CrmLinkRow,
   fields: DealFields,
-): Promise<{ type: "id"; id: number; adopted: boolean } | { type: "wait"; delayMs: number }> {
+  createAllowed: boolean,
+): Promise<{ type: "id"; id: number; adopted: boolean } | { type: "wait"; delayMs: number } | { type: "none" }> {
   const found = await port.findDealsByOrigin(link.originatorId, link.originId);
   if (found.length > 0) {
     const keep = found[0];
@@ -424,6 +468,8 @@ async function ensureCreated(
     const waited = deps.now().getTime() - link.creatingSince.getTime();
     if (waited < CREATE_SETTLE_MS) return { type: "wait", delayMs: CREATE_SETTLE_MS - waited };
   }
+  // Only a found deal is adopted (to move it to Spam); spam never creates one.
+  if (!createAllowed) return { type: "none" };
   await deps.store.updateLink(link.id, holder, { state: "creating", creatingSince: deps.now() });
   const { id } = await port.addDeal(fields);
   await deps.store.updateLink(link.id, holder, { crmId: BigInt(id), state: "active" });
@@ -431,20 +477,52 @@ async function ensureCreated(
 }
 
 /**
+ * The delete guard (G9): a deal may be deleted only when the portal shows it
+ * in the configured OUTLYY funnel, the link belongs to this environment's
+ * originator, and the deal is the link's own record or carries the link's
+ * originator and originId. Anything else is refused before the call.
+ */
+export function assertDeleteTarget(deal: DealRef, link: Pick<CrmLinkRow, "crmId" | "originatorId" | "originId">, config: Pick<CrmConfig, "categoryId" | "originatorId">): void {
+  const refuse = () => {
+    throw new CrmCallError("refused", "crm.item.delete", { code: "delete_target" });
+  };
+  if (link.originatorId !== config.originatorId) refuse();
+  if (deal.categoryId !== config.categoryId) refuse();
+  const own = link.crmId !== null && BigInt(deal.id) === link.crmId;
+  const tagged = deal.originatorId === link.originatorId && deal.originId === link.originId;
+  if (!own && !tagged) refuse();
+}
+
+/**
  * Delete every CRM copy of the subject: the linked record and any other
- * record carrying its originId (a twin, or a create whose answer was lost).
- * The link becomes a tombstone so no later change re-creates the deal.
+ * record carrying its originId (a twin, or a create whose answer was lost),
+ * each only after `assertDeleteTarget`. The link becomes a tombstone so no
+ * later change re-creates the deal.
  */
 async function deleteCopies(deps: CrmWorkerDeps, port: CrmPort, holder: string, link: CrmLinkRow, reason: "erasure" | "retention"): Promise<RowResult> {
   if (link.state === "deleted") return { type: "done", outcome: "already_deleted" };
-  const ids = new Set<number>();
-  if (link.crmId !== null) ids.add(Number(link.crmId));
+  const targets = new Map<number, DealRef>();
   if (link.crmId !== null || link.state === "creating") {
-    for (const d of await port.findDealsByOrigin(link.originatorId, link.originId)) ids.add(d.id);
+    for (const d of await port.findDealsByOrigin(link.originatorId, link.originId)) targets.set(d.id, d);
   }
-  for (const id of [...ids].sort((a, b) => a - b)) await port.deleteDeal(id);
+  if (link.crmId !== null && !targets.has(Number(link.crmId))) {
+    // The linked record no longer carries our originId (or is gone): delete it only if it is still in the OUTLYY funnel.
+    const own = await port.findDealById(Number(link.crmId));
+    if (own) targets.set(own.id, own);
+  }
+  const ids = [...targets.keys()].sort((a, b) => a - b);
+  if (link.crmId !== null && ids.length === 0) {
+    // The linked deal holds the customer's details but the service account cannot see it any more: moved to another
+    // funnel by staff, or deleted on the portal. Tombstone (never re-create), then dead-letter the row so the ops
+    // alert names it and an administrator checks the other funnels for this deal id (review C2A-08; doc 29d §5.4).
+    await deps.store.updateLink(link.id, holder, { state: "deleted", deletedAt: deps.now(), deleteReason: reason, pushedVersion: link.localVersion });
+    deps.emit?.("crm.erasure_unverified", { entityType: link.entityType, entityId: link.entityId, reason }, "error");
+    return { type: "error", error: new CrmCallError("refused", "crm.item.delete", { code: "linked_deal_not_visible" }) };
+  }
+  for (const id of ids) assertDeleteTarget(targets.get(id)!, link, deps.config);
+  for (const id of ids) await port.deleteDeal(id);
   await deps.store.updateLink(link.id, holder, { state: "deleted", deletedAt: deps.now(), deleteReason: reason, pushedVersion: link.localVersion });
-  return ids.size ? { type: "done", outcome: "deleted", deleted: true } : { type: "done", outcome: "nothing_to_delete" };
+  return ids.length ? { type: "done", outcome: "deleted", deleted: true } : { type: "done", outcome: "nothing_to_delete" };
 }
 
 /**

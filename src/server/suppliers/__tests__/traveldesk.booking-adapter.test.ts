@@ -111,8 +111,13 @@ describe("TravelDesk statuses as the engine sees them", () => {
     expect(travelDeskStatus({ status: 8, externalInProgress: null, externalFailed: null })).toBe("EXPIRED");
     expect(travelDeskStatus({ status: 4, externalInProgress: null, externalFailed: null })).toBe("CANCELLED");
     expect(travelDeskStatus({ status: 1, externalInProgress: true, externalFailed: false })).toBe("PENDING");
-    // Doc 29 Batch 6: while the external confirmation is in progress the booking waits, whatever the failed flag says.
-    expect(travelDeskStatus({ status: 1, externalInProgress: true, externalFailed: true })).toBe("PENDING");
+    // Batches 0–5 exactly (review 89 B6-04): on the internal route both flags set is no wait, and the predicate refuses it.
+    expect(travelDeskStatus({ status: 1, externalInProgress: true, externalFailed: true })).toBe("CONFIRMED");
+    expect(travelDeskStatus({ status: 1, externalInProgress: false, externalFailed: true })).toBe("CONFIRMED");
+    expect(travelDeskStatus({ status: 7, externalInProgress: false, externalFailed: true })).toBe("ON_HOLD");
+    // On the external route the flags are an end state (doc 29 Batch 6).
+    expect(travelDeskStatus({ status: 1, externalInProgress: true, externalFailed: true }, true)).toBe("PENDING");
+    expect(travelDeskStatus({ status: 1, externalInProgress: false, externalFailed: true }, true)).toBe("REJECTED");
     expect(travelDeskStatus({ status: 5, externalInProgress: null, externalFailed: null })).toBe("CONFIRMED");
     for (const s of [2, 3, 6, 99]) expect(travelDeskStatus({ status: s, externalInProgress: false, externalFailed: false })).toBe("UNKNOWN");
   });
@@ -518,7 +523,7 @@ describe("external-supplier bookings (doc 29 Batch 6)", () => {
     isExternalVoucherNotReady: false,
     ...over,
   });
-  const read = (over: Record<string, unknown>) => snapshotFrom(bookingFrom(bookingWire.parse(wire(over))));
+  const read = (over: Record<string, unknown>, externalRoute = true) => snapshotFrom(bookingFrom(bookingWire.parse(wire(over))), null, undefined, externalRoute);
 
   it("a booking the external supplier rejected is created (201) with the failed flag: once the confirmation is no longer in progress it reads REJECTED", () => {
     for (const status of [0, 1, 5]) {
@@ -549,6 +554,31 @@ describe("external-supplier bookings (doc 29 Batch 6)", () => {
     expect(json).not.toContain("example.invalid");
     expect(json).not.toContain("Synthetic supplier text");
     expect(s.ticketsIssued).toBeNull();
+  });
+
+  it("review 89 B6-04: an internal booking keeps the Batch 0–5 mapping, whatever the external flags say", () => {
+    for (const status of [0, 1, 5]) expect(read({ status, isExternalBookingFailed: true }, false).status).toBe("CONFIRMED");
+    expect(read({ status: 7, isExternalBookingFailed: true, reservationDeadline: "2026-11-01T08:15:00" }, false).status).toBe("ON_HOLD");
+    expect(read({ isExternalConfirmationInProgress: true, isExternalBookingFailed: true }, false).status).toBe("CONFIRMED");
+    expect(read({ isExternalConfirmationInProgress: true }, false).status).toBe("PENDING");
+  });
+
+  it("review 89 B6-03: a reservation the external provider is still making reads ON_HOLD with the flag for the engine", () => {
+    const s = read({ status: 7, isExternalConfirmationInProgress: true, reservationDeadline: "2026-11-01T08:15:00" });
+    expect(s).toMatchObject({ status: "ON_HOLD", externalInProgress: true });
+    expect(read({ status: 7, isExternalConfirmationInProgress: false, reservationDeadline: "2026-11-01T08:15:00" }).status).toBe("ON_HOLD");
+  });
+
+  it("status reads carry the route: list and reservation reads of an external attempt map its flags", async () => {
+    const failedRow = booking({ status: 1, reservationDeadline: null, externalInProgress: false, externalFailed: true });
+    const { t } = transport({ pages: () => ({ rows: [failedRow], totalCount: 1 }) });
+    const a = adapterFor(t);
+    const ext = await a.readStatus({ ...ref, externalRoute: true });
+    expect(ext.kind === "found" && ext.snapshot.status).toBe("REJECTED");
+    const internal = await a.readStatus(ref);
+    expect(internal.kind === "found" && internal.snapshot.status).toBe("CONFIRMED");
+    const found = await a.findByClientRef("OUTTD-ABC", { serviceDate: ref.serviceDate, offerExternalId: ref.offerExternalId, externalRoute: true });
+    expect(found.matches.map((m) => m.status)).toEqual(["REJECTED"]);
   });
 
   it("a voucher not ready after the confirmation does not stop the confirmation; the download answers not ready (502) until it is", () => {

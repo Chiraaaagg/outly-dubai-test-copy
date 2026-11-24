@@ -247,3 +247,13 @@ describe("OrderStatusView: an external supplier's booking (doc 29 Batch 6)", () 
     expect(render(status())).not.toContain('data-testid="external-confirmation"');
   });
 });
+
+describe("OrderStatusView: a released external hold (owner decision d)", () => {
+  it("offers the existing 'Send it to our team' inquiry route, only when the projection names it", () => {
+    const html = render(status({ state: "payment_released", tone: "neutral", inquiryHref: "/inquiry?from=booking&reason=external_hold", items: [item({ state: "payment_released", tickets: { fulfilment: "not_applicable", documents: [] } })] }));
+    expect(html).toContain('data-testid="send-to-team"');
+    expect(html).toContain('href="/inquiry?from=booking&amp;reason=external_hold"');
+    expect(html).toContain("Send it to our team");
+    expect(render(status())).not.toContain('data-testid="send-to-team"');
+  });
+});

@@ -93,12 +93,27 @@ export const ANSWERED_UNVERIFIED = ANSWERED_UNVERIFIED_REASON;
 /** More pages than this in one listing is reported as incomplete, never thrown away silently (SUP-12). */
 const MAX_LIST_PAGES = 50;
 
-/** Normalised status. A final status is only a candidate: the engine's predicate decides (SUP-1). */
-export function travelDeskStatus(r: Pick<TravelDeskBooking, "status" | "externalInProgress" | "externalFailed">): SupplierStatus {
+/**
+ * Normalised status. A final status is only a candidate: the engine's
+ * predicate decides (SUP-1).
+ *
+ * `externalRoute` (doc 29 Batch 6; review 89 B6-04): TravelDesk documents the
+ * external flags for external bookings only, so only an attempt on the
+ * external-supplier route reads them as an end state. There: poll until
+ * `isExternalConfirmationInProgress` is false, then read
+ * `isExternalBookingFailed`; in progress waits whatever the failed flag says,
+ * and finished-and-failed is TravelDesk's documented rejection (the booking
+ * is still created, 201), for a confirmed status or a reservation. A missing
+ * flag is never a rejection: it falls to CONFIRMED, where the predicate
+ * refuses it (`flag_missing`). Every other attempt keeps the mapping of
+ * Batches 0–5 exactly: a failed flag is no end state, and the predicate
+ * refuses the answer for a human (`external_failed`).
+ */
+export function travelDeskStatus(r: Pick<TravelDeskBooking, "status" | "externalInProgress" | "externalFailed">, externalRoute = false): SupplierStatus {
+  const failedDone = externalRoute && r.externalInProgress === false && r.externalFailed === true;
   switch (r.status) {
     case 7:
-      // A reservation the external supplier refused is created too; it holds nothing (doc 29 Batch 6).
-      return r.externalInProgress === false && r.externalFailed === true ? "REJECTED" : "ON_HOLD";
+      return failedDone ? "REJECTED" : "ON_HOLD";
     case 8:
       return "EXPIRED";
     case 4:
@@ -106,18 +121,16 @@ export function travelDeskStatus(r: Pick<TravelDeskBooking, "status" | "external
     case 0:
     case 1:
     case 5:
-      // Doc 29 Batch 6 (TravelDesk §8.6): poll until `isExternalConfirmationInProgress` is false, then read
-      // `isExternalBookingFailed`. While in progress the booking waits, whatever the failed flag says; once
-      // done, a failed flag is TravelDesk's documented rejection (a rejected booking is still created, 201).
-      // A missing flag is neither: it falls to CONFIRMED, where the predicate refuses it (`flag_missing`).
-      if (r.externalInProgress === true) return "PENDING";
-      if (r.externalInProgress === false && r.externalFailed === true) return "REJECTED";
-      return "CONFIRMED";
+      if (externalRoute) {
+        if (r.externalInProgress === true) return "PENDING";
+        return failedDone ? "REJECTED" : "CONFIRMED";
+      }
+      return r.externalInProgress === true && r.externalFailed !== true ? "PENDING" : "CONFIRMED";
     default:
       // 2 on-request, 3 payment required, 6 payment failed, codes not in the spec. 6 stays unknown (OpenAPI,
       // 22 Nov 2026: "PaymentFailed", with `paymentErrorMessage`, e.g. balance): the spec does not say the
-      // booking holds no seats, was not charged, or cannot still be paid and confirmed (Q-B11 open), and the
-      // engine treats no REJECTED as definite yet. Unknown keeps recovery and a human in the loop.
+      // booking holds no seats, was not charged, or cannot still be paid and confirmed (Q-B11 open). Unknown
+      // keeps recovery and a human in the loop.
       return "UNKNOWN";
   }
 }
@@ -136,8 +149,8 @@ function earliest(a: string | null, b: string | null): string | null {
  * mean the supplier returned tickets, so they count as issued. The snapshot
  * itself never holds ticket data.
  */
-export function snapshotFrom(r: TravelDeskBooking, holdCapUtc: string | null = null, tickets?: TicketEvidence): SupplierSnapshot & SupplierRefundFigure {
-  const status = travelDeskStatus(r);
+export function snapshotFrom(r: TravelDeskBooking, holdCapUtc: string | null = null, tickets?: TicketEvidence, externalRoute = false): SupplierSnapshot & SupplierRefundFigure {
+  const status = travelDeskStatus(r, externalRoute);
   const ticketsReturned = tickets !== undefined && tickets.kind !== "none";
   return {
     ...confirmationSnapshotFrom(r),
@@ -345,7 +358,7 @@ export class TravelDeskBookingAdapter implements SupplierBookingAdapter, CallObs
       // The deadline comes from the answer (still capped, CR-9); an answer with neither a deadline nor a timeout gives
       // the hold no known end, and the engine never confirms it.
       const unknownEnd = a.externalRoute === true && !r.reservationDeadline && r.reservationTimeout === null;
-      return { kind: "accepted", snapshot: snapshotFrom(r, unknownEnd ? null : new Date(sentAt + minutes * 60_000).toISOString()) };
+      return { kind: "accepted", snapshot: snapshotFrom(r, unknownEnd ? null : new Date(sentAt + minutes * 60_000).toISOString(), undefined, a.externalRoute === true) };
     } catch (e) {
       return outcomeFromError(e);
     }
@@ -355,7 +368,7 @@ export class TravelDeskBookingAdapter implements SupplierBookingAdapter, CallObs
   async book(a: AttemptRequest): Promise<MutationOutcome> {
     try {
       const { booking, tickets } = answerOf(await this.t.create(a.body));
-      return { kind: "accepted", snapshot: snapshotFrom(booking, null, tickets), tickets };
+      return { kind: "accepted", snapshot: snapshotFrom(booking, null, tickets, a.externalRoute === true), tickets };
     } catch (e) {
       return outcomeFromError(e);
     }
@@ -365,7 +378,7 @@ export class TravelDeskBookingAdapter implements SupplierBookingAdapter, CallObs
   async confirm(ref: SupplierRef): Promise<MutationOutcome> {
     try {
       const { booking, tickets } = answerOf(await this.t.confirm(ref.supplierBookingId));
-      return { kind: "accepted", snapshot: snapshotFrom(booking, null, tickets), tickets };
+      return { kind: "accepted", snapshot: snapshotFrom(booking, null, tickets, ref.externalRoute === true), tickets };
     } catch (e) {
       return outcomeFromError(e);
     }
@@ -410,10 +423,11 @@ export class TravelDeskBookingAdapter implements SupplierBookingAdapter, CallObs
       return { kind: "failed", reason: isTravelDeskApiError(e) ? e.kind : "internal" };
     }
     const hit = listed.rows.find((r) => r.supplierBookingId === ref.supplierBookingId);
-    if (hit) return { kind: "found", snapshot: snapshotFrom(hit) };
+    const external = ref.externalRoute === true;
+    if (hit) return { kind: "found", snapshot: snapshotFrom(hit, null, undefined, external) };
     if (!(await this.gate("bookings.reservation"))) return { kind: "failed", reason: READ_BUDGET_REASON };
     try {
-      return { kind: "found", snapshot: snapshotFrom(await this.t.getReservation(ref.supplierBookingId)) };
+      return { kind: "found", snapshot: snapshotFrom(await this.t.getReservation(ref.supplierBookingId), null, undefined, external) };
     } catch (e) {
       // The reservation read answers 400 for anything that is no longer a reservation (sandbox, 30 Oct 2026).
       if (isTravelDeskApiError(e) && (e.kind === "bad_request" || e.kind === "not_found")) {
@@ -423,12 +437,15 @@ export class TravelDeskBookingAdapter implements SupplierBookingAdapter, CallObs
     }
   }
 
-  async findByClientRef(clientRef: string, hint: { serviceDate: string; offerExternalId: string }) {
+  async findByClientRef(clientRef: string, hint: { serviceDate: string; offerExternalId: string; externalRoute?: boolean }) {
     const listed = await this.listStable({ from: hint.serviceDate, to: hint.serviceDate, offerId: Number(hint.offerExternalId) });
-    return { matches: listed.rows.filter((r) => r.bookingReference === clientRef).map((r) => snapshotFrom(r)), complete: listed.complete };
+    return { matches: listed.rows.filter((r) => r.bookingReference === clientRef).map((r) => snapshotFrom(r, null, undefined, hint.externalRoute === true)), complete: listed.complete };
   }
 
-  /** Every booking with a service date in the window, for reconciliation (`WindowLister`, booking-port.ts). */
+  /**
+   * Every booking with a service date in the window, for reconciliation (`WindowLister`, booking-port.ts).
+   * Read with the Batch 0–5 mapping: the engine compares an external-route row on the snapshot's own flags.
+   */
   async listWindow(q: { from: string; to: string }) {
     const listed = await this.listStable(q);
     return { snapshots: listed.rows.map((r) => snapshotFrom(r)), complete: listed.complete };

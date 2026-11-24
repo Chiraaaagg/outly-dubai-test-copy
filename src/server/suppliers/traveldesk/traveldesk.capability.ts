@@ -148,6 +148,16 @@ export const EXTERNAL_CLASS_KEYS: readonly string[] = Object.freeze([
 ]);
 
 /**
+ * Review 89 B6-09 (doc 29 §9.4): the class keys of enabled flag rows on the
+ * external route. Batch 6 leaves the readiness rules version unchanged on the
+ * premise that no such row exists before its own switch-on; a row found here
+ * means readiness must be re-run after the deploy (admin capabilities page).
+ */
+export function externalFlagsEnabled(flags: readonly { classKey: string; enabled: boolean }[]): string[] {
+  return flags.filter((f) => f.enabled && f.classKey.split(".")[3] === "external").map((f) => f.classKey).sort();
+}
+
+/**
  * Keys that may sell as a choice among their listed starts
  * (`listedStartsSellable`): Batch 2's two internal self-arrival keys and the
  * four listed-start keys of Batch 6 (external route, self arrival or pickup).
@@ -187,6 +197,37 @@ export const DATE_ONLY_CLASS_KEYS: readonly string[] = Object.freeze([
  */
 export const DATE_ONLY_Q5_UNCONFIRMED =
   "TravelDesk has not confirmed which slot id and times a date-only booking sends (question Q5). Keep this class off until TravelDesk answers and one supervised booking proves this exact key.";
+
+/**
+ * The code lock on the Batch 7 keys (owner decision d, 24 Nov 2026; review
+ * 92 B7-03). While false, neither date-only key can be switched on in
+ * production, and the capability gate refuses them there even if a flag row
+ * says on (`environmentRefusal`). The test environment stays switchable for
+ * a sandbox drill. Only a deploy lifts it: set it true in the change that
+ * records TravelDesk's answer to Q5 and the supervised production booking.
+ */
+export const DATE_ONLY_Q5_CONFIRMED: boolean = false;
+
+/**
+ * Why a class key may not be switched on, or sell, in `environment` in this
+ * build, or null: `date_only_q5_pending` for the two Batch 7 keys in
+ * production while `DATE_ONLY_Q5_CONFIRMED` is false. Read by the enable
+ * path (supplier-capability.service.ts) and by the gate (capability-gate.ts).
+ */
+export function environmentRefusal(classKey: string, environment: string, q5Confirmed: boolean = DATE_ONLY_Q5_CONFIRMED): "date_only_q5_pending" | null {
+  return !q5Confirmed && environment === "production" && DATE_ONLY_CLASS_KEYS.includes(classKey) ? "date_only_q5_pending" : null;
+}
+
+/**
+ * Whether readiness keeps `slot_rules_unknown` for a stored offer (review 92
+ * B7-04): the offer cannot be read, or it is a live-book offer without slots
+ * and is not sold as date only (`dateOnlySellable`: the gate allows its exact
+ * Batch 7 key). Every other offer is unaffected.
+ */
+export function slotRulesUnknown(stored: { bookingKind: string; timeSlots: readonly unknown[] } | null, gateAllows: boolean, classKey: string): boolean {
+  if (!stored) return true;
+  return stored.bookingKind === "live_book" && stored.timeSlots.length === 0 && !dateOnlySellable(gateAllows, classKey, stored.timeSlots);
+}
 
 /** A standing note for a class key that an administrator must read before switching it on, or null. */
 export function capabilityKeyNote(classKey: string): string | null {

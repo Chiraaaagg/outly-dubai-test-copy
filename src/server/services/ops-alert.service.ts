@@ -42,6 +42,7 @@ import { quoteBudgetIncidents } from "./quote-budget-alert";
  *  - `booking_attention`: a supplier booking needing staff:
  *    `outcome_unknown` past its first recovery search (or
  *    `not_found_unresolved`), `manual_review`, `charged_amount_mismatch`,
+ *    `reservation_slot_mismatch` (doc 29 Batch 7),
  *    `cancel_refused`, a late acceptance, a reserve held back because the
  *    wallet figures failed the funds check (`funds_unverified`);
  *  - `document_attention`: a ticket document flagged for staff past the
@@ -200,18 +201,29 @@ const date = (v: unknown): Date => (v instanceof Date ? v : new Date(String(v)))
 export function bookingReason(b: { state: string; errorCode: string | null; attention: boolean; recoverySearches: number }): string | null {
   if ((b.errorCode === "late_acceptance" || b.errorCode === "late_acceptance_duplicate") && b.attention) return "late_acceptance";
   if (b.errorCode === "charged_amount_mismatch" && b.attention) return "charged_amount_mismatch";
+  // Doc 29 Batch 7 (review 92 B7-12): the reservation names another slot than the one sent.
+  if (b.errorCode === "reservation_slot_mismatch" && b.attention) return "reservation_slot_mismatch";
   if (b.errorCode === "funds_unverified" && b.attention) return "funds_unverified";
   // Doc 29 Batch 6 (external-confirmation.ts): an external booking handed to our team at its wait limit, one the
   // external supplier failed after the confirm (the saga refunds it), and an external hold too short to confirm.
   if (b.errorCode === "external_confirmation_handoff" && b.attention) return "external_confirmation_handoff";
   if (b.errorCode === "external_booking_failed" && b.attention) return "external_booking_failed";
   if (b.errorCode === "external_hold_unusable" && b.attention) return "external_hold_unusable";
+  if (b.errorCode === "external_reservation_released" && b.attention) return "external_reservation_released";
+  if (b.errorCode === "external_failed_after_confirm" && b.attention) return "external_failed_after_confirm";
+  if (b.errorCode === "external_unconfirmed_at_start" && b.attention) return "external_unconfirmed_at_start";
+  // Review 89 B6-06: any flag on an external-route booking still waiting on its supplier (a read dead-letter sets a
+  // bare one). The query selects external-route rows only for this clause, so internal attempts alert as before.
+  if (b.state === "awaiting_external" && b.attention) return "external_confirmation_attention";
   if (b.state === "manual_review") return "manual_review";
   if (b.state === "cancel_refused") return "cancel_refused";
   // Past its first recovery search: still unknown (or proven not found yet), a human must look.
   if ((b.state === "outcome_unknown" && b.recoverySearches >= 1) || b.state === "not_found_unresolved") return "outcome_unknown";
   return null;
 }
+
+/** Doc 29 Batch 6: a failed external charge still unrefunded this long after the rejection raises an alert (within the 24 h funds window). */
+export const EXTERNAL_REFUND_ALERT_AFTER_MS = 3 * 3_600_000;
 
 export async function collectOpsIncidents(since: Date, now: Date, limit = COLLECT_LIMIT): Promise<OpsIncident[]> {
   const out: OpsIncident[] = [];
@@ -315,8 +327,9 @@ export async function collectOpsIncidents(since: Date, now: Date, limit = COLLEC
       b.order_id, o.reference, COALESCE(b.attention_required_at, b.updated_at) AS raised_at
     FROM supplier_bookings b LEFT JOIN orders o ON o.id = b.order_id
     WHERE (
-        (b.error_code IN ('late_acceptance', 'late_acceptance_duplicate', 'charged_amount_mismatch', 'funds_unverified',
-            'external_confirmation_handoff', 'external_booking_failed', 'external_hold_unusable') AND b.attention_required_at IS NOT NULL)
+        (b.error_code IN ('late_acceptance', 'late_acceptance_duplicate', 'charged_amount_mismatch', 'reservation_slot_mismatch', 'funds_unverified',
+            'external_confirmation_handoff', 'external_booking_failed', 'external_hold_unusable', 'external_unconfirmed_at_start', 'external_reservation_released', 'external_failed_after_confirm') AND b.attention_required_at IS NOT NULL)
+        OR (b.state = 'awaiting_external' AND b.attention_required_at IS NOT NULL AND b.external_route IS TRUE)
         OR b.state IN ('manual_review', 'cancel_refused', 'not_found_unresolved')
         OR (b.state = 'outcome_unknown' AND b.recovery_searches >= 1)
       )
@@ -330,6 +343,31 @@ export async function collectOpsIncidents(since: Date, now: Date, limit = COLLEC
       entityKind: "supplier_booking",
       entityId: String(r.id),
       reason,
+      raisedAt: date(r.raised_at),
+      orderId: str(r.order_id),
+      orderReference: str(r.reference),
+      bookingId: String(r.id),
+      supplierBookingRef: str(r.supplier_booking_id),
+      adminPath: bookingPath(str(r.reference)),
+    });
+  }
+
+  // Doc 29 Batch 6 (review 89 B6-14): a failed external booking whose recorded charge has no matching refund in the
+  // wallet book `EXTERNAL_REFUND_ALERT_AFTER_MS` after it was rejected. Raised then, before the funds window closes.
+  const unrefunded = await prisma.$queryRaw<Row[]>`
+    SELECT b.id, b.supplier_booking_id, b.order_id, o.reference, b.closed_at + make_interval(secs => ${EXTERNAL_REFUND_ALERT_AFTER_MS / 1000}::double precision) AS raised_at
+    FROM supplier_bookings b LEFT JOIN orders o ON o.id = b.order_id
+    WHERE b.state = 'rejected' AND b.external_route IS TRUE AND b.closed_at IS NOT NULL
+      AND b.closed_at + make_interval(secs => ${EXTERNAL_REFUND_ALERT_AFTER_MS / 1000}::double precision) BETWEEN ${since} AND ${now}
+      AND EXISTS (SELECT 1 FROM ledger_entries l WHERE l.supplier_booking_id = b.id AND l.book = 'supplier_wallet' AND l.kind = 'charged')
+      AND (SELECT COALESCE(sum(l.amount_minor), 0) FROM ledger_entries l WHERE l.supplier_booking_id = b.id AND l.book = 'supplier_wallet') < 0
+    ORDER BY raised_at DESC LIMIT ${limit}`;
+  for (const r of unrefunded) {
+    out.push({
+      kind: "booking_attention",
+      entityKind: "supplier_booking",
+      entityId: String(r.id),
+      reason: "external_refund_not_seen",
       raisedAt: date(r.raised_at),
       orderId: str(r.order_id),
       orderReference: str(r.reference),
@@ -441,10 +479,10 @@ export async function catalogueStaleIncidents(environment: SupplierEnvironment, 
 export async function crmDeleteIncidents(since: Date, now: Date, limit = COLLECT_LIMIT): Promise<OpsIncident[]> {
   const rows = await prisma
     .$queryRaw<Row[]>`
-    SELECT entity_type, entity_id::text AS entity_id, reason, max(updated_at) AS raised_at
+    SELECT entity_type, entity_id::text AS entity_id, reason, (last_error_code = 'refused:linked_deal_not_visible') AS unverified, max(updated_at) AS raised_at
     FROM crm_outbox
     WHERE kind = 'delete' AND status = 'dead' AND updated_at >= ${since} AND updated_at <= ${now}
-    GROUP BY entity_type, entity_id, reason
+    GROUP BY entity_type, entity_id, reason, unverified
     ORDER BY raised_at DESC LIMIT ${limit}`
     .catch((e: unknown) => {
       // 42P01 undefined_table: the CRM migration is not applied yet.
@@ -455,7 +493,9 @@ export async function crmDeleteIncidents(since: Date, now: Date, limit = COLLECT
     kind: "crm_delete_failed" as const,
     entityKind: "crm_subject" as const,
     entityId: `${String(r.entity_type)}:${String(r.entity_id)}`,
-    reason: r.reason === "retention" ? "crm_retention_delete_dead" : "crm_erasure_delete_dead",
+    // Unverified (review C2A-08): the linked deal was not visible to the service account; an administrator must
+    // look for it in the other funnels.
+    reason: `crm_${r.reason === "retention" ? "retention" : "erasure"}_${r.unverified === true ? "deal_not_visible" : "delete_dead"}`,
     raisedAt: date(r.raised_at),
     orderId: null,
     orderReference: null,

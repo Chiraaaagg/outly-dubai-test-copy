@@ -316,6 +316,12 @@ export type SupplierQuoteResult =
        * `startTime` and `endTime`, which the booking sends unchanged. Absent for every other offer.
        */
       availabilitySlot?: { timeSlotId: number; startMinutes: number; endMinutes: number };
+      /**
+       * Doc 29 Batch 7 (owner decision, 24 Nov 2026): the supplier gave no seat count (a `left` sentinel). The
+       * party fits the offer's own maximum, and the supplier checks seats at reserve, before capture. With it,
+       * `capacity: "unknown"` and `seatsLeft: null` are not a refusal. Absent otherwise.
+       */
+      seatsUnstated?: true;
     }
   | {
       ok: false;
@@ -326,6 +332,8 @@ export interface SupplierQuoteInput {
   mappingId: string;
   serviceDate: string;
   slotRef: string | null;
+  /** Doc 29 Batch 7: readiness says the mapping sells as date only (`dateOnlySellable`). Absent: an offer with no slot is refused. */
+  dateOnly?: boolean;
   /** Supplier units and counts (from `UnitDefinition.supplierUnit`). */
   supplierUnits: Record<string, number>;
   pickup: { hotelRef: string } | null;

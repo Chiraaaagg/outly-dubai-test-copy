@@ -3,11 +3,13 @@ import { resetEnvCache } from "@/server/lib/env";
 import {
   CRM_DEFERRED_VERSION,
   CRM_LINK_LOCK_TIMEOUT,
+  crmNewLinksAllowed,
   crmOutboxScope,
   dedupeKeyFor,
   enqueueCrmDelete,
   enqueueCrmErasure,
   enqueueCrmSync,
+  enqueueCrmSyncForContact,
   enqueueCrmSyncForOrders,
   isLockTimeout,
 } from "@/server/crm/crm.outbox";
@@ -22,6 +24,9 @@ import type { CrmScope } from "@/server/crm/crm.config";
  *    order, and a failure rolls back to the savepoint and is swallowed, so
  *    the domain transaction (an inquiry, a payment move, a refund) never
  *    fails because of the CRM.
+ *  - while the sync is switched off no subject is linked for the first time
+ *    (no backfill, decision C2-12): only an already linked subject bumps its
+ *    link and takes a row.
  * The SQL itself is exercised on the disposable database (crm.db.test.ts).
  */
 
@@ -83,7 +88,7 @@ describe("CRM outbox enqueue", () => {
 
   it("bumps the link version and writes one row per subject, under a savepoint, in a fixed order", async () => {
     const { tx, calls } = fakeTx();
-    expect(await enqueueCrmSync(tx, [{ type: "inquiry", id: B }, { type: "inquiry", id: A }, { type: "inquiry", id: B }], scope)).toBe(2);
+    expect(await enqueueCrmSync(tx, [{ type: "inquiry", id: B }, { type: "inquiry", id: A }, { type: "inquiry", id: B }], scope, true)).toBe(2);
     expect(calls[0]).toMatchObject({ op: "$executeRawUnsafe", sql: "SAVEPOINT crm_outbox_enqueue" });
     expect(calls.at(-1)).toMatchObject({ op: "$executeRawUnsafe", sql: "RELEASE SAVEPOINT crm_outbox_enqueue" });
     const upserts = calls.filter((c) => c.sql.includes("INSERT INTO crm_links"));
@@ -102,12 +107,12 @@ describe("CRM outbox enqueue", () => {
 
   it("an order from an inquiry is pushed on the inquiry's deal; a direct order on its own", async () => {
     const fromInquiry = fakeTx({ order: { id: B, sourceInquiryId: A } });
-    await enqueueCrmSyncForOrders(fromInquiry.tx, [B], scope);
+    await enqueueCrmSyncForOrders(fromInquiry.tx, [B], scope, true);
     const up = fromInquiry.calls.find((c) => c.sql.includes("INSERT INTO crm_links"))!;
     expect(up.values.slice(3, 5)).toEqual(["inquiry", A]);
     expect(up.values[6]).toBe(`inq:${A}`);
     const direct = fakeTx({ order: { id: B, sourceInquiryId: null } });
-    await enqueueCrmSyncForOrders(direct.tx, [B], scope);
+    await enqueueCrmSyncForOrders(direct.tx, [B], scope, true);
     const up2 = direct.calls.find((c) => c.sql.includes("INSERT INTO crm_links"))!;
     expect(up2.values.slice(3, 5)).toEqual(["order", B]);
   });
@@ -121,7 +126,7 @@ describe("CRM outbox enqueue", () => {
 
   it("the link statement waits at most the short lock timeout, and the caller's setting is put back (review R12)", async () => {
     const { tx, calls } = fakeTx();
-    await enqueueCrmSync(tx, [{ type: "inquiry", id: A }], scope);
+    await enqueueCrmSync(tx, [{ type: "inquiry", id: A }], scope, true);
     const sets = calls.filter((c) => c.sql.includes("set_config"));
     expect(sets.map((c) => c.values[0])).toEqual([CRM_LINK_LOCK_TIMEOUT, "7s"]);
     const sqls = calls.map((c) => c.sql);
@@ -134,7 +139,7 @@ describe("CRM outbox enqueue", () => {
 
   it("a link lock not granted in time falls back to a deferred row: no wait, no throw, no link bump (review R12)", async () => {
     const { tx, calls } = fakeTx({ lockTimeoutOn: /INSERT INTO crm_links/ });
-    await expect(enqueueCrmSync(tx, [{ type: "inquiry", id: A }], scope)).resolves.toBe(1);
+    await expect(enqueueCrmSync(tx, [{ type: "inquiry", id: A }], scope, true)).resolves.toBe(1);
     const sqls = calls.map((c) => c.sql);
     expect(sqls).toContain("ROLLBACK TO SAVEPOINT crm_outbox_link");
     expect(sqls).not.toContain("ROLLBACK TO SAVEPOINT crm_outbox_enqueue");
@@ -162,8 +167,130 @@ describe("CRM outbox enqueue", () => {
     expect(isLockTimeout(new Error("canceling statement due to lock timeout"))).toBe(true);
     expect(isLockTimeout({ code: "P2010", meta: { code: "23505" } })).toBe(false);
     const { tx, calls } = fakeTx({ failOn: /INSERT INTO crm_links/ });
-    await expect(enqueueCrmSync(tx, [{ type: "inquiry", id: A }], scope)).resolves.toBe(0);
+    await expect(enqueueCrmSync(tx, [{ type: "inquiry", id: A }], scope, true)).resolves.toBe(0);
     expect(calls.at(-1)?.sql).toBe("ROLLBACK TO SAVEPOINT crm_outbox_enqueue");
+  });
+
+  it("sync off (the portal host set, CRM_SYNC_ENABLED not true): no subject is linked for the first time (no backfill)", async () => {
+    vi.stubEnv("CRM_SYNC_ENABLED", "false");
+    resetEnvCache();
+    expect(crmNewLinksAllowed()).toBe(false);
+    const { tx, calls } = fakeTx();
+    // The default follows the switch.
+    await enqueueCrmSync(tx, [{ type: "inquiry", id: A }], scope);
+    expect(calls.some((c) => c.sql.includes("INSERT INTO crm_links"))).toBe(false);
+    const bump = calls.find((c) => c.sql.includes("UPDATE crm_links"))!;
+    expect(bump.sql).not.toContain("state <> 'deleted'");
+    vi.stubEnv("CRM_SYNC_ENABLED", "true");
+    resetEnvCache();
+    // On, but not fully configured: still no new links (C2A-04).
+    expect(crmNewLinksAllowed()).toBe(false);
+  });
+
+  it("new links only while the sync is on AND the whole configuration validates (C2A-04)", async () => {
+    const { fakeEnv } = await import("./_memory-store");
+    const stub = (over: Record<string, string | undefined>) => {
+      for (const [k, v] of Object.entries({ ...fakeEnv(), ...over })) vi.stubEnv(k, v === undefined ? "" : String(v));
+      resetEnvCache();
+    };
+    stub({ CRM_SYNC_ENABLED: "true" });
+    expect(crmNewLinksAllowed()).toBe(true);
+    stub({ CRM_SYNC_ENABLED: "true", CRM_BITRIX_FIELD_CODES: "reference=UF_CRM_REFERENCE" });
+    expect(crmNewLinksAllowed()).toBe(false);
+    stub({ CRM_SYNC_ENABLED: "false" });
+    expect(crmNewLinksAllowed()).toBe(false);
+  });
+
+  it("the boot check names what would block switch-on while the sync is still off (C2A-04)", async () => {
+    const { fakeEnv } = await import("./_memory-store");
+    const { assertBootEnv } = await import("@/server/lib/env");
+    for (const [k, v] of Object.entries({ ...fakeEnv(), CRM_SYNC_ENABLED: "false", CRM_BITRIX_DEFAULT_OWNER_ID: "" })) vi.stubEnv(k, v === undefined ? "" : String(v));
+    resetEnvCache();
+    expect(assertBootEnv().filter((p) => p.startsWith("CRM not ready for switch-on"))).toEqual(["CRM not ready for switch-on: CRM_BITRIX_DEFAULT_OWNER_ID is missing"]);
+  });
+
+  it("sync off: an unlinked subject takes no row; an already linked one is bumped and queued", async () => {
+    const none: ReturnType<typeof fakeTx> = fakeTx();
+    // The UPDATE finds no link: the stand-in answers an empty RETURNING for it.
+    const noneTx = none.tx as unknown as { $queryRaw: (s: TemplateStringsArray, ...v: unknown[]) => Promise<unknown> };
+    const orig = noneTx.$queryRaw;
+    noneTx.$queryRaw = async (strings, ...values) => (strings.join("?").includes("UPDATE crm_links") ? (none.calls.push({ op: "$queryRaw", sql: strings.join("?"), values }), []) : orig(strings, ...values));
+    await expect(enqueueCrmSync(none.tx, [{ type: "inquiry", id: A }], scope, false)).resolves.toBe(0);
+    expect(none.calls.some((c) => c.sql.includes("INSERT INTO crm_outbox"))).toBe(false);
+    const linked = fakeTx();
+    await expect(enqueueCrmSync(linked.tx, [{ type: "inquiry", id: A }], scope, false)).resolves.toBe(1);
+    expect(linked.calls.some((c) => c.sql.includes("INSERT INTO crm_outbox"))).toBe(true);
+  });
+
+  it("sync off and the link lock busy: no deferred row for a subject without a link", async () => {
+    const none = fakeTx({ lockTimeoutOn: /UPDATE crm_links/, linkState: null });
+    await expect(enqueueCrmSync(none.tx, [{ type: "inquiry", id: A }], scope, false)).resolves.toBe(0);
+    expect(none.calls.some((c) => c.sql.includes("INSERT INTO crm_outbox"))).toBe(false);
+    const live = fakeTx({ lockTimeoutOn: /UPDATE crm_links/, linkState: "active" });
+    await expect(enqueueCrmSync(live.tx, [{ type: "inquiry", id: A }], scope, false)).resolves.toBe(1);
+  });
+
+  it("erasure deletes are queued for linked subjects whether or not the sync is on", async () => {
+    vi.stubEnv("CRM_SYNC_ENABLED", "false");
+    resetEnvCache();
+    const { tx, calls } = fakeTx();
+    await expect(enqueueCrmErasure(tx, { inquiryIds: [A], orderIds: [] }, scope)).resolves.toBe(1);
+    expect(calls.find((c) => c.sql.includes("INSERT INTO crm_outbox"))!.values).toContain("erasure");
+  });
+
+  it("a marketing consent change re-pushes the contact's linked deals, never links a new one (C2A-02)", async () => {
+    const { tx, calls } = fakeTx();
+    const t = tx as unknown as { $queryRaw: (s: TemplateStringsArray, ...v: unknown[]) => Promise<unknown> };
+    const orig = t.$queryRaw;
+    t.$queryRaw = async (strings, ...values) => {
+      const sql = strings.join("?");
+      if (sql.includes("FROM crm_links l")) {
+        calls.push({ op: "$queryRaw", sql, values });
+        return [
+          { entity_type: "order", entity_id: B },
+          { entity_type: "inquiry", entity_id: A },
+        ];
+      }
+      return orig(strings, ...values);
+    };
+    const phone = ["+971", "4", "0001234"].join("");
+    await expect(enqueueCrmSyncForContact(tx, { phoneE164: phone }, scope)).resolves.toBe(2);
+    const lookup = calls.find((c) => c.sql.includes("FROM crm_links l"))!;
+    expect(lookup.values).toContain(phone);
+    expect(lookup.sql).toContain("state <> 'deleted'");
+    expect(calls.some((c) => c.sql.includes("INSERT INTO crm_links"))).toBe(false);
+    expect(calls.filter((c) => c.sql.includes("INSERT INTO crm_outbox"))).toHaveLength(2);
+  });
+
+  it("a consent change matching the limit of linked deals emits a warning (R-04)", async () => {
+    const { CRM_CONTACT_FANOUT_LIMIT } = await import("@/server/crm/crm.outbox");
+    const lines: string[] = [];
+    const spy = vi.spyOn(process.stdout, "write").mockImplementation((c) => (lines.push(String(c)), true));
+    const spyErr = vi.spyOn(process.stderr, "write").mockImplementation((c) => (lines.push(String(c)), true));
+    const spyLog = vi.spyOn(console, "warn").mockImplementation((...a) => void lines.push(a.map(String).join(" ")));
+    const spyLog2 = vi.spyOn(console, "log").mockImplementation((...a) => void lines.push(a.map(String).join(" ")));
+    try {
+      const { tx } = fakeTx();
+      const t = tx as unknown as { $queryRaw: (s: TemplateStringsArray, ...v: unknown[]) => Promise<unknown> };
+      const orig = t.$queryRaw;
+      const many = Array.from({ length: CRM_CONTACT_FANOUT_LIMIT }, (_, i) => ({ entity_type: "inquiry", entity_id: `00000000-0000-7000-8000-${i.toString(16).padStart(12, "0")}` }));
+      t.$queryRaw = async (strings, ...values) => (strings.join("?").includes("FROM crm_links l") ? many : orig(strings, ...values));
+      await enqueueCrmSyncForContact(tx, { email: ["a", "b.invalid"].join("@") }, scope);
+    } finally {
+      spy.mockRestore();
+      spyErr.mockRestore();
+      spyLog.mockRestore();
+      spyLog2.mockRestore();
+    }
+    expect(lines.some((l) => l.includes("crm.contact_fanout_capped") && l.includes(`"limit":${CRM_CONTACT_FANOUT_LIMIT}`) && l.includes('"channel":"email"'))).toBe(true);
+    expect(lines.join("")).not.toContain("b.invalid");
+  });
+
+  it("a consent change with no portal, or with neither phone nor email, writes nothing", async () => {
+    const { tx, calls } = fakeTx();
+    expect(await enqueueCrmSyncForContact(tx, { phoneE164: "+97140001234" }, null)).toBe(0);
+    expect(await enqueueCrmSyncForContact(tx, { phoneE164: " ", email: null }, scope)).toBe(0);
+    expect(calls).toEqual([]);
   });
 
   it("dedupe keys name the kind, subject, version and scope", () => {

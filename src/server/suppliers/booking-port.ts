@@ -164,6 +164,8 @@ export interface SupplierRef {
   /** Literal service date, `YYYY-MM-DD`. */
   serviceDate: string;
   offerExternalId: string;
+  /** Doc 29 Batch 6: the attempt is on the external-supplier route (its answers' external flags are an end state). Absent means internal. */
+  externalRoute?: boolean;
 }
 
 export interface SupplierSnapshot extends ConfirmationSnapshot {
@@ -237,7 +239,7 @@ export interface SupplierBookingAdapter {
   cancel?(ref: SupplierRef): Promise<MutationOutcome>;
   /** Must be side-effect free: never a read that can issue tickets (SUP-4). */
   readStatus(ref: SupplierRef): Promise<ReadOutcome>;
-  findByClientRef(clientRef: string, hint: { serviceDate: string; offerExternalId: string }): Promise<{ matches: SupplierSnapshot[]; complete: boolean }>;
+  findByClientRef(clientRef: string, hint: { serviceDate: string; offerExternalId: string; externalRoute?: boolean }): Promise<{ matches: SupplierSnapshot[]; complete: boolean }>;
   /** Spendable funds: the lower of the candidates until Q-C1 is answered (SUP-10). */
   funds(): Promise<{ spendableMinor: bigint; currency: "AED"; accountId: string }>;
 }

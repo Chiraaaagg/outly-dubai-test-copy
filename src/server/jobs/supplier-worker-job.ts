@@ -43,7 +43,7 @@ export const DOCUMENTS_AFTER_CONFIRM = Object.freeze({ budgetMs: 20_000, max: 2 
  * every transaction, no lease held, never delaying a job); a failure there
  * is the documents tick's to pick up.
  */
-export async function runSupplierWorker(kind: "scheduled" | "manual", opts: { budgetMs: number; mutationBudgetMs?: number; documentsAfterConfirm?: boolean }) {
+export async function runSupplierWorker(kind: "scheduled" | "manual", opts: { budgetMs: number; mutationBudgetMs?: number; documentsAfterConfirm?: boolean; externalPollWaits?: number }) {
   const config = traveldeskConfigFrom(env());
   if (!config) return { ok: true as const, skipped: "traveldesk not configured", ranAt: new Date().toISOString() };
   const accountId = bookingAccountId(config.environment, config.agencyId);
@@ -67,7 +67,12 @@ export async function runSupplierWorker(kind: "scheduled" | "manual", opts: { bu
       saga: sagaNotifier,
       afterConfirmed: documents ? (b: SupplierBooking) => documentService.runForBooking(documents, b.id, DOCUMENTS_AFTER_CONFIRM) : undefined,
     },
-    { budgetMs: Math.max(0, opts.budgetMs), ...(opts.mutationBudgetMs === undefined ? {} : { mutationBudgetMs: Math.max(0, opts.mutationBudgetMs) }) },
+    {
+      budgetMs: Math.max(0, opts.budgetMs),
+      ...(opts.mutationBudgetMs === undefined ? {} : { mutationBudgetMs: Math.max(0, opts.mutationBudgetMs) }),
+      // Doc 29 Batch 6: only the booking tick asks for in-run waits for external polls.
+      ...(opts.externalPollWaits ? { externalPollWaits: opts.externalPollWaits } : {}),
+    },
   );
   return { ok: true as const, environment: config.environment, mutations, ...result, ranAt: new Date().toISOString() };
 }

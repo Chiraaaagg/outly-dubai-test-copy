@@ -174,7 +174,8 @@ describe("booking-tick job route", () => {
     expect(res.status).toBe(200);
     expect(state.runs[0].mutations).toBe("paid_only");
     // The engine sends a mutation only with mutationTimeout + 30 s (180 s) of this left: a 90 s window, as a standalone worker run.
-    expect(state.budgets[0]).toEqual({ budgetMs: 225_000, mutationBudgetMs: 270_000 });
+    // Doc 29 Batch 6 (owner decision c): the booking tick also allows three in-run waits for external polls.
+    expect(state.budgets[0]).toEqual({ budgetMs: 225_000, mutationBudgetMs: 270_000, externalPollWaits: 3 });
   });
 
   describe("release switch SCHEDULED_BOOKING_JOBS_ENABLED (review fix 4)", () => {

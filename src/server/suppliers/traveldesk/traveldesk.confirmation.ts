@@ -1,5 +1,6 @@
 import type { ConfirmationFailure, ConfirmationSnapshot, ConfirmationVerdict, ExpectedBooking } from "../booking-port";
 import type { TravelDeskBooking } from "./traveldesk.booking";
+import { DATE_ONLY_CLASS_KEYS, deriveCapabilities } from "./traveldesk.capability";
 
 /**
  * When a TravelDesk answer counts as a confirmed booking (SUP-1, doc 22 §23 B1a).
@@ -106,4 +107,54 @@ export function isConfirmedSnapshot(expected: ExpectedBooking, s: ConfirmationSn
 export function isSameBooking(ours: { supplierBookingId: string | null; clientRef: string }, r: Pick<TravelDeskBooking, "supplierBookingId" | "bookingReference">): boolean {
   if (ours.supplierBookingId !== null && r.supplierBookingId !== ours.supplierBookingId) return false;
   return r.bookingReference === null || r.bookingReference === ours.clientRef;
+}
+
+/** The error code a booking carries when its reservation names another slot (`reservationSlotDiffers`); an ops-alert reason. */
+export const RESERVATION_SLOT_MISMATCH_CODE = "reservation_slot_mismatch";
+
+/**
+ * Whether a reservation answer names another slot than the one we sent
+ * (doc 29 Batch 7, review 92 B7-12), evaluated when the reservation is
+ * applied, for date-only bookings only (`reservationSlotHeld`). A mismatch takes the `charged_amount_mismatch` path: the booking
+ * waits for staff with no automatic confirm. It does not stop the payment
+ * saga's capture (review 92 B7-15): the card is captured, and the item is
+ * refunded when the hold runs out unless staff resolve it first. TravelDesk
+ * returns `timeSlotId` on the reservation (it does not echo
+ * `startTime`/`endTime`, which its schema marks write-only). An answer that
+ * leaves the id out says nothing and passes here; the confirm check
+ * (`isConfirmedSnapshot`) still demands an exact echo. `tourTime` is an
+ * undocumented free-text field (no format, and on pickup tours it may be the
+ * pickup), so it is not compared.
+ */
+export function reservationSlotDiffers(sentTimeSlotId: string | null, answer: Pick<ConfirmationSnapshot, "timeSlotId">): boolean {
+  return sentTimeSlotId !== null && answer.timeSlotId !== null && answer.timeSlotId !== sentTimeSlotId;
+}
+
+/**
+ * Whether the reserve-time slot check holds this booking (lead decision,
+ * 24 Nov 2026): only for a booking of one of the two Batch 7 date-only keys
+ * (`DATE_ONLY_CLASS_KEYS`, from its stored offer), because whether
+ * TravelDesk's reserve answer echoes the sent `timeSlotId` is unproven. A
+ * Batch 0–6 booking (fixed slot, listed starts, pickup, external, ticket) is
+ * never held by it, whatever id its reserve answer carries: it behaves
+ * exactly as before, and its confirm check still demands an exact echo.
+ * `classKey` null (offer not stored or unreadable) is not date only.
+ */
+export function reservationSlotHeld(classKey: string | null, sentTimeSlotId: string | null, answer: Pick<ConfirmationSnapshot, "timeSlotId">): boolean {
+  return classKey !== null && DATE_ONLY_CLASS_KEYS.includes(classKey) && reservationSlotDiffers(sentTimeSlotId, answer);
+}
+
+/**
+ * The class key of a booking's stored offer for `reservationSlotHeld`
+ * (review 92 B7-17). `read` loads the stored offer row. No row, and any
+ * failure of the read, give null ("not date only"), so a failed read never
+ * throws on this path and a Batch 0–6 booking behaves as before Batch 7.
+ */
+export async function storedOfferClassKey(read: () => Promise<{ payload: unknown } | null>): Promise<string | null> {
+  try {
+    const row = await read();
+    return row ? deriveCapabilities(row.payload).classKey : null;
+  } catch {
+    return null;
+  }
 }

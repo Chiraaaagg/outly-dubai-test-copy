@@ -1,13 +1,35 @@
 import "server-only";
 import { prisma } from "../lib/db";
-import type { CrmItemFacts, CrmOrderFacts, CrmSubject, CrmSubjectState } from "./crm.mapping";
+import {
+  bitrixInstant,
+  lineTotalMinor,
+  marginAedMinor,
+  revenueFromPayments,
+  type CrmConsentFacts,
+  type CrmConsentFlag,
+  type CrmContactFacts,
+  type CrmItemFacts,
+  type CrmOrderFacts,
+  type CrmSubject,
+  type CrmSubjectState,
+} from "./crm.mapping";
 
 /**
  * Current local state of one deal subject, read at push time (doc 29 §6.4:
  * the outbox stores no payload; the worker re-reads and pushes a full
- * snapshot). Reads only the columns the mapping needs. Contact columns are
- * read solely to detect an erased subject (the `[deleted-…]` marker the
- * erasure workflow writes) and never leave this function.
+ * snapshot). Reads only the columns the mapping needs.
+ *
+ * Customer details (C2a, decision C2-4): the lead's name, phone and email
+ * as given on the inquiry, or on the order's traveller snapshot once the
+ * sale exists. They go to the deal's own fields only. An erased subject is
+ * detected by the `[deleted-…]` marker the erasure workflow writes and its
+ * details are never returned. Nothing else personal is read: no hotel,
+ * pickup, dietary or special-request text, no participant data, no IP hash,
+ * no spam signals, no attribution.
+ *
+ * Consent (Q6): the latest row of the append-only `consents` record for
+ * marketing by email (the lead's email) and marketing by WhatsApp (the
+ * lead's phone), each with its time.
  *
  * Line names come from the catalogue (the product's title or the combo's
  * name), never from the item's `titleSnapshot`: on an assisted inquiry or
@@ -15,10 +37,21 @@ import type { CrmItemFacts, CrmOrderFacts, CrmSubject, CrmSubjectState } from ".
  * into it would reach the deal (review R14). A line with no catalogue record
  * gets a generic name.
  *
- * Money: only provider-verified payments count (`source = gateway_verified`,
- * PAY-9), in the order's currency, less each payment's refunded total. A manual
- * payment recorded by staff is not revenue evidence here (see the C1 record:
- * assisted orders paid by link show 0 until C2 decides).
+ * Money (owner answer Q4): provider-verified payments (`gateway_verified`,
+ * PAY-9) count with their captured amount; a payment a staff member recorded
+ * in OUTLYY admin (`source = manual`, status captured or refunded) counts
+ * with its amount, the same as a Stripe capture. Each payment counts in the
+ * order's currency only, less its verified refunds (the payment's refunded
+ * total, max-merged with the provider's read for gateway payments; settled
+ * refund rows for staff-recorded ones), never below zero. Provider and link
+ * identifiers are never read.
+ *
+ * Margin (decision C2-9, Q8, review C2A-10): one AED amount, the gross
+ * profit of `domain/margin.ts` over the live lines (customer price − net
+ * cost − the variable costs in the line's MarginSnapshot), only for an order
+ * charged in AED whose every live line has a known (positive) net cost;
+ * otherwise null (an empty field). The net cost and the snapshot never leave
+ * this function.
  */
 
 const ERASED = "[deleted-";
@@ -32,7 +65,7 @@ function isoDate(d: Date | null): string | null {
   return d ? d.toISOString().slice(0, 10) : null;
 }
 
-async function orderFacts(orderId: string): Promise<(CrmOrderFacts & { erased: boolean }) | null> {
+async function orderFacts(orderId: string): Promise<(CrmOrderFacts & { erased: boolean; contact: CrmContactFacts | null; placedAt: Date }) | null> {
   const o = await prisma.order.findUnique({
     where: { id: orderId },
     select: {
@@ -41,6 +74,10 @@ async function orderFacts(orderId: string): Promise<(CrmOrderFacts & { erased: b
       currency: true,
       leadPhone: true,
       leadName: true,
+      leadEmail: true,
+      totalAed: true,
+      totalInr: true,
+      placedAt: true,
       items: {
         select: {
           id: true,
@@ -54,56 +91,78 @@ async function orderFacts(orderId: string): Promise<(CrmOrderFacts & { erased: b
           chargedCurrency: true,
           chargedAmountMinor: true,
           quoteLineIndex: true,
+          netCostAed: true,
+          marginSnapshot: true,
           documents: { where: { status: "valid", customerVisible: true }, select: { id: true }, take: 1 },
         },
       },
       payments: {
-        where: { source: "gateway_verified" },
-        select: { id: true, currency: true, capturedMinor: true, refundedMinor: true, authorizedAt: true },
+        where: { source: { in: ["gateway_verified", "manual"] } },
+        select: {
+          id: true,
+          source: true,
+          status: true,
+          currency: true,
+          amountMinor: true,
+          capturedMinor: true,
+          refundedMinor: true,
+          authorizedAt: true,
+          refunds: { select: { status: true, amountMinor: true } },
+        },
       },
     },
   });
   if (!o) return null;
   const currency = o.currency;
-  let captured = 0n;
-  let refunded = 0n;
-  let authorised = false;
-  for (const p of o.payments) {
-    if (p.authorizedAt || p.capturedMinor > 0n) authorised = true;
-    if (p.currency !== currency) continue;
-    captured += p.capturedMinor;
-    // The payment's refunded total: our settled refunds max-merged with the provider's read (refunds.ts), so a
-    // refund made outside OUTLYY also lowers revenue.
-    refunded += p.refundedMinor > p.capturedMinor ? p.capturedMinor : p.refundedMinor;
-  }
+  const { capturedMinor, refundedMinor, authorised, refundPending, otherCurrencyPaid } = revenueFromPayments(o.payments, currency);
   const items: CrmItemFacts[] = [...o.items]
     .sort((a, b) => (a.quoteLineIndex ?? 0) - (b.quoteLineIndex ?? 0) || a.id.localeCompare(b.id))
     .map((i) => ({
       title: catalogueTitle(i),
       serviceDate: isoDate(i.serviceDate),
-      totalMinor: i.chargedCurrency === currency && i.chargedAmountMinor !== null ? i.chargedAmountMinor : currency === "AED" ? i.totalAed : i.totalInr,
+      totalMinor: lineTotalMinor(i, currency),
       status: i.status,
       needsDocument: i.fulfilmentOrigin === "instant_checkout",
       documentReady: i.documents.length > 0,
     }));
+  const erased = o.leadPhone.startsWith(ERASED) || o.leadName.startsWith(ERASED) || Boolean(o.leadEmail?.startsWith(ERASED));
   return {
     reference: o.reference,
     status: o.status,
     currency,
     authorised,
-    capturedMinor: captured,
-    refundedMinor: refunded > captured ? captured : refunded,
+    capturedMinor,
+    refundedMinor,
     items,
-    erased: o.leadPhone.startsWith(ERASED) || o.leadName.startsWith(ERASED),
+    totalMinor: currency === "AED" ? o.totalAed : o.totalInr,
+    refundPending,
+    otherCurrencyPaid,
+    marginAedMinor: currency === "AED" ? marginAedMinor(o.items) : null,
+    erased,
+    contact: erased ? null : { name: o.leadName, phone: o.leadPhone, email: o.leadEmail },
+    placedAt: o.placedAt,
   };
+}
+
+async function consentFor(contact: CrmContactFacts | null): Promise<CrmConsentFacts> {
+  const flag = (r: { granted: boolean; createdAt: Date } | null): CrmConsentFlag | null => (r ? { granted: r.granted, at: bitrixInstant(r.createdAt) } : null);
+  if (!contact) return { marketingEmail: null, marketingWhatsapp: null };
+  const select = { granted: true, createdAt: true } as const;
+  const [email, whatsapp] = await Promise.all([
+    contact.email
+      ? prisma.consent.findFirst({ where: { channel: "email", purpose: "marketing", email: contact.email.toLowerCase() }, orderBy: { createdAt: "desc" }, select })
+      : Promise.resolve(null),
+    prisma.consent.findFirst({ where: { channel: "whatsapp", purpose: "marketing", phoneE164: contact.phone }, orderBy: { createdAt: "desc" }, select }),
+  ]);
+  return { marketingEmail: flag(email), marketingWhatsapp: flag(whatsapp) };
 }
 
 export async function loadSubjectState(subject: CrmSubject): Promise<CrmSubjectState> {
   if (subject.type === "order") {
     const o = await orderFacts(subject.id);
     if (!o) return { subject, exists: false, erased: false, inquiry: null, order: null };
-    const { erased, ...order } = o;
-    return { subject, exists: true, erased, inquiry: null, order };
+    const { erased, contact, placedAt, ...order } = o;
+    return { subject, exists: true, erased, inquiry: null, order, createdAt: placedAt, contact, consent: await consentFor(contact) };
   }
   const q = await prisma.inquiry.findUnique({
     where: { id: subject.id },
@@ -114,7 +173,11 @@ export async function loadSubjectState(subject: CrmSubject): Promise<CrmSubjectS
       currency: true,
       leadPhone: true,
       leadName: true,
+      leadEmail: true,
+      indicativeTotalAed: true,
+      indicativeTotalInr: true,
       convertedOrderId: true,
+      createdAt: true,
       items: {
         select: { product: { select: { title: true } }, combo: { select: { name: true } }, serviceDate: true, sortOrder: true },
         orderBy: [{ sortOrder: "asc" }, { id: "asc" }],
@@ -123,8 +186,10 @@ export async function loadSubjectState(subject: CrmSubject): Promise<CrmSubjectS
   });
   if (!q) return { subject, exists: false, erased: false, inquiry: null, order: null };
   const o = q.convertedOrderId ? await orderFacts(q.convertedOrderId) : null;
-  const erased = q.leadPhone.startsWith(ERASED) || q.leadName.startsWith(ERASED) || Boolean(o?.erased);
-  const order = o ? (({ erased: _e, ...rest }) => rest)(o) : null;
+  const erased = q.leadPhone.startsWith(ERASED) || q.leadName.startsWith(ERASED) || Boolean(q.leadEmail?.startsWith(ERASED)) || Boolean(o?.erased);
+  const order = o ? (({ erased: _e, contact: _c, placedAt: _p, ...rest }) => rest)(o) : null;
+  // Abandoned carts never carry contact data (they are never visible either).
+  const contact: CrmContactFacts | null = erased || q.source === "abandoned_cart" ? null : (o?.contact ?? { name: q.leadName, phone: q.leadPhone, email: q.leadEmail });
   return {
     subject,
     exists: true,
@@ -134,8 +199,12 @@ export async function loadSubjectState(subject: CrmSubject): Promise<CrmSubjectS
       status: q.status,
       source: q.source,
       currency: q.currency,
+      indicativeMinor: q.currency === "AED" ? q.indicativeTotalAed : q.indicativeTotalInr,
       items: q.items.map((i) => ({ title: catalogueTitle(i), serviceDate: isoDate(i.serviceDate), totalMinor: null })),
     },
     order,
+    createdAt: q.createdAt,
+    contact,
+    consent: await consentFor(contact),
   };
 }

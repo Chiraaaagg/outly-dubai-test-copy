@@ -19,7 +19,7 @@ import { ageBandMismatches, offerReadinessFacts } from "../suppliers/traveldesk/
 import { readinessService } from "./readiness.service";
 import { verifyStepUp } from "./approval.service";
 import { gateVerdict, loadCapabilityGate } from "../suppliers/capability-gate";
-import { bookingKindSellable, CAPABILITY_DERIVATION_VERSION, dateOnlySellable, deriveCapabilities, listedStartsSellable, TICKET_CLASS_KEYS } from "../suppliers/traveldesk/traveldesk.capability";
+import { bookingKindSellable, CAPABILITY_DERIVATION_VERSION, dateOnlySellable, deriveCapabilities, listedStartsSellable, slotRulesUnknown, TICKET_CLASS_KEYS } from "../suppliers/traveldesk/traveldesk.capability";
 import type { ReadLimits } from "../suppliers/read-budget";
 import { TravelDeskApiError } from "../suppliers/traveldesk/traveldesk.http";
 import { bookingAccountId, DEFAULT_BOOKING_ACCOUNT_ID, mutationInFlight, takeReadToken } from "./supplier-booking.service";
@@ -593,7 +593,7 @@ export const supplierCatalogService = {
       // Doc 29 Batch 7: a live-book offer without slots keeps `slot_rules_unknown`, unless the gate allows its exact
       // date-only key (flag on, evidence for the key and current terms). Its time then comes from fresh availability only.
       const dateOnly = dateOnlySellable(capability.verdict.instant, capability.verdict.classKey, stored?.timeSlots);
-      if (!stored || (stored.bookingKind === "live_book" && stored.timeSlots.length === 0 && !dateOnly)) blockers.push("slot_rules_unknown");
+      if (slotRulesUnknown(stored, capability.verdict.instant, capability.verdict.classKey)) blockers.push("slot_rules_unknown");
       const kindSellable = ref.success && m.bookingKind === ref.data.bookingKind && bookingKindSellable(ref.data.bookingKind, capability.verdict);
       if (supplier.adapter !== "traveldesk" || !kindSellable) blockers.push("capability_not_ready");
       const openDatedSellable = kindSellable && ref.success && ref.data.bookingKind === "ticket_only" && TICKET_CLASS_KEYS.includes(capability.verdict.classKey);

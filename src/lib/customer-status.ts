@@ -211,6 +211,12 @@ export interface CustomerOrderStatus {
    * account): the page then offers "Remove access on this browser" (batch 3).
    */
   canRemoveBrowserAccess?: boolean;
+  /**
+   * Doc 29 Batch 6 (owner decision d): the existing "Send it to our team"
+   * inquiry route, offered when an external operator's hold was too short to
+   * book online and was released. Absent or null otherwise.
+   */
+  inquiryHref?: string | null;
   /** Suggested client refresh interval while the state can still change on its own; null when it will not. */
   pollAfterMs: number | null;
 }

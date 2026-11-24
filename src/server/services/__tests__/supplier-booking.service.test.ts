@@ -36,6 +36,12 @@ const enabled = Boolean(process.env.DATABASE_URL);
 const RUN = uuidv7().slice(-8);
 const CODE = `zz-td-${RUN}`;
 const OFFER = 777_001;
+/**
+ * Review 89 B6-23: a block that needs a wallet account of its own (no rows of
+ * other cases on it) sets this; `create`, `deps` and new fakes then act for
+ * that agency id instead of the shared `default` account.
+ */
+let ownAccount: number | null = null;
 
 type Step = "ok" | "lost" | "in_progress" | "still_reserved" | "external_failed" | "wrong_date" | TravelDeskApiError;
 
@@ -57,13 +63,15 @@ class FakeTravelDesk implements TravelDeskBookingTransport {
   fundsMinor: bigint | null = 10_000_000n;
   /** When set, the three raw wallet figures the balance read reports instead of a credit account built from `fundsMinor` (doc 29 §4.5). */
   wallet: { balanceMinor: bigint; creditFacilityMinor: bigint; payableBalanceMinor: bigint } | null = null;
-  agencyId = 1;
+  agencyId = ownAccount ?? 1;
   balanceReads = 0;
   /** Runs inside the balance read, i.e. after the job was claimed and just before the send. */
   onBalance: (() => Promise<void>) | null = null;
   /** Runs inside the cancel call, before it answers (a slow cancel). */
   onCancel: (() => Promise<void>) | null = null;
   chargeOverride: bigint | null = null;
+  /** Doc 29 Batch 7 (review 92 B7-16): when set, the slot id the reserve answer carries instead of the one sent (null: none). */
+  reserveSlotId: number | null | undefined = undefined;
   /** A reservation deadline this far after the send, instead of 15 minutes; null answers no deadline (doc 29 Batch 6). */
   deadlineMs: number | null = 15 * 60_000;
   private seq = 50_000 + Math.floor(Math.random() * 1000);
@@ -117,7 +125,16 @@ class FakeTravelDesk implements TravelDeskBookingTransport {
     this.calls.push("reserve");
     const s = this.step("reserve");
     if (s instanceof TravelDeskApiError) throw s;
-    const b = this.make(body, 7);
+    // Doc 29 Batch 6: a reservation the external provider is still making, or one it refused (201 with the flag).
+    let b = this.make(body, 7, s === "in_progress");
+    if (this.reserveSlotId !== undefined) {
+      b = { ...b, timeSlotId: this.reserveSlotId };
+      this.store.set(b.supplierBookingId, b);
+    }
+    if (s === "external_failed") {
+      b = { ...b, externalFailed: true };
+      this.store.set(b.supplierBookingId, b);
+    }
     if (s === "lost") throw new TravelDeskApiError("timeout", "bookings.reserve");
     return b;
   }
@@ -248,7 +265,7 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
   }
 
   function create(i: CreateIntentInput, opts: Record<string, unknown> = {}) {
-    return svc.createIntent(null, i, { supplierCode: CODE, now, ...opts });
+    return svc.createIntent(null, i, { supplierCode: CODE, now, ...(ownAccount !== null ? { accountId: String(ownAccount) } : {}), ...opts });
   }
 
   function adapterFor(td: FakeTravelDesk) {
@@ -256,7 +273,16 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
   }
 
   function deps(td: FakeTravelDesk, over: Partial<EngineDeps> = {}): EngineDeps {
-    return { adapter: adapterFor(td), environment: "test", supplierCode: CODE, mutationTimeoutMs: 1_000, now, readLimits: readLimits(1_000_000), ...over };
+    return {
+      adapter: adapterFor(td),
+      environment: "test",
+      supplierCode: CODE,
+      mutationTimeoutMs: 1_000,
+      now,
+      readLimits: readLimits(1_000_000),
+      ...(ownAccount !== null ? { accountId: String(ownAccount) } : {}),
+      ...over,
+    };
   }
 
   /** Run jobs, advancing the clock between rounds, until nothing is due within `maxMs`. */
@@ -725,7 +751,9 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
   });
 
   /* -------------------------------------------------------------------------
-   * Doc 29 Batch 6: external-supplier bookings (external-confirmation.ts)
+   * Doc 29 Batch 6: external-supplier bookings (external-confirmation.ts).
+   * Every case runs an external-route attempt (`externalRoute: true`) unless
+   * it says it pins the internal route (review 89 B6-04, B6-07).
    * ---------------------------------------------------------------------- */
 
   /** The poll job queued for a booking, and how long after the clock it is due. */
@@ -733,12 +761,13 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
     const job = await prisma.supplierJob.findUnique({ where: { dedupeKey: `poll:${id}` } });
     return job && job.status === "queued" ? job.runAfter.getTime() - clock : null;
   }
+  const ext = (over: Record<string, unknown> = {}) => intent({ externalRoute: true, ...over });
 
   it("a slow external confirmation is polled every 15 s (never under 10 s), handed to our team at the 30-minute wait limit without leaving its state, then polled more slowly (SUP-17)", async () => {
     const td = new FakeTravelDesk(now);
     td.steps.confirm.push("in_progress");
     // An activity weeks away: the normal limit applies.
-    const b = await create(intent({ serviceDate: "2030-03-01" }));
+    const b = await create(ext({ serviceDate: "2030-03-01" }));
     await drain(td, 0);
     const waiting = await booking(b.id);
     expect(waiting.state).toBe("awaiting_external");
@@ -776,13 +805,37 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
     expect(await booking(b.id)).toMatchObject({ state: "confirmed", attentionRequiredAt: null, errorCode: null });
   });
 
+  it("review 89 B6-04: an internal attempt keeps the Batch 0-5 wait exactly (backoff, external_confirmation_slow at 30 minutes)", async () => {
+    const td = new FakeTravelDesk(now);
+    td.steps.confirm.push("in_progress");
+    const b = await create(intent({ serviceDate: "2030-03-01" }));
+    await drain(td, 0);
+    await drain(td, 40 * 60_000, 15_000);
+    const slow = await booking(b.id);
+    expect(slow).toMatchObject({ state: "awaiting_external", errorCode: "external_confirmation_slow", closedAt: null });
+    expect(slow.externalRoute).toBeNull();
+    expect(slow.attentionRequiredAt).not.toBeNull();
+    expect(slow.pollCount).toBeLessThan(40);
+  });
+
+  it("review 89 B6-04: an internal confirm answered with the failed flag is held for a human, never rejected", async () => {
+    const td = new FakeTravelDesk(now);
+    td.steps.confirm.push("external_failed");
+    const b = await create(intent());
+    await drain(td, 0);
+    const held = await booking(b.id);
+    expect(held).toMatchObject({ state: "outcome_unknown", errorCode: "unconfirmed_snapshot" });
+    expect(held.errorMessage).toContain("external_failed");
+    expect(held.attentionRequiredAt).not.toBeNull();
+  });
+
   it("near the activity the wait limit comes earlier: no later than 3 hours before the start", async () => {
     const td = new FakeTravelDesk(now);
     td.steps.confirm.push("in_progress");
     // Today (Dubai) at 15:10: 11:10Z, so 3 hours before is 08:10Z, ten minutes after the test clock's 08:00Z.
     const day = new Date(clock + 4 * 3_600_000).toISOString().slice(0, 10);
     const start = (new Date(clock).getUTCHours() + 4) * 60 + new Date(clock).getUTCMinutes() + 3 * 60 + 10;
-    const b = await create(intent({ serviceDate: day, slot: { timeSlotId: 9, startMinutes: start, endMinutes: start + 60 } }));
+    const b = await create(ext({ serviceDate: day, slot: { timeSlotId: 9, startMinutes: start, endMinutes: start + 60 } }));
     await drain(td, 0);
     const since = (await booking(b.id)).confirmedAt!.getTime();
     const limit = since + Math.min(30 * 60_000, Date.parse(`${day}T00:00:00Z`) + start * 60_000 - 4 * 3_600_000 - 3 * 3_600_000 - since);
@@ -793,10 +846,135 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
     expect(await booking(b.id)).toMatchObject({ state: "awaiting_external", errorCode: "external_confirmation_handoff" });
   });
 
+  it("review 89 B6-08: a pickup time before the start brings the near-service limit forward", async () => {
+    const td = new FakeTravelDesk(now);
+    td.steps.confirm.push("in_progress");
+    // Start 16:10 Dubai, pickup 15:10 Dubai: 3 hours before the pickup is 08:10Z.
+    const day = new Date(clock + 4 * 3_600_000).toISOString().slice(0, 10);
+    const pickup = (new Date(clock).getUTCHours() + 4) * 60 + 3 * 60 + 10;
+    const b = await create(ext({ serviceDate: day, slot: { timeSlotId: 9, startMinutes: pickup + 60, endMinutes: pickup + 120 } }));
+    await drain(td, 0);
+    await prisma.supplierBooking.update({ where: { id: b.id }, data: { pickupTimeMinutes: pickup } });
+    const since = (await booking(b.id)).confirmedAt!.getTime();
+    await drain(td, since + 12 * 60_000 - clock, 2_000);
+    expect(await booking(b.id)).toMatchObject({ state: "awaiting_external", errorCode: "external_confirmation_handoff" });
+  });
+
+  it("review 89 B6-06: the hand-off fires on time while every read fails, and after an earlier read dead-letter", async () => {
+    const td = new FakeTravelDesk(now);
+    td.steps.confirm.push("in_progress");
+    const b = await create(ext({ serviceDate: "2030-03-01" }));
+    await drain(td, 0);
+    const since = (await booking(b.id)).confirmedAt!.getTime();
+    // Reads fail from here on: the poll job errors (dead-letter after five), but the wait limit still fires.
+    td.outageUntil = since + 3 * 3_600_000;
+    await drain(td, since + 45 * 60_000 - clock, 30_000);
+    const handed = await booking(b.id);
+    expect(handed.state).toBe("awaiting_external");
+    expect(handed.attentionRequiredAt).not.toBeNull();
+    const reasons = (await events(b.id)).filter((e) => e.kind === "attention").map((e) => (e.detail as { reason?: string }).reason);
+    expect(reasons).toContain("external_confirmation_handoff");
+    expect(td.calls).not.toContain("cancel");
+  });
+
+  it("review 89 B6-19: with every read failing, the hand-off is raised within a minute of the wait limit, not after the error backoff", async () => {
+    const td = new FakeTravelDesk(now);
+    td.steps.confirm.push("in_progress");
+    const b = await create(ext({ serviceDate: "2030-03-01" }));
+    await drain(td, 0);
+    const since = (await booking(b.id)).confirmedAt!.getTime();
+    td.outageUntil = since + 3 * 3_600_000;
+    await drain(td, since + 31 * 60_000 - clock, 10_000);
+    const reasons = (await events(b.id)).filter((e) => e.kind === "attention").map((e) => (e.detail as { reason?: string }).reason);
+    expect(reasons).toContain("external_confirmation_handoff");
+  });
+
+  it("review 89 B6-12: still unconfirmed when the guest is affected, our team is told again", async () => {
+    const td = new FakeTravelDesk(now);
+    td.steps.confirm.push("in_progress");
+    // Starts in one hour: the hand-off at the 5-minute floor, then the second alert at the start.
+    const day = new Date(clock + 4 * 3_600_000).toISOString().slice(0, 10);
+    const start = (new Date(clock).getUTCHours() + 4) * 60 + 60;
+    const b = await create(ext({ serviceDate: day, slot: { timeSlotId: 9, startMinutes: start, endMinutes: start + 60 } }));
+    await drain(td, 0);
+    await drain(td, 70 * 60_000, 30_000);
+    const late = await booking(b.id);
+    expect(late).toMatchObject({ state: "awaiting_external", errorCode: "external_unconfirmed_at_start" });
+    const reasons = (await events(b.id)).filter((e) => e.kind === "attention").map((e) => (e.detail as { reason?: string }).reason);
+    expect(reasons).toEqual(["external_confirmation_handoff", "external_unconfirmed_at_start"]);
+  });
+
+  it("owner decision c: the scheduled run waits for external polls inside the tick, up to three times, 15 s apart", async () => {
+    const td = new FakeTravelDesk(now);
+    td.steps.confirm.push("in_progress");
+    const b = await create(ext({ serviceDate: "2030-03-01" }));
+    await drain(td, 0);
+    const before = (await booking(b.id)).pollCount;
+    const waits: number[] = [];
+    const sleep = async (ms: number) => {
+      waits.push(ms);
+      clock += ms;
+    };
+    await svc.runDueJobs(deps(td, { sleep }), { budgetMs: 200_000, externalPollWaits: 3 });
+    expect(waits.length).toBeLessThanOrEqual(3);
+    for (const w of waits) expect(w).toBeLessThanOrEqual(15_000);
+    const after = (await booking(b.id)).pollCount;
+    expect(after - before).toBeGreaterThanOrEqual(waits.length);
+    expect(after - before).toBeLessThanOrEqual(4);
+    // Without the option (manual runs, the other routes) the run never waits.
+    const none: number[] = [];
+    await svc.runDueJobs(deps(td, { sleep: async (ms) => void none.push(ms) }), { budgetMs: 200_000 });
+    expect(none).toEqual([]);
+  });
+
+  it("review 89 B6-17: only the eight longest-waiting external bookings of an account poll every 15 s; the rest once a minute", async () => {
+    const td = new FakeTravelDesk(now);
+    // Earlier tests may have left waiting rows on this account: close them out of the count.
+    await prisma.supplierBooking.updateMany({ where: { supplierId, state: "awaiting_external" }, data: { externalRoute: null } });
+    const ids: string[] = [];
+    for (let i = 0; i < 10; i++) {
+      td.steps.confirm.push("in_progress");
+      const b = await create(ext({ serviceDate: "2030-03-01" }));
+      await drain(td, 0, 1_000);
+      ids.push(b.id);
+    }
+    // One poll round for all: each re-queues its next read.
+    clock += 61_000;
+    await svc.runDueJobs(deps(td), { budgetMs: 60_000 });
+    const gaps = [];
+    for (const id of ids) {
+      const job = await prisma.supplierJob.findUniqueOrThrow({ where: { dedupeKey: `poll:${id}` } });
+      gaps.push(job.runAfter.getTime() - clock);
+    }
+    expect(gaps.slice(0, 8).every((g) => g <= 15_000)).toBe(true);
+    expect(gaps.slice(8).every((g) => g === 60_000)).toBe(true);
+  });
+
+  it("review 89 B6-22: handed-off waits take no fast place: with eight of them, a new wait still polls every 15 s", async () => {
+    const td = new FakeTravelDesk(now);
+    await prisma.supplierBooking.updateMany({ where: { supplierId, state: "awaiting_external" }, data: { externalRoute: null } });
+    const old: string[] = [];
+    for (let i = 0; i < 8; i++) {
+      td.steps.confirm.push("in_progress");
+      const b = await create(ext({ serviceDate: "2030-03-01" }));
+      await drain(td, 0, 1_000);
+      old.push(b.id);
+    }
+    // All eight handed to our team.
+    await prisma.supplierBooking.updateMany({ where: { id: { in: old } }, data: { attentionRequiredAt: now(), errorCode: "external_confirmation_handoff" } });
+    td.steps.confirm.push("in_progress");
+    const fresh = await create(ext({ serviceDate: "2030-03-01" }));
+    await drain(td, 0, 1_000);
+    clock += 20_000;
+    await svc.runDueJobs(deps(td), { budgetMs: 60_000 });
+    const job = await prisma.supplierJob.findUniqueOrThrow({ where: { dedupeKey: `poll:${fresh.id}` } });
+    expect(job.runAfter.getTime() - clock).toBeLessThanOrEqual(15_000);
+  });
+
   it("201 with the failed flag: a confirm the external supplier rejected is `rejected`, our team is told, and nothing is cancelled", async () => {
     const td = new FakeTravelDesk(now);
     td.steps.confirm.push("external_failed");
-    const b = await create(intent());
+    const b = await create(ext());
     await drain(td, 0);
     const failed = await booking(b.id);
     expect(failed).toMatchObject({ state: "rejected", errorCode: "external_booking_failed", externalFailed: true });
@@ -808,7 +986,7 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
   it("in progress, then failed: the poll that sees the confirmation finished and failed rejects it", async () => {
     const td = new FakeTravelDesk(now);
     td.steps.confirm.push("in_progress");
-    const b = await create(intent());
+    const b = await create(ext());
     await drain(td, 0);
     const id = (await booking(b.id)).supplierBookingId!;
     // Still in progress with the failed flag set: it keeps waiting.
@@ -816,15 +994,57 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
     clock += 16_000;
     await svc.runDueJobs(deps(td), { budgetMs: 60_000 });
     expect((await booking(b.id)).state).toBe("awaiting_external");
-    td.store.set(id, { ...td.store.get(id)!, externalInProgress: false, externalFailed: true });
+    // The supplier gives the money back with the failure (review 89 B6-05): the wallet book records the refund.
+    td.store.set(id, { ...td.store.get(id)!, externalInProgress: false, externalFailed: true, refundMinor: td.store.get(id)!.paidFromBalanceMinor });
     await drain(td, 60_000, 16_000);
     expect(await booking(b.id)).toMatchObject({ state: "rejected", errorCode: "external_booking_failed" });
+    const book = await prisma.ledgerEntry.findMany({ where: { book: "supplier_wallet", supplierBookingId: b.id }, orderBy: { occurredAt: "asc" } });
+    expect(book.map((x) => [x.kind, x.amountMinor])).toEqual([
+      ["charged", -24_000n],
+      ["refunded", 24_000n],
+    ]);
+  });
+
+  it("review 89 B6-03: a reservation the provider is still making is not confirmed until it is done", async () => {
+    const td = new FakeTravelDesk(now);
+    td.steps.reserve.push("in_progress");
+    const b = await create(ext());
+    await drain(td, 0);
+    const making = await booking(b.id);
+    expect(making).toMatchObject({ state: "reserved", errorCode: "external_reservation_in_progress", attentionRequiredAt: null });
+    expect(td.calls).not.toContain("confirm");
+    // Done: the next poll turns it into an ordinary hold, which is confirmed.
+    const id = making.supplierBookingId!;
+    td.store.set(id, { ...td.store.get(id)!, externalInProgress: false });
+    await drain(td, 60_000, 16_000);
+    expect(await booking(b.id)).toMatchObject({ state: "confirmed", errorCode: null });
+  });
+
+  it("review 89 B6-03: a reservation still in progress near its send-by is released, never confirmed; one that fails is rejected", async () => {
+    const td = new FakeTravelDesk(now);
+    td.steps.reserve.push("in_progress");
+    const b = await create(ext());
+    await drain(td, 0);
+    await drain(td, 20 * 60_000, 15_000);
+    const released = await booking(b.id);
+    expect(td.calls).not.toContain("confirm");
+    expect(["cancelled", "expired"]).toContain(released.state);
+    expect((await events(b.id)).some((e) => e.kind === "release_requested")).toBe(true);
+    // Review 89 B6-15: told like an unusable hold, and the code outlives the release.
+    expect(released.errorCode).toBe("external_reservation_released");
+    expect(released.attentionRequiredAt).not.toBeNull();
+    const td2 = new FakeTravelDesk(now);
+    td2.steps.reserve.push("external_failed");
+    const failed = await create(ext());
+    await drain(td2, 0);
+    expect(await booking(failed.id)).toMatchObject({ state: "rejected", errorCode: "external_booking_failed", attentionRequiredAt: null });
+    expect(td2.calls).not.toContain("confirm");
   });
 
   it("documents are never fetched while the external confirmation is in progress (links can appear before it finishes)", async () => {
     const td = new FakeTravelDesk(now);
     td.steps.confirm.push("in_progress");
-    const b = await create(intent());
+    const b = await create(ext());
     await drain(td, 0);
     expect((await booking(b.id)).state).toBe("awaiting_external");
     // The document sweep reads confirmed order-item bookings only; this one is neither, and no document row exists.
@@ -832,15 +1052,28 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
     expect(td.calls).not.toContain("get");
   });
 
-  it("an external hold takes its deadline from the answer; a five-minute hold is never confirmed and is left to the release", async () => {
+  it("owner decision a: a five-minute external hold takes its deadline from the answer and is confirmed, sent no later than 60 s before it", async () => {
     const td = new FakeTravelDesk(now);
     td.deadlineMs = 5 * 60_000;
     const sent = clock;
-    const b = await create(intent({ externalRoute: true }));
-    await drain(td, 0);
+    const b = await create(ext());
+    await svc.runDueJobs(deps(td), { budgetMs: 60_000, maxJobs: 1 });
     const held = await booking(b.id);
     expect(held.externalRoute).toBe(true);
     expect(held.reservationDeadline!.getTime()).toBe(sent + 5 * 60_000);
+    // On the worker's (test) clock: `confirmSendByFor` answers on the database clock, which the test clock is years from.
+    expect(engine.confirmSendBy(held, { mutationTimeoutMs: 1_000 })!.getTime()).toBe(sent + 4 * 60_000);
+    expect(await svc.confirmSendByFor(b.id, { mutationTimeoutMs: 1_000 })).not.toBeNull();
+    await drain(td, 0);
+    expect(await booking(b.id)).toMatchObject({ state: "confirmed", errorCode: null });
+  });
+
+  it("a hold under 3 min 30 s is never confirmed and is left to the release; its code outlives the expiry for the alert", async () => {
+    const td = new FakeTravelDesk(now);
+    td.deadlineMs = 3 * 60_000;
+    const b = await create(ext());
+    await drain(td, 0);
+    const held = await booking(b.id);
     expect(held).toMatchObject({ state: "reserved", errorCode: "external_hold_unusable" });
     expect(held.attentionRequiredAt).not.toBeNull();
     expect(await svc.confirmSendByFor(b.id, { mutationTimeoutMs: 1_000 })).toBeNull();
@@ -852,7 +1085,7 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
   it("an external hold with no deadline and no timeout in the answer is of unknown length: no 15 minutes assumed, never confirmed", async () => {
     const td = new FakeTravelDesk(now);
     td.deadlineMs = null;
-    const b = await create(intent({ externalRoute: true }));
+    const b = await create(ext());
     await drain(td, 0);
     const held = await booking(b.id);
     expect(held.reservationDeadline).toBeNull();
@@ -860,18 +1093,43 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
     expect(td.calls).not.toContain("confirm");
   });
 
-  it("an external hold long enough to confirm (12 minutes, from the answer) is confirmed as before; an internal drill keeps the 15-minute rule", async () => {
+  it("review 89 B6-14: a failed external charge counts as held for 24 h from its rejection, less any refund, and alerts after 3 h unrefunded", async () => {
+    const t = new Date();
+    const probe = { id: uuidv7(), supplierId, environment: "test" as const, accountId: "default" };
+    const before = await engine.openHoldsMinor(probe, t);
+    async function failedCharge(closedAgoMs: number, entries: Array<["charged" | "refunded", bigint]>) {
+      const b = await create(ext());
+      await prisma.supplierBooking.update({ where: { id: b.id }, data: { state: "rejected", closedAt: new Date(t.getTime() - closedAgoMs), errorCode: "external_booking_failed" } });
+      for (const [kind, amountMinor] of entries) {
+        await prisma.ledgerEntry.create({
+          data: { id: uuidv7(), book: "supplier_wallet", supplierBookingId: b.id, currency: "AED", amountMinor, kind, evidenceRef: `zz-td-${RUN}:b6-14`, occurredAt: t },
+        });
+      }
+      return b;
+    }
+    const inside = await failedCharge(4 * 3_600_000, [["charged", -10_000n]]);
+    await failedCharge(25 * 3_600_000, [["charged", -7_000n]]);
+    await failedCharge(3_600_000, [["charged", -9_000n], ["refunded", 4_000n]]);
+    await failedCharge(3_600_000, [["charged", -3_000n], ["refunded", 3_000n]]);
+    // Inside the window 10,000; after it nothing; a partial refund holds the remainder only; a full one nothing.
+    expect((await engine.openHoldsMinor(probe, t)) - before).toBe(15_000n);
+    // A later write to the row does not restart the window (keyed on closed_at).
+    await prisma.supplierBooking.updateMany({ where: { supplierId, state: "rejected", closedAt: { lt: new Date(t.getTime() - 24 * 3_600_000) } }, data: { attentionRequiredAt: null } });
+    expect((await engine.openHoldsMinor(probe, t)) - before).toBe(15_000n);
+    const { collectOpsIncidents } = await import("../ops-alert.service");
+    const incidents = await collectOpsIncidents(new Date(t.getTime() - 2 * 3_600_000), t);
+    expect(incidents.filter((i) => i.entityId === inside.id).map((i) => i.reason)).toEqual(["external_refund_not_seen"]);
+  });
+
+  it("an internal drill keeps the 15-minute rule when the answer gives no deadline", async () => {
     const td = new FakeTravelDesk(now);
-    td.deadlineMs = 12 * 60_000;
-    const ext = await create(intent({ externalRoute: true }));
-    await drain(td, 0);
-    expect(await booking(ext.id)).toMatchObject({ state: "confirmed", externalRoute: true });
     td.deadlineMs = null;
+    const sent = clock;
     const internal = await create(intent());
     await svc.runDueJobs(deps(td), { budgetMs: 60_000, maxJobs: 1 });
     const r = await booking(internal.id);
     expect(r.externalRoute).toBeNull();
-    expect(r.reservationDeadline).not.toBeNull();
+    expect(r.reservationDeadline!.getTime()).toBe(sent + 15 * 60_000);
   });
 
   it("a reservation whose charged amount differs is held for a human, never confirmed, and runs out on its own", async () => {
@@ -885,6 +1143,73 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
     await drain(td, 20 * 60_000, 60_000);
     expect((await booking(b.id)).state).toBe("expired");
     expect(td.calls).not.toContain("confirm");
+  });
+
+  /** A stored date-only offer (no slot metadata, doc 29 Batch 7) for the reserve-time slot check cases. */
+  async function dateOnlyOffer(): Promise<number> {
+    const { storedOffer } = await import("../../suppliers/__tests__/fixtures/traveldesk-terms");
+    const offerId = OFFER + 50;
+    await prisma.supplierCatalogueItem.upsert({
+      where: { supplierId_environment_kind_externalId: { supplierId, environment: "test", kind: "offer", externalId: String(offerId) } },
+      create: {
+        id: uuidv7(),
+        supplierId,
+        environment: "test",
+        kind: "offer",
+        externalId: String(offerId),
+        parentExternalId: "1",
+        name: "engine test date-only offer",
+        bookingKind: "live_book",
+        payload: storedOffer({ offerId, tourId: 1, timeSlots: [], durationHours: 3 }) as never,
+        payloadHash: "x",
+      },
+      update: {},
+    });
+    return offerId;
+  }
+  const WHOLE_DAY = { timeSlotId: 0, startMinutes: 0, endMinutes: 1439 };
+
+  it("doc 29 Batch 7 (B7-16): a date-only reservation naming another slot id waits for staff, is never confirmed automatically, and is an ops incident", async () => {
+    const td = new FakeTravelDesk(now);
+    td.reserveSlotId = 5; // the intent sent slot 0
+    const t0 = new Date(clock);
+    const b = await create(intent({ offerId: await dateOnlyOffer(), slot: WHOLE_DAY }));
+    await drain(td, 0);
+    const held = await booking(b.id);
+    expect(held).toMatchObject({ state: "reserved", errorCode: "reservation_slot_mismatch" });
+    expect(held.attentionRequiredAt).not.toBeNull();
+    expect(td.calls).not.toContain("confirm");
+    expect(await prisma.supplierJob.count({ where: { supplierBookingId: b.id, kind: "confirm", status: "queued" } })).toBe(0);
+    const { collectOpsIncidents } = await import("../ops-alert.service");
+    const incidents = await collectOpsIncidents(new Date(t0.getTime() - 60_000), now());
+    expect(incidents.filter((i) => i.entityId === b.id).map((i) => i.reason)).toContain("reservation_slot_mismatch");
+    await drain(td, 20 * 60_000, 60_000);
+    expect((await booking(b.id)).state).toBe("expired");
+    expect(td.calls).not.toContain("confirm");
+  });
+
+  it("doc 29 Batch 7 (B7-16): a date-only reservation that leaves the slot id out passes the reserve check; the confirm check still refuses to confirm it", async () => {
+    const td = new FakeTravelDesk(now);
+    td.reserveSlotId = null;
+    const b = await create(intent({ offerId: await dateOnlyOffer(), slot: WHOLE_DAY }));
+    await drain(td, 0);
+    const after = await booking(b.id);
+    expect(after.errorCode).not.toBe("reservation_slot_mismatch");
+    // The confirm answer carries the reservation's (missing) id: an exact echo is required to confirm (SUP-1).
+    expect(after).toMatchObject({ state: "outcome_unknown", errorCode: "unconfirmed_snapshot", errorMessage: "identity_mismatch" });
+    expect(td.calls.filter((c) => c === "confirm")).toHaveLength(1);
+  });
+
+  it.each([0, 10])("lead decision: a fixed-slot (Batch 0) reservation whose answer carries slot id %s is not held by the reserve check; it behaves as before Batch 7", async (answered) => {
+    const td = new FakeTravelDesk(now);
+    td.reserveSlotId = answered; // the intent sent slot 9 on the stored fixed-slot offer
+    const b = await create(intent());
+    await drain(td, 0);
+    const after = await booking(b.id);
+    expect(after.errorCode).not.toBe("reservation_slot_mismatch");
+    // As at 6518a30: the confirm is sent, and the existing confirm check refuses an answer that does not echo the sent id.
+    expect(td.calls.filter((c) => c === "confirm")).toHaveLength(1);
+    expect(after).toMatchObject({ state: "outcome_unknown", errorCode: "unconfirmed_snapshot", errorMessage: "identity_mismatch" });
   });
 
   it("caps the reservation deadline at the send plus the hold length when TravelDesk's deadline is later (CR-9)", async () => {
@@ -2025,8 +2350,60 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
 
   describe("wallet funds (doc 29 §4.5, D1)", () => {
     const prodKey = () => bookingControlKeyFor(CODE, "production", "777");
+    // Review 89 B6-23: these cases run on a test wallet account of their own, so rows other cases leave on the shared
+    // account (failed external charges count as open holds for 24 h, B6-05/B6-14) never change their outcome.
+    beforeAll(() => {
+      ownAccount = 600_000 + Math.floor(Math.random() * 99_999);
+    });
     afterAll(async () => {
+      ownAccount = null;
       await prisma.setting.deleteMany({ where: { key: prodKey() } });
+    });
+
+    it("review 89 B6-23: a failed external charge explains a payable figure below the derived one, by at most its unrefunded charge, for at most 24 h", async () => {
+      const td = new FakeTravelDesk(now);
+      const t = new Date();
+      async function failedCharge(closedAgoMs: number, refundedMinor = 0n) {
+        const f = await create(intent({ externalRoute: true }));
+        await prisma.supplierJob.updateMany({ where: { supplierBookingId: f.id }, data: { status: "cancelled" } });
+        await prisma.supplierBooking.update({ where: { id: f.id }, data: { state: "rejected", closedAt: new Date(t.getTime() - closedAgoMs), errorCode: "external_booking_failed" } });
+        const entry = (kind: string, amountMinor: bigint) => ({ id: uuidv7(), book: "supplier_wallet", supplierBookingId: f.id, currency: "AED" as const, amountMinor, kind, evidenceRef: `zz-td-${RUN}:b6-23`, occurredAt: t });
+        await prisma.ledgerEntry.create({ data: entry("charged", -5_000n) });
+        if (refundedMinor > 0n) await prisma.ledgerEntry.create({ data: entry("refunded", refundedMinor) });
+        return f;
+      }
+      async function reserveWith(wallet: FakeTravelDesk["wallet"]) {
+        td.wallet = wallet;
+        // Held, not confirmed: the only job due is this reserve.
+        const b = await create(intent({ afterReserve: "hold" }));
+        const r = await svc.runDueJobs(deps(td), { budgetMs: 60_000 });
+        const outcomes = r.processed.map((p) => p.outcome);
+        // A hold taken here is closed again, so it never explains the next case's gap.
+        await prisma.supplierJob.updateMany({ where: { supplierBookingId: b.id }, data: { status: "cancelled" } });
+        await prisma.supplierBooking.updateMany({ where: { id: b.id, state: { in: ["reserved", "awaiting_payment"] } }, data: { state: "cancelled", closedAt: new Date() } });
+        return { b, outcomes };
+      }
+      // Payable 350.00 against a derived 400.00: a gap of 50.00, the failed external charge still out.
+      const gap = { balanceMinor: -40_000n, creditFacilityMinor: 0n, payableBalanceMinor: 35_000n };
+      const failed = await failedCharge(3_600_000);
+      const inside = await reserveWith(gap);
+      expect(inside.outcomes.some((o) => o.startsWith("funds_unverified"))).toBe(false);
+      expect(inside.outcomes).toContain("reserved");
+      expect((await booking(inside.b.id)).reservedAt).not.toBeNull();
+      // It spends the lower figure.
+      expect(await walletEvents(inside.b.id, "funds_check")).toEqual([{ fundsMinor: 35_000, runningMinor: null }]);
+      // Never a payable figure above the derived one.
+      const above = await reserveWith({ balanceMinor: -40_000n, creditFacilityMinor: 0n, payableBalanceMinor: 45_000n });
+      expect(above.outcomes).toContain("funds_unverified:funds_mismatch");
+      // Never more than the unrefunded charge: with 20.00 of it refunded, a 50.00 gap is no longer explained.
+      await prisma.ledgerEntry.create({ data: { id: uuidv7(), book: "supplier_wallet", supplierBookingId: failed.id, currency: "AED", amountMinor: 2_000n, kind: "refunded", evidenceRef: `zz-td-${RUN}:b6-23`, occurredAt: t } });
+      const partial = await reserveWith(gap);
+      expect(partial.outcomes).toContain("funds_unverified:funds_mismatch");
+      // Never after 24 h: the same gap, explained only by a charge rejected 25 hours ago, is refused.
+      await prisma.supplierBooking.update({ where: { id: failed.id }, data: { closedAt: new Date(t.getTime() - 25 * 3_600_000) } });
+      await failedCharge(25 * 3_600_000);
+      const after = await reserveWith(gap);
+      expect(after.outcomes).toContain("funds_unverified:funds_mismatch");
     });
 
     async function walletEvents(id: string, kind: string) {
@@ -2302,13 +2679,30 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
       await onlyRecent();
       const td = new FakeTravelDesk(now);
       td.steps.confirm.push("external_failed");
-      const b = await create(intent());
+      const b = await create(intent({ externalRoute: true }));
       await drain(td, 0);
       expect((await booking(b.id)).state).toBe("rejected");
       const r = await reconcile(td);
-      expect(r.issues.filter((i) => i.bookingId === b.id)).toEqual([]);
+      // Listed with its charge and no refund figure: reported for a human (review 89 B6-05), never re-blocked.
+      expect(r.issues.filter((i) => i.bookingId === b.id).map((i) => i.kind)).toEqual(["refund_not_seen"]);
       expect(r.reblocked).toBe(0);
       expect((await booking(b.id)).state).toBe("rejected");
+    });
+
+    it("review 89 B6-18: a confirmed external booking the provider later fails is reported and told to our team; no money moves, no state change", async () => {
+      await onlyRecent();
+      const td = new FakeTravelDesk(now);
+      const b = await create(intent({ externalRoute: true }));
+      await drain(td, 0);
+      const done = await booking(b.id);
+      expect(done.state).toBe("confirmed");
+      td.store.set(done.supplierBookingId!, { ...td.store.get(done.supplierBookingId!)!, externalInProgress: false, externalFailed: true });
+      const r = await reconcile(td);
+      expect(r.issues.filter((i) => i.bookingId === b.id).map((i) => i.kind)).toEqual(["status_mismatch"]);
+      const flagged = await booking(b.id);
+      expect(flagged).toMatchObject({ state: "confirmed", errorCode: "external_failed_after_confirm" });
+      expect(flagged.attentionRequiredAt).not.toBeNull();
+      expect(td.calls).not.toContain("cancel");
     });
 
     it("a booking closed as never created that TravelDesk shows live is re-blocked at once, with an alert (late acceptance)", async () => {

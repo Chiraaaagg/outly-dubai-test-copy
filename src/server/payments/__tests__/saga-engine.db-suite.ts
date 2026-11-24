@@ -25,6 +25,8 @@ type Prisma = typeof import("../../lib/db").prisma;
 
 const OFFER = 778_001;
 const OFFER_HASH = "b".repeat(64);
+/** The Batch 6 key the stored offer derives to when it is external (fixed single start, self arrival, per person). */
+const EXTERNAL_KEY = "live.fixed_slot_single.self.external.per_person";
 
 describe.skipIf(!dbEnabled)("B3 payment saga with the real engine and a scripted TravelDesk (disposable database)", () => {
   let prisma: Prisma;
@@ -40,7 +42,27 @@ describe.skipIf(!dbEnabled)("B3 payment saga with the real engine and a scripted
     engine = await import("../../services/supplier-booking.service");
   });
 
+  /** The flag row as it was before this suite switched it on: restored afterwards. */
+  let flagBefore: { enabled: boolean; requiresOfferEvidence: boolean; reason: string } | null | undefined;
+  async function enableExternalFlag() {
+    const where = { adapter_environment_classKey: { adapter: "traveldesk", environment: "test" as const, classKey: EXTERNAL_KEY } };
+    if (flagBefore === undefined) {
+      const row = await prisma.supplierCapabilityFlag.findUnique({ where });
+      flagBefore = row ? { enabled: row.enabled, requiresOfferEvidence: row.requiresOfferEvidence, reason: row.reason } : null;
+    }
+    await prisma.supplierCapabilityFlag.upsert({
+      where,
+      create: { id: uuidv7(), adapter: "traveldesk", environment: "test", classKey: EXTERNAL_KEY, enabled: true, requiresOfferEvidence: true, reason: "zz-b6 saga-engine test flag" },
+      update: { enabled: true, requiresOfferEvidence: true },
+    });
+  }
+
   afterAll(async () => {
+    if (flagBefore !== undefined) {
+      const where = { adapter_environment_classKey: { adapter: "traveldesk", environment: "test" as const, classKey: EXTERNAL_KEY } };
+      if (flagBefore === null) await prisma.supplierCapabilityFlag.deleteMany({ where: { adapter: "traveldesk", environment: "test", classKey: EXTERNAL_KEY } });
+      else await prisma.supplierCapabilityFlag.update({ where, data: flagBefore });
+    }
     await cleanupB3(prisma);
     const ids = suppliers.map((s) => s.id);
     await prisma.supplierAccountLease.deleteMany({ where: { supplierId: { in: ids } } });
@@ -48,7 +70,7 @@ describe.skipIf(!dbEnabled)("B3 payment saga with the real engine and a scripted
   });
 
   /** A harness whose saga talks to the real engine, wired as wiring.ts does it, with hooks for racing the release. */
-  async function withEngine() {
+  async function withEngine(opts: { external?: boolean } = {}) {
     const base = await harness(prisma);
     const code = `zz-b3-td-${uuidv7().slice(-12)}`;
     const supplier = await prisma.supplier.create({ data: { id: uuidv7(), code, name: "zz-b3 TravelDesk (saga with the engine)", source: "api", adapter: "traveldesk" } });
@@ -64,11 +86,24 @@ describe.skipIf(!dbEnabled)("B3 payment saga with the real engine and a scripted
         parentExternalId: "1",
         name: "zz-b3 engine saga offer",
         bookingKind: "live_book",
-        payload: storedOffer({ offerId: OFFER, tourId: 1, timeSlots: [storedSlot({ timeSlotId: 9, startMinutes: 1260, endMinutes: 1365 })] }) as never,
+        payload: storedOffer({
+          offerId: OFFER,
+          tourId: 1,
+          ...(opts.external ? { isExternal: true } : {}),
+          timeSlots: [storedSlot({ timeSlotId: 9, startMinutes: 1260, endMinutes: 1365, ...(opts.external ? { isExternal: true } : {}) })],
+        }) as never,
         payloadHash: "x",
       },
     });
 
+    if (opts.external) {
+      // Doc 29 Batch 6 (review 89 B6-07): a real external-route customer order. The class flag is switched on for the
+      // test only (restored in afterAll; the db suites run one file at a time) and the offer gets evidence for it.
+      await enableExternalFlag();
+      await prisma.supplierOfferEnablement.create({
+        data: { id: uuidv7(), supplierId: supplier.id, environment: "test", offerExternalId: String(OFFER), classKey: EXTERNAL_KEY, evidenceKind: "contract_test", reference: "zz-b6-saga-engine", offerTermsHash: OFFER_HASH },
+      });
+    }
     const { createEngineSagaApi } = await import("../../services/engine-saga.service");
     const { createPaymentSaga, dbBookingStateReader } = await import("../saga");
     const { createPaymentInbox } = await import("../inbox");
@@ -131,7 +166,7 @@ describe.skipIf(!dbEnabled)("B3 payment saga with the real engine and a scripted
               id: uuidv7(),
               productId,
               supplierId: supplier.id,
-              externalRef: { tourId: 1, offerId: OFFER, bookingKind: "live_book", isExternal: false },
+              externalRef: { tourId: 1, offerId: OFFER, bookingKind: "live_book", isExternal: opts.external === true },
               supplierProductId: "1",
               supplierOfferId: String(OFFER),
               bookingKind: "live_book",
@@ -282,37 +317,58 @@ describe.skipIf(!dbEnabled)("B3 payment saga with the real engine and a scripted
     expect(await prisma.customerRemedy.findMany({ where: { orderItemId: c.orderItemId } })).toMatchObject([{ kind: "refund", status: "completed" }]);
   });
   /* -------------------------------------------------------------------------
-   * Doc 29 Batch 6: external confirmations after the capture
+   * Doc 29 Batch 6: external-route customer orders (review 89 B6-01, B6-07)
    * ---------------------------------------------------------------------- */
 
-  it("an external confirmation still in progress past its wait limit is handed to our team and never refunded; once the supplier fails it, the item is refunded in full", async () => {
-    const e = await withEngine();
+  /** Runs the worker and the saga together for `minutes`, four minutes at a time. */
+  async function waitWith(e: Awaited<ReturnType<typeof withEngine>>, sagaId: string, minutes: number) {
+    for (let m = 0; m < minutes; m += 4) {
+      e.h.clock.advance(4 * 60_000);
+      await e.work({}, 2);
+      await e.h.saga.advance(sagaId);
+    }
+  }
+
+  it("B6-01: an external confirmation that succeeds after the send-by and after the hand-off is confirmed and fulfilled, with no saga flag", async () => {
+    const e = await withEngine({ external: true });
     e.td.steps.confirm.push("in_progress");
     const c = await e.sold();
     await deliver(e.h, c.gw, "payment.authorized", c.gw.pay(c.providerOrderId));
     await e.work();
-    expect((await e.booking(c.orderItemId)).state).toBe("awaiting_external");
-    expect((await sagaState(e.h, c.sagaId)).state).toBe("confirm_pending");
+    const waiting = await e.booking(c.orderItemId);
+    expect(waiting).toMatchObject({ state: "awaiting_external", externalRoute: true });
     expect(c.gw.callsOf("capture")).toHaveLength(1);
-
-    // Forty minutes later the supplier is still working: handed off, still waiting, no money moved back.
-    for (let i = 0; i < 10; i++) {
-      e.h.clock.advance(4 * 60_000);
-      await e.work({}, 2);
-      await e.h.saga.advance(c.sagaId);
-    }
+    // Past the confirm send-by (15-minute hold) and past the 30-minute hand-off: the saga raises no flag of its own.
+    await waitWith(e, c.sagaId, 40);
     const handed = await e.booking(c.orderItemId);
     expect(handed).toMatchObject({ state: "awaiting_external", errorCode: "external_confirmation_handoff" });
-    expect(handed.attentionRequiredAt).not.toBeNull();
+    let s = await sagaState(e.h, c.sagaId);
+    expect(s.state).toBe("confirm_pending");
+    expect(s.attentionRequiredAt).toBeNull();
+    // The supplier confirms late: booked with the payment that backed the confirm, saga fulfilled, nothing refunded.
+    const id = handed.supplierBookingId!;
+    e.td.store.set(id, { ...e.td.store.get(id)!, externalInProgress: false });
+    await waitWith(e, c.sagaId, 12);
+    expect(await e.booking(c.orderItemId)).toMatchObject({ state: "confirmed", attentionRequiredAt: null });
+    s = await sagaState(e.h, c.sagaId);
+    expect(s.state).toBe("fulfilled");
+    expect(await prisma.refund.count({ where: { paymentId: c.paymentId } })).toBe(0);
+  });
+
+  it("still in progress past its wait limit it is handed to our team and never refunded; once the supplier fails it, the item is refunded in full", async () => {
+    const e = await withEngine({ external: true });
+    e.td.steps.confirm.push("in_progress");
+    const c = await e.sold();
+    await deliver(e.h, c.gw, "payment.authorized", c.gw.pay(c.providerOrderId));
+    await e.work();
+    await waitWith(e, c.sagaId, 40);
+    const handed = await e.booking(c.orderItemId);
+    expect(handed).toMatchObject({ state: "awaiting_external", errorCode: "external_confirmation_handoff" });
     expect((await sagaState(e.h, c.sagaId)).state).toBe("confirm_pending");
     expect(await prisma.refund.count({ where: { paymentId: c.paymentId } })).toBe(0);
-
-    // The supplier now shows it failed: rejected, refunded in full through the saga's refund path, no cancel sent.
     const id = handed.supplierBookingId!;
     e.td.store.set(id, { ...e.td.store.get(id)!, externalInProgress: false, externalFailed: true });
-    e.h.clock.advance(11 * 60_000);
-    await e.work({}, 3);
-    await e.h.saga.advance(c.sagaId);
+    await waitWith(e, c.sagaId, 12);
     expect(await e.booking(c.orderItemId)).toMatchObject({ state: "rejected", errorCode: "external_booking_failed" });
     expect((await sagaState(e.h, c.sagaId)).state).toBe("refunded");
     expect(await prisma.refund.findMany({ where: { paymentId: c.paymentId } })).toMatchObject([{ reason: "confirm_rejected", status: "succeeded", amountMinor: 10_000n }]);
@@ -320,7 +376,7 @@ describe.skipIf(!dbEnabled)("B3 payment saga with the real engine and a scripted
   });
 
   it("a confirm answered 201 with the external failed flag after the capture refunds the item in full and tells our team", async () => {
-    const e = await withEngine();
+    const e = await withEngine({ external: true });
     e.td.steps.confirm.push("external_failed");
     const c = await e.sold();
     await deliver(e.h, c.gw, "payment.authorized", c.gw.pay(c.providerOrderId));
@@ -332,5 +388,59 @@ describe.skipIf(!dbEnabled)("B3 payment saga with the real engine and a scripted
     expect((await sagaState(e.h, c.sagaId)).state).toBe("refunded");
     expect(await prisma.refund.findMany({ where: { paymentId: c.paymentId } })).toMatchObject([{ reason: "confirm_rejected", status: "succeeded", amountMinor: 10_000n }]);
     expect(e.td.calls.filter((x) => x === "reserve" || x === "confirm" || x === "cancel")).toEqual(["reserve", "confirm"]);
+  });
+
+  it("owner decision a: a five-minute provider hold is captured and confirmed in the same run", async () => {
+    const e = await withEngine({ external: true });
+    e.td.deadlineMs = 5 * 60_000;
+    const c = await e.sold();
+    await deliver(e.h, c.gw, "payment.authorized", c.gw.pay(c.providerOrderId));
+    await e.work();
+    expect(await e.booking(c.orderItemId)).toMatchObject({ state: "confirmed", externalRoute: true });
+    expect((await sagaState(e.h, c.sagaId)).state).toBe("fulfilled");
+    expect(c.gw.callsOf("capture")).toHaveLength(1);
+  });
+
+  it("B6-13: five-minute hold, the confirm answer times out, recovery after the send-by reads it confirmed: fulfilled, no saga flag, no refund", async () => {
+    const e = await withEngine({ external: true });
+    e.td.deadlineMs = 5 * 60_000;
+    e.td.steps.confirm.push("applied_lost");
+    const c = await e.sold();
+    await deliver(e.h, c.gw, "payment.authorized", c.gw.pay(c.providerOrderId));
+    await e.work({}, 1);
+    const lost = await e.booking(c.orderItemId);
+    expect(lost.state).toBe("outcome_unknown");
+    expect(c.gw.callsOf("capture")).toHaveLength(1);
+    // Past the send-by (deadline − 60 s) before recovery reads it: the saga must not withdraw the evidence.
+    e.h.clock.advance(5 * 60_000);
+    await e.h.saga.advance(c.sagaId);
+    expect((await sagaState(e.h, c.sagaId)).attentionRequiredAt).toBeNull();
+    await waitWith(e, c.sagaId, 8);
+    expect(await e.booking(c.orderItemId)).toMatchObject({ state: "confirmed" });
+    const s = await sagaState(e.h, c.sagaId);
+    expect(s.state).toBe("fulfilled");
+    expect(s.attentionRequiredAt).toBeNull();
+    expect(await prisma.refund.count({ where: { paymentId: c.paymentId } })).toBe(0);
+    expect(e.td.calls.filter((x) => x === "confirm")).toHaveLength(1);
+  });
+
+  it("a hold too short to confirm is released by the saga at once, without capture, and our team is told", async () => {
+    const e = await withEngine({ external: true });
+    e.td.deadlineMs = 3 * 60_000;
+    const c = await e.sold();
+    const pid = c.gw.pay(c.providerOrderId);
+    await deliver(e.h, c.gw, "payment.authorized", pid);
+    await e.work();
+    await e.h.saga.advance(c.sagaId);
+    await e.work();
+    const b = await e.booking(c.orderItemId);
+    expect(["cancelled", "expired"]).toContain(b.state);
+    expect(b.errorCode).toBe("external_hold_unusable");
+    expect(b.attentionRequiredAt).not.toBeNull();
+    const s = await sagaState(e.h, c.sagaId);
+    expect(s.state).toBe("released");
+    expect(c.gw.callsOf("capture")).toHaveLength(0);
+    expect(c.gw.callsOf("void")).toEqual([[pid, `void:${c.paymentId}`]]);
+    expect(e.td.calls).not.toContain("confirm");
   });
 });

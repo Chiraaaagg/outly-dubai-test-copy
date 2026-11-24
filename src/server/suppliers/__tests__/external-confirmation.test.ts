@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  EXTERNAL_CONFIRM_MARGIN_MS,
   EXTERNAL_MIN_HOLD_MS,
+  EXTERNAL_POLL_WAITS_PER_RUN,
+  externalWaitStartMinutes,
   EXTERNAL_POLL_MIN_MS,
   externalHandoffAt,
   externalHoldUsable,
@@ -55,19 +58,39 @@ describe("poll cadence", () => {
   });
 });
 
-describe("hold length", () => {
+describe("hold length (owner decision a, 24 Nov 2026: short holds may sell)", () => {
   const reserved = new Date("2026-12-01T06:00:00Z");
   const after = (ms: number) => new Date(reserved.getTime() + ms);
 
-  it("a five-minute provider hold is too short to confirm safely; ten minutes is enough", () => {
-    expect(externalHoldUsable(reserved, after(5 * MIN))).toBe(false);
-    expect(externalHoldUsable(reserved, after(EXTERNAL_MIN_HOLD_MS - 1))).toBe(false);
+  it("a five-minute provider hold is usable; below 3 min 30 s (60 s margin + 2-min capture budget + 30 s) it is not", () => {
+    expect(EXTERNAL_MIN_HOLD_MS).toBe(210_000);
+    expect(EXTERNAL_MIN_HOLD_MS).toBe(EXTERNAL_CONFIRM_MARGIN_MS + 2 * MIN + 30_000);
+    expect(externalHoldUsable(reserved, after(5 * MIN))).toBe(true);
     expect(externalHoldUsable(reserved, after(EXTERNAL_MIN_HOLD_MS))).toBe(true);
-    expect(externalHoldUsable(reserved, after(15 * MIN))).toBe(true);
+    expect(externalHoldUsable(reserved, after(EXTERNAL_MIN_HOLD_MS - 1))).toBe(false);
+    expect(externalHoldUsable(reserved, after(3 * MIN))).toBe(false);
   });
 
   it("an unknown deadline or hold start is never usable", () => {
     expect(externalHoldUsable(reserved, null)).toBe(false);
     expect(externalHoldUsable(null, after(15 * MIN))).toBe(false);
+  });
+});
+
+describe("the minute the guest is affected (review 89 B6-08)", () => {
+  it("is the pickup time when it comes before the start, else the start", () => {
+    expect(externalWaitStartMinutes(600, 540)).toBe(540);
+    expect(externalWaitStartMinutes(600, null)).toBe(600);
+    expect(externalWaitStartMinutes(600, 660)).toBe(600);
+    expect(externalWaitStartMinutes(null, 540)).toBe(540);
+    // A 13:30 start with an 11:30 pickup: the near-service limit counts from 11:30 (3 h before is 08:30, before `since`).
+    expect(externalHandoffAt({ since, serviceDate: "2026-12-01", startMinutes: externalWaitStartMinutes(13 * 60 + 30, 11 * 60 + 30) }).getTime() - since.getTime()).toBe(5 * MIN);
+  });
+});
+
+describe("in-run waits for external polls (owner decision c)", () => {
+  it("up to three waits a run: four reads a minute on the one-minute tick, each 15 s apart", () => {
+    expect(EXTERNAL_POLL_WAITS_PER_RUN).toBe(3);
+    expect((EXTERNAL_POLL_WAITS_PER_RUN + 1) * externalPollDelayMs(null)).toBe(60_000);
   });
 });

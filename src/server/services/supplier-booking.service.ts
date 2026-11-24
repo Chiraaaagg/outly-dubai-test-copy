@@ -36,19 +36,33 @@ import { documentService, reportPersisted, type PersistResult } from "./document
 import { buildBookingRequest } from "../suppliers/traveldesk/traveldesk.booking";
 import { type BrowseRoute, READ_BUDGET, type ReadClass, type ReadLimits } from "../suppliers/read-budget";
 import { mutationHealth, READ_BUDGET_REASON, type ReadGate } from "../suppliers/traveldesk/traveldesk.booking-adapter";
-import { isConfirmedSnapshot, withinChargeTolerance } from "../suppliers/traveldesk/traveldesk.confirmation";
+import { isConfirmedSnapshot, RESERVATION_SLOT_MISMATCH_CODE, reservationSlotDiffers, reservationSlotHeld, storedOfferClassKey, withinChargeTolerance } from "../suppliers/traveldesk/traveldesk.confirmation";
 import { SUPPLIER_WALLET_BOOK, type SupplierRefundFigure, walletEntriesFor, walletPhaseOf } from "../suppliers/wallet-ledger";
 import { bookingAccountId, DEFAULT_BOOKING_ACCOUNT_ID } from "../suppliers/control-account";
 import { checkOfferCapability } from "../suppliers/capability-gate";
 import { bookingKindSellable, parseClassKey } from "../suppliers/traveldesk/traveldesk.capability";
 import {
+  EXTERNAL_CONFIRM_MARGIN_MS,
+  EXTERNAL_FAILED_AFTER_CONFIRM_CODE,
   EXTERNAL_FAILED_CODE,
   EXTERNAL_HANDOFF_CODE,
+  EXTERNAL_HOLD_IN_PROGRESS_CODE,
   EXTERNAL_HOLD_UNUSABLE_CODE,
+  EXTERNAL_IN_PROGRESS_RELEASE_LEAD_MS,
+  EXTERNAL_PAST_START_CODE,
+  EXTERNAL_POLL_INTERVAL_MS,
+  EXTERNAL_POLL_MIN_MS,
+  EXTERNAL_FAST_POLL_MAX,
+  EXTERNAL_POLL_SLOW_MS,
+  EXTERNAL_WAIT_LIMIT_MS,
+  EXTERNAL_REJECTED_HELD_MS,
+  EXTERNAL_RELEASE_CODES,
+  EXTERNAL_RESERVATION_RELEASED_CODE,
   externalHandoffAt,
   externalHoldUsable,
   externalPollDelayMs,
-  EXTERNAL_POLL_INTERVAL_MS,
+  externalWaitStartMinutes,
+  serviceStartMs,
 } from "../suppliers/external-confirmation";
 import {
   candidateSpendable,
@@ -197,6 +211,8 @@ export interface EngineDeps {
   /** The adapter's environment. A worker only ever claims jobs of bookings in this environment. */
   environment: SupplierEnvironment;
   now?: () => Date;
+  /** Waits inside a run for an external poll (doc 29 Batch 6, `externalPollWaits`); tests advance their clock instead. Default: a timer. */
+  sleep?: (ms: number) => Promise<void>;
   /** Identifies this worker in leases and job locks. */
   holder?: string;
   /** Tests isolate on their own supplier row. */
@@ -310,6 +326,10 @@ const RELEASE_LAPSES_CODE = "release_cancel_refused_hold_lapses";
  * follows the answer that left the booking in `awaiting_external` by this.
  */
 const POLL_INTERVAL_MS = EXTERNAL_POLL_INTERVAL_MS;
+/** Internal attempts in `awaiting_external` (Batches 0–5, SUP-17, unchanged): polls back off from 15 s to this. */
+const LEGACY_POLL_MAX_INTERVAL_MS = 10 * 60_000;
+/** Internal attempts: after this long in `awaiting_external` a human is told; polling goes on (SUP-17, unchanged). */
+const LEGACY_EXTERNAL_ATTENTION_MS = 30 * 60_000;
 const RECOVERY_DELAY_MS = 30_000;
 const RECOVERY_MIN_SEARCHES = 2;
 /** A lost reserve is reported unresolved only after the 15-minute hold plus a margin (Q-B5). */
@@ -526,6 +546,30 @@ async function enqueue(db: Db, kind: string, bookingId: string, runAfter: Date, 
       WHERE supplier_jobs.status <> 'running' OR supplier_jobs.locked_by = ${holder ?? null}`;
 }
 
+/** Time a worker run keeps free after an in-run wait for an external poll (doc 29 Batch 6): the read and its writes. */
+const EXTERNAL_POLL_RUN_MARGIN_MS = 30_000;
+
+function sleepMs(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * The earliest queued poll of an external-route booking of this supplier,
+ * environment and account that still waits (`awaiting_external`, or a
+ * reservation the provider is still making), due by the worker's clock `t`
+ * or later; null when there is none.
+ */
+async function nextExternalPollDue(supplierId: string, environment: SupplierEnvironment, account: string | null, t: Date): Promise<Date | null> {
+  const rows = await prisma.$queryRaw<{ run_after: Date | null }[]>`
+    SELECT min(j.run_after) AS run_after FROM supplier_jobs j JOIN supplier_bookings b ON b.id = j.supplier_booking_id
+    WHERE j.status = 'queued' AND j.kind = 'poll' AND b.external_route IS TRUE
+      AND b.supplier_id = ${supplierId}::uuid AND b.environment = ${environment}::supplier_environment
+      AND (${account}::text IS NULL OR b.account_id = ${account})
+      AND (b.state = 'awaiting_external' OR (b.state = 'reserved' AND b.error_code = ${EXTERNAL_HOLD_IN_PROGRESS_CODE}))
+      AND j.run_after >= ${new Date(t.getTime() - 60_000)}`;
+  return rows[0]?.run_after ?? null;
+}
+
 interface NextJob {
   kind: string;
   runAfter: Date;
@@ -546,9 +590,17 @@ interface WalletEvidence {
  * Amounts come from the supplier's figures only, in AED minor units.
  */
 async function recordWallet(tx: Tx, b: SupplierBooking, w: WalletEvidence) {
-  const phase = walletPhaseOf(b.state);
-  if (!phase) return;
+  let phase = walletPhaseOf(b.state);
+  // Doc 29 Batch 6 (review 89 B6-05): an external booking the supplier failed after a recorded charge is given back
+  // like a release, so its refund figure is written when an answer carries one. Without a charge it records nothing.
+  const externalRejected = !phase && b.state === "rejected" && b.externalRoute === true;
+  if (!phase && !externalRejected) return;
   const recorded = await tx.ledgerEntry.findMany({ where: { book: SUPPLIER_WALLET_BOOK, supplierBookingId: b.id }, select: { kind: true, amountMinor: true } });
+  if (externalRejected) {
+    if (!recorded.some((e) => e.kind === "charged")) return;
+    phase = "released";
+  }
+  if (!phase) return;
   const entries = walletEntriesFor({ phase, snapshot: w.snapshot, recorded });
   // The environment and account are in the reference: the book has no column for them, and sandbox money is not real.
   const evidenceRef = `${w.supplierCode}.${b.environment}.${b.accountId}:booking:${w.snapshot.ref}:status:${w.snapshot.rawStatus}`;
@@ -635,11 +687,16 @@ type SendByFields = Pick<SupplierBooking, "reservationDeadline"> & Partial<Pick<
  * `EXTERNAL_MIN_HOLD_MS` from the reserve answer to the deadline, or of
  * unknown length) has no send-by either, so no confirm is ever queued or sent
  * for it and the payment saga releases it at once (an unknown send-by never
- * captures).
+ * captures; a capture-first gateway refunds instead).
  */
 export function confirmSendBy(b: SendByFields, deps: Pick<EngineDeps, "mutationTimeoutMs">) {
   if (!b.reservationDeadline) return null;
-  if (b.externalRoute === true && !externalHoldUsable(b.reservedAt ?? null, b.reservationDeadline)) return null;
+  if (b.externalRoute === true) {
+    // Owner decision, 24 Nov 2026 (doc 29 §8.7): short provider holds may sell. The send-by is the deadline less
+    // `EXTERNAL_CONFIRM_MARGIN_MS`, for a hold whose known length covers capture and confirm (`externalHoldUsable`).
+    if (!externalHoldUsable(b.reservedAt ?? null, b.reservationDeadline)) return null;
+    return new Date(b.reservationDeadline.getTime() - EXTERNAL_CONFIRM_MARGIN_MS);
+  }
   return new Date(b.reservationDeadline.getTime() - confirmBudgetMs(deps));
 }
 
@@ -779,7 +836,7 @@ function expectedFrom(b: SupplierBooking): ExpectedBooking {
 }
 
 function refOf(b: SupplierBooking): SupplierRef {
-  return { supplierBookingId: b.supplierBookingId!, serviceDate: isoDate(b.serviceDate), offerExternalId: b.offerExternalId };
+  return { supplierBookingId: b.supplierBookingId!, serviceDate: isoDate(b.serviceDate), offerExternalId: b.offerExternalId, ...(b.externalRoute === true ? { externalRoute: true } : {}) };
 }
 
 /**
@@ -1118,7 +1175,8 @@ export type ReconcileIssueKind =
   | "amount_mismatch" // charged amount differs from what we recorded
   | "found_by_reference" // a booking we closed in a guard-releasing state is live at the supplier (re-blocked)
   | "uncertain_state" // a row we are unsure about, or that waits for a human, is found at the supplier
-  | "unknown_to_outly"; // a supplier booking carries our reference prefix but no row of ours
+  | "unknown_to_outly" // a supplier booking carries our reference prefix but no row of ours
+  | "refund_not_seen"; // doc 29 Batch 6: an external booking the supplier failed, listed without a refund of its charge
 
 export interface ReconcileIssue {
   kind: ReconcileIssueKind;
@@ -1174,9 +1232,16 @@ const UNCERTAIN: SupplierBookingState[] = [...RECOVERING, "manual_review", "rese
  * the supplier shows live (anything but cancelled or expired). Its order item
  * may already be free for a second attempt, so it is re-blocked.
  */
-function lateAcceptance(b: Pick<SupplierBooking, "state">, t: Pick<SupplierSnapshot, "status">) {
-  // A booking the external supplier failed (REJECTED, doc 29 Batch 6) is as ended as a cancelled or expired one.
-  return (GUARD_RELEASING_STATES as readonly SupplierBookingState[]).includes(b.state) && t.status !== "CANCELLED" && t.status !== "EXPIRED" && t.status !== "REJECTED";
+function lateAcceptance(b: Pick<SupplierBooking, "state" | "externalRoute">, t: Pick<SupplierSnapshot, "status" | "externalInProgress" | "externalFailed">) {
+  if (!(GUARD_RELEASING_STATES as readonly SupplierBookingState[]).includes(b.state) || t.status === "CANCELLED" || t.status === "EXPIRED" || t.status === "REJECTED") return false;
+  // Doc 29 Batch 6: the window list reads every row with the Batch 0–5 mapping, so an external-route booking the
+  // supplier failed is recognised on its own flags; it is as ended as a cancelled or expired one.
+  return !(b.externalRoute === true && externalFailedSnapshot(t));
+}
+
+/** The external confirmation finished and failed (TravelDesk's documented rejection, doc 29 Batch 6). */
+function externalFailedSnapshot(t: Pick<SupplierSnapshot, "externalInProgress" | "externalFailed">) {
+  return t.externalInProgress === false && t.externalFailed === true;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1394,12 +1459,31 @@ export const WALLET_DIRECTION_PAUSE_REASON = "wallet_direction_auto";
 const OPEN_HOLD_STATES: SupplierBookingState[] = ["reserving", "reserved", "awaiting_payment", "confirming"];
 
 /** Outly's own open holds on the booking's supplier account, other than the booking itself. */
-async function openHoldsMinor(b: Pick<SupplierBooking, "id" | "supplierId" | "environment" | "accountId">): Promise<bigint> {
-  const rows = await prisma.supplierBooking.findMany({
-    where: { supplierId: b.supplierId, environment: b.environment, accountId: b.accountId, state: { in: OPEN_HOLD_STATES }, id: { not: b.id } },
-    select: { expectedNetMinor: true, chargedNetMinor: true },
+export async function openHoldsMinor(b: Pick<SupplierBooking, "id" | "supplierId" | "environment" | "accountId">, now: Date = new Date()): Promise<bigint> {
+  const scope = { supplierId: b.supplierId, environment: b.environment, accountId: b.accountId, id: { not: b.id } };
+  const rows = await prisma.supplierBooking.findMany({ where: { ...scope, state: { in: OPEN_HOLD_STATES } }, select: { expectedNetMinor: true, chargedNetMinor: true } });
+  const held = rows.reduce((sum, x) => sum + (x.chargedNetMinor !== null && x.chargedNetMinor > x.expectedNetMinor ? x.chargedNetMinor : x.expectedNetMinor), 0n);
+  return held + (await failedExternalHeldMinor(scope, now));
+}
+
+/**
+ * Doc 29 Batch 6 (review 89 B6-05, B6-14): what failed external bookings may
+ * still tie up in the wallet. A `rejected` external-route booking closed in
+ * the last `EXTERNAL_REJECTED_HELD_MS` (keyed on `closed_at`, set once when it
+ * was rejected, so a later write does not restart it) counts with its
+ * recorded charge less what the book shows refunded; a partial refund lowers
+ * it by the refunded amount only. From the wallet book, never from a price.
+ */
+async function failedExternalHeldMinor(scope: { supplierId: string; environment: SupplierEnvironment; accountId: string; id: { not: string } }, now: Date): Promise<bigint> {
+  const failed = await prisma.supplierBooking.findMany({
+    where: { ...scope, state: "rejected", externalRoute: true, closedAt: { gt: new Date(now.getTime() - EXTERNAL_REJECTED_HELD_MS) }, ledgerEntries: { some: { book: SUPPLIER_WALLET_BOOK, kind: "charged" } } },
+    select: { ledgerEntries: { where: { book: SUPPLIER_WALLET_BOOK }, select: { amountMinor: true } } },
   });
-  return rows.reduce((sum, x) => sum + (x.chargedNetMinor !== null && x.chargedNetMinor > x.expectedNetMinor ? x.chargedNetMinor : x.expectedNetMinor), 0n);
+  // Entries are signed: charges negative, refunds positive. What is still out is minus their sum.
+  return failed.reduce((sum, x) => {
+    const out = -x.ledgerEntries.reduce((a, e) => a + e.amountMinor, 0n);
+    return out > 0n ? sum + out : sum;
+  }, 0n);
 }
 
 /**
@@ -1511,6 +1595,7 @@ export const supplierBookingService = {
     const byRef = new Map(theirs.filter((t) => t.bookingReference).map((t) => [t.bookingReference!, t]));
     const issues: ReconcileIssue[] = [];
     const lateAccepted: { b: SupplierBooking; t: SupplierSnapshot }[] = [];
+    const failedAfterConfirm: SupplierBooking[] = [];
     const matched = new Set<string>();
     const issue = (kind: ReconcileIssueKind, b: SupplierBooking | null, t: SupplierSnapshot | null) =>
       issues.push({ kind, bookingId: b?.id ?? null, supplierBookingId: t?.ref ?? b?.supplierBookingId ?? null, reference: t?.bookingReference ?? b?.clientRef ?? null, ours: b?.state ?? null, theirs: t?.status ?? null });
@@ -1528,7 +1613,19 @@ export const supplierBookingService = {
         lateAccepted.push({ b, t });
         continue;
       }
+      // Doc 29 Batch 6 (review 89 B6-05): a failed external booking that was charged must show the money back.
+      if (b.state === "rejected" && b.externalRoute === true && t.chargedNetMinor !== null && t.chargedNetMinor > 0n) {
+        const back = (t as SupplierSnapshot & SupplierRefundFigure).refundedNetMinor ?? null;
+        if (back === null || back < t.chargedNetMinor) issue("refund_not_seen", b, t);
+      }
       if (b.state === "not_created" || b.state === "rejected") continue;
+      // Review 89 B6-18: the window list reads every row with the Batch 0–5 mapping, so a confirmed external booking
+      // the provider later failed (or reopened) is found on its own flags. Reported and told to our team; no money moves.
+      if (b.state === "confirmed" && b.externalRoute === true && (externalFailedSnapshot(t) || t.externalInProgress === true)) {
+        issue("status_mismatch", b, t);
+        failedAfterConfirm.push(b);
+        continue;
+      }
       if (UNCERTAIN.includes(b.state)) {
         issue("uncertain_state", b, t);
         continue;
@@ -1564,6 +1661,15 @@ export const supplierBookingService = {
     const flagged = issues.map((i) => i.bookingId).filter((id): id is string => id !== null);
     const moved = new Set((await prisma.supplierBooking.findMany({ where: { id: { in: flagged }, updatedAt: { gt: readAt } }, select: { id: true } })).map((b) => b.id));
     const settled = issues.filter((i) => !i.bookingId || !moved.has(i.bookingId));
+
+    for (const b of failedAfterConfirm) {
+      if (moved.has(b.id) || b.attentionRequiredAt) continue;
+      const flagged = await prisma.supplierBooking.updateMany({
+        where: { id: b.id, state: "confirmed", attentionRequiredAt: null },
+        data: { attentionRequiredAt: now, errorCode: EXTERNAL_FAILED_AFTER_CONFIRM_CODE, errorMessage: "The external provider shows a confirmed booking as failed or in progress" },
+      });
+      if (flagged.count) await writeEvent(prisma, b.id, "attention", { detail: { via: "reconcile", reason: EXTERNAL_FAILED_AFTER_CONFIRM_CODE } });
+    }
 
     let reblocked = 0;
     for (const { b, t } of lateAccepted) {
@@ -1988,7 +2094,7 @@ export const supplierBookingService = {
    * `mutationTimeoutMs + 30 s` of it left; the caller sets it so that point
    * stays inside the function's `maxDuration`.
    */
-  async runDueJobs(deps: EngineDeps, opts: { budgetMs: number; maxJobs?: number; mutationBudgetMs?: number }) {
+  async runDueJobs(deps: EngineDeps, opts: { budgetMs: number; maxJobs?: number; mutationBudgetMs?: number; externalPollWaits?: number }) {
     const now = deps.now ?? (() => new Date());
     const holder = deps.holder ?? `worker-${uuidv7().slice(-8)}`;
     const mutationMs = deps.mutationTimeoutMs ?? 150_000;
@@ -2006,6 +2112,7 @@ export const supplierBookingService = {
     const full: Deps = { ...deps, holder, mutationTimeoutMs: mutationMs, now, confirmedInRun };
     await this.sweepStuck(full);
     const stranded = await this.flagStrandedAccounts(full, account);
+    let pollWaits = 0;
 
     for (let i = 0; i < (opts.maxJobs ?? 50); i++) {
       const elapsed = Date.now() - started;
@@ -2042,7 +2149,20 @@ export const supplierBookingService = {
         )
         RETURNING id, kind, supplier_booking_id, attempts`;
       const job = claimed[0];
-      if (!job) break;
+      if (!job) {
+        // Doc 29 Batch 6 (owner decision c, external-confirmation.ts rule 1): the scheduled tick runs once a minute,
+        // so it waits here for an external poll due within the poll interval, at most `externalPollWaits` times a run
+        // (up to four reads a minute), and only while the wait fits the run's budget. The reads keep their own
+        // read-budget tokens and their 15 s spacing (never under 10 s) from the queue.
+        if (pollWaits >= (opts.externalPollWaits ?? 0)) break;
+        const due = await nextExternalPollDue(supplier.id, deps.environment, account, t);
+        if (!due) break;
+        const waitMs = Math.max(EXTERNAL_POLL_MIN_MS / 10, due.getTime() - t.getTime());
+        if (waitMs > EXTERNAL_POLL_INTERVAL_MS || Date.now() - started + waitMs + EXTERNAL_POLL_RUN_MARGIN_MS > opts.budgetMs) break;
+        pollWaits++;
+        await (deps.sleep ?? sleepMs)(waitMs);
+        continue;
+      }
       let outcome = "ok";
       try {
         outcome = await this.runJob(job.kind, job.supplier_booking_id!, full);
@@ -2107,7 +2227,13 @@ export const supplierBookingService = {
       if (job.supplier_booking_id) await writeEvent(prisma, job.supplier_booking_id, "alert", { detail: { reason: "mutation_job_failed", jobKind: job.kind } });
       return;
     }
-    const delay = Math.min(RECOVERY_DELAY_MS * 2 ** Math.min(errors - 1, 10), READ_RETRY_MAX_MS);
+    let delay = Math.min(RECOVERY_DELAY_MS * 2 ** Math.min(errors - 1, 10), READ_RETRY_MAX_MS);
+    // Review 89 B6-19: a failing poll of a waiting external booking retries no later than its next time-based alert,
+    // so the hand-off and the at-start alert (decided before the read) are not held back by the error backoff.
+    if (job.kind === "poll" && job.supplier_booking_id) {
+      const due = await this.nextExternalAlertAt(job.supplier_booking_id);
+      if (due) delay = Math.min(delay, Math.max(RECOVERY_DELAY_MS, due.getTime() - deps.now().getTime()));
+    }
     await prisma.supplierJob.updateMany({
       where: { id: job.id, lockedBy: deps.holder },
       data: { status: "queued", attempts: errors, lastError: msg, runAfter: new Date(deps.now().getTime() + delay), lockedBy: null, lockedUntil: null },
@@ -2494,6 +2620,32 @@ export const supplierBookingService = {
   },
 
   /**
+   * Doc 29 Batch 6 (review 89 B6-01): whether the payment that backed this
+   * attempt's confirm (bound on its `request_sent`, `startSend`) is still
+   * captured and has no refund for this item opened or done. Read only for a
+   * booking already waiting on its external supplier, whose confirm went out
+   * under full evidence: a saga flag raised during the wait must not turn the
+   * supplier's late confirmation into an unpaid booking.
+   */
+  async sentEvidenceHolds(b: SupplierBooking): Promise<boolean> {
+    if (!b.orderItemId || (await this.confirmsSent(b.id)) <= 0) return false;
+    const sent = await prisma.supplierBookingEvent.findFirst({
+      where: { supplierBookingId: b.id, kind: "request_sent", operation: OPERATION.confirm },
+      orderBy: { at: "desc" },
+      select: { detail: true },
+    });
+    const paymentId = (sent?.detail as { paymentId?: unknown } | null)?.paymentId;
+    if (typeof paymentId !== "string") return false;
+    const p = await prisma.payment.findUnique({
+      where: { id: paymentId },
+      select: { orderId: true, status: true, capturedAt: true, capturedMinor: true, refundedMinor: true, refunds: { where: { orderItemId: b.orderItemId }, select: { status: true } } },
+    });
+    if (!p || p.orderId !== b.orderId || !p.capturedAt || p.capturedMinor <= p.refundedMinor) return false;
+    if (p.status !== "captured" && p.status !== "partially_refunded") return false;
+    return !p.refunds.some((r) => r.status !== "failed");
+  },
+
+  /**
    * Whether an open supported customer cancellation request names this
    * order-item attempt (B5): `kind = 'supported'`, still `requested`,
    * `cancelling` or `cancel_unverified`. An exception request, a closed one
@@ -2639,6 +2791,11 @@ export const supplierBookingService = {
   async doConfirm(b: SupplierBooking, lease: Lease, deps: Deps) {
     if (!HOLDING.includes(b.state) || !b.supplierBookingId || !deps.adapter.confirm) return `skip:${b.state}`;
     if (b.attentionRequiredAt) return "attention_required";
+    // Doc 29 Batch 6 (review 89 B6-03): never confirm a reservation the external provider is still making.
+    if (b.externalRoute === true && b.errorCode === EXTERNAL_HOLD_IN_PROGRESS_CODE) {
+      await enqueue(prisma, "poll", b.id, new Date(deps.now().getTime() + POLL_INTERVAL_MS), deps.holder);
+      return "reservation_in_progress";
+    }
     // The saga asked for this hold to be released: no confirm follows (B3).
     if (await releaseRequested(prisma, b.id)) return "released";
     if ((await this.confirmsSent(b.id)) > 0) {
@@ -2825,7 +2982,7 @@ export const supplierBookingService = {
       if (r.kind !== "found") throw new Error(`Booking re-read: ${r.kind === "failed" ? r.reason : "not_found"}`);
       found = r.snapshot;
     } else {
-      const r = await deps.adapter.findByClientRef(b.clientRef, { serviceDate: isoDate(b.serviceDate), offerExternalId: b.offerExternalId });
+      const r = await deps.adapter.findByClientRef(b.clientRef, { serviceDate: isoDate(b.serviceDate), offerExternalId: b.offerExternalId, ...(b.externalRoute === true ? { externalRoute: true } : {}) });
       await writeEvent(prisma, b.id, "recovery_search", { operation: "bookings.list", detail: { matches: r.matches.length, complete: r.complete, search: b.recoverySearches + 1 } });
       if (r.matches.length > 1) {
         // Two bookings under one reference: no re-read can settle which one is ours.
@@ -2907,6 +3064,9 @@ export const supplierBookingService = {
   async doPoll(b: SupplierBooking, deps: Deps) {
     if (!b.supplierBookingId) return `skip:${b.state}`;
     if (b.state !== "awaiting_external" && !HOLDING.includes(b.state)) return `skip:${b.state}`;
+    // Doc 29 Batch 6 (review 89 B6-06): the hand-off is decided on time, before the read, so it fires while reads fail.
+    // An internal attempt keeps the Batch 0–5 wait (backoff, `external_confirmation_slow`) exactly (review 89 B6-04).
+    const wait = b.state === "awaiting_external" && b.externalRoute === true ? await this.externalWaitChecks(b, deps) : null;
     const r = await deps.adapter.readStatus(refOf(b));
     if (r.kind === "failed" && r.reason === READ_BUDGET_REASON) return this.awaitReadBudget(b, b.state === "awaiting_external" ? "poll" : "watchdog", deps);
     if (r.kind !== "found") throw new Error(`Booking re-read: ${r.kind === "failed" ? r.reason : "not_found"}`);
@@ -2914,30 +3074,48 @@ export const supplierBookingService = {
     const t = deps.now();
     if (b.state === "awaiting_external") {
       await writeEvent(prisma, b.id, "poll", { operation: "bookings.list", detail: { supplierStatus: s.status, pollCount: b.pollCount + 1 } });
-      if (s.status === "PENDING") {
-        // Doc 29 Batch 6 (external-confirmation.ts): poll every 15 s (never under 10 s) inside the wait limit; at the
-        // limit hand the booking to our team and keep reading, more slowly. Nothing is refunded here: the booking may
-        // still confirm, and money goes back only once the supplier shows it failed or gone.
+      if (s.status === "PENDING" && b.externalRoute !== true) {
         const polls = b.pollCount + 1;
         const since = b.confirmedAt ?? b.reservedAt ?? b.createdAt;
-        const handoffAt = externalHandoffAt({ since, serviceDate: isoDate(b.serviceDate), startMinutes: b.startMinutes });
-        const due = t.getTime() >= handoffAt.getTime();
-        const handOff = due && !b.attentionRequiredAt;
-        await prisma.supplierBooking.updateMany({
-          where: { id: b.id, state: b.state },
-          data: { ...responseData(s), pollCount: polls, ...(handOff ? { attentionRequiredAt: t, errorCode: EXTERNAL_HANDOFF_CODE, errorMessage: "The external supplier has not confirmed within the wait limit" } : {}) },
-        });
-        if (handOff) {
-          await writeEvent(prisma, b.id, "attention", { detail: { reason: EXTERNAL_HANDOFF_CODE, pollCount: polls } });
-          emitEvent("supplier.external_handoff", { supplierBookingId: b.id, pollCount: polls }, "warn");
-        }
-        const interval = externalPollDelayMs(due ? t.getTime() - handoffAt.getTime() : null);
+        const slow = t.getTime() - since.getTime() > LEGACY_EXTERNAL_ATTENTION_MS;
+        await prisma.supplierBooking.updateMany({ where: { id: b.id, state: b.state }, data: { pollCount: polls, ...(slow && !b.attentionRequiredAt ? { attentionRequiredAt: t, errorCode: "external_confirmation_slow" } : {}) } });
+        if (slow && !b.attentionRequiredAt) await writeEvent(prisma, b.id, "attention", { detail: { reason: "external_confirmation_slow", pollCount: polls } });
+        const interval = Math.min(POLL_INTERVAL_MS * 2 ** Math.floor((polls - 1) / 4), LEGACY_POLL_MAX_INTERVAL_MS);
         await enqueue(prisma, "poll", b.id, new Date(t.getTime() + interval), deps.holder);
-        return handOff ? "handed_off" : "still_in_progress";
+        return "still_in_progress";
+      }
+      if (s.status === "PENDING") {
+        // Doc 29 Batch 6 (external-confirmation.ts): poll every 15 s (never under 10 s) inside the wait limit; after the
+        // hand-off keep reading, more slowly. Nothing is refunded here: the booking may still confirm, and money goes
+        // back only once the supplier shows it failed or gone.
+        const polls = b.pollCount + 1;
+        await prisma.supplierBooking.updateMany({ where: { id: b.id, state: b.state }, data: { ...responseData(s), pollCount: polls } });
+        let interval = externalPollDelayMs(wait?.due ? t.getTime() - wait.handoffAt.getTime() : null);
+        // Review 89 B6-17: only the longest-waiting few of the account poll at the fast cadence.
+        if (!wait?.due && !(await this.inFastPollSet(b, t))) interval = Math.max(interval, EXTERNAL_POLL_SLOW_MS);
+        await enqueue(prisma, "poll", b.id, new Date(t.getTime() + interval), deps.holder);
+        return wait?.handedOffNow ? "handed_off" : "still_in_progress";
       }
       return this.applySupplierState(b, s, deps, "poll");
     }
     await writeEvent(prisma, b.id, "poll", { operation: "watchdog", detail: { supplierStatus: s.status } });
+    if (s.status === "ON_HOLD" && b.externalRoute === true && b.errorCode === EXTERNAL_HOLD_IN_PROGRESS_CODE) {
+      // Doc 29 Batch 6 (review 89 B6-03): the provider finished the reservation: it becomes a hold like any other.
+      if (s.externalInProgress !== true) return this.applySupplierState(b, s, deps, "poll");
+      const sendBy = confirmSendBy(b, deps);
+      if (!sendBy || t.getTime() >= sendBy.getTime() - EXTERNAL_IN_PROGRESS_RELEASE_LEAD_MS) {
+        // Review 89 B6-15: told like an unusable hold (ops alert, "Send it to our team"); the code outlives the release.
+        await prisma.supplierBooking.updateMany({
+          where: { id: b.id, state: b.state },
+          data: { ...responseData(s), errorCode: EXTERNAL_RESERVATION_RELEASED_CODE, errorMessage: "The external provider was still making the reservation at its release point", attentionRequiredAt: b.attentionRequiredAt ?? t },
+        });
+        await writeEvent(prisma, b.id, "attention", { detail: { reason: EXTERNAL_RESERVATION_RELEASED_CODE } });
+        await this.releaseHold(b.id, EXTERNAL_HOLD_IN_PROGRESS_CODE, { now: deps.now, saga: deps.saga });
+        return "reservation_in_progress_released";
+      }
+      await enqueue(prisma, "poll", b.id, new Date(t.getTime() + POLL_INTERVAL_MS), deps.holder);
+      return "reservation_in_progress";
+    }
     if (s.status === "ON_HOLD") {
       const deadline = this.holdDeadline(b, s, deps);
       if (deadline && (!b.reservationDeadline || deadline < b.reservationDeadline)) await prisma.supplierBooking.updateMany({ where: { id: b.id, state: b.state }, data: { reservationDeadline: deadline } });
@@ -2946,6 +3124,93 @@ export const supplierBookingService = {
       return "still_reserved";
     }
     return this.applySupplierState(b, s, deps, "watchdog");
+  },
+
+  /**
+   * Review 89 B6-19: the next time-based alert of a waiting external-route
+   * booking not raised yet (the hand-off, then the at-start alert), or null.
+   */
+  async nextExternalAlertAt(bookingId: string): Promise<Date | null> {
+    const b = await prisma.supplierBooking.findUnique({ where: { id: bookingId } });
+    if (!b || b.state !== "awaiting_external" || b.externalRoute !== true) return null;
+    const date = isoDate(b.serviceDate);
+    const startMinutes = externalWaitStartMinutes(b.startMinutes, b.pickupTimeMinutes);
+    const pending: number[] = [];
+    for (const [reason, at] of [
+      [EXTERNAL_HANDOFF_CODE, externalHandoffAt({ since: b.confirmedAt ?? b.reservedAt ?? b.createdAt, serviceDate: date, startMinutes }).getTime()],
+      [EXTERNAL_PAST_START_CODE, serviceStartMs(date, startMinutes)],
+    ] as const) {
+      const raised = await prisma.supplierBookingEvent.count({ where: { supplierBookingId: b.id, kind: "attention", detail: { path: ["reason"], equals: reason } } });
+      if (!raised) pending.push(at);
+    }
+    return pending.length ? new Date(Math.min(...pending)) : null;
+  },
+
+  /**
+   * Review 89 B6-17: whether this waiting external booking is among the
+   * `EXTERNAL_FAST_POLL_MAX` longest-waiting ones of its account (earliest
+   * `confirmed_at`, then id), which poll at 15 s. Bookings past their hand-off
+   * (flagged, or waiting longer than the normal limit) poll slowly already and
+   * take no fast place (review 89 B6-22).
+   */
+  async inFastPollSet(b: SupplierBooking, now: Date): Promise<boolean> {
+    const since = b.confirmedAt ?? b.createdAt;
+    const ahead = await prisma.supplierBooking.count({
+      where: {
+        supplierId: b.supplierId,
+        environment: b.environment,
+        accountId: b.accountId,
+        state: "awaiting_external",
+        externalRoute: true,
+        attentionRequiredAt: null,
+        id: { not: b.id },
+        AND: [{ confirmedAt: { gt: new Date(now.getTime() - EXTERNAL_WAIT_LIMIT_MS) } }, { OR: [{ confirmedAt: { lt: since } }, { confirmedAt: since, id: { lt: b.id } }] }],
+      },
+    });
+    return ahead < EXTERNAL_FAST_POLL_MAX;
+  },
+
+  /**
+   * Doc 29 Batch 6 (external-confirmation.ts rule 2; review 89 B6-06, B6-08,
+   * B6-12): the time-based alerts of a booking waiting on its external
+   * supplier, decided before any read. At the wait limit the booking is
+   * handed to our team (attention, `external_confirmation_handoff`), and when
+   * the guest is affected (pickup, else start) while still unconfirmed, our
+   * team is told again (`external_unconfirmed_at_start`). Each is raised once,
+   * deduplicated on its own `attention` event, whatever attention flag the row
+   * already carries (a read dead-letter sets a bare one). The error code is
+   * written unless the row holds another code, so a late-acceptance hold keeps
+   * its own. Moves no money.
+   */
+  async externalWaitChecks(b: SupplierBooking, deps: Deps): Promise<{ handoffAt: Date; due: boolean; handedOffNow: boolean }> {
+    const t = deps.now();
+    const since = b.confirmedAt ?? b.reservedAt ?? b.createdAt;
+    const date = isoDate(b.serviceDate);
+    const startMinutes = externalWaitStartMinutes(b.startMinutes, b.pickupTimeMinutes);
+    const handoffAt = externalHandoffAt({ since, serviceDate: date, startMinutes });
+    const due = t.getTime() >= handoffAt.getTime();
+    const raised = async (reason: string) =>
+      (await prisma.supplierBookingEvent.count({ where: { supplierBookingId: b.id, kind: "attention", detail: { path: ["reason"], equals: reason } } })) > 0;
+    const raise = async (reason: string, message: string) => {
+      const replaceable = b.errorCode === null || b.errorCode === EXTERNAL_HANDOFF_CODE || b.errorCode === EXTERNAL_PAST_START_CODE;
+      await prisma.supplierBooking.updateMany({
+        where: { id: b.id, state: b.state },
+        data: { attentionRequiredAt: b.attentionRequiredAt ?? t, ...(replaceable ? { errorCode: reason, errorMessage: message } : {}) },
+      });
+      await writeEvent(prisma, b.id, "attention", { detail: { reason, pollCount: b.pollCount } });
+      b = { ...b, attentionRequiredAt: b.attentionRequiredAt ?? t, ...(replaceable ? { errorCode: reason, errorMessage: message } : {}) };
+    };
+    let handedOffNow = false;
+    if (due && !(await raised(EXTERNAL_HANDOFF_CODE))) {
+      await raise(EXTERNAL_HANDOFF_CODE, "The external supplier has not confirmed within the wait limit");
+      emitEvent("supplier.external_handoff", { supplierBookingId: b.id, pollCount: b.pollCount }, "warn");
+      handedOffNow = true;
+    }
+    if (t.getTime() >= serviceStartMs(date, startMinutes) && !(await raised(EXTERNAL_PAST_START_CODE))) {
+      await raise(EXTERNAL_PAST_START_CODE, "The external supplier has not confirmed by the time the guest is affected");
+      emitEvent("supplier.external_past_start", { supplierBookingId: b.id, pollCount: b.pollCount }, "error");
+    }
+    return { handoffAt, due, handedOffNow };
   },
 
   /**
@@ -3033,6 +3298,16 @@ export const supplierBookingService = {
     return n > 0;
   },
 
+  /** The capability class key of a booking's stored offer (doc 29 Batch 7); null when not stored, unreadable, or the read fails (B7-17). */
+  async storedClassKey(b: Pick<SupplierBooking, "supplierId" | "environment" | "offerExternalId">): Promise<string | null> {
+    return storedOfferClassKey(() =>
+      prisma.supplierCatalogueItem.findUnique({
+        where: { supplierId_environment_kind_externalId: { supplierId: b.supplierId, environment: b.environment, kind: "offer", externalId: b.offerExternalId } },
+        select: { payload: true },
+      }),
+    );
+  },
+
   /** Keep a booking blocking in outcome_unknown with attention set, and queue a re-read with backoff — in one transaction. */
   async holdForReread(b: SupplierBooking, s: SupplierSnapshot, deps: Deps, error: { errorCode: string; errorMessage: string }, detail: Record<string, unknown>) {
     const t = deps.now();
@@ -3066,18 +3341,33 @@ export const supplierBookingService = {
       return moved ? "manual_review" : "lost_race";
     }
     // PAY-1: a customer booking is never confirmed without captured payment, whatever the supplier reports.
-    if ((to === "confirmed" || to === "awaiting_external") && needsPayment(b) && !(await this.paymentEvidence(b, deps))) return this.holdUnpaid(b, s, deps, via);
+    // Doc 29 Batch 6 (review 89 B6-01, B6-13): an external booking whose confirm was sent under evidence (waiting on its
+    // supplier, or in recovery after a lost confirm answer) has its late answer accepted while the payment that backed
+    // that confirm is still captured and not refunded, whatever flag the saga has raised meanwhile.
+    // Review 89 B6-13: whatever state the answer finds it in (a lost or timed-out confirm leaves it in recovery).
+    if ((to === "confirmed" || to === "awaiting_external") && needsPayment(b) && !(await this.paymentEvidence(b, deps)) && !(b.externalRoute === true && (await this.sentEvidenceHolds(b)))) {
+      return this.holdUnpaid(b, s, deps, via);
+    }
     if (to === "confirmed") {
       const verdict = isConfirmedSnapshot(expectedFrom(b), s);
       if (!verdict.confirmed) return this.holdUnconfirmed(b, s, verdict.reasons, deps, via);
     }
-    if (to === "reserved" && needsPayment(b)) to = "awaiting_payment";
+    // Doc 29 Batch 6 (review 89 B6-03): an external reservation still being made by the provider is no usable hold
+    // yet: it stays `reserved` (the saga does not capture it), no confirm is sent, and it is re-read every 15 s.
+    const reservationInProgress = to === "reserved" && b.externalRoute === true && s.externalInProgress === true;
+    if (to === "reserved" && needsPayment(b) && !reservationInProgress) to = "awaiting_payment";
     const t = deps.now();
     const holding = HOLDING.includes(to);
     let problem = attention ?? null;
     // A reservation's amount must match what we asked for (shared tolerance); otherwise it is held for a human.
     if (holding && !problem && (s.chargedNetMinor === null || !withinChargeTolerance(s.chargedNetMinor, b.expectedNetMinor))) {
       problem = { errorCode: "charged_amount_mismatch", errorMessage: `charged ${s.chargedNetMinor ?? "none"} vs expected ${b.expectedNetMinor}` };
+    }
+    // Doc 29 Batch 7 (review 92 B7-12; lead decision 24 Nov 2026): a date-only booking whose reservation names another
+    // slot than the one sent waits for a human the same way. Only date-only bookings: Batch 0-6 bookings are never held by
+    // it (the reserve echo is unproven), and the offer is read only when the ids differ.
+    if (holding && !problem && reservationSlotDiffers(b.timeSlotId, s) && reservationSlotHeld(await this.storedClassKey(b), b.timeSlotId, s)) {
+      problem = { errorCode: RESERVATION_SLOT_MISMATCH_CODE, errorMessage: `reserved slot ${s.timeSlotId} vs sent ${b.timeSlotId}` };
     }
     const deadline = holding ? this.holdDeadline(b, s, deps) : null;
     // Doc 29 Batch 6: an external hold too short to confirm safely, or of unknown length, is never confirmed (its send-by
@@ -3093,10 +3383,13 @@ export const supplierBookingService = {
       if ((await this.confirmsSent(b.id)) > 0) problem = failed;
       else note = failed;
     }
-    // The unusable-hold code outlives the release that follows, so the ops alert still sees it.
-    const kept = b.errorCode === EXTERNAL_HOLD_UNUSABLE_CODE ? { errorCode: b.errorCode, errorMessage: b.errorMessage ?? "" } : null;
+    if (reservationInProgress && !problem) note = { errorCode: EXTERNAL_HOLD_IN_PROGRESS_CODE, errorMessage: "The external provider is still making the reservation" };
+    // The unusable-hold and released-reservation codes outlive the release that follows, so the ops alert and the
+    // status page still see them.
+    const kept = b.errorCode !== null && EXTERNAL_RELEASE_CODES.includes(b.errorCode) ? { errorCode: b.errorCode, errorMessage: b.errorMessage ?? "" } : null;
     const lateHeld = !problem && b.attentionRequiredAt !== null && (await this.wasLateAccepted(b.id));
-    const code = problem ?? note ?? kept;
+    // A kept release code wins over a note (a re-read of a released reservation still in progress keeps it).
+    const code = problem ?? kept ?? note;
     const extra: Prisma.SupplierBookingUpdateManyMutationInput = lateHeld ? { ...responseData(s) } : { ...responseData(s), errorCode: code?.errorCode ?? null, errorMessage: code?.errorMessage ?? null };
     if (problem) extra.attentionRequiredAt = b.attentionRequiredAt ?? t;
     else if (!lateHeld && (holding || to === "confirmed" || to === "awaiting_external")) extra.attentionRequiredAt = null;
@@ -3111,10 +3404,13 @@ export const supplierBookingService = {
     if (holding) {
       // SUP-2: every reservation gets a watchdog at its deadline, whatever else follows it.
       next.push(watchdogJob({ reservationDeadline: deadline }, t));
-      if (!problem && !lateHeld) {
-        if (to === "reserved" && b.afterReserve === "confirm") next.push(confirmJob({ reservationDeadline: deadline }, t, deps));
+      // B6-11: the send-by of the queued confirm knows the route and the hold's start.
+      const sendByOf = { reservationDeadline: deadline, externalRoute: b.externalRoute, reservedAt: b.reservedAt ?? t };
+      if (reservationInProgress && !problem && !lateHeld) next.push({ kind: "poll", runAfter: new Date(t.getTime() + POLL_INTERVAL_MS) });
+      else if (!problem && !lateHeld) {
+        if (to === "reserved" && b.afterReserve === "confirm") next.push(confirmJob(sendByOf, t, deps));
         else if (to === "reserved" && b.afterReserve === "cancel") next.push({ kind: "cancel", runAfter: t });
-        else if (to === "awaiting_payment" && !(await releaseRequested(prisma, b.id)) && (await this.paymentEvidence(b, deps))) next.push(confirmJob({ reservationDeadline: deadline }, t, deps));
+        else if (to === "awaiting_payment" && !(await releaseRequested(prisma, b.id)) && (await this.paymentEvidence(b, deps))) next.push(confirmJob(sendByOf, t, deps));
       }
     }
     if (to === "awaiting_external") next.push({ kind: "poll", runAfter: new Date(t.getTime() + POLL_INTERVAL_MS) });

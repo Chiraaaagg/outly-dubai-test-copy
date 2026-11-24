@@ -2,10 +2,10 @@ import { describe, expect, it } from "vitest";
 import { BitrixRestClient } from "@/server/crm/bitrix.client";
 import type { CrmScope } from "@/server/crm/crm.config";
 import { originIdFor, type CrmSubject, type CrmSubjectState } from "@/server/crm/crm.mapping";
-import { BREAKER_THRESHOLD, CREATE_SETTLE_MS, pacedLimiter, runCrmWorker } from "@/server/crm/crm.worker";
+import { assertDeleteTarget, BREAKER_THRESHOLD, CREATE_SETTLE_MS, pacedLimiter, runCrmWorker, SWITCH_ON_SLACK_MS } from "@/server/crm/crm.worker";
 import { CRM_DEFERRED_VERSION } from "@/server/crm/crm.outbox";
 import { FakeBitrix24 } from "./_bitrix-fake";
-import { FAKE_HOST, FAKE_SECRET, FAKE_USER, FakeClock, MemoryCrmStore, StateBook, directOrderState, fakeConfig, inquiryState, subjectId } from "./_memory-store";
+import { FAKE_HOST, FAKE_OWNER, FAKE_SECRET, FAKE_SITE, FAKE_USER, FakeClock, MemoryCrmStore, StateBook, TEST_CONTACT, directOrderState, fakeConfig, fieldCode, inquiryState, subjectId } from "./_memory-store";
 
 /**
  * The CRM outbox worker against the fake Bitrix24 portal and the in-memory
@@ -60,7 +60,7 @@ function harness(opts: { fakeHost?: string } = {}) {
 const inquiry = (): CrmSubject => ({ type: "inquiry", id: subjectId() });
 
 describe("CRM worker: deal push on the fake portal", () => {
-  it("creates one deal in the OUTLYY funnel with no contact and no personal data", async () => {
+  it("creates one deal in the OUTLYY funnel with no Contact record; customer details only in their own deal fields", async () => {
     const h = harness();
     const s = inquiry();
     h.put(inquiryState(s.id));
@@ -75,6 +75,34 @@ describe("CRM worker: deal push on the fake portal", () => {
     expect(h.fake.calls.map((c) => c.method)).toEqual(["crm.item.list", "crm.item.add", "crm.item.productrow.set"]);
     expect(h.fake.refusedMethods).toEqual([]);
     expect(h.store.link(h.scope, s)).toMatchObject({ state: "active", pushedVersion: 1n });
+    // C2a: the OUTLYY fields, the default owner on create, and the customer's details on the deal only.
+    expect(deals[0]).toMatchObject({
+      assignedById: Number(FAKE_OWNER),
+      [fieldCode("reference")]: "INQ-1048213",
+      [fieldCode("environment")]: "staging",
+      [fieldCode("admin_link")]: `${FAKE_SITE}/admin/inquiries/${s.id}`,
+      [fieldCode("customer_name")]: TEST_CONTACT.name,
+      [fieldCode("customer_phone")]: TEST_CONTACT.phone,
+      [fieldCode("customer_email")]: TEST_CONTACT.email,
+      [fieldCode("as_of")]: expect.stringMatching(/^2026-11-22T08:00:0\d\+00:00$/),
+    });
+    const elsewhere = JSON.stringify({ title: deals[0].title, rows: deals[0].productRows });
+    expect(elsewhere).not.toContain(TEST_CONTACT.name);
+    expect(elsewhere).not.toContain(TEST_CONTACT.phone);
+  });
+
+  it("the default owner is set on create only: a reassignment on the portal is kept by later pushes", async () => {
+    const h = harness();
+    const s = inquiry();
+    h.put(inquiryState(s.id));
+    await h.run();
+    const deal = h.fake.dealsFor(originIdFor(s))[0];
+    expect(deal.assignedById).toBe(Number(FAKE_OWNER));
+    deal.assignedById = 31; // the sales lead hands it on
+    h.put(inquiryState(s.id, { status: "contacted" }));
+    h.clock.advance(1_000);
+    await h.run();
+    expect(h.fake.dealsFor(originIdFor(s))[0]).toMatchObject({ assignedById: 31, stageId: "C7:CONTACTED" });
   });
 
   it("paces calls at one a second per portal and never trips the portal's own limit", async () => {
@@ -235,6 +263,45 @@ describe("CRM worker: deal push on the fake portal", () => {
     expect(h.store.link(h.scope, s)).toMatchObject({ state: "active", pushedVersion: 1n });
   });
 
+  it("a create that never landed, then the subject turned spam: no deal is ever created (C2A-09)", async () => {
+    const h = harness();
+    const s = inquiry();
+    h.put(inquiryState(s.id));
+    // The search answers; the add fails at the network, so the link stays `creating` with nothing on the portal.
+    h.fake.script = [];
+    const real = h.fake.fetch;
+    let calls = 0;
+    const port = new BitrixRestClient(h.config, {
+      fetchImpl: async (url, init) => {
+        calls += 1;
+        if (calls === 2) h.fake.script = ["network"];
+        return real(url, init);
+      },
+      now: h.clock.ms,
+    });
+    const deps = {
+      config: h.config,
+      store: h.store,
+      port,
+      loadState: h.book.load,
+      limiter: pacedLimiter({ minIntervalMs: 1_000, maxPerRun: 12, now: h.clock.ms, sleep: h.clock.sleep }),
+      now: h.clock.now,
+      random: () => 0.5,
+    };
+    await runCrmWorker({ ...deps, holder: "w1" });
+    expect(h.store.link(h.scope, s)).toMatchObject({ state: "creating", crmId: null });
+    h.put(inquiryState(s.id, { status: "spam" }));
+    h.clock.advance(2 * CREATE_SETTLE_MS);
+    for (let i = 0; i < 5; i++) {
+      await runCrmWorker({ ...deps, holder: `w${i + 2}` });
+      h.clock.advance(5 * 60_000);
+    }
+    expect(h.fake.dealsFor(originIdFor(s))).toHaveLength(0);
+    expect(h.fake.callsOf("crm.item.add").filter((c) => c.outcome === "ok")).toHaveLength(0);
+    expect(h.store.link(h.scope, s)).toMatchObject({ state: "pending", crmId: null, creatingSince: null });
+    expect(h.store.rows.some((r) => r.outcome === "not_created")).toBe(true);
+  });
+
   it("a create that may not have reached the portal waits the settle delay before creating", async () => {
     const h = harness();
     const s = inquiry();
@@ -307,6 +374,109 @@ describe("CRM worker: deal push on the fake portal", () => {
     await h.run();
     expect(h.fake.dealsFor(originIdFor(s))).toHaveLength(0);
     expect(h.store.link(h.scope, s)?.state).toBe("deleted");
+  });
+
+  it("a delete never touches a deal OUTLYY did not create: a hand-made deal and another environment's deal survive", async () => {
+    const h = harness();
+    const s = inquiry();
+    h.put(inquiryState(s.id));
+    await h.run();
+    const manual = h.fake.seedDeal({ originId: null, originatorId: null, title: "made by hand" });
+    // Review C2A-14 (b): deals that share the subject's originId but are not OUTLYY's in this environment and funnel.
+    const prod = h.fake.seedDeal({ originId: originIdFor(s), originatorId: "outlyy-production" });
+    const untagged = h.fake.seedDeal({ originId: originIdFor(s), originatorId: null, title: "copied by hand" });
+    const otherFunnel = h.fake.seedDeal({ originId: originIdFor(s), originatorId: "outlyy-staging", categoryId: 0, stageId: "C0:NEW" });
+    const ours = h.fake.dealsFor(originIdFor(s)).find((d) => d.categoryId === 7 && d.originatorId === "outlyy-staging")!;
+    h.store.enqueue(h.scope, s, "delete", "erasure");
+    h.clock.advance(1_000);
+    await h.run();
+    expect(h.fake.deals.has(ours.id)).toBe(false);
+    expect(h.fake.dealsFor(originIdFor(s)).map((d) => d.id).sort((a, b) => a - b)).toEqual([prod.id, untagged.id, otherFunnel.id].sort((a, b) => a - b));
+    expect(h.fake.deals.has(manual.id)).toBe(true);
+    expect(h.fake.callsOf("crm.item.delete")).toHaveLength(1);
+  });
+
+  it("erasure deletes the linked deal even after staff cleared its originId, but only while it is in the OUTLYY funnel", async () => {
+    const h = harness();
+    const [a, b] = [inquiry(), inquiry()];
+    h.put(inquiryState(a.id));
+    h.put(inquiryState(b.id));
+    await h.run();
+    const da = h.fake.dealsFor(originIdFor(a))[0];
+    const db = h.fake.dealsFor(originIdFor(b))[0];
+    da.originId = null;
+    db.originId = null;
+    db.categoryId = 9; // moved out of the OUTLYY funnel: not the service account's to delete
+    h.store.enqueue(h.scope, a, "delete", "erasure");
+    h.store.enqueue(h.scope, b, "delete", "erasure");
+    h.clock.advance(1_000);
+    await h.run();
+    expect(h.fake.deals.has(da.id)).toBe(false);
+    expect(h.fake.deals.has(db.id)).toBe(true);
+    expect(h.store.link(h.scope, a)).toMatchObject({ state: "deleted", deleteReason: "erasure" });
+    // C2A-08: the deal still holds personal data somewhere the sync cannot see: tombstoned, dead-lettered, error event.
+    expect(h.store.rows.filter((r) => r.kind === "delete").map((r) => [r.outcome, r.lastErrorCode])).toEqual([
+      ["deleted", null],
+      ["dead", "refused:linked_deal_not_visible"],
+    ]);
+    expect(h.store.link(h.scope, b)).toMatchObject({ state: "deleted", deleteReason: "erasure" });
+    expect(h.events.find((e) => e.name === "crm.erasure_unverified")?.fields).toEqual({ entityType: "inquiry", entityId: b.id, reason: "erasure" });
+    expect(h.events.some((e) => e.name === "crm.dead_letter" && e.fields.reason === "refused:linked_deal_not_visible")).toBe(true);
+  });
+
+  it("the delete guard: only a deal in the OUTLYY funnel that is this link's record or carries its originator and originId", () => {
+    const cfg = fakeConfig();
+    const link = { crmId: 101n, originatorId: "outlyy-staging", originId: "inq:00000000-0000-7000-8000-000000000001" };
+    const deal = { id: 101, originatorId: "outlyy-staging", originId: link.originId, categoryId: 7, updatedBy: 17 };
+    expect(() => assertDeleteTarget(deal, link, cfg)).not.toThrow();
+    expect(() => assertDeleteTarget({ ...deal, originId: null, originatorId: null }, link, cfg)).not.toThrow();
+    expect(() => assertDeleteTarget({ ...deal, id: 102 }, link, cfg)).not.toThrow();
+    const refused = expect.objectContaining({ kind: "refused", code: "refused:delete_target" });
+    expect(() => assertDeleteTarget({ ...deal, categoryId: 0 }, link, cfg)).toThrow(refused);
+    expect(() => assertDeleteTarget({ ...deal, id: 102, originId: null }, link, cfg)).toThrow(refused);
+    expect(() => assertDeleteTarget({ ...deal, id: 102, originatorId: "outlyy-production" }, link, cfg)).toThrow(refused);
+    expect(() => assertDeleteTarget(deal, { ...link, originatorId: "outlyy-production" }, cfg)).toThrow(refused);
+  });
+
+  it("sync off: a subject never linked takes no row and nothing reaches the portal (no backfill)", async () => {
+    const h = harness();
+    const s = inquiry();
+    h.book.set(inquiryState(s.id));
+    expect(h.store.enqueue(h.scope, s, "sync", null, false)).toBeNull();
+    expect(h.store.link(h.scope, s)).toBeUndefined();
+    await h.run();
+    expect(h.fake.calls).toHaveLength(0);
+    // A subject pushed while the sync was on keeps queueing its changes.
+    h.put(inquiryState(s.id));
+    await h.run();
+    expect(h.store.enqueue(h.scope, s, "sync", null, false)).not.toBeNull();
+  });
+
+  it("no backfill: a subject created before switch-on (the first worker run) never gets a new deal", async () => {
+    const h = harness();
+    await h.run(); // switch-on: the first run records the portal
+    h.clock.advance(3 * 86_400_000);
+    const switchOn = h.clock.t - 3 * 86_400_000;
+    const [old, edge, fresh] = [inquiry(), inquiry(), inquiry()];
+    h.put({ ...inquiryState(old.id), createdAt: new Date(switchOn - 86_400_000) });
+    h.put({ ...inquiryState(edge.id), createdAt: new Date(switchOn - SWITCH_ON_SLACK_MS / 2) });
+    h.put({ ...inquiryState(fresh.id), createdAt: new Date(switchOn + 60_000) });
+    await h.run();
+    expect(h.fake.dealsFor(originIdFor(old))).toHaveLength(0);
+    expect(h.fake.dealsFor(originIdFor(edge))).toHaveLength(1);
+    expect(h.fake.dealsFor(originIdFor(fresh))).toHaveLength(1);
+    expect(h.store.rows.find((r) => r.entityId === old.id)?.outcome).toBe("before_switch_on");
+  });
+
+  it("switch-on is the first link when the first worker run comes late: no subject of that window is lost (R-03)", async () => {
+    const h = harness();
+    const s = inquiry();
+    // Switched on at T0: the first inquiry is linked at once, but the cron does not run for half an hour.
+    h.put({ ...inquiryState(s.id), createdAt: new Date(h.clock.t + 60_000) });
+    h.clock.advance(30 * 60_000);
+    await h.run();
+    expect(h.fake.dealsFor(originIdFor(s))).toHaveLength(1);
+    expect(h.store.rows[0].outcome).toBe("pushed");
   });
 
   it("a delete for a subject never pushed writes no row and calls nothing", async () => {
@@ -401,7 +571,7 @@ describe("CRM worker: deal push on the fake portal", () => {
   it("the payload guard refuses personal data before any call and dead-letters at once", async () => {
     const h = harness();
     const s = inquiry();
-    h.put(inquiryState(s.id, { items: [{ title: "Call guest.one@example.test", serviceDate: null }] }));
+    h.put(inquiryState(s.id, { items: [{ title: `Call ${["guest.one", "example.test"].join("@")}`, serviceDate: null }] }));
     const r = await h.run();
     expect(r.dead).toBe(1);
     expect(h.store.rows[0]).toMatchObject({ status: "dead", lastErrorCode: "refused:row_email" });
@@ -440,6 +610,17 @@ describe("CRM worker: deal push on the fake portal", () => {
     await h.run();
     expect(h.fake.dealsFor(originIdFor(o))[0]).toMatchObject({ stageId: "C7:REFUNDED", opportunity: 150 });
     expect(h.fake.dealsFor(originIdFor(o))[0].productRows).toEqual([{ productName: "Burj Khalifa At the Top (2026-12-02)", price: 250, quantity: 1 }]);
+  });
+
+  it("a staff payment in another currency: deal at 0 revenue with its own word, and a warning event (C2A-05)", async () => {
+    const h = harness();
+    const o: CrmSubject = { type: "order", id: subjectId() };
+    const s = directOrderState(o.id, { authorised: true, status: "paid" });
+    s.order!.otherCurrencyPaid = true;
+    h.put(s);
+    await h.run();
+    expect(h.fake.dealsFor(originIdFor(o))[0]).toMatchObject({ opportunity: 0, [fieldCode("payment_status")]: "paid_other_currency" });
+    expect(h.events.find((e) => e.name === "crm.currency_mismatch")?.fields).toEqual({ entityType: "order", entityId: o.id });
   });
 
   it("a single-flight lease: a second worker for the same portal does nothing while the first holds it", async () => {

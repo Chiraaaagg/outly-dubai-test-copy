@@ -90,6 +90,14 @@ export const START_TIMES_TTL_MS = 60_000;
 /** How long past expiry those rows may still be shown, labelled with their time, when a refresh is refused or fails. */
 export const START_TIMES_STALE_MS = 120_000;
 const START_TIMES_MAX_ENTRIES = 500;
+/**
+ * Doc 29 Batch 7 (review 92 B7-07): how long a date-only offer's rows for one
+ * date serve the page. Mostly they give one start for the whole date, which
+ * changes rarely, so they are kept five minutes instead of one; this keeps
+ * date-only pages from drawing down the browse share Batch 2's listed starts
+ * use. The page labels the answer with its time; the quote never uses it.
+ */
+export const DATE_ONLY_START_TIMES_TTL_MS = 5 * 60_000;
 
 /**
  * The public start-times read for one mapping and date (doc 29 Batch 2).
@@ -98,11 +106,13 @@ const START_TIMES_MAX_ENTRIES = 500;
  * recent answer is cached; the other two as for a quote. Never a price.
  */
 export type StartTimesResult =
-  | { ok: true; times: ListedStart[]; checkedAt: string; stale: boolean }
+  /** `dateOnlyStart` (doc 29 Batch 7): the date has one start; `times` is then empty and the page shows the start, when real, as text. */
+  | { ok: true; times: ListedStart[]; checkedAt: string; stale: boolean; dateOnlyStart?: { startsAt: string | null; status: ListedStart["status"] } }
   | { ok: false; reason: "not_listed" | "busy" | "supplier_unavailable" | "availability_unknown" };
 
 export interface SupplierStartTimesReader {
-  startTimes(input: { mappingId: string; serviceDate: string }): Promise<StartTimesResult>;
+  /** `dateOnly`: readiness says the mapping sells as date only (Batch 7); without it an offer with no slot is `not_listed`. */
+  startTimes(input: { mappingId: string; serviceDate: string; dateOnly?: boolean }): Promise<StartTimesResult>;
 }
 
 class BrowseBudgetSpent extends Error {}
@@ -128,6 +138,13 @@ export function createSupplierQuoteService(deps: SupplierQuoteDeps): SupplierQuo
   // Start-times rows per supplier, environment, account, offer and date (Batch 2). Browse only: a quote never reads it.
   const startRows = new TtlCache<TravelDeskAvailabilityRow[]>({
     ttlMs: START_TIMES_TTL_MS,
+    staleIfErrorMs: START_TIMES_STALE_MS,
+    maxEntries: START_TIMES_MAX_ENTRIES,
+    now: () => (deps.nowMs ? deps.nowMs() : deps.now().getTime()),
+  });
+  // Batch 7: the same rows for date-only offers, kept longer (`DATE_ONLY_START_TIMES_TTL_MS`).
+  const dateOnlyRows = new TtlCache<TravelDeskAvailabilityRow[]>({
+    ttlMs: DATE_ONLY_START_TIMES_TTL_MS,
     staleIfErrorMs: START_TIMES_STALE_MS,
     maxEntries: START_TIMES_MAX_ENTRIES,
     now: () => (deps.nowMs ? deps.nowMs() : deps.now().getTime()),
@@ -210,7 +227,7 @@ export function createSupplierQuoteService(deps: SupplierQuoteDeps): SupplierQuo
           return withHotel(quoteTickets({ offer, policy, serviceDate: input.serviceDate, units, stock, now: deps.now(), issuesTicketsAtConfirm }));
         }
         const { rows } = await live.source.getAvailability(ref.data.offerId, input.serviceDate, input.serviceDate, { isExternal: ref.data.isExternal });
-        const quoted = withHotel(quoteSlot({ offer, policy, serviceDate: input.serviceDate, slotRef: input.slotRef, units, rows, now: deps.now(), issuesTicketsAtConfirm }));
+        const quoted = withHotel(quoteSlot({ offer, policy, serviceDate: input.serviceDate, slotRef: input.slotRef, units, rows, now: deps.now(), issuesTicketsAtConfirm, dateOnly: input.dateOnly === true }));
         // Doc 29 Batch 6: the checkout says confirmation can take a few minutes for an external supplier's offer.
         return quoted.ok && offer.isExternal ? { ...quoted, externalConfirmation: true } : quoted;
       } catch {
@@ -227,29 +244,37 @@ export function createSupplierQuoteService(deps: SupplierQuoteDeps): SupplierQuo
      * quote read. A spent browse share serves a recent cached answer
      * (`stale`) or `busy`. The caller decides whether the offer's class is
      * switched on; this only refuses an offer that is not wholly "any time".
-     * Doc 29 Batch 7: an offer with no slot metadata reads its starts from the
-     * rows (`dateOnlyStartsOn`) and answers `not_listed` unless they give
-     * several starts.
+     * Doc 29 Batch 7: an offer with no slot metadata, asked with `dateOnly`,
+     * reads its starts from the rows (`dateOnlyStartsOn`, cached for
+     * `DATE_ONLY_START_TIMES_TTL_MS`): several starts are listed, one start
+     * comes back as `dateOnlyStart`, none as `not_listed`.
      */
     async startTimes(input): Promise<StartTimesResult> {
       const a = await approvedOffer(input.mappingId);
       if (!a || a.ref.bookingKind !== "live_book") return { ok: false, reason: "availability_unknown" };
-      // Doc 29 Batch 7: an offer with no slot metadata lists the starts its fresh rows give (several, or none shown).
-      const dateOnly = a.offer.timeSlots.length === 0;
+      // Doc 29 Batch 7: an offer with no slot metadata, whose date-only key readiness allows, lists the starts its rows give.
+      const dateOnly = input.dateOnly === true && a.offer.timeSlots.length === 0;
       if (!dateOnly && listedStartsOn(a.offer, input.serviceDate, [], deps.now()) === null) return { ok: false, reason: "not_listed" };
       const take = deps.takeBrowseReadToken;
       const live = deps.source(a.mapping.environment);
       if (!live || !take) return { ok: false, reason: "supplier_unavailable" };
       const key = `${a.mapping.supplierCode}:${a.mapping.environment}:${live.accountId}:${a.ref.offerId}:${input.serviceDate}`;
       try {
-        const cached = await startRows.get(key, async () => {
+        const cached = await (dateOnly ? dateOnlyRows : startRows).get(key, async () => {
           if (!(await take(a.mapping.supplierCode, a.mapping.environment, live.accountId))) throw new BrowseBudgetSpent();
           const { rows } = await live.source.getAvailability(a.ref.offerId, input.serviceDate, input.serviceDate, { isExternal: a.ref.isExternal });
           return rows;
         });
-        const times = dateOnly ? dateOnlyStartsOn(a.offer, input.serviceDate, cached.value, deps.now()) : listedStartsOn(a.offer, input.serviceDate, cached.value, deps.now());
+        const checkedAt = new Date(cached.fetchedAt).toISOString();
+        if (dateOnly) {
+          const d = dateOnlyStartsOn(a.offer, input.serviceDate, cached.value, deps.now());
+          if (!d) return { ok: false, reason: "not_listed" };
+          if ("single" in d) return { ok: true, times: [], checkedAt, stale: cached.stale, dateOnlyStart: d.single };
+          return { ok: true, times: d.times, checkedAt, stale: cached.stale };
+        }
+        const times = listedStartsOn(a.offer, input.serviceDate, cached.value, deps.now());
         if (!times) return { ok: false, reason: "not_listed" };
-        return { ok: true, times, checkedAt: new Date(cached.fetchedAt).toISOString(), stale: cached.stale };
+        return { ok: true, times, checkedAt, stale: cached.stale };
       } catch (e) {
         return { ok: false, reason: e instanceof BrowseBudgetSpent ? "busy" : "supplier_unavailable" };
       }

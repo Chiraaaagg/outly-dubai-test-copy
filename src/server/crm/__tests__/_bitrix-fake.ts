@@ -1,9 +1,12 @@
 import type { FetchLike } from "@/server/crm/bitrix.client";
+import { CRM_FIELD_KEYS } from "@/server/crm/crm.config";
 
 /**
  * In-process fake Bitrix24 portal for the CRM tests (doc 29 §7.4 "a fake
  * Bitrix24 server"). It answers the five `crm.item.*` methods the client may
- * call, over the inbound-webhook URL shape
+ * call (a list filters on `=id`, `=originatorId`, `=originId` and
+ * `=categoryId`; custom fields are stored as sent), over the inbound-webhook
+ * URL shape
  * `https://<host>/rest/<user>/<secret>/<method>.json`, with the documented
  * answer and error shapes, and refuses everything else. Synthetic data only;
  * nothing leaves the process.
@@ -20,11 +23,27 @@ import type { FetchLike } from "@/server/crm/bitrix.client";
  *    documented non-Enterprise limit): beyond it, 503 QUERY_LIMIT_EXCEEDED,
  *    counted in `bucketRefusals`;
  *  - `seedDeal` puts a record in place, e.g. a twin.
+ *
+ * Field names, stricter than the portal on purpose (review C2A-01): the real
+ * `crm.item.add`/`update` expect camelCase custom field names unless the call
+ * passes `useOriginalUfNames: "Y"`, and silently drop names they do not know.
+ * The fake refuses instead (400 INVALID_ARG_VALUE), so a test sees it: a
+ * `UF_CRM_…` key without the flag, any name that is not a standard deal field,
+ * `assignedById` or one of the portal's configured custom fields (`ufCodes`,
+ * default: the synthetic `UF_CRM_<KEY>` codes of `_memory-store.fieldCode`),
+ * a Date/Time value that is not ISO 8601 with an offset and whole seconds,
+ * and a Yes/No value other than `Y`/`N`.
  */
+
+const STANDARD_FIELDS = new Set(["title", "categoryId", "stageId", "opportunity", "currencyId", "isManualOpportunity", "originatorId", "originId", "assignedById"]);
+const DEFAULT_UF_CODES = CRM_FIELD_KEYS.map((k) => `UF_CRM_${k.toUpperCase()}`);
+const BITRIX_DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/;
 
 export type FakeFailure = "throttle503" | "throttle429" | "server_error" | "reject" | "bad_shape" | "network" | "lose_answer";
 
 export interface FakeDeal {
+  /** OUTLYY custom fields (`UF_CRM_…`) and the responsible person land here as sent. */
+  [field: string]: unknown;
   id: number;
   title: string;
   categoryId: number;
@@ -59,7 +78,24 @@ export class FakeBitrix24 {
   private bucket = 0;
   private bucketAt = 0;
 
-  constructor(private readonly opts: { host: string; userId: string; secret: string; now: () => number }) {}
+  private readonly ufCodes: Set<string>;
+
+  constructor(private readonly opts: { host: string; userId: string; secret: string; now: () => number; ufCodes?: string[] }) {
+    this.ufCodes = new Set(opts.ufCodes ?? DEFAULT_UF_CODES);
+  }
+
+  /** Why a write's fields would not land on the portal as sent, or null. */
+  private fieldProblem(p: Record<string, unknown>): string | null {
+    const fields = (p.fields ?? {}) as Record<string, unknown>;
+    for (const [k, v] of Object.entries(fields)) {
+      if (STANDARD_FIELDS.has(k)) continue;
+      if (!this.ufCodes.has(k)) return `unknown field ${/^[A-Za-z0-9_]{1,60}$/.test(k) ? k : "?"}`;
+      if (p.useOriginalUfNames !== "Y") return `${k} needs useOriginalUfNames=Y`;
+      if ((k.endsWith("_AT") || k.endsWith("_AS_OF")) && v !== "" && !(typeof v === "string" && BITRIX_DATETIME.test(v))) return `${k} is not a Bitrix24 date-time`;
+      if (k.includes("_CONSENT_") && !k.endsWith("_AT") && v !== "Y" && v !== "N") return `${k} is not Y or N`;
+    }
+    return null;
+  }
 
   seedDeal(d: Partial<FakeDeal> & Pick<FakeDeal, "originId">): FakeDeal {
     const deal: FakeDeal = {
@@ -154,18 +190,33 @@ export class FakeBitrix24 {
       case "crm.item.list": {
         const f = (p.filter ?? {}) as Record<string, unknown>;
         const items = [...this.deals.values()]
-          .filter((d) => (f["=originatorId"] === undefined || d.originatorId === f["=originatorId"]) && (f["=originId"] === undefined || d.originId === f["=originId"]) && (f["=categoryId"] === undefined || d.categoryId === f["=categoryId"]))
+          .filter(
+            (d) =>
+              (f["=id"] === undefined || d.id === Number(f["=id"])) &&
+              (f["=originatorId"] === undefined || d.originatorId === f["=originatorId"]) &&
+              (f["=originId"] === undefined || d.originId === f["=originId"]) &&
+              (f["=categoryId"] === undefined || d.categoryId === f["=categoryId"]),
+          )
           .sort((a, b) => a.id - b.id)
-          .map((d) => ({ id: d.id, originatorId: d.originatorId, originId: d.originId, categoryId: d.categoryId, updatedBy: d.updatedBy }));
+          .map((d) => {
+            const base = { id: d.id, originatorId: d.originatorId, originId: d.originId, categoryId: d.categoryId, updatedBy: d.updatedBy };
+            // Custom fields come back only when selected, and under their original codes only with the flag.
+            const uf = ((p.select ?? []) as string[]).filter((k) => this.ufCodes.has(k) && p.useOriginalUfNames === "Y");
+            return { ...base, ...Object.fromEntries(uf.map((k) => [k, d[k] ?? null])) };
+          });
         return { status: 200, body: { result: { items }, total: items.length, time: { start: 0, finish: 0 } } };
       }
       case "crm.item.add": {
-        const fields = p.fields as Omit<FakeDeal, "id" | "updatedBy" | "productRows">;
-        const deal: FakeDeal = { ...fields, id: this.nextId++, updatedBy: Number(this.opts.userId), productRows: [] };
+        const problem = this.fieldProblem(p);
+        if (problem) return { status: 400, body: { error: "INVALID_ARG_VALUE", error_description: problem } };
+        const fields = p.fields as Record<string, unknown>;
+        const deal = { ...fields, id: this.nextId++, updatedBy: Number(this.opts.userId), productRows: [] } as unknown as FakeDeal;
         this.deals.set(deal.id, deal);
         return { status: 200, body: { result: { item: { id: deal.id, title: deal.title, stageId: deal.stageId } } } };
       }
       case "crm.item.update": {
+        const problem = this.fieldProblem(p);
+        if (problem) return { status: 400, body: { error: "INVALID_ARG_VALUE", error_description: problem } };
         const d = this.deals.get(Number(p.id));
         if (!d) return notFound;
         Object.assign(d, p.fields, { updatedBy: Number(this.opts.userId) });

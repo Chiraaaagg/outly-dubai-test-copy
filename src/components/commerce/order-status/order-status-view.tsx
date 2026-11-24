@@ -11,6 +11,7 @@ import type { ReturnHint } from "@/lib/checkout-return";
 import { fetchOrderStatus, OrderRequestError, removeBrowserAccess } from "@/lib/api/order-status";
 import { ticketTypeLine } from "@/lib/ticket-validity";
 import { cn, formatDateLong } from "@/lib/utils";
+import { rememberBookingForInquiry } from "@/lib/inquiry-handoff";
 import { CancellationPanel } from "./cancellation-panel";
 import {
   cartFingerprint,
@@ -290,6 +291,15 @@ export function OrderStatusView({ initial, returnHint = null }: { initial: Custo
             currency={status.currency}
           />
         </MotionConfig>
+
+        {/* Doc 29 Batch 6 (owner decision d): the existing inquiry route, after an external hold too short to book online. */}
+        {status.inquiryHref && (
+          <div className="mx-auto mt-4 flex max-w-md justify-center" data-testid="send-to-team">
+            <ButtonLink href={status.inquiryHref} size="sm" onClick={() => rememberBookingForInquiry(status.reference)}>
+              Send it to our team
+            </ButtonLink>
+          </div>
+        )}
 
         {allDocs.length > 0 && (
           <div

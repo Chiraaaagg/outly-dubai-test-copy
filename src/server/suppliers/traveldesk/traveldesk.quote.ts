@@ -368,6 +368,12 @@ export interface SlotQuoteInput {
   rows: TravelDeskAvailabilityRow[];
   now: Date;
   issuesTicketsAtConfirm: Tristate;
+  /**
+   * Doc 29 Batch 7: the caller's gate allowed this offer's exact date-only key
+   * (`dateOnlySellable`). Only then is an offer with no stored slot quoted
+   * from its rows; without it such an offer is refused as before Batch 7.
+   */
+  dateOnly?: boolean;
 }
 
 /** Live-book offers: pick the exact slot and decide from fresh rows plus stored rules. */
@@ -375,10 +381,10 @@ export function quoteSlot(input: SlotQuoteInput): SupplierQuoteResult {
   const { offer, serviceDate, units, now } = input;
   if (!isOfferedOn(offer.daysOffered, serviceDate)) return refuse("closed");
   if (!paxAllowed(offer, units)) return refuse("unit_rule_failed");
-  // Doc 29 Batch 7: an offer whose metadata lists no slot is quoted from the fresh rows alone. Readiness lets
-  // such an offer reach a quote only when its date-only class key is switched on; before Batch 7 it always
-  // ended `availability_unknown` here (no stored rules for any row).
-  if (offer.timeSlots.length === 0) return quoteDateOnly(input);
+  // Doc 29 Batch 7: an offer whose metadata lists no slot is quoted from the fresh rows alone, and only when the
+  // caller says its date-only key is switched on (review 92 B7-08). Otherwise it goes on below, where it always
+  // ends refused (no stored rules for any row), as before Batch 7.
+  if (offer.timeSlots.length === 0 && input.dateOnly === true) return quoteDateOnly(input);
 
   const wanted = parseSlotRef(input.slotRef);
   if (wanted === "malformed") return refuse("invalid_slot");
@@ -527,23 +533,79 @@ export function dateOnlyStartsFrom(serviceDate: string, rows: readonly TravelDes
 
 /**
  * Latest instant a date-only offer may be booked: 00:00 Asia/Dubai on the
- * service date. Its advance-booking hours are slot metadata
- * (`minimumAdvancedBooking`), which a date-only offer does not have, so the
- * earliest moment the activity could begin is used. TravelDesk's reserve,
- * sent before the card is captured, stays the final check.
+ * service date (owner decision, 24 Nov 2026). Its advance-booking hours are
+ * slot metadata (`minimumAdvancedBooking`), which a date-only offer does not
+ * have, so the earliest moment the activity could begin is used. TravelDesk's
+ * reserve, sent before the card is captured, stays the final check.
  */
 export function dateOnlyCutoffMs(serviceDate: string): number {
   return dubaiInstantMs(serviceDate, 0);
 }
 
 /**
+ * The start a date-only line shows before payment (owner decision c,
+ * 24 Nov 2026): `HH:mm` when the row names a real start time; null for a
+ * row starting 00:00 (a whole-day 00:00 to 23:59 row, or 00:00 to 00:00),
+ * which says nothing about when the activity begins.
+ */
+export function dateOnlyShownStart(startMinutes: number): string | null {
+  return startMinutes > 0 ? minutesToHhmm(startMinutes) : null;
+}
+
+/** Whether every row at one start carries the same price (review 92 B7-01: otherwise which one TravelDesk charges is unknown). */
+function samePrice(rows: readonly TravelDeskAvailabilityRow[]): boolean {
+  const key = (p: TravelDeskNetPrice) =>
+    [p.date, p.perAdultMinor, p.perChildMinor, p.perTripMinor, p.perAdultUsdMinor, p.perChildUsdMinor, p.perTripUsdMinor, [...p.roundedFields].sort().join("+")].join("|");
+  return rows.every((r) => key(r.price) === key(rows[0].price));
+}
+
+/**
+ * Whether a row's price can be charged for this party as a date-only sale
+ * (Batch 7; review 92 B7-05): AED, dated the service date or undated, no
+ * per-trip component (private units and person-plus-unit prices stay
+ * inquiry, owner decision 7), a non-zero price for every category in the
+ * party, and a charge that rounds to a known whole-dirham total. Null when
+ * not; otherwise the charged net.
+ */
+function dateOnlyCharge(offer: StoredOffer, r: TravelDeskAvailabilityRow, serviceDate: string, units: QuoteUnits): bigint | null {
+  const p = r.price;
+  if (perTripPriced(offer, p) || p.perTripMinor !== 0n) return null;
+  if (p.date !== null && p.date !== serviceDate) return null;
+  if ((units.adults > 0 && p.perAdultMinor <= 0n) || (units.children > 0 && p.perChildMinor <= 0n)) return null;
+  const charged = chargedTotalMinor(p, units);
+  if (!roundingWithinTolerance(p, units) || charged === null || charged <= 0n) return null;
+  return charged;
+}
+
+/**
+ * The row TravelDesk itself would book at one start (review 92 B7-01): the
+ * booking sends only the slot id and times, and TravelDesk takes "the first
+ * that has enough available seats left". So: in row order, the first row
+ * that is bookable and has `seats` or more seats left, where a capacity
+ * sentinel (`left` 99 999 or 999 999) means no seat count is given (owner
+ * decision a, 24 Nov 2026) and counts as enough. Null when no row qualifies.
+ */
+function rowTravelDeskTakes(rows: readonly TravelDeskAvailabilityRow[], seats: number): TravelDeskAvailabilityRow | null {
+  return rows.find((r) => r.price.isBookable && r.seatsLeft > 0 && (CAPACITY_SENTINELS.has(r.seatsLeft) || r.seatsLeft >= seats)) ?? null;
+}
+
+/**
  * The date-only quote (Batch 7). One start on the date: the guest picks only
- * the date (no time is sent or shown, `slotRef` null). Several starts: the
- * guest must have picked one of them, as for listed starts (Batch 2), and the
- * line names it. Either way the result carries the chosen row's own values
- * (`availabilitySlot`), which are what the booking sends, and nothing else.
- * Unknown dates, unpriced or zero-priced rows and unknown capacity (a
- * sentinel `left`, or a per-trip price) all refuse: never a guess.
+ * the date; the line names the start only when it is a real time
+ * (`dateOnlyShownStart`), so it can be shown before payment. Several starts:
+ * the guest must have picked one, as for listed starts (Batch 2). The result
+ * carries the chosen row's own values (`availabilitySlot`), which are what
+ * the booking sends, and nothing else.
+ *
+ *  - Rows at one start must carry the same price; the row priced is the one
+ *    TravelDesk would book (`rowTravelDeskTakes`), and if that row fails a
+ *    price check the line is refused, never priced from another row.
+ *  - A capacity sentinel is "no seat count given" (owner decision a): the
+ *    party is capped by the offer's own maximum (`maxPax`; an offer without
+ *    one is refused) and TravelDesk checks seats at reserve, before capture.
+ *  - The cut-off and the free-cancellation window both count from 00:00
+ *    Dubai on the service date (owner decision b; review 92 B7-02), whatever
+ *    start the row names.
  */
 function quoteDateOnly(input: SlotQuoteInput): SupplierQuoteResult {
   const { offer, serviceDate, units, now } = input;
@@ -559,79 +621,64 @@ function quoteDateOnly(input: SlotQuoteInput): SupplierQuoteResult {
 
   const cutoff = dateOnlyCutoffMs(serviceDate);
   if (now.getTime() >= cutoff) return refuse("past_cutoff");
+  if (!samePrice(pick.rows)) return refuse("availability_unknown");
   const seats = units.adults + units.children;
-  const reasons: Refusal[] = [];
-  // Rows sharing one slot id at one start are units of the same slot: the first with enough seats ("use first that have enough available seats left").
-  for (const r of pick.rows) {
-    if (r.seatsLeft === 0 && r.price.isBookable) {
-      reasons.push("closed");
-      continue;
-    }
-    if (!r.price.isBookable || r.seatsLeft <= 0) {
-      reasons.push("sold_out");
-      continue;
-    }
-    // A sentinel may mean "not stocked" as well as "unlimited" (Q-A6); a per-trip `left` may count vehicles (Q-C8). Unknown is never sold.
-    if (CAPACITY_SENTINELS.has(r.seatsLeft) || perTripPriced(offer, r.price)) {
-      reasons.push("availability_unknown");
-      continue;
-    }
-    if (r.seatsLeft < seats) {
-      reasons.push("sold_out");
-      continue;
-    }
-    if (r.price.date !== null && r.price.date !== serviceDate) {
-      reasons.push("availability_unknown");
-      continue;
-    }
-    const charged = chargedTotalMinor(r.price, units);
-    // A date with no price in force is not on sale: a zero net is never a price.
-    if (!roundingWithinTolerance(r.price, units) || charged === null || charged <= 0n) {
-      reasons.push("availability_unknown");
-      continue;
-    }
-    return ok(input, {
-      slotRef: wanted ? slotRefOf(pick.timeSlotId, pick.startMinutes) : null,
-      netAedMinor: charged,
-      netUsdMinor: netUsdMinorOf(r.price, units),
-      capacity: "limited",
-      seatsLeft: r.seatsLeft,
-      cutoffUtc: new Date(cutoff).toISOString(),
-      availabilitySlot: { timeSlotId: pick.timeSlotId, startMinutes: pick.startMinutes, endMinutes: pick.endMinutes },
-    });
-  }
-  return refuse(pickReason(reasons));
+  const r = rowTravelDeskTakes(pick.rows, seats);
+  if (!r) return refuse(pick.rows.every((x) => x.seatsLeft === 0 && x.price.isBookable) ? "closed" : "sold_out");
+  const unstated = CAPACITY_SENTINELS.has(r.seatsLeft);
+  // No seat count: the offer's own maximum caps the party (paxAllowed already applied it). Without one, nothing does.
+  if (unstated && !(offer.maxPax > 0 && seats <= offer.maxPax)) return refuse("availability_unknown");
+  const charged = dateOnlyCharge(offer, r, serviceDate, units);
+  if (charged === null) return refuse("availability_unknown");
+  return ok(input, {
+    slotRef: wanted || dateOnlyShownStart(pick.startMinutes) ? slotRefOf(pick.timeSlotId, pick.startMinutes) : null,
+    netAedMinor: charged,
+    netUsdMinor: netUsdMinorOf(r.price, units),
+    capacity: unstated ? "unknown" : "limited",
+    seatsLeft: unstated ? null : r.seatsLeft,
+    ...(unstated ? { seatsUnstated: true as const } : {}),
+    cutoffUtc: new Date(cutoff).toISOString(),
+    availabilitySlot: { timeSlotId: pick.timeSlotId, startMinutes: pick.startMinutes, endMinutes: pick.endMinutes },
+    refundFromMidnight: true,
+  });
 }
 
 /**
- * The start times of a date-only offer on a date for the public start-times
- * read (Batch 7), reusing Batch 2's listed-start marks. Null unless the fresh
- * rows give at least two distinct starts that `dateOnlyStartsFrom` accepts:
- * with one start the guest picks only the date, and with none, or rows that
- * disagree, the quote refuses, so the page shows no times. A start the quote
- * would refuse for unknown capacity reads `unavailable`. Prices and counts
- * never leave the server. Indicative only; the quote stays the one promise.
+ * The date-only offer's starts on a date for the public start-times read
+ * (Batch 7). `times` when the fresh rows give at least two distinct starts
+ * that `dateOnlyStartsFrom` accepts, with Batch 2's marks; `single` when they
+ * give exactly one, with the start shown before payment (`dateOnlyShownStart`,
+ * null for 00:00) and the same mark (review 92 B7-13), so the page never
+ * shows "Starts 15:00" for a date the quote would refuse; null when they give
+ * none, or rows that disagree: the page then shows no times and the quote
+ * refuses. A start is `unavailable` when the offer does not run that weekday,
+ * the cut-off has passed, every row is closed, or the quote would refuse it
+ * for its price (rows at it priced differently, a per-trip part, a zero adult
+ * price, another day's price, rounding: review 92 B7-06); `sold_out` when no
+ * row has a seat; a sentinel `left` reads `available`, with no count. Prices
+ * and counts never leave the server. Indicative only.
  */
-export function dateOnlyStartsOn(offer: StoredOffer, serviceDate: string, rows: TravelDeskAvailabilityRow[], now: Date): ListedStart[] | null {
+export function dateOnlyStartsOn(
+  offer: StoredOffer,
+  serviceDate: string,
+  rows: TravelDeskAvailabilityRow[],
+  now: Date,
+): { times: ListedStart[] } | { single: { startsAt: string | null; status: ListedStart["status"] } } | null {
   if (offer.timeSlots.length !== 0) return null;
   const starts = dateOnlyStartsFrom(serviceDate, rows);
-  if (!starts || starts.length < 2) return null;
+  if (!starts || starts.length === 0) return null;
   const shut = !isOfferedOn(offer.daysOffered, serviceDate) || now.getTime() >= dateOnlyCutoffMs(serviceDate);
-  const rank: ListedStart["status"][] = ["unavailable", "sold_out", "limited", "available"];
-  return starts.map((s): ListedStart => {
-    const time = minutesToHhmm(s.startMinutes);
-    if (shut) return { time, status: "unavailable" };
-    let best = 0;
-    for (const r of s.rows) {
-      if (r.seatsLeft === 0 && r.price.isBookable) continue; // a closed day (Q-A1)
-      let status: ListedStart["status"];
-      if (!r.price.isBookable || r.seatsLeft <= 0) status = "sold_out";
-      else if (CAPACITY_SENTINELS.has(r.seatsLeft) || perTripPriced(offer, r.price)) continue; // the quote refuses unknown capacity
-      else status = r.seatsLeft <= LIMITED_SEATS_AT ? "limited" : "available";
-      best = Math.max(best, rank.indexOf(status));
-    }
-    return { time, status: rank[best] };
-  });
+  const one: QuoteUnits = { adults: 1, children: 0, infants: 0 };
+  const markOf = (s: DateOnlyStart): ListedStart["status"] => {
+    if (shut || !samePrice(s.rows)) return "unavailable";
+    const open = s.rows.filter((r) => r.price.isBookable && r.seatsLeft > 0);
+    if (open.length === 0) return s.rows.every((r) => r.seatsLeft === 0 && r.price.isBookable) ? "unavailable" : "sold_out";
+    if (dateOnlyCharge(offer, open[0], serviceDate, one) === null) return "unavailable";
+    if (open.some((r) => CAPACITY_SENTINELS.has(r.seatsLeft))) return "available";
+    return Math.max(...open.map((r) => r.seatsLeft)) <= LIMITED_SEATS_AT ? "limited" : "available";
+  };
+  if (starts.length === 1) return { single: { startsAt: dateOnlyShownStart(starts[0].startMinutes), status: markOf(starts[0]) } };
+  return { times: starts.map((s): ListedStart => ({ time: minutesToHhmm(s.startMinutes), status: markOf(s) })) };
 }
 
 /**
@@ -763,15 +810,23 @@ export function quoteTickets(input: TicketQuoteInput): SupplierQuoteResult {
 
 function ok(
   input: { serviceDate: string; policy: TravelDeskCancellationRule[] | null; now: Date; issuesTicketsAtConfirm: Tristate },
-  part: Pick<Ok, "slotRef" | "netAedMinor" | "netUsdMinor" | "capacity" | "seatsLeft" | "cutoffUtc"> & { ticketValidUntil?: string | null; openDatedTicket?: true; availabilitySlot?: AvailabilitySlot },
+  part: Pick<Ok, "slotRef" | "netAedMinor" | "netUsdMinor" | "capacity" | "seatsLeft" | "cutoffUtc"> & {
+    ticketValidUntil?: string | null;
+    openDatedTicket?: true;
+    availabilitySlot?: AvailabilitySlot;
+    seatsUnstated?: true;
+    /** Batch 7: count the supplier's refund window from 00:00 on the service date, whatever start the line names. */
+    refundFromMidnight?: true;
+  },
 ): SupplierQuoteResult {
   // Doc 29 §4.4: issued tickets can never be cancelled, so a ticket quote carries no supplier refund window, whatever the tour policy says.
-  // Otherwise the window counts back from the booked slot's start (doc 29 §8.7).
-  const startMinutes = part.slotRef ? (exactSlotOf(part.slotRef)?.startMinutes ?? null) : null;
+  // Otherwise the window counts back from the booked slot's start (doc 29 §8.7); a date-only line from 00:00 (Batch 7, B7-02).
+  const { refundFromMidnight, ...result } = part;
+  const startMinutes = part.slotRef && !refundFromMidnight ? (exactSlotOf(part.slotRef)?.startMinutes ?? null) : null;
   const free = part.openDatedTicket ? null : freeCancellationUntilMs(input.serviceDate, input.policy, startMinutes);
   return {
     ok: true,
-    ...part,
+    ...result,
     ticketValidUntil: part.ticketValidUntil ?? null,
     checkedAt: input.now.toISOString(),
     issuesTicketsAtConfirm: input.issuesTicketsAtConfirm,

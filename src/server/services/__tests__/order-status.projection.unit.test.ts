@@ -656,3 +656,53 @@ describe("an item booked through an external supplier", () => {
     expect(s.nextStep).not.toContain("can take a few minutes");
   });
 });
+
+describe("external-supplier items: fix round (review 89, owner decisions of 24 Nov 2026)", () => {
+  const ext = (state: string, over: Record<string, unknown> = {}) => ({ state, startMinutes: 600, confirmedAt: T0, cancelledAt: null, updatedAt: T0, externalRoute: true, ...over });
+  const SECOND = "01890000-0000-7000-8000-0000000000a2";
+  const two = (bookings: [Record<string, unknown>, Record<string, unknown>]) => {
+    const base = snap("confirm_pending", { captured: true });
+    return {
+      ...base,
+      items: [
+        item({ instant: true, booking: bookings[0] as Item["booking"] }),
+        item({ id: SECOND, title: "Dhow cruise (synthetic)", instant: true, cancellation: facts({ orderItemId: SECOND }), booking: bookings[1] as Item["booking"] }),
+      ],
+    };
+  };
+
+  it("B6-02: a two-item order with an external item still waiting promises no refund time, at order level or in the deadline", () => {
+    const s = projectCustomerStatus(two([{ ...confirmedBooking }, ext("awaiting_external")]), NOW);
+    expect(s.state).toBe("booking_processing");
+    expect(s.nextStep).toContain("If the operator can't confirm an activity, you get its amount back automatically.");
+    expect(s.nextStep).not.toMatch(/by \d/);
+    expect(s.deadlines.remedyAtUtc).toBeNull();
+    expect(s.items[1].externalConfirmation).toContain("can take a few minutes");
+  });
+
+  it("B6-02: once the external item is settled, the multi-item deadline wording returns", () => {
+    const s = projectCustomerStatus(two([ext("confirming", { externalRoute: null }), ext("confirmed")]), NOW);
+    expect(s.deadlines.remedyAtUtc).toBe(DEADLINE.toISOString());
+  });
+
+  it("B6-06: any flag on a booking still waiting says our team is following it up", () => {
+    const s = projectCustomerStatus(snap("confirm_pending", { captured: true, item: { booking: ext("awaiting_external", { externalHandedOff: true }) } }), NOW);
+    expect(s.headline).toContain("taking longer than usual");
+  });
+
+  it("owner decision d: a released external hold too short to book online offers the existing 'Send it to our team' route", () => {
+    const released = projectCustomerStatus(snap("released", { item: { booking: ext("cancelled", { externalHoldUnusable: true, confirmedAt: null }) } }), NOW);
+    expect(released.state).toBe("payment_released");
+    expect(released.headline).toContain("Nothing was charged");
+    expect(released.nextStep).toContain("Send it to our team");
+    expect(released.inquiryHref).toBe("/inquiry?from=booking&reason=external_hold");
+    // Capture-first gateway: refunded instead, same offer.
+    const refunded = projectCustomerStatus(snap("refunded", { captured: true, item: { booking: ext("cancelled", { externalHoldUnusable: true, confirmedAt: null }), refunds: [{ status: "succeeded", createdAt: T0, updatedAt: T0 }] } }), NOW);
+    expect(refunded.inquiryHref).toBe("/inquiry?from=booking&reason=external_hold");
+    // Any other release offers nothing new.
+    expect(projectCustomerStatus(snap("released", { item: { booking: ext("cancelled", { confirmedAt: null }) } }), NOW).inquiryHref).toBeNull();
+    expect(forbiddenKeys(released)).toEqual([]);
+    // Review 89 B6-21: the link to the measured /inquiry page names no booking.
+    expect(released.inquiryHref).not.toContain(released.reference);
+  });
+});

@@ -5,6 +5,7 @@ import { PAYMENTS_STEP_CAP_MS, runPaymentsJob } from "@/server/jobs/payments-job
 import { scheduledBookingJobsOff } from "@/server/jobs/schedule-switch";
 import { runSupplierWorker } from "@/server/jobs/supplier-worker-job";
 import { MUTATION_START_MARGIN_MS } from "@/server/services/supplier-booking.service";
+import { EXTERNAL_POLL_WAITS_PER_RUN } from "@/server/suppliers/external-confirmation";
 import "@/server/wiring";
 
 export const runtime = "nodejs";
@@ -45,7 +46,8 @@ async function run(req: NextRequest) {
   const result = await runBookingTick(
     {
       payments: (capMs) => runPaymentsJob({ capMs }),
-      supplier: (budget) => runSupplierWorker("scheduled", { ...budget, documentsAfterConfirm: true }),
+      // Doc 29 Batch 6 (owner decision c): up to three in-run waits for external polls, so they are read every 15 s.
+      supplier: (budget) => runSupplierWorker("scheduled", { ...budget, documentsAfterConfirm: true, externalPollWaits: EXTERNAL_POLL_WAITS_PER_RUN }),
     },
     {
       budgetMs: (maxDuration - 30) * 1000,

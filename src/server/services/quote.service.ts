@@ -485,6 +485,7 @@ export function createQuoteService(deps: QuoteDeps): QuoteServiceImpl {
         mappingId: local.mapping.mappingId,
         serviceDate: line.serviceDate,
         slotRef: line.slotRef,
+        ...(local.mapping.dateOnlySellable === true ? { dateOnly: true } : {}),
         supplierUnits: supplierUnitsFor(units, line.units),
         pickup: line.pickup,
       });
@@ -496,7 +497,8 @@ export function createQuoteService(deps: QuoteDeps): QuoteServiceImpl {
 
     const seats = units.reduce((n, u) => n + (u.seatConsuming ? qty(line.units, u.unitId) : 0), 0);
     if (supplier.capacity !== "unlimited" && supplier.seatsLeft !== null && supplier.seatsLeft < seats) return "sold_out";
-    if (supplier.capacity === "unknown" && supplier.seatsLeft === null) return "availability_unknown";
+    // Batch 7: a date-only row with no seat count given is not a refusal (the supplier checks seats at reserve, before capture).
+    if (supplier.capacity === "unknown" && supplier.seatsLeft === null && supplier.seatsUnstated !== true) return "availability_unknown";
     // Too close to the cutoff to pay before it (CR-B2-9).
     if (supplier.cutoffUtc && Date.parse(supplier.cutoffUtc) - now.getTime() < MIN_PAYMENT_WINDOW_MS) return "past_cutoff";
 
@@ -507,16 +509,18 @@ export function createQuoteService(deps: QuoteDeps): QuoteServiceImpl {
       await deps.readiness.reevaluate(line.productId, "supplier_policy_changed");
       return "policy_exceeds_supplier";
     }
+    // Doc 29 Batch 7 (B7-02): a date-only line counts every refund window from 00:00 on the service date.
+    const refundStart = supplier.availabilitySlot ? null : slotStartMinutes(supplier.slotRef);
     let freeUntil: Date | null = null;
     if (hours > 0) {
       const supplierUntil = supplier.supplierFreeCancellationUntilUtc;
-      if (supplier.issuesTicketsAtConfirm !== "no" || !supplierUntil || Number.isNaN(Date.parse(supplierUntil)) || supplierPolicyTightened(line.serviceDate, hours, supplierUntil, slotStartMinutes(supplier.slotRef))) {
+      if (supplier.issuesTicketsAtConfirm !== "no" || !supplierUntil || Number.isNaN(Date.parse(supplierUntil)) || supplierPolicyTightened(line.serviceDate, hours, supplierUntil, refundStart)) {
         // The approved terms no longer hold: re-run the product's readiness (awaited, so a serverless
         // instance does not drop it after the response; it never throws).
         await deps.readiness.reevaluate(line.productId, "supplier_policy_changed");
         return "policy_exceeds_supplier";
       }
-      freeUntil = freeCancellationDeadline({ serviceDate: line.serviceDate, hours, startMinutes: slotStartMinutes(supplier.slotRef), supplierUntilUtc: supplierUntil, now });
+      freeUntil = freeCancellationDeadline({ serviceDate: line.serviceDate, hours, startMinutes: refundStart, supplierUntilUtc: supplierUntil, now });
     }
 
     return {

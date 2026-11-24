@@ -7,7 +7,8 @@ import { documentService } from "./document.service";
 import { orderAccessService, type OrderAccess } from "./order-access.service";
 import { evaluateCancellation, loadCancellationFacts, serviceStartUtc, type CancellationFacts } from "./cancellation.service";
 import { ticketFactsForOrder } from "./ticket-facts.service";
-import { EXTERNAL_HANDOFF_CODE } from "../suppliers/external-confirmation";
+import { EXTERNAL_RELEASE_CODES } from "../suppliers/external-confirmation";
+import { inquiryHref } from "@/lib/inquiry-handoff";
 import type { CustomerTicketFacts } from "@/lib/ticket-validity";
 import { EXTERNAL_CONFIRMATION_STATEMENT, freeCancellationCopy, TICKET_NON_REFUNDABLE_STATEMENT } from "@/lib/utils";
 import {
@@ -90,8 +91,10 @@ export interface StatusItemSnapshot {
     pickupTimeMinutes?: number | null;
     /** Doc 29 Batch 6: the attempt books through an external supplier; absent or null reads as internal. */
     externalRoute?: boolean | null;
-    /** Doc 29 Batch 6: still waiting on the external supplier, and handed to our team at the wait limit. */
+    /** Doc 29 Batch 6: still waiting on the external supplier, and flagged for our team (the hand-off, or any other flag). */
     externalHandedOff?: boolean;
+    /** Doc 29 Batch 6: the external operator's hold was too short to book online and was released. */
+    externalHoldUnusable?: boolean;
   } | null;
   /** The pickup hotel chosen at checkout (`order_items.pickup_hotel_name_snapshot`); absent or null without pickup. */
   pickupHotelName?: string | null;
@@ -489,12 +492,21 @@ function documentsFor(item: StatusItemSnapshot, canDownload: boolean): CustomerD
  * and handed to our team at the wait limit. Multi-item orders keep their
  * per-item words.
  */
-function externalView(s: StatusSnapshot): { external: boolean; handedOff: boolean } {
-  if (multiItem(s)) return { external: false, handedOff: false };
+function externalView(s: StatusSnapshot): { external: boolean; handedOff: boolean; multiUnsettled: boolean; holdUnusable: boolean } {
   const covered = s.items.filter((i) => sagaCovers(s, i));
+  const holdUnusable = covered.some((i) => i.booking?.externalHoldUnusable === true);
+  if (multiItem(s)) {
+    // Review 89 B6-02: an external item still waiting is never refunded at the saga's deadline, so the order-level
+    // sentence names no time while one is unsettled.
+    const multiUnsettled = covered.some((i) => i.booking?.externalRoute === true && !EXTERNAL_SETTLED.includes(i.booking.state));
+    return { external: false, handedOff: false, multiUnsettled, holdUnusable };
+  }
   const external = covered.some((i) => i.booking?.externalRoute === true);
-  return { external, handedOff: external && covered.some((i) => i.booking?.externalHandedOff === true) };
+  return { external, handedOff: external && covered.some((i) => i.booking?.externalHandedOff === true), multiUnsettled: false, holdUnusable };
 }
+
+/** Attempt states after which an external item no longer waits on its supplier. */
+const EXTERNAL_SETTLED = ["confirmed", "cancelled", "rejected", "expired", "not_created", "cancelling", "cancel_unverified", "cancel_refused"];
 
 /** "your Desert safari" for one item, "your 3 activities" for several. */
 function whatBooked(s: StatusSnapshot): string {
@@ -528,8 +540,12 @@ function words(
   const what = whatBooked(s);
   const by = remedyAt ? formatDubaiAndUtc(remedyAt) : null;
   const team = s.saga?.attentionRequiredAt ? " Our team is also checking it." : "";
-  const { external, handedOff } = externalView(s);
-  const remedy = external ? " If the operator cannot confirm it, you get the full amount back automatically, as a released hold or a refund." : ` ${remedySentence(by, multi)}`;
+  const { external, handedOff, multiUnsettled, holdUnusable } = externalView(s);
+  const remedy = external
+    ? " If the operator cannot confirm it, you get the full amount back automatically, as a released hold or a refund."
+    : ` ${remedySentence(multiUnsettled ? null : by, multi)}`;
+  // Owner decision d (24 Nov 2026): after an external hold too short to book online, offer "Send it to our team".
+  const handOver = holdUnusable ? " The operator couldn't hold your place long enough to book it online. Send it to our team and they book it with you." : "";
   switch (state) {
     case "awaiting_payment":
       if (!s.saga || s.order.rail === "assisted") {
@@ -581,12 +597,12 @@ function words(
       return { headline: "Part of your order is booked.", nextStep: "Each activity below shows where it stands. Anything not booked is refunded or released automatically." };
     case "payment_released":
       return s.saga?.state === "released"
-        ? { headline: "The hold on your card has been released. Nothing was charged.", nextStep: "Your bank may take a few days to remove the hold from your statement." }
-        : { headline: "We are releasing the hold on your card. Nothing has been charged.", nextStep: "You do not need to do anything. Your bank may take a few days to remove the hold." };
+        ? { headline: "The hold on your card has been released. Nothing was charged.", nextStep: `Your bank may take a few days to remove the hold from your statement.${handOver}` }
+        : { headline: "We are releasing the hold on your card. Nothing has been charged.", nextStep: `You do not need to do anything. Your bank may take a few days to remove the hold.${handOver}` };
     case "refund_processing":
-      return { headline: "Your refund is on its way.", nextStep: "You do not need to do anything. Your bank may take several working days to show it." };
+      return { headline: "Your refund is on its way.", nextStep: `You do not need to do anything. Your bank may take several working days to show it.${handOver}` };
     case "refunded":
-      return { headline: "You have been refunded in full.", nextStep: "Your bank may take several working days to show it on your statement." };
+      return { headline: "You have been refunded in full.", nextStep: `Your bank may take several working days to show it on your statement.${handOver}` };
     case "payment_failed":
       return { headline: "Your payment did not go through. Nothing was taken.", nextStep: "You can try again with another card, or message us on WhatsApp and our team will help." };
     case "cancellation_processing":
@@ -644,7 +660,8 @@ export function projectCustomerStatus(s: StatusSnapshot, now: Date): CustomerOrd
   const per = s.items.map((item) => ({ item, ...itemState(s, item, now) }));
   const sagaItem = per.find((p) => p.sagaItem);
   const state = !per.length ? recordedState(s.order.status, false) : sagaItem && per.length === 1 ? sagaItem.state : orderState(per.map((p) => p.state));
-  const remedy = ["payment_processing", "booking_processing"].includes(state) && !externalView(s).external ? remedyFor(s) : { at: null, kind: null };
+  const ext = externalView(s);
+  const remedy = ["payment_processing", "booking_processing"].includes(state) && !ext.external && !ext.multiUnsettled ? remedyFor(s) : { at: null, kind: null };
   const { headline, nextStep } = words(state, s, remedy.at, s.canDownload);
 
   const items: CustomerItemStatus[] = per.map(({ item, state: itemSt }) => ({
@@ -706,6 +723,7 @@ export function projectCustomerStatus(s: StatusSnapshot, now: Date): CustomerOrd
     },
     items,
     canDownload: s.canDownload,
+    inquiryHref: ext.holdUnusable && ["payment_released", "refund_processing", "refunded"].includes(state) ? inquiryHref("external_hold", "booking") : null,
     pollAfterMs: pollable ?? null,
   };
 }
@@ -800,8 +818,11 @@ export async function loadStatusSnapshot(access: Pick<OrderAccess, "orderId" | "
               updatedAt: booking.updatedAt,
               pickupTimeMinutes: booking.pickupTimeMinutes,
               externalRoute: booking.externalRoute,
-              // Only the hand-off code (doc 29 Batch 6); no other internal code reaches the projection.
-              externalHandedOff: booking.state === "awaiting_external" && booking.attentionRequiredAt !== null && booking.errorCode === EXTERNAL_HANDOFF_CODE,
+              // Doc 29 Batch 6: two booleans only; no internal code reaches the projection. Any flag on a waiting booking
+              // means our team is on it (review 89 B6-06: a read dead-letter sets one without the hand-off code).
+              externalHandedOff: booking.state === "awaiting_external" && booking.attentionRequiredAt !== null,
+              // An unusable hold, or a reservation released while the provider was still making it (review 89 B6-15).
+              externalHoldUnusable: booking.externalRoute === true && booking.errorCode !== null && EXTERNAL_RELEASE_CODES.includes(booking.errorCode),
             }
           : null,
         pickupHotelName: item.pickupHotelNameSnapshot,

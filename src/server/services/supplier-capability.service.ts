@@ -11,6 +11,9 @@ import {
   CAPABILITY_DERIVATION_VERSION,
   deriveCapabilities,
   capabilityKeyNote,
+  DATE_ONLY_CLASS_KEYS,
+  environmentRefusal,
+  externalFlagsEnabled,
   neverEnabledReason,
   parseClassKey,
   SEEDED_CLASS_KEYS,
@@ -98,6 +101,7 @@ const NEVER_MESSAGE: Record<string, string> = {
   private_units_inquiry: "Private-unit classes stay inquiry (owner decision, 22 November 2026)",
   date_only_inquiry: "Only the two internal, per-person date-only classes of Batch 7 are built (and kept off until TravelDesk answers Q5); other date-only classes stay inquiry",
   ticket_booking_refused: "Only the open-dated, self-arrival, internal, per-person ticket class is built; other ticket classes stay inquiry",
+  date_only_q5_pending: "Date-only classes cannot be switched on in production until TravelDesk answers Q5 and the code lock is lifted; the test environment stays switchable for a sandbox drill",
   external_route_unproven: "Only the five per-person external classes of Batch 6 are built; other external classes stay inquiry",
 };
 
@@ -173,6 +177,8 @@ export interface CapabilityOverview {
   staleDerivations: number;
   classes: CapabilityClassRow[];
   evidence: EvidenceRow[];
+  /** Review 89 B6-09: enabled flag rows on the external route (none is expected before a Batch 6 switch-on). */
+  externalFlagsEnabled: string[];
 }
 
 export const supplierCapabilityService = {
@@ -200,7 +206,8 @@ export const supplierCapabilityService = {
       : [];
     const termsByOffer = new Map(caps.map((c) => [c.offerExternalId, c.offerTermsHash]));
 
-    const keys = new Set<string>([...SEEDED_CLASS_KEYS, ...flags.map((f) => f.classKey), ...caps.map((c) => c.classKey)]);
+    // Doc 29 Batch 7: the date-only keys are always listed, so their Q5 note and production lock are visible even with no offer or flag row.
+    const keys = new Set<string>([...SEEDED_CLASS_KEYS, ...DATE_ONLY_CLASS_KEYS, ...flags.map((f) => f.classKey), ...caps.map((c) => c.classKey)]);
     const classes: CapabilityClassRow[] = [...keys].sort().map((classKey) => {
       const f = flags.find((x) => x.classKey === classKey) ?? null;
       const inClass = caps.filter((c) => c.classKey === classKey);
@@ -211,7 +218,7 @@ export const supplierCapabilityService = {
           ? { id: f.id, enabled: f.enabled, requiresOfferEvidence: f.requiresOfferEvidence, reason: f.reason, changedAt: f.changedAt.toISOString(), changedBy: f.changedBy, approvalId: f.approvalId }
           : null,
         seeded: SEEDED_CLASS_KEYS.includes(classKey),
-        neverEnabled: neverEnabledReason(classKey),
+        neverEnabled: neverEnabledReason(classKey) ?? environmentRefusal(classKey, environment),
         note: capabilityKeyNote(classKey),
         offers: inClass.length,
         offersNeedingReview: inClass.filter((c) => c.reviewReasons.length > 0).length,
@@ -227,6 +234,7 @@ export const supplierCapabilityService = {
       lastDerivedAt: last?.toISOString() ?? null,
       staleDerivations: caps.filter((c) => c.derivationVersion !== CAPABILITY_DERIVATION_VERSION).length,
       classes,
+      externalFlagsEnabled: externalFlagsEnabled(flags),
       evidence: evidence.map((e) => ({
         id: e.id,
         offerExternalId: e.offerExternalId,
@@ -267,7 +275,7 @@ export const supplierCapabilityService = {
     const reason = checkReason(input.reason);
     checkKey(input.classKey);
     if (input.enabled) {
-      const never = neverEnabledReason(input.classKey);
+      const never = neverEnabledReason(input.classKey) ?? environmentRefusal(input.classKey, input.environment);
       if (never) throw Errors.conflict(NEVER_MESSAGE[never], { classKey: input.classKey, reason: never });
     }
     const now = opts.now ?? new Date();

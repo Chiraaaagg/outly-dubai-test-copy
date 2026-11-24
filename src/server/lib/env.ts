@@ -314,10 +314,12 @@ const schema = z.object({
   /** Comma list of rails served by the one Stripe account: `aed_card`, `inr_pacb`. Default `aed_card`. */
   STRIPE_RAILS: optionalStr,
 
-  // CRM — Bitrix24 one-way push (doc 29 §5, §6.4; CRM batch C1). Validated in
-  // src/server/crm/crm.config.ts. No portal host ⇒ nothing is enqueued; a
-  // portal host without CRM_SYNC_ENABLED=true ⇒ rows wait, nothing is sent.
-  // Keep production CRM values in Vercel's Production scope only.
+  // CRM — Bitrix24 one-way push (doc 29 §5, §6.4; CRM batches C1, C2a; doc
+  // 29d). Validated in src/server/crm/crm.config.ts. No portal host ⇒ nothing
+  // is enqueued; a portal host without CRM_SYNC_ENABLED=true ⇒ no new subject
+  // is queued (no backfill) and nothing is sent; only subjects already pushed
+  // while the sync was on keep queueing. Keep production CRM values in
+  // Vercel's Production scope only.
   /**
    * Release switch for CRM delivery (`/api/jobs/crm-worker`). While false the
    * worker answers `skipped` and calls nothing. Only "true" enables it;
@@ -327,15 +329,21 @@ const schema = z.object({
   CRM_SYNC_ENABLED: strictBool("CRM_SYNC_ENABLED"),
   /** `test` or `production`; production only with APP_ENV=production on Vercel's production deployment. */
   CRM_BITRIX_ENV: z.preprocess((v) => (v === "" ? undefined : v), z.enum(["test", "production"]).optional()),
-  /** Pinned portal host, e.g. `<portal>.bitrix24.com` (no scheme, path or port). */
+  /** Pinned portal host, e.g. `<portal>.bitrix24.in` (no scheme, path or port). */
   CRM_BITRIX_PORTAL_HOST: optionalStr,
   /** Inbound webhook of the dedicated non-admin service user (owner decision 15): its numeric user id and secret. */
   CRM_BITRIX_WEBHOOK_USER_ID: optionalStr,
   CRM_BITRIX_WEBHOOK_SECRET: optionalStr,
   /** The OUTLYY deal funnel id (never 0, the other business's funnel). */
   CRM_BITRIX_DEAL_CATEGORY_ID: optionalStr,
-  /** `stage_key=C<category>:<STATUS_ID>` pairs for every OUTLYY stage (crm.config.ts CRM_STAGE_KEYS). */
+  /** `stage_key=C<category>:<STATUS_ID>` pairs for the 12 OUTLYY stages (crm.config.ts CRM_STAGE_KEYS). */
   CRM_BITRIX_STAGE_IDS: optionalStr,
+  /** `field_key=UF_CRM_…` pairs for the 20 OUTLYY custom deal fields (crm.config.ts CRM_FIELD_KEYS). */
+  CRM_BITRIX_FIELD_CODES: optionalStr,
+  /** Bitrix24 user id of the Dubai sales lead who owns every new deal (decision C2-8). */
+  CRM_BITRIX_DEFAULT_OWNER_ID: optionalStr,
+  /** The synthetic probe's own secret (doc 29d §5.2a; SEC-8), at least 32 characters. Unset ⇒ the probe is refused. */
+  CRM_PROBE_SECRET: optionalStr,
   CRM_BITRIX_TIMEOUT_MS: int(5_000),
 
   // Photography — Pexels search for any catalogue image without a curated id (src/lib/images/manifest.ts).
@@ -412,6 +420,7 @@ export function assertBootEnv(): string[] {
   if (e.CRON_SECRET && e.SUPPLIER_JOB_SECRET === e.CRON_SECRET) problems.push("SUPPLIER_JOB_SECRET equals CRON_SECRET — set a distinct value");
   if (e.CRON_SECRET && e.HEALTH_DETAIL_TOKEN === e.CRON_SECRET) problems.push("HEALTH_DETAIL_TOKEN equals CRON_SECRET — set a distinct value");
   if (e.SUPPLIER_JOB_SECRET && e.HEALTH_DETAIL_TOKEN === e.SUPPLIER_JOB_SECRET) problems.push("HEALTH_DETAIL_TOKEN equals SUPPLIER_JOB_SECRET — set a distinct value");
+  if (e.CRM_PROBE_SECRET && [e.CRON_SECRET, e.SUPPLIER_JOB_SECRET, e.HEALTH_DETAIL_TOKEN].includes(e.CRM_PROBE_SECRET)) problems.push("CRM_PROBE_SECRET equals another job secret — set a distinct value");
   if (e.SUPPLIER_ADAPTER_TRAVELDESK === "live") {
     for (const p of traveldeskConfigProblems(e)) problems.push(`TravelDesk live but unusable: ${p}`);
   }
@@ -419,7 +428,10 @@ export function assertBootEnv(): string[] {
   if (e.CRM_SYNC_ENABLED) {
     for (const p of crmConfigProblems(e)) problems.push(`CRM sync on but unusable: ${p}`);
   } else if (e.CRM_BITRIX_PORTAL_HOST) {
-    for (const p of crmScopeProblems(e)) problems.push(`CRM portal refused, nothing is enqueued: ${p}`);
+    const scope = crmScopeProblems(e);
+    for (const p of scope) problems.push(`CRM portal refused, nothing is enqueued: ${p}`);
+    // Review C2A-04: show before switch-on what would keep the sync from running once it is on.
+    for (const p of crmConfigProblems(e)) if (!scope.includes(p)) problems.push(`CRM not ready for switch-on: ${p}`);
   }
   if (Object.keys(process.env).some((k) => k.startsWith("NEXT_PUBLIC_") && (k.includes("BITRIX") || k.includes("CRM_")))) {
     problems.push("A NEXT_PUBLIC_*BITRIX* or NEXT_PUBLIC_*CRM_* variable exists — CRM settings must never reach the browser");

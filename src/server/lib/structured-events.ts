@@ -124,6 +124,10 @@ export const STRUCTURED_EVENTS = {
   "crm.circuit_open": ["reason", "pausedUntil", "failures"],
   "crm.refused": ["reason"],
   "crm.retention": ["scheduled", "purgedOutbox", "purgedLinks"],
+  "crm.probe": ["mode", "ok", "dealId", "created", "notOk", "deleted"],
+  "crm.currency_mismatch": ["entityType", "entityId"],
+  "crm.erasure_unverified": ["entityType", "entityId", "reason"],
+  "crm.contact_fanout_capped": ["limit", "channel"],
   // Retention purge (doc 26 §2; doc 29 Batch 1c). Counts, a table name and a reason code only.
   "retention.purged": [
     "otpChallenges",
@@ -147,6 +151,7 @@ export const STRUCTURED_EVENTS = {
   "readiness.rerun": ["candidates", "instant", "inquiry", "durationMs"],
   // External-supplier bookings (doc 29 Batch 6; external-confirmation.ts). Our booking id and codes or counts only.
   "supplier.external_handoff": ["supplierBookingId", "pollCount"],
+  "supplier.external_past_start": ["supplierBookingId", "pollCount"],
   "supplier.external_failed": ["supplierBookingId", "afterConfirm"],
   "supplier.external_hold_unusable": ["supplierBookingId", "holdMs"],
 } as const satisfies Record<string, readonly string[]>;

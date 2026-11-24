@@ -216,6 +216,24 @@ export interface BookingView {
   id: string;
   state: string;
   reservationDeadline: Date | null;
+  /** Doc 29 Batch 6: the attempt is on the external-supplier route; absent reads as internal. */
+  externalRoute?: boolean | null;
+  /** Doc 29 Batch 6 (review 89 B6-13): a confirm was sent for this attempt; read for external-route attempts only. */
+  confirmSent?: boolean;
+}
+
+/**
+ * Doc 29 Batch 6 (review 89 B6-01, B6-13): an external-route item whose
+ * confirm was sent and whose outcome is the engine's to settle (waiting on the
+ * supplier, the confirm call in flight, or recovery after a lost answer). The
+ * saga raises no deadline flag for it: the engine's hand-off and outcome
+ * alerts tell our team, and a saga flag would withdraw the payment evidence
+ * the late answer needs.
+ */
+const EXTERNAL_ENGINE_OWNED = ["awaiting_external", "confirming", "outcome_unknown", "not_found_unresolved"];
+function externalWaitExempt(b: { state: string; externalRoute?: boolean | null; confirmSent?: boolean }): boolean {
+  if (b.externalRoute !== true) return false;
+  return b.state === "awaiting_external" || (b.confirmSent === true && EXTERNAL_ENGINE_OWNED.includes(b.state));
 }
 
 /** The engine's attempt for an order item, read only. */
@@ -228,9 +246,19 @@ export const dbBookingStateReader: BookingStateReader = {
     const b = await prisma.supplierBooking.findFirst({
       where: { orderItemId },
       orderBy: [{ attempt: "desc" }, { createdAt: "desc" }],
-      select: { id: true, state: true, reservationDeadline: true },
+      select: { id: true, state: true, reservationDeadline: true, externalRoute: true },
     });
-    return b ? { id: b.id, state: b.state, reservationDeadline: b.reservationDeadline } : null;
+    if (!b) return null;
+    // Only external-route attempts pay for the extra read (review 89 B6-13): sent confirms less those never sent.
+    let confirmSent = false;
+    if (b.externalRoute === true) {
+      const [sent, notSent] = await Promise.all([
+        prisma.supplierBookingEvent.count({ where: { supplierBookingId: b.id, kind: "request_sent", operation: "bookings.confirm" } }),
+        prisma.supplierBookingEvent.count({ where: { supplierBookingId: b.id, kind: "not_sent", operation: "bookings.confirm" } }),
+      ]);
+      confirmSent = sent - notSent > 0;
+    }
+    return { id: b.id, state: b.state, reservationDeadline: b.reservationDeadline, externalRoute: b.externalRoute, confirmSent };
   },
 };
 
@@ -905,6 +933,7 @@ export function createPaymentSaga(deps: SagaDeps) {
    */
   async function confirmPendingMulti(saga: SagaRow, payment: Payment, snap: GatewayPaymentSnapshot | null, items: SagaItem[], now: Date): Promise<boolean> {
     let unresolved = 0;
+    let exempt = 0;
     let awaitingConfirm = 0;
     const late: SagaItem[] = [];
     // Item-scoped human problems: told once no other item still needs its payment evidence.
@@ -953,8 +982,12 @@ export function createPaymentSaga(deps: SagaDeps) {
         unresolved += 1;
         continue;
       }
-      // Confirm sent with no answer yet, or the engine is recovering (F42): never re-confirmed.
-      late.push(item);
+      // Confirm sent with no answer yet, or the engine is recovering (F42): never re-confirmed. Doc 29 Batch 6 (review
+      // 89 B6-01): an item waiting on its external supplier is not late at the send-by; the engine owns that wait and
+      // hands it to our team at its own limit. Flagging the saga would withdraw the evidence its late answer needs.
+      // Review 89 B6-20: an exempt external item is counted apart, so it never hides a late internal item.
+      if (externalWaitExempt(b)) exempt += 1;
+      else late.push(item);
       unresolved += 1;
     }
     if (deferred.length && awaitingConfirm === 0 && !saga.attentionRequiredAt) await flagAttention(saga, deferred[0]);
@@ -966,7 +999,7 @@ export function createPaymentSaga(deps: SagaDeps) {
           const at = item.booking ? await deps.engine.confirmSendBy(item.booking.id) : null;
           if (at && now.getTime() <= Date.parse(at)) allPast = false;
         }
-        if (allPast && late.length === unresolved) await flagAttention(saga, "confirm_unresolved_at_deadline");
+        if (allPast && late.length === unresolved - exempt) await flagAttention(saga, "confirm_unresolved_at_deadline");
       }
       return false;
     }
@@ -1285,7 +1318,11 @@ export function createPaymentSaga(deps: SagaDeps) {
           return false;
         }
         // Confirm sent with no answer yet, or the engine is recovering (F42): never re-confirm; tell a human past the deadline.
-        if (saga.deadlineAt && now.getTime() > saga.deadlineAt.getTime() && !saga.attentionRequiredAt) await flagAttention(saga, "confirm_unresolved_at_deadline");
+        // Doc 29 Batch 6 (review 89 B6-01): not while the booking waits on its external supplier; the engine's hand-off
+        // (`external_confirmation_handoff`) tells our team, and a saga flag would withdraw the payment evidence.
+        if (!externalWaitExempt(booking) && saga.deadlineAt && now.getTime() > saga.deadlineAt.getTime() && !saga.attentionRequiredAt) {
+          await flagAttention(saga, "confirm_unresolved_at_deadline");
+        }
         return false;
       }
 

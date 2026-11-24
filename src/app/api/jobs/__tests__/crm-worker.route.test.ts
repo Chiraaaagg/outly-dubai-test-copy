@@ -57,6 +57,47 @@ describe("crm-worker job route", () => {
     expect(run).not.toHaveBeenCalled();
   });
 
+  it("the every-minute cron with the portal fully configured but the switch off: skipped, nothing runs (G8)", async () => {
+    const { fakeEnv } = await import("@/server/crm/__tests__/_memory-store");
+    for (const [k, v] of Object.entries(fakeEnv({ CRM_SYNC_ENABLED: undefined }))) if (v !== undefined) vi.stubEnv(k, String(v));
+    vi.stubEnv("CRM_SYNC_ENABLED", "false");
+    resetEnvCache();
+    const { GET } = await import("../crm-worker/route");
+    const res = await GET(req("GET", { authorization: `Bearer ${CRON}` }), undefined as never);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, skipped: "crm sync off" });
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("the synthetic probe: POST only, cron secret AND its own secret, never while the sync is on, never half configured", async () => {
+    const PROBE = "probe-".padEnd(40, "p");
+    const { GET, POST } = await import("../crm-worker/route");
+    const asProbe = (probeSecret: string | null) => ({ authorization: `Bearer ${CRON}`, "x-crm-probe": "synthetic", ...(probeSecret ? { "x-crm-probe-secret": probeSecret } : {}) });
+    // R-02: unset ⇒ refused (503), never open; the cron secret alone never runs it.
+    expect((await POST(req("POST", asProbe(CRON)), undefined as never)).status).toBe(503);
+    vi.stubEnv("CRM_PROBE_SECRET", PROBE);
+    resetEnvCache();
+    expect((await POST(req("POST", { "x-crm-probe": "synthetic", "x-crm-probe-secret": PROBE }), undefined as never)).status).toBe(401);
+    expect((await POST(req("POST", asProbe(null)), undefined as never)).status).toBe(401);
+    expect((await POST(req("POST", asProbe(CRON)), undefined as never)).status).toBe(401);
+    expect(await (await POST(req("POST", asProbe(PROBE)), undefined as never)).json()).toMatchObject({ ok: true, skipped: "crm not configured" });
+    // GET ignores the probe header: the cron path is always the worker.
+    expect(await (await GET(req("GET", asProbe(PROBE)), undefined as never)).json()).toMatchObject({ skipped: "crm sync off" });
+    // A probe secret equal to the cron secret, or too short, is not configured.
+    for (const bad of [CRON, "short"]) {
+      vi.stubEnv("CRM_PROBE_SECRET", bad);
+      resetEnvCache();
+      expect((await POST(req("POST", asProbe(bad)), undefined as never)).status).toBe(503);
+    }
+    vi.stubEnv("CRM_PROBE_SECRET", PROBE);
+    resetEnvCache();
+    const probe = asProbe(PROBE);
+    vi.stubEnv("CRM_SYNC_ENABLED", "true");
+    resetEnvCache();
+    expect(await (await POST(req("POST", probe), undefined as never)).json()).toMatchObject({ skipped: expect.stringContaining("only before switch-on") });
+    expect(run).not.toHaveBeenCalled();
+  });
+
   it("any value other than exactly \"true\" keeps it off", async () => {
     vi.stubEnv("CRM_SYNC_ENABLED", "TRUE");
     resetEnvCache();

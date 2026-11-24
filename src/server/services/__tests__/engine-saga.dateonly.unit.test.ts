@@ -157,4 +157,16 @@ describe("engineSagaApi.startAttempt for a date-only offer (doc 29 Batch 7)", ()
     for (const [tx, reason] of cases) expect(await refusal(api().startAttempt(tx, ids)), reason).toBe(reason);
     expect(engine.createIntent).not.toHaveBeenCalled();
   });
+
+  it("in production the Q5 code lock refuses the key even with a flag row on and evidence (owner decision d)", async () => {
+    const prod = { environment: "production" as const, agencyId: "agency-1", mutationTimeoutMs: 150_000 };
+    const tx = fakeTx({ lines: [line({ supplierEnvironment: "production", supplierAccountId: "agency-1" })] });
+    tx.productSupplierMapping.findUnique = async () => ({ ...(await fakeTx().productSupplierMapping.findUnique()), environment: "production" });
+    const prodApi = createEngineSagaApi({ config: () => prod, payments: { capturedFor: async () => null } });
+    const e = await prodApi.startAttempt(tx, ids).catch((x) => x);
+    expect(isAppError(e) && (e.details as { reason?: string }).reason).toBe("capability_not_enabled");
+    // Refused by the lock (the class is not sellable there), not by a missing flag or evidence.
+    expect(String((e as Error).message)).toContain("class_not_sellable");
+    expect(engine.createIntent).not.toHaveBeenCalled();
+  });
 });

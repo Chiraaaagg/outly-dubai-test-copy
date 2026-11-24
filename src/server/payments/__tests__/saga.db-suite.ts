@@ -250,6 +250,31 @@ describe.skipIf(!dbEnabled)("B3 payment saga (disposable database)", () => {
       expect(await prisma.refund.count({ where: { paymentId: c.paymentId } })).toBe(0);
     });
 
+    it("doc 29 Batch 6 (review 89 B6-13): an external item whose confirm was sent gets no deadline flag in recovery; an internal one still does", async () => {
+      for (const state of ["confirming", "outcome_unknown", "awaiting_external"]) {
+        const x = await harness(prisma);
+        x.engine.confirmOutcome = "unknown";
+        const c = await checkedOut(x, run, "AED", "card");
+        x.engine.external.add(c.orderItemId);
+        await deliver(x, c.gw, "payment.authorized", c.gw.pay(c.providerOrderId));
+        await reserveAndConfirm(x, c.orderItemId);
+        x.engine.set(c.orderItemId, state);
+        x.clock.advance(20 * 60_000);
+        await x.saga.advance(c.sagaId);
+        expect(await sagaState(x, c.sagaId), state).toMatchObject({ state: "confirm_pending", attentionRequiredAt: null });
+        expect(await prisma.refund.count({ where: { paymentId: c.paymentId } })).toBe(0);
+      }
+      const x = await harness(prisma);
+      x.engine.confirmOutcome = "unknown";
+      const c = await checkedOut(x, run, "AED", "card");
+      await deliver(x, c.gw, "payment.authorized", c.gw.pay(c.providerOrderId));
+      await reserveAndConfirm(x, c.orderItemId);
+      x.engine.set(c.orderItemId, "outcome_unknown");
+      x.clock.advance(20 * 60_000);
+      await x.saga.advance(c.sagaId);
+      expect((await sagaState(x, c.sagaId)).attentionRequiredAt).not.toBeNull();
+    });
+
     it("an engine intake refusal after capture (paused between payment and reserve) refunds", async () => {
       const x = await harness(prisma);
       x.engine.refuseIntake = true;

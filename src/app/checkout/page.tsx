@@ -57,7 +57,7 @@ import {
 import { fetchOrderStatus } from "@/lib/api/order-status";
 import { resumePayment } from "@/lib/resume-payment";
 import { inquiryHref, inquiryReasonForQuote, inquiryReasonText, type InquiryReason } from "@/lib/inquiry-handoff";
-import { retimeHrefFor } from "@/lib/start-time-retry";
+import { retimeHrefFor, reviewTime } from "@/lib/start-time-retry";
 import { PickupHotelFields, usePickupHotelLists } from "@/components/checkout/pickup-hotel-fields";
 import {
   CART_HOTEL_FIELD,
@@ -1182,7 +1182,7 @@ export default function CheckoutPage() {
                         <div className="min-w-0 flex-1">
                           {!single && <p className="font-bold leading-snug text-ink-900">{item.title}</p>}
                           <p className="tnum text-[0.95rem] text-ink-900">
-                            {reviewDate(item.date)} · {item.time} Dubai time · {paxLabel(item.pax)}
+                            {reviewDate(item.date)} · {reviewTime(item.time, live?.lines.find((l) => l.index === index)?.slotRef ?? null)} Dubai time · {paxLabel(item.pax)}
                           </p>
                           {/* Pickup lines that differ from one another each say their own hotel (doc 29 Batch 3). */}
                           {!sharedPickup && item.pickupHotel?.hotelId ? <p className="text-[0.95rem] text-ink-700">Pickup from {item.pickupHotel.name}</p> : null}

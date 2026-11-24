@@ -25,6 +25,7 @@ const NEVER_LABEL: Record<string, string> = {
   not_a_class: "not a sale class",
   private_units_inquiry: "private units stay inquiry",
   date_only_inquiry: "date-only class not built",
+  date_only_q5_pending: "locked in production until Q5",
   ticket_booking_refused: "ticket class not built",
   external_route_unproven: "external class not built",
 };
@@ -152,6 +153,14 @@ export default async function CapabilityFlagsPage({ searchParams }: { searchPara
         <StatCard label="Derivation" value={`v${view.derivationVersion}`} hint={view.lastDerivedAt ? `derived ${fmtDateTime(view.lastDerivedAt)}` : "no sync since Batch 1a"} />
         <StatCard label="Older derivations" value={String(view.staleDerivations)} hint="rewritten by the next sync" tone={view.staleDerivations ? "warn" : "neutral"} />
       </div>
+
+      {/* Review 89 B6-09 (doc 29 §9.4): an external flag switched on outside Batch 6's own switch-on. */}
+      {view.externalFlagsEnabled.length > 0 && (
+        <Alert tone="warning" className="mb-4">
+          External-route flags are on in {env}: {view.externalFlagsEnabled.join(", ")}. Re-run readiness after deploying Batch 6, and check each
+          against its evidence (doc 29 §9.4).
+        </Alert>
+      )}
 
       {!view.lastDerivedAt && (
         <Alert tone="warning" className="mb-4">

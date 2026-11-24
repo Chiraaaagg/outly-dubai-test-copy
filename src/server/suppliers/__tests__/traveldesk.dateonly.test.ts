@@ -12,8 +12,11 @@ import {
   capabilityKeyNote,
   capabilityVerdict,
   DATE_ONLY_CLASS_KEYS,
+  DATE_ONLY_Q5_CONFIRMED,
   DATE_ONLY_Q5_UNCONFIRMED,
   dateOnlySellable,
+  environmentRefusal,
+  slotRulesUnknown,
   deriveCapabilities,
   EXTERNAL_CLASS_KEYS,
   legacyLiveBookGate,
@@ -26,7 +29,7 @@ import {
   type CapabilityFlagState,
 } from "../traveldesk/traveldesk.capability";
 import { parseStoredOffer, parseStoredPolicy, type StoredOffer } from "../traveldesk/traveldesk.offer-terms";
-import { dateOnlyBookingSlot, dateOnlyCutoffMs, dateOnlyStartsFrom, dateOnlyStartsOn, quoteSlot, type QuoteUnits } from "../traveldesk/traveldesk.quote";
+import { dateOnlyBookingSlot, dateOnlyCutoffMs, dateOnlyShownStart, dateOnlyStartsFrom, dateOnlyStartsOn, quoteSlot, type QuoteUnits } from "../traveldesk/traveldesk.quote";
 import { row, SERVICE_DATE, storedSlot } from "./fixtures/traveldesk-terms";
 
 /**
@@ -74,8 +77,9 @@ function rowsOf(name: keyof typeof availabilityFixtures): { rows: TravelDeskAvai
   return availabilityFrom(availabilityWire.parse(wire));
 }
 
-function quote(rows: TravelDeskAvailabilityRow[], over: { slotRef?: string | null; units?: QuoteUnits; now?: Date; offer?: StoredOffer } = {}) {
+function quote(rows: TravelDeskAvailabilityRow[], over: { slotRef?: string | null; units?: QuoteUnits; now?: Date; offer?: StoredOffer; dateOnly?: boolean } = {}) {
   return quoteSlot({
+    dateOnly: over.dateOnly ?? true,
     offer: over.offer ?? dateOnlyOffer(),
     policy,
     serviceDate: DATE,
@@ -137,6 +141,32 @@ describe("Batch 7 date-only keys", () => {
     expect(listedStartsSellable(v.instant, v.classKey, slots as never, 3)).toBe(false);
   });
 
+  it("the Q5 code lock: both keys refused in production while TravelDesk's answer is pending; the test environment stays switchable", () => {
+    expect(DATE_ONLY_Q5_CONFIRMED).toBe(false);
+    for (const k of DATE_ONLY_CLASS_KEYS) {
+      expect(environmentRefusal(k, "production")).toBe("date_only_q5_pending");
+      expect(environmentRefusal(k, "test")).toBeNull();
+      // Lifting the lock (a deploy) frees production.
+      expect(environmentRefusal(k, "production", true)).toBeNull();
+    }
+    for (const k of [...SEEDED_CLASS_KEYS, ...EXTERNAL_CLASS_KEYS, ...TICKET_CLASS_KEYS, "live.date_only_no_slot_metadata.self.external.per_person"]) expect(environmentRefusal(k, "production"), k).toBeNull();
+  });
+
+  it("slotRulesUnknown (review 92 B7-04): the blocker lifts only for a live offer without slots whose exact Batch 7 key the gate allows", () => {
+    const noSlots = { bookingKind: "live_book", timeSlots: [] as unknown[] };
+    expect(slotRulesUnknown(noSlots, true, SELF)).toBe(false);
+    expect(slotRulesUnknown(noSlots, true, PICKUP)).toBe(false);
+    // Flag off or no evidence (the gate refuses), another date-only key, an unreadable offer: the blocker stays.
+    expect(slotRulesUnknown(noSlots, false, SELF)).toBe(true);
+    expect(slotRulesUnknown(noSlots, true, "live.date_only_no_slot_metadata.self.external.per_person")).toBe(true);
+    expect(slotRulesUnknown(noSlots, true, SEEDED_CLASS_KEYS[0])).toBe(true);
+    expect(slotRulesUnknown(null, true, SELF)).toBe(true);
+    // Offers with slots, and offers that are not live book, never had the blocker and do not get it.
+    expect(slotRulesUnknown({ bookingKind: "live_book", timeSlots: [storedSlot()] }, false, SEEDED_CLASS_KEYS[0])).toBe(false);
+    expect(slotRulesUnknown({ bookingKind: "ticket_only", timeSlots: [] }, false, TICKET_CLASS_KEYS[0])).toBe(false);
+    expect(slotRulesUnknown({ bookingKind: "on_request", timeSlots: [] }, false, "inquiry_only")).toBe(false);
+  });
+
   it("dateOnlySellable is false for any other key, for an offer that lists slots, and for an unreadable offer", () => {
     expect(dateOnlySellable(true, SELF, [])).toBe(true);
     expect(dateOnlySellable(true, "live.date_only_no_slot_metadata.self.external.per_person", [])).toBe(false);
@@ -194,11 +224,21 @@ describe("date-only quote (quoteSlot with no stored slot)", () => {
       // 00:00 Asia/Dubai on the service date: advance hours are slot metadata, which this offer has none of.
       cutoffUtc: "2026-12-30T20:00:00.000Z",
       issuesTicketsAtConfirm: "no",
-      // 72 h before 00:00 Dubai on the service date: no start is shown, so the earliest one counts.
+      // 72 h before 00:00 Dubai on the service date: every date-only line counts from 00:00 (owner decision b).
       supplierFreeCancellationUntilUtc: "2026-12-27T20:00:00.000Z",
       ticketValidUntil: null,
       availabilitySlot: { timeSlotId: 0, startMinutes: 0, endMinutes: 1439 },
     });
+    // A one-row date whose row names a real start: the line names it, so it is shown before payment (owner decision c);
+    // the refund window still counts from 00:00.
+    expect(quote(rowsOf("singleRealStart").rows)).toMatchObject({
+      ok: true,
+      slotRef: "4@15:00",
+      availabilitySlot: { timeSlotId: 4, startMinutes: 900, endMinutes: 1080 },
+      supplierFreeCancellationUntilUtc: "2026-12-27T20:00:00.000Z",
+    });
+    expect(dateOnlyShownStart(0)).toBeNull();
+    expect(dateOnlyShownStart(900)).toBe("15:00");
     expect(quote(rowsOf("singleZeroEnd").rows)).toMatchObject({ ok: true, slotRef: null, availabilitySlot: { timeSlotId: 0, startMinutes: 0, endMinutes: 0 } });
     // Naming the one start is accepted and names the row exactly.
     expect(quote(rowsOf("singleWholeDay").rows, { slotRef: "00:00" })).toMatchObject({ ok: true, slotRef: "0@00:00", availabilitySlot: { timeSlotId: 0, startMinutes: 0, endMinutes: 1439 } });
@@ -212,8 +252,8 @@ describe("date-only quote (quoteSlot with no stored slot)", () => {
       ok: true,
       slotRef: "7@18:00",
       availabilitySlot: { timeSlotId: 7, startMinutes: 1080, endMinutes: 1260 },
-      // Counted from the chosen start, 18:00 Dubai.
-      supplierFreeCancellationUntilUtc: "2026-12-28T14:00:00.000Z",
+      // From 00:00 on the service date, not the chosen 18:00 (review 92 B7-02).
+      supplierFreeCancellationUntilUtc: "2026-12-27T20:00:00.000Z",
     });
     expect(quote(rows, { slotRef: "8@20:00" })).toMatchObject({ ok: true, slotRef: "8@20:00", seatsLeft: 3, availabilitySlot: { timeSlotId: 8, startMinutes: 1200, endMinutes: 1380 } });
     expect(quote(rows, { slotRef: "7@20:00" })).toEqual({ ok: false, reason: "invalid_slot" });
@@ -223,13 +263,39 @@ describe("date-only quote (quoteSlot with no stored slot)", () => {
     expect(quote(rows, { slotRef: "20:00", units: { adults: 3, children: 1, infants: 0 } })).toEqual({ ok: false, reason: "sold_out" });
   });
 
-  it("rows sharing one slot id: the first with enough seats", () => {
+  it("rows sharing one slot id: the row TravelDesk takes, the first bookable one with enough seats (review 92 B7-01)", () => {
     expect(quote(rowsOf("sharedSlotId").rows)).toMatchObject({ ok: true, seatsLeft: 12, availabilitySlot: { timeSlotId: 0, startMinutes: 0, endMinutes: 1439 } });
     expect(quote(rowsOf("sharedSlotId").rows, { units: { adults: 1, children: 0, infants: 0 } })).toMatchObject({ ok: true, seatsLeft: 2 });
+    expect(quote(rowsOf("notBookableThenOpen").rows)).toMatchObject({ ok: true, seatsLeft: 12 });
+    // A sentinel row first is the row TravelDesk takes (99 999 is enough): no seat count is given.
+    expect(quote(rowsOf("sentinelThenCounted").rows)).toMatchObject({ ok: true, capacity: "unknown", seatsLeft: null, seatsUnstated: true });
+    // Rows at one start priced differently: which one is charged is unknown.
+    expect(quote(rowsOf("differentPrices").rows)).toEqual({ ok: false, reason: "availability_unknown" });
   });
 
-  it("no row, an unpriced date, a zero price, a capacity sentinel or rows that disagree: not on sale, never a guess", () => {
-    for (const name of ["none", "unpriced", "zeroPrice", "capacitySentinel", "conflictingSlotIds", "conflictingEnds", "endBeforeStart"] as const) {
+  it("a capacity sentinel is 'no seat count given' (owner decision a): sold up to the offer's own maximum, never past it", () => {
+    expect(quote(rowsOf("capacitySentinel").rows)).toMatchObject({ ok: true, capacity: "unknown", seatsLeft: null, seatsUnstated: true, netAedMinor: 52_000n });
+    // The offer's maxPax (20 in the fixture) caps the party first.
+    expect(quote(rowsOf("capacitySentinel").rows, { units: { adults: 21, children: 0, infants: 0 } })).toEqual({ ok: false, reason: "unit_rule_failed" });
+    // An offer with no maximum gives no cap at all: refused.
+    expect(quote(rowsOf("capacitySentinel").rows, { offer: dateOnlyOffer({ maxPax: 0 }) })).toEqual({ ok: false, reason: "availability_unknown" });
+    // A counted row says nothing of the kind.
+    expect(quote(rowsOf("singleWholeDay").rows)).not.toHaveProperty("seatsUnstated");
+  });
+
+  it("price checks on the row TravelDesk takes (B7-05): a per-trip part, or a zero price for a category in the party, refuse", () => {
+    expect(quote(rowsOf("mixedTripPrice").rows)).toEqual({ ok: false, reason: "availability_unknown" });
+    expect(quote(rowsOf("freeChild").rows)).toEqual({ ok: false, reason: "availability_unknown" });
+    // No child in the party: a zero child price charges nobody nothing.
+    expect(quote(rowsOf("freeChild").rows, { units: { adults: 2, children: 0, infants: 0 } })).toMatchObject({ ok: true, netAedMinor: 40_000n });
+  });
+
+  it("without the caller's date-only verdict (flag off), an offer with no slot is refused as before Batch 7 (B7-08)", () => {
+    for (const name of ["singleWholeDay", "severalStarts", "capacitySentinel"] as const) expect(quote(rowsOf(name).rows, { dateOnly: false, slotRef: name === "severalStarts" ? "18:00" : null }).ok, name).toBe(false);
+  });
+
+  it("no row, an unpriced date, a zero price or rows that disagree: not on sale, never a guess", () => {
+    for (const name of ["none", "unpriced", "zeroPrice", "conflictingSlotIds", "conflictingEnds", "endBeforeStart"] as const) {
       expect(quote(rowsOf(name).rows), name).toEqual({ ok: false, reason: "availability_unknown" });
     }
     // A per-trip price (vehicles, Q-C8) is unknown capacity too.
@@ -255,7 +321,7 @@ describe("date-only quote (quoteSlot with no stored slot)", () => {
 
   it("an offer that lists slots is quoted as before: no availability slot on its result", () => {
     const fixed = parseStoredOffer(storedOffer())!;
-    const r = quoteSlot({ offer: fixed, policy, serviceDate: SERVICE_DATE, slotRef: "21:00", units: PARTY, rows: [row()], now: NOW, issuesTicketsAtConfirm: "no" });
+    const r = quoteSlot({ offer: fixed, policy, serviceDate: SERVICE_DATE, slotRef: "21:00", units: PARTY, rows: [row()], now: NOW, issuesTicketsAtConfirm: "no", dateOnly: true });
     expect(r).toMatchObject({ ok: true, slotRef: "11@21:00" });
     expect(r).not.toHaveProperty("availabilitySlot");
     // And a date-only row (slot 0) against it is still refused: no stored rules.
@@ -264,30 +330,50 @@ describe("date-only quote (quoteSlot with no stored slot)", () => {
 });
 
 describe("date-only start times for the page (Batch 2 marks reused)", () => {
-  it("one start or none: no times (the guest picks only the date); several: the listed starts with marks", () => {
+  it("one start: no choice, with the start shown only when it is a real time; none or rows that disagree: nothing; several: the listed starts", () => {
     const offer = dateOnlyOffer();
-    expect(dateOnlyStartsOn(offer, DATE, rowsOf("singleWholeDay").rows, NOW)).toBeNull();
-    expect(dateOnlyStartsOn(offer, DATE, rowsOf("sharedSlotId").rows, NOW)).toBeNull();
+    expect(dateOnlyStartsOn(offer, DATE, rowsOf("singleWholeDay").rows, NOW)).toEqual({ single: { startsAt: null, status: "available" } });
+    expect(dateOnlyStartsOn(offer, DATE, rowsOf("singleZeroEnd").rows, NOW)).toEqual({ single: { startsAt: null, status: "available" } });
+    expect(dateOnlyStartsOn(offer, DATE, rowsOf("sharedSlotId").rows, NOW)).toEqual({ single: { startsAt: null, status: "available" } });
+    expect(dateOnlyStartsOn(offer, DATE, rowsOf("singleRealStart").rows, NOW)).toEqual({ single: { startsAt: "15:00", status: "available" } });
     expect(dateOnlyStartsOn(offer, DATE, rowsOf("none").rows, NOW)).toBeNull();
     expect(dateOnlyStartsOn(offer, DATE, rowsOf("conflictingSlotIds").rows, NOW)).toBeNull();
-    expect(dateOnlyStartsOn(offer, DATE, rowsOf("severalStarts").rows, NOW)).toEqual([
-      { time: "18:00", status: "available" },
-      { time: "20:00", status: "limited" },
-    ]);
+    expect(dateOnlyStartsOn(offer, DATE, rowsOf("severalStarts").rows, NOW)).toEqual({
+      times: [
+        { time: "18:00", status: "available" },
+        { time: "20:00", status: "limited" },
+      ],
+    });
   });
 
-  it("a sentinel start reads unavailable (the quote refuses it); past the cut-off every start does; an offer with slots is not date only", () => {
+  it("one start carries the quote's checks (B7-13): weekday, cut-off, sold out, closed, unpriced or a price the quote refuses", () => {
+    const real = rowsOf("singleRealStart").rows;
+    const single = (rows: TravelDeskAvailabilityRow[], over: { offer?: StoredOffer; now?: Date } = {}) => dateOnlyStartsOn(over.offer ?? dateOnlyOffer(), DATE, rows, over.now ?? NOW);
+    expect(single(real)).toEqual({ single: { startsAt: "15:00", status: "available" } });
+    // 31 Dec 2026 is a Thursday (bit 8): an offer running Mondays only does not run that day.
+    expect(single(real, { offer: dateOnlyOffer({ daysOffered: 1 }) })).toEqual({ single: { startsAt: "15:00", status: "unavailable" } });
+    expect(single(real, { now: new Date("2026-12-30T20:00:00Z") })).toEqual({ single: { startsAt: "15:00", status: "unavailable" } });
+    expect(single(real.map((r) => ({ ...r, price: { ...r.price, isBookable: false } })))).toEqual({ single: { startsAt: "15:00", status: "sold_out" } });
+    expect(single(real.map((r) => ({ ...r, seatsLeft: 0 })))).toEqual({ single: { startsAt: "15:00", status: "unavailable" } });
+    expect(single(rowsOf("zeroPrice").rows)).toEqual({ single: { startsAt: null, status: "unavailable" } });
+    expect(single(rowsOf("mixedTripPrice").rows)).toEqual({ single: { startsAt: null, status: "unavailable" } });
+    expect(single(rowsOf("differentPrices").rows)).toEqual({ single: { startsAt: null, status: "unavailable" } });
+    expect(single(rowsOf("capacitySentinel").rows)).toEqual({ single: { startsAt: null, status: "available" } });
+  });
+
+  it("a sentinel start reads available with no count; a start the quote refuses for its price reads unavailable (B7-06); past the cut-off every start does", () => {
     const offer = dateOnlyOffer();
-    const rows = rowsOf("severalStarts").rows.map((r) => (r.startMinutes === 1080 ? { ...r, seatsLeft: 99_999 } : r));
-    expect(dateOnlyStartsOn(offer, DATE, rows, NOW)).toEqual([
-      { time: "18:00", status: "unavailable" },
-      { time: "20:00", status: "limited" },
-    ]);
-    expect(dateOnlyStartsOn(offer, DATE, rowsOf("severalStarts").rows, new Date("2026-12-31T00:00:00Z"))).toEqual([
-      { time: "18:00", status: "unavailable" },
-      { time: "20:00", status: "unavailable" },
-    ]);
-    expect(dateOnlyStartsOn(parseStoredOffer(storedOffer())!, DATE, rowsOf("severalStarts").rows, NOW)).toBeNull();
+    const several = rowsOf("severalStarts").rows;
+    const at = (start: number, f: (r: TravelDeskAvailabilityRow) => TravelDeskAvailabilityRow) => several.map((r) => (r.startMinutes === start ? f(r) : r));
+    expect(dateOnlyStartsOn(offer, DATE, at(1080, (r) => ({ ...r, seatsLeft: 99_999 })), NOW)).toEqual({ times: [{ time: "18:00", status: "available" }, { time: "20:00", status: "limited" }] });
+    expect(dateOnlyStartsOn(offer, DATE, at(1080, (r) => ({ ...r, price: { ...r.price, perTripMinor: 5_000n } })), NOW)).toEqual({ times: [{ time: "18:00", status: "unavailable" }, { time: "20:00", status: "limited" }] });
+    expect(dateOnlyStartsOn(offer, DATE, at(1080, (r) => ({ ...r, price: { ...r.price, perAdultMinor: 0n } })), NOW)).toEqual({ times: [{ time: "18:00", status: "unavailable" }, { time: "20:00", status: "limited" }] });
+    expect(dateOnlyStartsOn(offer, DATE, at(1080, (r) => ({ ...r, price: { ...r.price, date: "2026-12-30" } })), NOW)).toEqual({ times: [{ time: "18:00", status: "unavailable" }, { time: "20:00", status: "limited" }] });
+    // Rows at one start priced differently.
+    const twoRows = [...several, { ...several[0], seatsLeft: 9, price: { ...several[0].price, perAdultMinor: 21_000n } }];
+    expect(dateOnlyStartsOn(offer, DATE, twoRows, NOW)).toEqual({ times: [{ time: "18:00", status: "unavailable" }, { time: "20:00", status: "limited" }] });
+    expect(dateOnlyStartsOn(offer, DATE, several, new Date("2026-12-31T00:00:00Z"))).toEqual({ times: [{ time: "18:00", status: "unavailable" }, { time: "20:00", status: "unavailable" }] });
+    expect(dateOnlyStartsOn(parseStoredOffer(storedOffer())!, DATE, several, NOW)).toBeNull();
   });
 });
 
@@ -298,6 +384,8 @@ describe("the booking sends exactly the availability row's values", () => {
   it.each([
     ["one whole-day row", "singleWholeDay", null, { timeSlotId: 0, startTime: 0, endTime: 1439 }],
     ["one row ending 00:00", "singleZeroEnd", null, { timeSlotId: 0, startTime: 0, endTime: 0 }],
+    ["one row with a real start", "singleRealStart", null, { timeSlotId: 4, startTime: 900, endTime: 1080 }],
+    ["a sentinel row", "capacitySentinel", null, { timeSlotId: 0, startTime: 0, endTime: 1439 }],
     ["rows sharing a slot id", "sharedSlotId", null, { timeSlotId: 0, startTime: 0, endTime: 1439 }],
     ["the chosen one of several starts", "severalStarts", "18:00", { timeSlotId: 7, startTime: 1080, endTime: 1260 }],
   ] as const)("%s", (_name, fixture, slotRef, sent) => {

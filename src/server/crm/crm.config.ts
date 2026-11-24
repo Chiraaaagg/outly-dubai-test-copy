@@ -1,6 +1,7 @@
 /**
- * Bitrix24 CRM configuration (doc 29 §5.2, §6.4, §6.5; CRM batch C1) — env
- * slice → validated scope and config, or the reasons they are refused.
+ * Bitrix24 CRM configuration (doc 29 §5.2, §6.4, §6.5; CRM batches C1 and
+ * C2a; doc 29d) — env slice → validated scope and config, or the reasons
+ * they are refused.
  *
  * Two levels, both pure (env is a parameter, as in traveldesk.config.ts):
  *
@@ -9,13 +10,16 @@
  *    pairing. No scope ⇒ the enqueue hooks write nothing at all, which is the
  *    state of every environment after C1 (no portal is configured anywhere).
  *  - `crmConfigFrom`: everything the worker needs to deliver (credential,
- *    funnel, stage map, timeout). Null unless every check passes: never half
- *    configured. Delivery also needs `CRM_SYNC_ENABLED=true` (default off),
- *    checked by the job, not here.
+ *    funnel, the 12-stage map, the custom field codes, the default deal
+ *    owner, the admin link base, timeout). Null unless every check passes:
+ *    never half configured, so a missing field code or owner fails closed.
+ *    Delivery also needs `CRM_SYNC_ENABLED=true` (default off), checked by
+ *    the job, not here.
  *
  * Guard rails:
  *  - The portal host is pinned (`CRM_BITRIX_PORTAL_HOST`): a bare host name,
- *    https only, on a Bitrix24 cloud domain. A `.test` host (reserved, never
+ *    https only, on a Bitrix24 cloud domain (C2a adds `.bitrix24.in`, where
+ *    the OUTLYY portal is; doc 29 §8.9 item 1.1). A `.test` host (reserved, never
  *    resolves) is accepted outside production only, for the fake portal.
  *    The client refuses any request to another host.
  *  - `CRM_BITRIX_ENV=production` ⇔ `APP_ENV=production`, and only on Vercel's
@@ -32,13 +36,15 @@
 export type CrmEnvironment = "development" | "staging" | "production";
 export type CrmPortalKind = "test" | "production";
 
-/** OUTLYY's deal stages (doc 29 §5.4). The Bitrix24 STATUS_ID of each is configured: C2 creates the funnel. */
+/**
+ * OUTLYY's 12 deal stages (doc 29 §5.4 as changed by decision C2-7: no
+ * "Negotiating"; doc 29d §3.5). The Bitrix24 STATUS_ID of each is configured.
+ */
 export const CRM_STAGE_KEYS = [
   "new_inquiry",
   "assigned",
   "contacted",
   "quoted",
-  "negotiating",
   "payment_pending",
   "paid_awaiting_supplier",
   "confirmed_tickets_pending",
@@ -50,8 +56,37 @@ export const CRM_STAGE_KEYS = [
 ] as const;
 export type CrmStageKey = (typeof CRM_STAGE_KEYS)[number];
 
-/** Bitrix24 cloud domains the portal host may sit on. Self-hosted is unverified (doc 29 §5.1); extend in C2 if C0 shows it. */
-export const BITRIX_CLOUD_SUFFIXES: readonly string[] = [".bitrix24.com", ".bitrix24.eu", ".bitrix24.de"];
+/**
+ * The OUTLYY custom deal fields (doc 29d §3.8, consent flags per Q6). Each
+ * key's Bitrix24 field code (`UF_CRM_…`) is configured in
+ * `CRM_BITRIX_FIELD_CODES`; every key must be present.
+ */
+export const CRM_FIELD_KEYS = [
+  "reference",
+  "environment",
+  "admin_link",
+  "customer_name",
+  "customer_phone",
+  "customer_email",
+  "payment_status",
+  "supplier_booking_status",
+  "ticket_status",
+  "refund_status",
+  "refund_amount",
+  "travel_date",
+  "item_summary",
+  "as_of",
+  "indicative_amount",
+  "margin",
+  "consent_marketing_email",
+  "consent_marketing_email_at",
+  "consent_marketing_whatsapp",
+  "consent_marketing_whatsapp_at",
+] as const;
+export type CrmFieldKey = (typeof CRM_FIELD_KEYS)[number];
+
+/** Bitrix24 cloud domains the portal host may sit on. Self-hosted is unverified (doc 29 §5.1). `.bitrix24.in`: the OUTLYY portal (C0 item 1.1). */
+export const BITRIX_CLOUD_SUFFIXES: readonly string[] = [".bitrix24.com", ".bitrix24.eu", ".bitrix24.de", ".bitrix24.in"];
 /** Reserved TLD for the fake portal in tests and local work; refused in production. */
 export const TEST_PORTAL_SUFFIX = ".test";
 
@@ -71,7 +106,13 @@ export interface CrmEnvSlice {
   CRM_BITRIX_DEAL_CATEGORY_ID?: string;
   /** `key=STAGE_ID` pairs, comma-separated, one per CRM_STAGE_KEYS entry. */
   CRM_BITRIX_STAGE_IDS?: string;
+  /** `key=UF_CRM_…` pairs, comma-separated, one per CRM_FIELD_KEYS entry. */
+  CRM_BITRIX_FIELD_CODES?: string;
+  /** Bitrix24 user id of the Dubai sales lead who owns every new deal (decision C2-8). */
+  CRM_BITRIX_DEFAULT_OWNER_ID?: string;
   CRM_BITRIX_TIMEOUT_MS?: number;
+  /** The site origin; the deal's admin link is `<origin>/admin/…`. */
+  NEXT_PUBLIC_SITE_URL?: string;
 }
 
 export interface CrmScope {
@@ -88,6 +129,11 @@ export interface CrmConfig extends CrmScope {
   webhookSecret: string;
   categoryId: number;
   stageIds: Readonly<Record<CrmStageKey, string>>;
+  fieldCodes: Readonly<Record<CrmFieldKey, string>>;
+  /** Responsible person on a new deal; never sent on an update, so a reassignment on the portal is kept. */
+  defaultOwnerId: number;
+  /** Origin of the OUTLYY admin, no trailing slash (e.g. `https://outlyy.example`). */
+  adminBaseUrl: string;
   timeoutMs: number;
 }
 
@@ -173,6 +219,50 @@ function categoryOf(env: CrmEnvSlice): number | null {
   return n > 0 ? n : null;
 }
 
+const FIELD_CODE = /^UF_CRM_[A-Z0-9_]{1,40}$/;
+
+function parseFieldCodes(raw: string | undefined): { codes: Record<string, string>; problems: string[] } {
+  const problems: string[] = [];
+  const codes: Record<string, string> = {};
+  if (!raw) return { codes, problems: ["CRM_BITRIX_FIELD_CODES is missing"] };
+  const known = new Set<string>(CRM_FIELD_KEYS);
+  for (const pair of raw.split(",").map((s) => s.trim()).filter(Boolean)) {
+    const eq = pair.indexOf("=");
+    const key = eq > 0 ? pair.slice(0, eq).trim() : "";
+    const value = eq > 0 ? pair.slice(eq + 1).trim() : "";
+    if (!known.has(key)) {
+      problems.push(`CRM_BITRIX_FIELD_CODES: unknown field key '${/^[a-z_]{1,40}$/.test(key) ? key : "?"}'`);
+      continue;
+    }
+    if (key in codes) problems.push(`CRM_BITRIX_FIELD_CODES: ${key} is given twice`);
+    if (!FIELD_CODE.test(value)) problems.push(`CRM_BITRIX_FIELD_CODES: ${key} must be a custom deal field code (UF_CRM_…)`);
+    codes[key] = value;
+  }
+  for (const k of CRM_FIELD_KEYS) if (!(k in codes)) problems.push(`CRM_BITRIX_FIELD_CODES: ${k} is missing`);
+  const values = Object.values(codes);
+  if (new Set(values).size !== values.length) problems.push("CRM_BITRIX_FIELD_CODES: two field keys share one field code");
+  return { codes, problems };
+}
+
+/** The admin origin from NEXT_PUBLIC_SITE_URL: https, no path, query or credentials; http only for localhost outside production. */
+function adminBase(env: CrmEnvSlice): { base: string | null; problems: string[] } {
+  const raw = env.NEXT_PUBLIC_SITE_URL?.trim();
+  if (!raw) return { base: null, problems: ["NEXT_PUBLIC_SITE_URL is missing (the deal's admin link)"] };
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return { base: null, problems: ["NEXT_PUBLIC_SITE_URL is not a URL"] };
+  }
+  const problems: string[] = [];
+  const production = (env.APP_ENV ?? "development") === "production" || env.CRM_BITRIX_ENV === "production";
+  const local = u.hostname === "localhost" || u.hostname === "127.0.0.1";
+  if (u.username || u.password || u.search || u.hash || (u.pathname !== "/" && u.pathname !== "")) problems.push("NEXT_PUBLIC_SITE_URL must be a bare origin for the admin link (no path, query or credentials)");
+  if (u.protocol !== "https:" && !(u.protocol === "http:" && local && !production)) problems.push("NEXT_PUBLIC_SITE_URL must be https for the admin link");
+  if (local && production) problems.push("NEXT_PUBLIC_SITE_URL must not be localhost when the CRM portal is production");
+  return { base: problems.length ? null : u.origin, problems };
+}
+
 /** Every reason the delivery configuration is refused. Empty ⇒ usable. */
 export function crmConfigProblems(env: CrmEnvSlice): string[] {
   const problems = crmScopeProblems(env);
@@ -188,6 +278,12 @@ export function crmConfigProblems(env: CrmEnvSlice): string[] {
   else if (rawCategory === "0") problems.push("CRM_BITRIX_DEAL_CATEGORY_ID must not be 0: funnel 0 belongs to the other business on the shared portal");
   else if (category === null) problems.push("CRM_BITRIX_DEAL_CATEGORY_ID must be a positive integer");
   problems.push(...parseStageIds(env.CRM_BITRIX_STAGE_IDS, category).problems);
+  problems.push(...parseFieldCodes(env.CRM_BITRIX_FIELD_CODES).problems);
+  const owner = env.CRM_BITRIX_DEFAULT_OWNER_ID?.trim();
+  if (!owner) problems.push("CRM_BITRIX_DEFAULT_OWNER_ID is missing");
+  else if (!/^[1-9]\d{0,8}$/.test(owner)) problems.push("CRM_BITRIX_DEFAULT_OWNER_ID must be the sales lead's numeric user id");
+  else if (user && Number(owner) === Number(user)) problems.push("CRM_BITRIX_DEFAULT_OWNER_ID must not be the service account");
+  problems.push(...adminBase(env).problems);
   const t = env.CRM_BITRIX_TIMEOUT_MS ?? CRM_DEFAULT_TIMEOUT_MS;
   if (!Number.isFinite(t) || t < CRM_MIN_TIMEOUT_MS || t > CRM_MAX_TIMEOUT_MS) {
     problems.push(`CRM_BITRIX_TIMEOUT_MS must be between ${CRM_MIN_TIMEOUT_MS} and ${CRM_MAX_TIMEOUT_MS}`);
@@ -202,6 +298,7 @@ export function crmConfigFrom(env: CrmEnvSlice): CrmConfig | null {
   if (!scope) return null;
   const categoryId = categoryOf(env) as number;
   const { ids } = parseStageIds(env.CRM_BITRIX_STAGE_IDS, categoryId);
+  const { codes } = parseFieldCodes(env.CRM_BITRIX_FIELD_CODES);
   return {
     ...scope,
     portalKind: env.CRM_BITRIX_ENV as CrmPortalKind,
@@ -210,6 +307,9 @@ export function crmConfigFrom(env: CrmEnvSlice): CrmConfig | null {
     webhookSecret: env.CRM_BITRIX_WEBHOOK_SECRET as string,
     categoryId,
     stageIds: Object.freeze(ids as Record<CrmStageKey, string>),
+    fieldCodes: Object.freeze(codes as Record<CrmFieldKey, string>),
+    defaultOwnerId: Number((env.CRM_BITRIX_DEFAULT_OWNER_ID as string).trim()),
+    adminBaseUrl: adminBase(env).base as string,
     timeoutMs: env.CRM_BITRIX_TIMEOUT_MS ?? CRM_DEFAULT_TIMEOUT_MS,
   };
 }

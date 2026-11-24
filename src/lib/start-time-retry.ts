@@ -28,7 +28,8 @@ export function parseRetimeId(raw: string | null | undefined): string | null {
 /**
  * The "Choose another time" link for a refused quote, or null when a new
  * time cannot fix it: any refused line for another reason, more than one
- * refused line, or an activity without another time to choose.
+ * refused line, or an activity without another time to choose (a date-only
+ * activity, with no stored times, counts when its line carries a start).
  */
 export function retimeHrefFor(
   refused: readonly { index: number; reason: string }[],
@@ -41,7 +42,58 @@ export function retimeHrefFor(
   const item = cart[[...indexes][0]];
   if (!item || item.kind !== "activity" || !parseRetimeId(item.id)) return null;
   const activity = activities.find((a) => a.slug === item.slug);
-  if (!activity || activity.timeSlots.length < 2) return null;
+  // Doc 29 Batch 7 (review 92 B7-06): a page with no stored times whose line carries a start came from a date-only
+  // offer's fresh starts; the activity page reads them again, so another time can be chosen there.
+  const dateOnlyStart = activity?.timeSlots.length === 0 && /^([01]\d|2[0-3]):[0-5]\d$/.test(item.time);
+  if (!activity || (activity.timeSlots.length < 2 && !dateOnlyStart)) return null;
   const q = new URLSearchParams({ date: item.date, retime: item.id });
   return `/activities/${encodeURIComponent(item.slug)}?${q.toString()}#book`;
+}
+
+/**
+ * The start time the checkout review shows for a line (doc 29 Batch 7, owner
+ * decision c): the quoted supplier start (`<timeSlotId>@HH:mm`) when the
+ * cart line has no time of its own, as for a date-only offer whose one row
+ * names a real start; otherwise the cart line's time.
+ */
+export function reviewTime(itemTime: string, quotedSlotRef: string | null): string {
+  if (/^([01]\d|2[0-3]):[0-5]\d$/.test(itemTime)) return itemTime;
+  const m = quotedSlotRef ? /@(([01]\d|2[0-3]):[0-5]\d)$/.exec(quotedSlotRef) : null;
+  return m ? m[1] : itemTime;
+}
+
+/** What the product page says for a date-only date with one start (doc 29 Batch 7). */
+export interface DateOnlyStartView {
+  /** "Starts 15:00", or why the date cannot be booked; null when there is nothing to say. */
+  line: string | null;
+  /** "Pickup time is on your voucher." for a pickup offer the guest can book; null otherwise. */
+  note: string | null;
+  /** The guest cannot continue on this date. */
+  blocked: boolean;
+}
+
+/**
+ * The one-start date-only view (owner decision c; review 92 B7-11, B7-13).
+ *  - The start is shown only as the activity's start ("Starts 15:00"), never
+ *    as a pickup time: TravelDesk returns the pickup time on the booking,
+ *    and the availability row's start is not it. A pickup offer adds
+ *    "Pickup time is on your voucher."
+ *  - A date the quote would refuse (`status` not available or limited: not
+ *    offered that weekday, past the cut-off, sold out, unpriced) shows no
+ *    start and blocks: "Not available on this date. Choose another date."
+ *  - A line sent back from checkout because this very start was refused is
+ *    never sent back to it: on the same date and start it blocks with
+ *    "Choose another date", whatever a cached answer says.
+ */
+export function dateOnlyStartView(input: {
+  startsAt: string | null;
+  status: "available" | "limited" | "sold_out" | "unavailable";
+  pickup: boolean;
+  date: string;
+  retime: { date: string; time: string } | null;
+}): DateOnlyStartView {
+  const refusedHere = input.retime !== null && input.retime.date === input.date && input.startsAt !== null && input.retime.time === input.startsAt;
+  if (refusedHere) return { line: `The ${input.startsAt} start can't be booked for your group on this date. Choose another date.`, note: null, blocked: true };
+  if (input.status !== "available" && input.status !== "limited") return { line: "Not available on this date. Choose another date.", note: null, blocked: true };
+  return { line: input.startsAt ? `Starts ${input.startsAt}` : null, note: input.pickup ? "Pickup time is on your voucher." : null, blocked: false };
 }

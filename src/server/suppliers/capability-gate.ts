@@ -4,6 +4,7 @@ import type { prisma, Tx } from "../lib/db";
 import {
   capabilityVerdict,
   deriveCapabilities,
+  environmentRefusal,
   type CapabilityFlagState,
   type CapabilityVerdict,
   type DerivedCapability,
@@ -30,6 +31,8 @@ type Db = Tx | typeof prisma;
 
 export interface CapabilityGateContext {
   adapter: string;
+  /** The environment the flags were read for; a key locked there (`environmentRefusal`, Batch 7) never sells. Required (review 92 B7-14). */
+  environment: SupplierEnvironment;
   flags: Map<string, CapabilityFlagState>;
   /** Evidence per offer external id (active and revoked; the verdict ignores revoked rows). */
   evidence: Map<string, OfferEvidenceState[]>;
@@ -62,6 +65,7 @@ export async function loadCapabilityGate(
   for (const e of evidence) byOffer.set(e.offerExternalId, [...(byOffer.get(e.offerExternalId) ?? []), e]);
   return {
     adapter: input.adapter,
+    environment: input.environment,
     flags: new Map(flags.map((f) => [f.classKey, { enabled: f.enabled, requiresOfferEvidence: f.requiresOfferEvidence }])),
     evidence: byOffer,
   };
@@ -75,6 +79,10 @@ export async function loadCapabilityGate(
 export function gateVerdict(ctx: CapabilityGateContext, offerExternalId: string, payload: unknown, termsHash: string | null): CapabilityCheck {
   const capability = deriveCapabilities(payload);
   if (ctx.adapter !== CAPABILITY_ADAPTER) return { capability, verdict: { instant: false, classKey: capability.classKey, reason: "class_unknown" } };
+  // Batch 7 (owner decision d): a key locked in this environment is refused whatever its flag row says.
+  if (environmentRefusal(capability.classKey, ctx.environment)) {
+    return { capability, verdict: { instant: false, classKey: capability.classKey, reason: "class_not_sellable" } };
+  }
   const verdict = capabilityVerdict(capability, ctx.flags.get(capability.classKey) ?? null, ctx.evidence.get(offerExternalId) ?? [], termsHash);
   return { capability, verdict };
 }

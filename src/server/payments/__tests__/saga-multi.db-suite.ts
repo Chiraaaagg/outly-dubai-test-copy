@@ -770,4 +770,34 @@ describe.skipIf(!dbEnabled)("B3 multi-item payment saga (disposable database)", 
       expect(x.engine.confirmsSent).toBe(2);
     });
   });
+  describe("doc 29 Batch 6 (review 89 B6-20)", () => {
+    it("a waiting external item does not hide a late internal item of the same order: the saga is flagged once the internal one is past its send-by", async () => {
+      const x = await harness(prisma);
+      x.engine.confirmOutcome = "unknown";
+      const c = await checkedOut(x, run, "AED", "card", { items: 2 });
+      x.engine.external.add(c.itemIds[1]);
+      await deliver(x, c.gw, "payment.authorized", c.gw.pay(c.providerOrderId));
+      for (const id of c.itemIds) await reserved(x, id);
+      x.engine.set(c.itemIds[0], "confirming");
+      x.engine.set(c.itemIds[1], "awaiting_external");
+      await x.saga.advance(c.sagaId);
+      expect((await sagaState(x, c.sagaId)).attentionRequiredAt).toBeNull();
+      x.clock.advance(20 * 60_000);
+      await x.saga.advance(c.sagaId);
+      expect((await sagaState(x, c.sagaId)).attentionRequiredAt).not.toBeNull();
+    });
+
+    it("with only external items waiting, no deadline flag is raised", async () => {
+      const x = await harness(prisma);
+      x.engine.confirmOutcome = "unknown";
+      const c = await checkedOut(x, run, "AED", "card", { items: 2 });
+      for (const id of c.itemIds) x.engine.external.add(id);
+      await deliver(x, c.gw, "payment.authorized", c.gw.pay(c.providerOrderId));
+      for (const id of c.itemIds) await reserved(x, id);
+      for (const id of c.itemIds) x.engine.set(id, "awaiting_external");
+      x.clock.advance(20 * 60_000);
+      await x.saga.advance(c.sagaId);
+      expect((await sagaState(x, c.sagaId)).attentionRequiredAt).toBeNull();
+    });
+  });
 });

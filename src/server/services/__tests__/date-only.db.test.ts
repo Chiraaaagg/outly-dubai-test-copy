@@ -13,8 +13,9 @@ import { offerTermsHash } from "../../suppliers/traveldesk/traveldesk.offer-term
  * the gated path (`dateOnlySellable`). The target guard refuses anything but
  * the disposable test database. Rows live under a run-scoped supplier code
  * and a `zz-test-` product slug and are removed in afterAll; the flag row
- * this suite writes is deleted again (a missing row reads as off). Synthetic
- * ids and amounts only.
+ * rows this suite writes are deleted again by their own ids (a missing row
+ * reads as off), and it refuses to start if a row for the key exists already
+ * (review 92 B7-10). Synthetic ids and amounts only.
  */
 
 const enabled = Boolean(process.env.DATABASE_URL);
@@ -28,6 +29,7 @@ describe.skipIf(!enabled)("date-only readiness (doc 29 Batch 7, local DB)", () =
   let catalog: typeof import("../supplier-catalog.service").supplierCatalogService;
   let supplierId: string;
   let productId: string;
+  let flagId: string | null = null;
   const TOUR = BASE;
   const OFFER = BASE + 1;
   const offerPayload = storedOffer({ offerId: OFFER, tourId: TOUR, timeSlots: [], durationHours: 3 });
@@ -40,8 +42,10 @@ describe.skipIf(!enabled)("date-only readiness (doc 29 Batch 7, local DB)", () =
     ({ prisma } = await import("../../lib/db"));
     await assertDisposableDbLive(prisma);
     ({ supplierCatalogService: catalog } = await import("../supplier-catalog.service"));
-    // Nothing left over from an earlier failed run of this suite.
-    await prisma.supplierCapabilityFlag.deleteMany({ where: { adapter: "traveldesk", classKey: SELF } });
+    // Review 92 B7-10: a row for this key on the shared local database is not ours to delete; refuse to start instead.
+    if (await prisma.supplierCapabilityFlag.count({ where: { adapter: "traveldesk", environment: "test", classKey: SELF } })) {
+      throw new Error("a test-environment flag row for the date-only key already exists on this database; this suite will not change it");
+    }
     supplierId = uuidv7();
     await prisma.supplier.create({ data: { id: supplierId, code: CODE, name: "zz date-only test", source: "api", adapter: "traveldesk" } });
     for (const [kind, externalId, parent, payload] of [
@@ -76,7 +80,8 @@ describe.skipIf(!enabled)("date-only readiness (doc 29 Batch 7, local DB)", () =
 
   afterAll(async () => {
     if (!prisma) return;
-    await prisma.supplierCapabilityFlag.deleteMany({ where: { adapter: "traveldesk", classKey: SELF } });
+    // Only the row this suite created, by its id.
+    if (flagId) await prisma.supplierCapabilityFlag.deleteMany({ where: { id: flagId } });
     await prisma.productSupplierMapping.deleteMany({ where: { supplierId } });
     await prisma.supplierCatalogueItem.deleteMany({ where: { supplierId } });
     // Evidence rows cascade with the supplier.
@@ -92,7 +97,8 @@ describe.skipIf(!enabled)("date-only readiness (doc 29 Batch 7, local DB)", () =
   });
 
   it("the flag on without evidence is still refused, and the blocker stays", async () => {
-    await prisma.supplierCapabilityFlag.create({ data: { id: uuidv7(), adapter: "traveldesk", environment: "test", classKey: SELF, enabled: true, requiresOfferEvidence: true, reason: "zz date-only db test" } });
+    flagId = uuidv7();
+    await prisma.supplierCapabilityFlag.create({ data: { id: flagId, adapter: "traveldesk", environment: "test", classKey: SELF, enabled: true, requiresOfferEvidence: true, reason: "zz date-only db test" } });
     const v = await readiness();
     expect(v.blockers).toContain("slot_rules_unknown");
     expect(v.mapping).toMatchObject({ capabilityRefusal: "offer_evidence_missing", dateOnlySellable: false });
@@ -107,9 +113,50 @@ describe.skipIf(!enabled)("date-only readiness (doc 29 Batch 7, local DB)", () =
     expect(v.blockers).not.toContain("capability_not_ready");
     expect(v.mapping).toMatchObject({ capabilityRefusal: null, dateOnlySellable: true, listedStartsSellable: false });
     // Switched off again: back to the blocker at once.
-    await prisma.supplierCapabilityFlag.updateMany({ where: { adapter: "traveldesk", environment: "test", classKey: SELF }, data: { enabled: false } });
+    await prisma.supplierCapabilityFlag.update({ where: { id: flagId! }, data: { enabled: false } });
     const off = await readiness();
     expect(off.blockers).toContain("slot_rules_unknown");
     expect(off.mapping).toMatchObject({ dateOnlySellable: false });
+  });
+
+  it("production is locked until Q5 (owner decision d): the gate refuses even a flag row written straight into the table", async () => {
+    // Same offer and mapping, in production; a flag row and evidence written directly, bypassing the service's refusal.
+    await prisma.supplierCatalogueItem.createMany({
+      data: [
+        { id: uuidv7(), supplierId, environment: "production", kind: "tour", externalId: String(TOUR), parentExternalId: null, name: "zz b7 tour", bookingKind: null, payload: tourPayload as never, payloadHash: "x" },
+        { id: uuidv7(), supplierId, environment: "production", kind: "offer", externalId: String(OFFER), parentExternalId: String(TOUR), name: "zz b7 offer", bookingKind: "live_book", payload: offerPayload as never, payloadHash: "x" },
+      ],
+    });
+    const prodProduct = uuidv7();
+    const any = await prisma.product.findFirstOrThrow({ select: { categorySlug: true } });
+    await prisma.product.create({ data: { id: prodProduct, slug: `zz-test-${RUN}-b7-prod`, title: "zz date-only product prod", tier: "C", status: "draft", categorySlug: any.categorySlug, confirmation: "instant", content: {} } });
+    await prisma.productSupplierMapping.create({
+      data: {
+        id: uuidv7(),
+        productId: prodProduct,
+        supplierId,
+        variantCode: null,
+        externalRef: { tourId: TOUR, offerId: OFFER, bookingKind: "live_book", isExternal: false },
+        supplierProductId: String(TOUR),
+        supplierOfferId: String(OFFER),
+        bookingKind: "live_book",
+        environment: "production",
+        syncStatus: "ok",
+        approvedOfferHash: terms,
+      },
+    });
+    const prodFlag = uuidv7();
+    if (await prisma.supplierCapabilityFlag.count({ where: { adapter: "traveldesk", environment: "production", classKey: SELF } })) throw new Error("a production flag row for the date-only key already exists on this database");
+    await prisma.supplierCapabilityFlag.create({ data: { id: prodFlag, adapter: "traveldesk", environment: "production", classKey: SELF, enabled: true, requiresOfferEvidence: true, reason: "zz date-only lock test" } });
+    try {
+      await prisma.supplierOfferEnablement.create({
+        data: { id: uuidv7(), supplierId, environment: "production", offerExternalId: String(OFFER), classKey: SELF, evidenceKind: "production_booking", reference: "zz b7 lock test", offerTermsHash: terms },
+      });
+      const v = (await catalog.mappingReadinessFor(prodProduct, "production", { supplierCode: CODE })).variants[0];
+      expect(v.blockers).toEqual(expect.arrayContaining(["slot_rules_unknown", "capability_not_ready"]));
+      expect(v.mapping).toMatchObject({ capabilityRefusal: "class_not_sellable", dateOnlySellable: false });
+    } finally {
+      await prisma.supplierCapabilityFlag.deleteMany({ where: { id: prodFlag } });
+    }
   });
 });

@@ -19,6 +19,7 @@ import {
   classKeyOf,
   deriveCapabilities,
   EXTERNAL_CLASS_KEYS,
+  externalFlagsEnabled,
   INQUIRY_CLASS,
   legacyLiveBookGate,
   LISTED_START_CLASS_KEYS,
@@ -145,7 +146,7 @@ describe("class keys", () => {
     }
   });
 
-  it("per-unit, date-only, other ticket, unknown and inquiry keys can never be switched on (owner decisions 6 and 7; Batch 5 builds one ticket key)", () => {
+  it("per-unit, unbuilt date-only, other ticket, unknown and inquiry keys can never be switched on (owner decisions 6 and 7; Batch 5 builds one ticket key, Batch 7 two date-only keys)", () => {
     expect(neverEnabledReason("live.listed_starts_customer_selected.self.internal.per_unit")).toBe("private_units_inquiry");
     expect(neverEnabledReason("live.fixed_slot_single.pickup_required.internal.mixed_person_plus_unit")).toBe("private_units_inquiry");
     // Batch 7 builds the two internal per-person date-only keys (switched off); any other date-only key stays refused.
@@ -736,5 +737,19 @@ describe.skipIf(!HAS_LEDGER)("Batch 6 coverage over the 22 November 2026 catalog
     expect(external.every((x) => B6_KEYS.includes(x.cap.classKey))).toBe(true);
     for (const x of all.filter((x) => x.cap.dimensions.route === "external" && x.cap.dimensions.pricingUnit !== "per_person")) expect(x.v.instant).toBe(false);
     expect(all.find((x) => x.r.offerId === "1592")!.v.instant).toBe(false);
+  });
+});
+
+describe("review 89 B6-09: the release check for enabled external flags", () => {
+  it("reports every enabled external-route flag row, and nothing else", () => {
+    expect(externalFlagsEnabled([])).toEqual([]);
+    expect(
+      externalFlagsEnabled([
+        { classKey: "live.fixed_slot_single.self.internal.per_person", enabled: true },
+        { classKey: "live.listed_start_single.self.external.per_person", enabled: false },
+        { classKey: "live.listed_starts_customer_selected.self.external.per_person", enabled: true },
+        { classKey: "live.fixed_slot_choice.self.external.per_person", enabled: true },
+      ]),
+    ).toEqual(["live.fixed_slot_choice.self.external.per_person", "live.listed_starts_customer_selected.self.external.per_person"]);
   });
 });

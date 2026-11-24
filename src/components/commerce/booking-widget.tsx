@@ -14,6 +14,7 @@ import { track } from "@/lib/analytics";
 import { ctaFor } from "@/lib/cta";
 import { computeBreakdown, guestRowsFor, toCartItem, variantById } from "@/lib/pricing";
 import { fetchStartTimes, type StartTimesAnswer } from "@/lib/api/start-times";
+import { dateOnlyStartView } from "@/lib/start-time-retry";
 import { startMark } from "@/lib/perf-mark";
 import { useAbortableRead } from "@/lib/use-abortable-read";
 import type { Activity, PaxCount } from "@/lib/types";
@@ -118,6 +119,19 @@ export function BookingWidget({
     }
   });
   const listed = startTimes.status === "ready" && startTimes.data.source === "supplier" ? startTimes.data : null;
+  // Doc 29 Batch 7 (owner decision c): a date-only offer with one start on this date. Its time, when a real one, is shown before payment.
+  const dateOnlyAnswer = startTimes.status === "ready" && startTimes.data.source === "date_only" ? startTimes.data : null;
+  // Review 92 B7-11, B7-13: never shown as a pickup time; a date the quote would refuse, or the start just refused, blocks.
+  const dateOnlyView = dateOnlyAnswer
+    ? dateOnlyStartView({
+        startsAt: dateOnlyAnswer.startsAt,
+        status: dateOnlyAnswer.status,
+        pickup: activity.pickupIncluded,
+        date,
+        retime: retimeItem ? { date: retimeItem.date, time: retimeItem.time } : null,
+      })
+    : null;
+  const dateOnlyStart = dateOnlyAnswer && dateOnlyView && !dateOnlyView.blocked ? (dateOnlyAnswer.startsAt ?? undefined) : undefined;
   // Once this variant answered with listed starts, later dates show the picker's own loading state.
   // Keyed by variant: another variant that is simply not listed shows its stored times with no "live times" line.
   const [listedVariant, setListedVariant] = useState<string | null>(null);
@@ -161,7 +175,13 @@ export function BookingWidget({
 
   const proceed = async () => {
     // Listed times on screen, or a line sent back for a new time: a time must be chosen, never assumed.
-    if (!chosenTime && (pickerTimes || pickerLoading || retimeItem)) {
+    // A date-only date the quote would refuse, or the start just refused: another date must be chosen.
+    if (dateOnlyView?.blocked) {
+      setFocusTimes(true);
+      return;
+    }
+    // A date-only date with one start needs no choice, even for a line sent back for a new time.
+    if (!chosenTime && (pickerTimes || pickerLoading || (retimeItem && !dateOnlyAnswer))) {
       setTimeNotice("Choose a start time first.");
       setFocusTimes(true);
       return;
@@ -169,7 +189,7 @@ export function BookingWidget({
     setSubmitting(true);
     const item = toCartItem(activity, {
       date,
-      time: chosenTime ?? activity.timeSlots[0] ?? "Flexible",
+      time: chosenTime ?? dateOnlyStart ?? activity.timeSlots[0] ?? "Flexible",
       pax: shownPax,
       variantId,
       addOnIds,
@@ -375,6 +395,22 @@ export function BookingWidget({
 
         {/* ---- Time: the supplier's listed starts for the date when the offer sells that way
             (Batch 2), otherwise the listing's slots with no availability claims ---- */}
+        {dateOnlyView && !pickerTimes && (dateOnlyView.line || dateOnlyView.note) ? (
+          <div ref={dateOnlyView.blocked ? timesRef : undefined} tabIndex={dateOnlyView.blocked ? -1 : undefined} className="outline-none" data-testid="date-only-start">
+            {dateOnlyView.line ? (
+              dateOnlyView.blocked ? (
+                <p role="status" className="rounded-[var(--radius-control)] bg-sun-50 p-3 text-xs font-semibold leading-relaxed text-sun-800">
+                  {dateOnlyView.line}
+                </p>
+              ) : (
+                <p className="text-sm text-ink-900">
+                  <span className="font-bold">{dateOnlyView.line}</span> <span className="text-ink-600">Dubai time</span>
+                </p>
+              )
+            ) : null}
+            {dateOnlyView.note ? <p className="mt-1 text-xs text-ink-600">{dateOnlyView.note}</p> : null}
+          </div>
+        ) : null}
         {pickerTimes || pickerLoading ? (
           <div>
             <p id={timeLabelId} className="mb-2 text-sm font-bold text-ink-900">
