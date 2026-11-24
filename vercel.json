@@ -1,0 +1,38 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "regions": ["bom1"],
+  "crons": [
+    {
+      "path": "/api/jobs/inquiry-sweep",
+      "schedule": "*/5 * * * *"
+    },
+    {
+      "path": "/api/jobs/offline-conversions",
+      "schedule": "30 3 * * *"
+    },
+    {
+      "path": "/api/jobs/fx-refresh",
+      "schedule": "30 4,16 * * *"
+    },
+    {
+      "path": "/api/jobs/booking-tick",
+      "schedule": "* * * * *"
+    },
+    {
+      "path": "/api/jobs/documents-tick",
+      "schedule": "*/2 * * * *"
+    },
+    {
+      "path": "/api/jobs/supplier-reconcile",
+      "schedule": "*/15 * * * *"
+    },
+    {
+      "path": "/api/jobs/catalogue-sync",
+      "schedule": "0 23 * * *"
+    },
+    {
+      "path": "/api/jobs/retention-purge",
+      "schedule": "45 2 * * *"
+    }
+  ]
+}

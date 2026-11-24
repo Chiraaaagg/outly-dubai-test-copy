@@ -1,0 +1,59 @@
+/*
+ * Card shipped by 21st.dev with the OTP Verification Card and Collapsible Form
+ * Fields components (an older shadcn/ui Card). MIT, shadcn/ui.
+ * Verbatim copy: docs/checkout-redesign-review/components/otp-verification-card/deps/components/ui/card.tsx
+ * (identical to collapsible-form-fields/deps/components/ui/card.tsx).
+ *
+ * Edits (docs/checkout-redesign-review/notes/batch2-components.md): colour
+ * tokens mapped onto OUTLYY (card = paper, text = ink-900, description =
+ * ink-600, shadow-sm = shadow-soft); radius = --radius-card.
+ */
+import * as React from "react";
+
+import { cn } from "@/lib/utils";
+
+const Card = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement>>(
+  ({ className, ...props }, ref) => (
+    <div
+      ref={ref}
+      className={cn("rounded-[var(--radius-card)] border bg-paper text-ink-900 shadow-soft", className)}
+      {...props}
+    />
+  ),
+);
+Card.displayName = "Card";
+
+const CardHeader = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement>>(
+  ({ className, ...props }, ref) => (
+    <div ref={ref} className={cn("flex flex-col space-y-1.5 p-6", className)} {...props} />
+  ),
+);
+CardHeader.displayName = "CardHeader";
+
+const CardTitle = React.forwardRef<HTMLParagraphElement, React.HTMLAttributes<HTMLHeadingElement>>(
+  ({ className, ...props }, ref) => (
+    <h3 ref={ref} className={cn("text-2xl font-semibold leading-none tracking-tight", className)} {...props} />
+  ),
+);
+CardTitle.displayName = "CardTitle";
+
+const CardDescription = React.forwardRef<HTMLParagraphElement, React.HTMLAttributes<HTMLParagraphElement>>(
+  ({ className, ...props }, ref) => (
+    <p ref={ref} className={cn("text-sm text-ink-600", className)} {...props} />
+  ),
+);
+CardDescription.displayName = "CardDescription";
+
+const CardContent = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement>>(
+  ({ className, ...props }, ref) => <div ref={ref} className={cn("p-6 pt-0", className)} {...props} />,
+);
+CardContent.displayName = "CardContent";
+
+const CardFooter = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement>>(
+  ({ className, ...props }, ref) => (
+    <div ref={ref} className={cn("flex items-center p-6 pt-0", className)} {...props} />
+  ),
+);
+CardFooter.displayName = "CardFooter";
+
+export { Card, CardHeader, CardFooter, CardTitle, CardDescription, CardContent };
