@@ -10,6 +10,7 @@ import { CAPABILITY_ADAPTER } from "../suppliers/capability-gate";
 import {
   CAPABILITY_DERIVATION_VERSION,
   deriveCapabilities,
+  capabilityKeyNote,
   neverEnabledReason,
   parseClassKey,
   SEEDED_CLASS_KEYS,
@@ -95,7 +96,7 @@ function checkKey(classKey: string): CapabilityDimensions {
 const NEVER_MESSAGE: Record<string, string> = {
   not_a_class: "This is not a sellable class",
   private_units_inquiry: "Private-unit classes stay inquiry (owner decision, 22 November 2026)",
-  date_only_inquiry: "Date-only classes stay inquiry until TravelDesk answers how to book them",
+  date_only_inquiry: "Only the two internal, per-person date-only classes of Batch 7 are built (and kept off until TravelDesk answers Q5); other date-only classes stay inquiry",
   ticket_booking_refused: "Only the open-dated, self-arrival, internal, per-person ticket class is built; other ticket classes stay inquiry",
   external_route_unproven: "Only the five per-person external classes of Batch 6 are built; other external classes stay inquiry",
 };
@@ -135,6 +136,8 @@ export interface CapabilityClassRow {
   seeded: boolean;
   /** Why this key can never be switched on in this release, or null. */
   neverEnabled: string | null;
+  /** A standing note to read before switching this key on (`capabilityKeyNote`; Batch 7: TravelDesk Q5 unconfirmed), or null. */
+  note: string | null;
   /** Live catalogue offers derived into this class. */
   offers: number;
   /** Of those, offers with something for a person to review first. */
@@ -209,6 +212,7 @@ export const supplierCapabilityService = {
           : null,
         seeded: SEEDED_CLASS_KEYS.includes(classKey),
         neverEnabled: neverEnabledReason(classKey),
+        note: capabilityKeyNote(classKey),
         offers: inClass.length,
         offersNeedingReview: inClass.filter((c) => c.reviewReasons.length > 0).length,
         mappedOffers: inClass.filter((c) => mapped.has(c.offerExternalId)).length,

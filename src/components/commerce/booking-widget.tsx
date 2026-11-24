@@ -129,7 +129,9 @@ export function BookingWidget({
   const pickerLoading = listedProduct && startTimes.status === "loading";
   const usableTime = (t: string | undefined) => !!t && !!pickerTimes?.some((x) => x.time === t && (x.status === "available" || x.status === "limited"));
   // With listed times on screen, only a time they offer counts as chosen; while a date's times load, none does.
-  const chosenTime = pickerLoading ? undefined : pickerTimes ? (usableTime(time) ? time : undefined) : time;
+  // Without listed times, only one of the page's own times counts: a time picked from another date's listed starts
+  // never carries over to a date that lists none (doc 29 Batch 7: a date-only offer shows times only on some dates).
+  const chosenTime = pickerLoading ? undefined : pickerTimes ? (usableTime(time) ? time : undefined) : time !== undefined && activity.timeSlots.includes(time) ? time : undefined;
   // The live times could not be read (busy, unavailable, an error); a variant that is not listed is not a fallback.
   const timesFellBack =
     listedProduct && (startTimes.status === "error" || (startTimes.status === "ready" && startTimes.data.source === "stored" && startTimes.data.reason !== "not_listed"));

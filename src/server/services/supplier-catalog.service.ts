@@ -19,7 +19,7 @@ import { ageBandMismatches, offerReadinessFacts } from "../suppliers/traveldesk/
 import { readinessService } from "./readiness.service";
 import { verifyStepUp } from "./approval.service";
 import { gateVerdict, loadCapabilityGate } from "../suppliers/capability-gate";
-import { bookingKindSellable, CAPABILITY_DERIVATION_VERSION, deriveCapabilities, listedStartsSellable, TICKET_CLASS_KEYS } from "../suppliers/traveldesk/traveldesk.capability";
+import { bookingKindSellable, CAPABILITY_DERIVATION_VERSION, dateOnlySellable, deriveCapabilities, listedStartsSellable, TICKET_CLASS_KEYS } from "../suppliers/traveldesk/traveldesk.capability";
 import type { ReadLimits } from "../suppliers/read-budget";
 import { TravelDeskApiError } from "../suppliers/traveldesk/traveldesk.http";
 import { bookingAccountId, DEFAULT_BOOKING_ACCOUNT_ID, mutationInFlight, takeReadToken } from "./supplier-booking.service";
@@ -427,6 +427,14 @@ export interface VariantMappingState {
      * its approved reference. Anything else is false.
      */
     openDatedSellable?: boolean;
+    /**
+     * Doc 29 Batch 7: the offer lists no slot and sells as date only. True
+     * only when the capability gate allows its exact date-only class key
+     * (`DATE_ONLY_CLASS_KEYS`; flag on, evidence for the key and current
+     * terms) and the stored offer has no slot. The booking then sends the
+     * times of a fresh availability row. Anything else is false.
+     */
+    dateOnlySellable?: boolean;
   } | null;
   /** Empty when the mapping side is ready; readiness adds its own reasons. */
   blockers: MappingBlocker[];
@@ -506,7 +514,8 @@ export const supplierCatalogService = {
    *    approved ones, the stored terms hash differently now, or there is no
    *    approved hash at all;
    *  - `slot_rules_unknown`: the stored offer cannot be read, or a slot-based
-   *    offer has no slots;
+   *    offer has no slots, unless its exact date-only class key is switched
+   *    on with evidence (doc 29 Batch 7, `dateOnlySellable`);
    *  - `capability_not_ready`: not a live-book offer (on request, unknown, or
    *    a TicketOnly offer whose one Batch 5 ticket key is not switched on, doc
    *    29 Batch 5), the mapping's booking kind disagrees with its approved
@@ -576,12 +585,15 @@ export const supplierCatalogService = {
       else if (m.syncStatus !== "ok" || !m.approvedOfferHash || currentOfferHash !== m.approvedOfferHash || !approvedSlotHoursHold(offer!.payload, m.approvedSlotHours)) {
         blockers.push("mapping_changed_upstream");
       }
-      if (!stored || (stored.bookingKind === "live_book" && stored.timeSlots.length === 0)) blockers.push("slot_rules_unknown");
       // The capability lookup decides (Batch 1a parity). The booking kind must agree on the mapping, its approved
       // reference and the stored offer's class (`bookingKindSellable`): live book needs a live class, TicketOnly the one
       // ticket key of Batch 5, which is off unless switched on with evidence. With that flag off this is the old
       // live-book test exactly.
       const capability = gateVerdict(gate, m.supplierOfferId ?? "", offer && !offer.removedAt ? offer.payload : null, currentOfferHash);
+      // Doc 29 Batch 7: a live-book offer without slots keeps `slot_rules_unknown`, unless the gate allows its exact
+      // date-only key (flag on, evidence for the key and current terms). Its time then comes from fresh availability only.
+      const dateOnly = dateOnlySellable(capability.verdict.instant, capability.verdict.classKey, stored?.timeSlots);
+      if (!stored || (stored.bookingKind === "live_book" && stored.timeSlots.length === 0 && !dateOnly)) blockers.push("slot_rules_unknown");
       const kindSellable = ref.success && m.bookingKind === ref.data.bookingKind && bookingKindSellable(ref.data.bookingKind, capability.verdict);
       if (supplier.adapter !== "traveldesk" || !kindSellable) blockers.push("capability_not_ready");
       const openDatedSellable = kindSellable && ref.success && ref.data.bookingKind === "ticket_only" && TICKET_CLASS_KEYS.includes(capability.verdict.classKey);
@@ -610,6 +622,7 @@ export const supplierCatalogService = {
           capabilityRefusal: capability.verdict.instant ? null : capability.verdict.reason,
           catalogueSyncedAt: syncedAt?.toISOString() ?? null,
           listedStartsSellable: listedStartsSellable(capability.verdict.instant, capability.verdict.classKey, stored?.timeSlots, stored?.durationHours),
+          dateOnlySellable: dateOnly,
           openDatedSellable: supplier.adapter === "traveldesk" && openDatedSellable,
         },
         blockers,

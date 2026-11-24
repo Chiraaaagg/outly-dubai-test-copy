@@ -227,6 +227,11 @@ export interface QuoteLineSnapshot {
   openDatedTicket?: boolean;
   /** Doc 29 Batch 6: the line is booked through an external supplier (confirmation can take minutes); absent otherwise. */
   externalConfirmation?: boolean;
+  /**
+   * Doc 29 Batch 7: a date-only line. The availability row the supplier check accepted (`timeSlotId`,
+   * start and end in minutes after Dubai midnight), which the booking sends exactly. Absent otherwise.
+   */
+  availabilitySlot?: { timeSlotId: number; startMinutes: number; endMinutes: number };
 }
 
 export interface QuoteSnapshot {
@@ -306,6 +311,11 @@ export type SupplierQuoteResult =
       pickupHotelName?: string | null;
       /** Doc 29 Batch 6: the offer is booked through an external supplier, whose confirmation can take minutes. Absent otherwise. */
       externalConfirmation?: true;
+      /**
+       * Doc 29 Batch 7: a date-only offer (no slot metadata). The fresh availability row's own `timeSlotId`,
+       * `startTime` and `endTime`, which the booking sends unchanged. Absent for every other offer.
+       */
+      availabilitySlot?: { timeSlotId: number; startMinutes: number; endMinutes: number };
     }
   | {
       ok: false;

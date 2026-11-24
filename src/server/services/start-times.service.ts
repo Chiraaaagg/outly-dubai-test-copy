@@ -13,7 +13,10 @@ import { supplierQuoteService, type SupplierStartTimesReader } from "./supplier-
  * sells as listed starts (`listedStartsSellable`: its exact listed-start
  * class key is switched on, evidence where asked). Everything else answers
  * `stored`, and the page keeps the start times it already shows, so with the
- * Batch 2 flags off this read makes no supplier call at all.
+ * Batch 2 flags off this read makes no supplier call at all. A date-only
+ * offer (doc 29 Batch 7, `dateOnlySellable`) is read the same way; it answers
+ * `supplier` only when the date has several starts, else `stored`
+ * (`not_listed`) and the guest picks only the date.
  *
  * The answer carries times and availability marks only: no price, no seat
  * count, no supplier id. It is indicative ("as of" `checkedAt`); the quote
@@ -58,7 +61,8 @@ export function createStartTimesService(deps: StartTimesDeps) {
       const out: Record<string, string | null> = {};
       for (const v of variants) {
         const m = mappingForVariant(a.mappings, v.id, variants.length);
-        out[v.id] = m && m.listedStartsSellable === true ? m.mappingId : null;
+        // Doc 29 Batch 7: a date-only offer reads its starts from availability too (chips only when there are several).
+        out[v.id] = m && (m.listedStartsSellable === true || m.dateOnlySellable === true) ? m.mappingId : null;
       }
       return out;
     });

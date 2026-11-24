@@ -148,7 +148,9 @@ describe("class keys", () => {
   it("per-unit, date-only, other ticket, unknown and inquiry keys can never be switched on (owner decisions 6 and 7; Batch 5 builds one ticket key)", () => {
     expect(neverEnabledReason("live.listed_starts_customer_selected.self.internal.per_unit")).toBe("private_units_inquiry");
     expect(neverEnabledReason("live.fixed_slot_single.pickup_required.internal.mixed_person_plus_unit")).toBe("private_units_inquiry");
-    expect(neverEnabledReason("live.date_only_no_slot_metadata.self.internal.per_person")).toBe("date_only_inquiry");
+    // Batch 7 builds the two internal per-person date-only keys (switched off); any other date-only key stays refused.
+    expect(neverEnabledReason("live.date_only_no_slot_metadata.self.internal.per_person")).toBeNull();
+    expect(neverEnabledReason("live.date_only_no_slot_metadata.self.external.per_person")).toBe("date_only_inquiry");
     // Batch 5: the one open-dated, self-arrival, internal, per-person ticket key may be switched on (by approval, with evidence); no other ticket key.
     expect(neverEnabledReason("ticket.open_dated.self.internal.per_person")).toBeNull();
     expect(neverEnabledReason("ticket.open_dated.self.external.per_person")).toBe("ticket_booking_refused");

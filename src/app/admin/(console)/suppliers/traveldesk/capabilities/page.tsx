@@ -24,7 +24,7 @@ const ENVS = ["production", "test"] as const;
 const NEVER_LABEL: Record<string, string> = {
   not_a_class: "not a sale class",
   private_units_inquiry: "private units stay inquiry",
-  date_only_inquiry: "date-only stays inquiry",
+  date_only_inquiry: "date-only class not built",
   ticket_booking_refused: "ticket class not built",
   external_route_unproven: "external class not built",
 };
@@ -58,7 +58,9 @@ export default async function CapabilityFlagsPage({ searchParams }: { searchPara
           <div className="mt-1 flex flex-wrap gap-1">
             {r.seeded && <StatusPill tone="info" title="Seeded on by migration (doc 29 §3.3 exception)">seeded</StatusPill>}
             {r.seeded && r.flag && !r.flag.requiresOfferEvidence && <StatusPill title="Offers in this class need no per-offer evidence">no evidence needed</StatusPill>}
+            {r.note && <StatusPill tone="warning">keep off: TravelDesk Q5 unanswered</StatusPill>}
           </div>
+          {r.note && <p className="mt-1 max-w-md text-xs text-ink-600">{r.note}</p>}
         </div>
       ),
     },

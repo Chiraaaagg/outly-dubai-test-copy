@@ -645,6 +645,8 @@ export function createQuoteService(deps: QuoteDeps): QuoteServiceImpl {
           ticketValidUntil: c.supplier.ticketValidUntil ?? null,
           ...(c.supplier.openDatedTicket === true ? { openDatedTicket: true } : {}),
           ...(c.supplier.externalConfirmation === true ? { externalConfirmation: true } : {}),
+          // Doc 29 Batch 7: the date-only row the booking will send, as the supplier check read it.
+          ...(c.supplier.availabilitySlot ? { availabilitySlot: { ...c.supplier.availabilitySlot } } : {}),
         });
       }
       if (refusals.length) return refused(refusals);

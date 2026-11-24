@@ -58,7 +58,13 @@ import type { ProductMappingReadiness, VariantMappingState } from "./supplier-ca
  *    then the same set equality applies to its listed starts. Never an
  *    arbitrary time. An open-dated ticket (doc 29 Batch 5,
  *    `openDatedSellable`: its ticket key switched on, with evidence) passes
- *    only with no page times and no stored slots, and only non-refundable;
+ *    only with no page times and no stored slots, and only non-refundable.
+ *    A date-only offer (doc 29 Batch 7, `dateOnlySellable`: its exact
+ *    date-only key switched on, with evidence) passes only with no page
+ *    times and no stored slots: the guest picks the date, and a time only
+ *    when a fresh availability read lists several starts. TravelDesk has not
+ *    confirmed this reading (Q5, `DATE_ONLY_Q5_UNCONFIRMED`), so the keys
+ *    stay off until it does;
  *  - page price equals quote price: every unit is one of the page's pax
  *    types and its authored price equals the price the activity page shows
  *    for that type (`unit_price_mismatch`);
@@ -109,6 +115,8 @@ import type { ProductMappingReadiness, VariantMappingState } from "./supplier-ca
  * but only when the gate allows them, and no such flag exists before the batch; switching one on re-runs
  * readiness for its mapped products (supplier-capability.service.ts). No stored verdict can differ, so a bump
  * would only send every instant product to inquiry until the next re-run.
+ * Not bumped by doc 29 Batch 7, for the same reason: `dateOnlySellable` lifts `slot_rules_unknown` and the
+ * time rule only for the two date-only keys, only when the gate allows them, and no such flag exists before it.
  */
 export const READINESS_RULES_VERSION = 11;
 
@@ -152,6 +160,8 @@ export interface MappingReadiness {
   listedStartsSellable?: boolean | null;
   /** Doc 29 Batch 5: the offer is an open-dated ticket sold instantly (flag on for the ticket key, with evidence). Absent or null = no. */
   openDatedSellable?: boolean | null;
+  /** Doc 29 Batch 7: the offer lists no slot and sells as date only (flag on for its exact key, with evidence). Absent or null = no. */
+  dateOnlySellable?: boolean | null;
 }
 
 export interface MappingReadinessSource {
@@ -305,10 +315,13 @@ export function pageStartMinutes(time: string): number | null {
  */
 export function slotTimesAgree(
   pageTimes: readonly string[],
-  m: Pick<MappingReadiness, "slotStartMinutes" | "anyTimeSlots" | "listedStartsSellable" | "openDatedSellable">,
+  m: Pick<MappingReadiness, "slotStartMinutes" | "anyTimeSlots" | "listedStartsSellable" | "openDatedSellable" | "dateOnlySellable">,
 ): "ok" | "slot_times_mismatch" | "slot_any_time_unsupported" {
   // Batch 5: an open-dated ticket has no start time. The page must offer none, and the offer must store none.
-  if (m.openDatedSellable === true) return pageTimes.length === 0 && Array.isArray(m.slotStartMinutes) && m.slotStartMinutes.length === 0 && m.anyTimeSlots === false ? "ok" : "slot_times_mismatch";
+  // Batch 7: a date-only offer stores none either; its times, if any, come from a fresh availability read on the page.
+  if (m.openDatedSellable === true || m.dateOnlySellable === true) {
+    return pageTimes.length === 0 && Array.isArray(m.slotStartMinutes) && m.slotStartMinutes.length === 0 && m.anyTimeSlots === false ? "ok" : "slot_times_mismatch";
+  }
   if (m.anyTimeSlots === null || m.anyTimeSlots === undefined) return "slot_times_mismatch";
   // Batch 2: "any time" sells only as one of the listed starts, below, and only with its flag on.
   if (m.anyTimeSlots === true && m.listedStartsSellable !== true) return "slot_any_time_unsupported";
@@ -688,6 +701,7 @@ export function fromCatalogReadiness(r: ProductMappingReadiness): MappingReadine
       anyTimeSlots: typeof extra.anyTimeSlots === "boolean" ? extra.anyTimeSlots : null,
       listedStartsSellable: extra.listedStartsSellable === true,
       openDatedSellable: extra.openDatedSellable === true,
+      dateOnlySellable: extra.dateOnlySellable === true,
     });
   }
   return [...out.values()];

@@ -8,11 +8,11 @@ import type { EngineSagaApi, SagaNotifier } from "../payments/contracts";
 import { dbPaymentEvidence } from "../payments/evidence";
 import { GUARD_RELEASING_STATES, type PaymentEvidencePort } from "../suppliers/booking-port";
 import { checkOfferCapability } from "../suppliers/capability-gate";
-import { bookingKindSellable } from "../suppliers/traveldesk/traveldesk.capability";
+import { bookingKindSellable, dateOnlySellable } from "../suppliers/traveldesk/traveldesk.capability";
 import { travelDeskExternalRefSchema } from "../suppliers/traveldesk/traveldesk.adapter";
 import { traveldeskConfigFrom } from "../suppliers/traveldesk/traveldesk.config";
 import { approvedSlotHoursHold, parseStoredOffer, slotEndMinutes } from "../suppliers/traveldesk/traveldesk.offer-terms";
-import { exactSlotOf, slotRulesFor, unitsFrom } from "../suppliers/traveldesk/traveldesk.quote";
+import { dateOnlyBookingSlot, exactSlotOf, slotRulesFor, unitsFrom } from "../suppliers/traveldesk/traveldesk.quote";
 import { bookingAccountId, supplierBookingService, TRAVELDESK_SUPPLIER_CODE } from "./supplier-booking.service";
 import { supplierGuestName } from "@/lib/guest-name";
 
@@ -85,6 +85,8 @@ const quoteLineSchema = z.object({
   supplierNetAedMinor: minorString,
   /** TravelDesk's own USD figure for the same net (SUP-24); never derived from AED. */
   supplierNetUsdMinor: minorString.nullable().optional(),
+  /** Doc 29 Batch 7: the availability row a date-only line was quoted on; absent on every other line. */
+  availabilitySlot: z.object({ timeSlotId: z.number().int(), startMinutes: z.number().int(), endMinutes: z.number().int() }).nullable().optional(),
 });
 
 /**
@@ -193,6 +195,12 @@ export function createEngineSagaApi(deps: EngineSagaDeps): EngineSagaApi {
         // Doc 29 Batch 5: an open-dated ticket has no slot and, in its one class, no pickup. A line that names either was not a ticket quote.
         if (line.slotRef !== null) refuse("ticket_slot_unexpected", "A ticket quote line names no slot");
         if (line.pickup) refuse("ticket_pickup_unexpected", "A ticket of this class has no hotel pickup");
+      } else if (dateOnlySellable(capability.verdict.instant, capability.verdict.classKey, stored.timeSlots)) {
+        // Doc 29 Batch 7: a date-only offer has no stored slot. The booking sends the availability row the quote
+        // accepted, copied as TravelDesk gave it (timeSlotId, startTime, endTime); never a stored or made-up value.
+        const slot = dateOnlyBookingSlot({ slotRef: line.slotRef, availabilitySlot: line.availabilitySlot });
+        if (!slot) refuse("slot_unknown", "The quote line names no availability row for this date-only offer");
+        slotForIntent = slot;
       } else {
         // The exact slot the supplier check accepted, with its end time from the approved stored offer.
         const slot = exactSlotOf(line.slotRef);

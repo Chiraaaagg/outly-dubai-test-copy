@@ -158,6 +158,54 @@ export const LISTED_START_SELLABLE_KEYS: readonly string[] = Object.freeze([
 ]);
 
 /**
+ * The two Batch 7 keys (doc 29 §3.3, §7.3 Batch 7): a live-book offer whose
+ * tour metadata lists no time slot at all ("date only"), internal route,
+ * per-person price, with self arrival (22 offers in the coverage ledger) or
+ * hotel pickup (2). **Not seeded**: no flag row means off. Switching one on
+ * goes through the approval path with per-offer evidence for that exact key,
+ * which `capabilityVerdict` asks of every key outside `SEEDED_CLASS_KEYS`.
+ *
+ * Built switched off on the safe reading of TravelDesk's own documentation
+ * while our question Q5 ("which slot id and times should a booking send?")
+ * is unanswered: the booking sends `timeSlotId`, `startTime` and `endTime`
+ * copied from a fresh availability row for that offer and date
+ * (`dateOnlyStartsFrom`, `quoteSlot`), never values we make up. See
+ * `DATE_ONLY_Q5_UNCONFIRMED`: the flags stay off until TravelDesk answers
+ * and one supervised booking proves each key. Any other date-only key
+ * (external route, per unit) stays refused (`date_only_inquiry`).
+ */
+export const DATE_ONLY_CLASS_KEYS: readonly string[] = Object.freeze([
+  "live.date_only_no_slot_metadata.self.internal.per_person",
+  "live.date_only_no_slot_metadata.pickup_required.internal.per_person",
+]);
+
+/**
+ * Readiness note for the Batch 7 keys, shown beside them on the admin
+ * capability screen (`capabilityKeyNote`). TravelDesk has not answered Q5,
+ * so the time values a date-only booking sends rest on our reading of their
+ * documentation, not on their confirmation.
+ */
+export const DATE_ONLY_Q5_UNCONFIRMED =
+  "TravelDesk has not confirmed which slot id and times a date-only booking sends (question Q5). Keep this class off until TravelDesk answers and one supervised booking proves this exact key.";
+
+/** A standing note for a class key that an administrator must read before switching it on, or null. */
+export function capabilityKeyNote(classKey: string): string | null {
+  return DATE_ONLY_CLASS_KEYS.includes(classKey) ? DATE_ONLY_Q5_UNCONFIRMED : null;
+}
+
+/**
+ * Whether an offer may sell as a date-only offer (Batch 7): the capability
+ * gate allowed its exact class key (`gateAllows`: flag on, evidence for the
+ * key and current terms), that key is one of `DATE_ONLY_CLASS_KEYS`, and the
+ * stored offer really lists no slot. The time a booking sends then comes
+ * from a fresh availability row only. Anything else is false, and readiness
+ * keeps its `slot_rules_unknown` blocker for a live-book offer without slots.
+ */
+export function dateOnlySellable(gateAllows: boolean, classKey: string, slots: readonly unknown[] | null | undefined): boolean {
+  return gateAllows && DATE_ONLY_CLASS_KEYS.includes(classKey) && Array.isArray(slots) && slots.length === 0;
+}
+
+/**
  * The one Batch 5 key (doc 29 §3.3, §7.3 Batch 5): an open-dated TicketOnly
  * offer, self arrival, internal route, per-person price; 54 offers in the
  * coverage ledger. Booked like a live offer, in two steps (reserve holds the
@@ -302,7 +350,9 @@ export function parseClassKey(key: string): CapabilityDimensions | null {
  *  - `not_a_class`: `unknown`, `inquiry_only` or not a composed key;
  *  - `private_units_inquiry`: per-unit or per person plus per unit pricing
  *    (owner decision 7, 22 Nov 2026: private units stay inquiry);
- *  - `date_only_inquiry`: no slot metadata (owner decision 6: date-only stays
+ *  - `date_only_inquiry`: no slot metadata, other than the two keys of
+ *    Batch 7 (`DATE_ONLY_CLASS_KEYS`: internal, per person, self arrival or
+ *    pickup), which are built switched off (owner decision 6: date-only stays
  *    inquiry until TravelDesk answers Q5);
  *  - `ticket_booking_refused`: a ticket class other than the one Batch 5
  *    builds (`TICKET_CLASS_KEYS`: open dated, self arrival, internal, per
@@ -317,7 +367,7 @@ export function neverEnabledReason(
   const d = parseClassKey(key);
   if (!d) return "not_a_class";
   if (d.pricingUnit === "per_unit" || d.pricingUnit === "mixed_person_plus_unit") return "private_units_inquiry";
-  if (d.timeShape === "date_only_no_slot_metadata") return "date_only_inquiry";
+  if (d.timeShape === "date_only_no_slot_metadata" && !DATE_ONLY_CLASS_KEYS.includes(key)) return "date_only_inquiry";
   if (d.fulfilment === "ticket" && !TICKET_CLASS_KEYS.includes(key)) return "ticket_booking_refused";
   if (d.route === "external" && d.fulfilment === "live" && !EXTERNAL_CLASS_KEYS.includes(key)) return "external_route_unproven";
   return null;

@@ -10,7 +10,7 @@ import { TravelDeskReadClient } from "../suppliers/traveldesk/traveldesk.client"
 import type { TravelDeskAvailabilityRow, TravelDeskTicketStock } from "../suppliers/traveldesk/traveldesk.codec";
 import { traveldeskConfigFrom, type TravelDeskConfig } from "../suppliers/traveldesk/traveldesk.config";
 import { approvedSlotHoursHold, offerTermsHash, parseStoredOffer, parseStoredPolicy } from "../suppliers/traveldesk/traveldesk.offer-terms";
-import { hotelOnPickupList, listedStartsOn, pickupShapeFits, quoteSlot, quoteTickets, unitsFrom, type ListedStart } from "../suppliers/traveldesk/traveldesk.quote";
+import { dateOnlyStartsOn, hotelOnPickupList, listedStartsOn, pickupShapeFits, quoteSlot, quoteTickets, unitsFrom, type ListedStart } from "../suppliers/traveldesk/traveldesk.quote";
 import { TtlCache } from "../suppliers/cache";
 import { cleanHotelText } from "./pickup-hotels.service";
 import { bookingAccountId, DEFAULT_BOOKING_ACCOUNT_ID, takeBrowseReadToken, takeQuoteReadToken } from "./supplier-booking.service";
@@ -227,11 +227,16 @@ export function createSupplierQuoteService(deps: SupplierQuoteDeps): SupplierQuo
      * quote read. A spent browse share serves a recent cached answer
      * (`stale`) or `busy`. The caller decides whether the offer's class is
      * switched on; this only refuses an offer that is not wholly "any time".
+     * Doc 29 Batch 7: an offer with no slot metadata reads its starts from the
+     * rows (`dateOnlyStartsOn`) and answers `not_listed` unless they give
+     * several starts.
      */
     async startTimes(input): Promise<StartTimesResult> {
       const a = await approvedOffer(input.mappingId);
       if (!a || a.ref.bookingKind !== "live_book") return { ok: false, reason: "availability_unknown" };
-      if (listedStartsOn(a.offer, input.serviceDate, [], deps.now()) === null) return { ok: false, reason: "not_listed" };
+      // Doc 29 Batch 7: an offer with no slot metadata lists the starts its fresh rows give (several, or none shown).
+      const dateOnly = a.offer.timeSlots.length === 0;
+      if (!dateOnly && listedStartsOn(a.offer, input.serviceDate, [], deps.now()) === null) return { ok: false, reason: "not_listed" };
       const take = deps.takeBrowseReadToken;
       const live = deps.source(a.mapping.environment);
       if (!live || !take) return { ok: false, reason: "supplier_unavailable" };
@@ -242,7 +247,7 @@ export function createSupplierQuoteService(deps: SupplierQuoteDeps): SupplierQuo
           const { rows } = await live.source.getAvailability(a.ref.offerId, input.serviceDate, input.serviceDate, { isExternal: a.ref.isExternal });
           return rows;
         });
-        const times = listedStartsOn(a.offer, input.serviceDate, cached.value, deps.now());
+        const times = dateOnly ? dateOnlyStartsOn(a.offer, input.serviceDate, cached.value, deps.now()) : listedStartsOn(a.offer, input.serviceDate, cached.value, deps.now());
         if (!times) return { ok: false, reason: "not_listed" };
         return { ok: true, times, checkedAt: new Date(cached.fetchedAt).toISOString(), stale: cached.stale };
       } catch (e) {
