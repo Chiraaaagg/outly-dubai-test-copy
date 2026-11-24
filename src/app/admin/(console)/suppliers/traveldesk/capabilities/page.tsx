@@ -26,6 +26,7 @@ const NEVER_LABEL: Record<string, string> = {
   private_units_inquiry: "private units stay inquiry",
   date_only_inquiry: "date-only stays inquiry",
   ticket_booking_refused: "ticket class not built",
+  external_route_unproven: "external class not built",
 };
 
 function flagPill(r: CapabilityClassRow) {

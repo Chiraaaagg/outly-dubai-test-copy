@@ -1201,6 +1201,13 @@ export default function CheckoutPage() {
                             cancellationPolicyBeforeQuote(item.freeCancellationHours, { openDatedTicket: item.openDatedTicket })}
                         </span>
                       </p>
+                      {/* Doc 29 Batch 6: an external supplier's offer says, before payment, that its confirmation can take a few minutes. */}
+                      {live?.lines.find((l) => l.index === index)?.externalConfirmationCopy ? (
+                        <p className="mt-2 flex gap-2 text-sm text-ink-600" data-testid="checkout-external-confirmation">
+                          <Clock aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
+                          <span>{live.lines.find((l) => l.index === index)!.externalConfirmationCopy}</span>
+                        </p>
+                      ) : null}
                     </li>
                   ))}
                 </ul>

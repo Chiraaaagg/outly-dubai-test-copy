@@ -590,3 +590,47 @@ describe("`left` counts adults and children only (OpenAPI AvailabilityDto.left)"
     expect(slot([row({ seatsLeft: 2 })], { offer, units: party(0) })).toEqual({ ok: false, reason: "sold_out" });
   });
 });
+
+/* ---------------------------------------------------------------------------
+ * Doc 29 Batch 6: external offers use the same advance-booking cut-off
+ * ------------------------------------------------------------------------ */
+
+describe("external offers: the advance-booking cut-off (Batch 6)", () => {
+  // 24 of the 57 Batch 6 offers carry a negative `minimumAdvancedBooking`. The existing rule applies unchanged:
+  // the cut-off is the start minus the hours, for either sign (doc 29 §8.7; the 13:00-vs-15:00 example is open).
+  const external = (hours: number | null, over: Record<string, unknown> = {}) =>
+    offerOf({
+      isExternal: true,
+      timeSlots: [600, 780].map((startMinutes) => storedSlot({ timeSlotId: 41, startMinutes, endMinutes: startMinutes + 120, isAnyTime: true, isExternal: true, minimumAdvancedBookingHours: hours })),
+      ...over,
+    });
+  const r = (startMinutes: number) => row({ timeSlotId: 41, startMinutes, endMinutes: startMinutes + 120 });
+
+  it("a negative value moves the cut-off later the same day, exactly as for an internal offer", () => {
+    const offer = external(-5);
+    const at = (iso: string) => slot([r(600)], { offer, slotRef: "10:00", now: new Date(iso) });
+    // 10:00 Dubai with -5 h: bookable the same day until 15:00 Dubai (11:00Z), and the quote expires then.
+    const open = at("2026-11-12T08:00:00Z");
+    expect(open.ok && open.cutoffUtc).toBe("2026-11-12T11:00:00.000Z");
+    expect(at("2026-11-12T10:59:59Z").ok).toBe(true);
+    expect(at("2026-11-12T11:00:00Z")).toEqual({ ok: false, reason: "past_cutoff" });
+    expect(open.ok && open.cutoffUtc).toBe(new Date(slotCutoffMs(SERVICE_DATE, 600, -5)).toISOString());
+  });
+
+  it("a positive value closes before the start, and no value means the start itself", () => {
+    expect(slot([r(600)], { offer: external(5), slotRef: "10:00", now: new Date("2026-11-12T01:00:00Z") })).toEqual({ ok: false, reason: "past_cutoff" });
+    expect(slot([r(600)], { offer: external(5), slotRef: "10:00", now: new Date("2026-11-12T00:59:59Z") }).ok).toBe(true);
+    const none = slot([r(600)], { offer: external(null), slotRef: "10:00", now: new Date("2026-11-12T05:00:00Z") });
+    expect(none.ok && none.cutoffUtc).toBe("2026-11-12T06:00:00.000Z");
+  });
+
+  it("the public listed starts follow the same cut-off", () => {
+    const offer = external(-5);
+    const rows = [r(600), r(780)];
+    // 12:00Z is past 10:00's cut-off (11:00Z) but not 13:00's (14:00Z).
+    expect(listedStartsOn(offer, SERVICE_DATE, rows, new Date("2026-11-12T12:00:00Z"))).toEqual([
+      { time: "10:00", status: "unavailable" },
+      { time: "13:00", status: "available" },
+    ]);
+  });
+});

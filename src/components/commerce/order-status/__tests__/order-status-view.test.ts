@@ -216,3 +216,34 @@ describe("OrderStatusView: open-dated tickets (doc 29 Batch 5)", () => {
     expect(html).not.toContain("non-refundable once issued");
   });
 });
+
+describe("OrderStatusView: an external supplier's booking (doc 29 Batch 6)", () => {
+  const statement = "This operator confirms bookings through their own system, so confirmation can take a few minutes after you pay.";
+
+  it("shows the item's confirmation statement while waiting, with no download before the operator confirms", () => {
+    const html = render(
+      status({
+        state: "booking_processing",
+        tone: "progress",
+        headline: "Payment received. We're booking your Dhow cruise dinner with the operator.",
+        nextStep: "This operator confirms through their own system, so it can take a few minutes. This page updates by itself.",
+        steps: {
+          payment: { status: "done", label: "Payment received", at: "2030-01-01T10:01:00.000Z" },
+          booking: { status: "in_progress", label: "Confirming with the operator", at: null },
+          tickets: { status: "not_started", label: "Follows the operator's confirmation", at: null },
+          refund: null,
+        },
+        items: [item({ state: "booking_processing", tickets: { fulfilment: "not_applicable", documents: [] }, externalConfirmation: statement })],
+        pollAfterMs: 5_000,
+      }),
+    );
+    expect(html).toContain('data-testid="external-confirmation"');
+    expect(html).toContain(statement);
+    expect(html).not.toContain("/api/tickets/documents/");
+  });
+
+  it("keeps the statement once booked, and shows none for an item without it", () => {
+    expect(render(status({ items: [item({ tickets: { fulfilment: "issued", documents: [doc] }, externalConfirmation: statement })] }))).toContain(statement);
+    expect(render(status())).not.toContain('data-testid="external-confirmation"');
+  });
+});

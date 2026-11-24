@@ -141,6 +141,12 @@ export interface CustomerItemStatus {
    * when no policy is stored (assisted orders) or the item is no longer live.
    */
   cancellationTerms?: string | null;
+  /**
+   * Doc 29 Batch 6: booked through an external supplier. The one statement
+   * that its confirmation can take a few minutes, true in every state; absent
+   * or null for other items.
+   */
+  externalConfirmation?: string | null;
   cancellation: CancellationView;
   /**
    * Doc 29 Batch 5: an open-dated ticket item, with its last valid day, the

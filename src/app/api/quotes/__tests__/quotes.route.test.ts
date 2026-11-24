@@ -168,6 +168,7 @@ describe("POST /api/quotes: public projection only (CR-B2-1)", () => {
           ticketValidUntil: null,
           ticketValidityCopy: null,
           openDatedTicket: false,
+          externalConfirmationCopy: null,
         },
       ],
     });

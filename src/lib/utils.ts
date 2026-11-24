@@ -124,6 +124,15 @@ export const NON_REFUNDABLE_STATEMENT = "This booking is non-refundable once con
 export const TICKET_NON_REFUNDABLE_STATEMENT = "These tickets are non-refundable once issued.";
 
 /**
+ * Doc 29 Batch 6: the one statement for an item booked through an external
+ * supplier. It is true in every state the booking can reach (waiting,
+ * booked, refused and refunded, handed to our team), so the checkout review
+ * and the status page show it unchanged.
+ */
+export const EXTERNAL_CONFIRMATION_STATEMENT =
+  "This operator confirms bookings through their own system, so confirmation can take a few minutes after you pay. If they cannot confirm it, you get the full amount back, as a released hold or a refund.";
+
+/**
  * The one cancellation statement for a quote or a booking, from the quote's
  * own `freeCancellationUntilUtc` (CR-B2-6; checkout redesign CO-01): the
  * exact deadline in Dubai time. The quote, the review step and the status

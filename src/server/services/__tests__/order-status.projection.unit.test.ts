@@ -596,3 +596,63 @@ describe("pollAfterMs: the poll-hint schedule per state (checkout redesign batch
     expect(settled).toMatchObject({ state: "partially_fulfilled", pollAfterMs: null });
   });
 });
+
+/* ---------------------------------------------------------------------------
+ * Doc 29 Batch 6: external-supplier bookings
+ * ------------------------------------------------------------------------ */
+
+describe("an item booked through an external supplier", () => {
+  const STATEMENT = "This operator confirms bookings through their own system, so confirmation can take a few minutes after you pay. If they cannot confirm it, you get the full amount back, as a released hold or a refund.";
+  const ext = (state: string, over: Record<string, unknown> = {}) => ({ state, startMinutes: 600, confirmedAt: T0, cancelledAt: null, updatedAt: T0, externalRoute: true, ...over });
+
+  it("waiting: says confirmation can take a few minutes, promises no clock, and keeps polling", () => {
+    const s = projectCustomerStatus(snap("confirm_pending", { captured: true, item: { booking: ext("awaiting_external") } }), NOW);
+    expect(s.state).toBe("booking_processing");
+    expect(s.headline).toContain("We're booking");
+    expect(s.nextStep).toContain("can take a few minutes");
+    expect(s.nextStep).toContain("full amount back");
+    // The saga's confirm send-by is not a refund promise for an external confirmation: no deadline is shown.
+    expect(s.deadlines.remedyAtUtc).toBeNull();
+    expect(s.nextStep).not.toMatch(/by \d/);
+    expect(s.items[0].externalConfirmation).toBe(STATEMENT);
+    expect(s.pollAfterMs).not.toBeNull();
+    expect(forbiddenKeys(s)).toEqual([]);
+  });
+
+  it("handed to our team at the wait limit: says so plainly, and still promises no refund before the operator answers", () => {
+    const s = projectCustomerStatus(snap("confirm_pending", { captured: true, item: { booking: ext("awaiting_external", { externalHandedOff: true }) } }), NOW);
+    expect(s.state).toBe("booking_processing");
+    expect(s.headline).toContain("taking longer than usual");
+    expect(s.nextStep).toContain("Our team is following it up");
+    expect(s.nextStep).toContain("If the operator cannot confirm it");
+    expect(s.items[0].externalConfirmation).toBe(STATEMENT);
+    expect(JSON.stringify(s)).not.toContain("external_confirmation_handoff");
+  });
+
+  it("confirmed: the statement stays true and is still shown", () => {
+    const s = projectCustomerStatus(snap("fulfilled", { captured: true, item: { status: "confirmed", booking: ext("confirmed") } }), NOW);
+    expect(s.state).toBe("confirmed");
+    expect(s.items[0].externalConfirmation).toBe(STATEMENT);
+  });
+
+  it("failed by the operator after the capture: the refund is shown plainly, with the same statement", () => {
+    const processing = projectCustomerStatus(
+      snap("refund_pending", { captured: true, item: { booking: ext("rejected"), refunds: [{ status: "requested", createdAt: T0, updatedAt: T0 }] } }),
+      NOW,
+    );
+    expect(processing.state).toBe("refund_processing");
+    expect(processing.headline).toBe("Your refund is on its way.");
+    expect(processing.steps.booking).toMatchObject({ status: "failed", label: "The operator could not confirm this booking" });
+    expect(processing.items[0].externalConfirmation).toBe(STATEMENT);
+    const done = projectCustomerStatus(snap("refunded", { captured: true, item: { booking: ext("rejected"), refunds: [{ status: "succeeded", createdAt: T0, updatedAt: T0 }] } }), NOW);
+    expect(done.state).toBe("refunded");
+    expect(done.items[0].externalConfirmation).toBe(STATEMENT);
+  });
+
+  it("an internal item shows no such statement and keeps its remedy deadline", () => {
+    const s = projectCustomerStatus(snap("confirm_pending", { captured: true, item: { booking: { ...ext("confirming"), externalRoute: null } } }), NOW);
+    expect(s.items[0].externalConfirmation).toBeNull();
+    expect(s.deadlines.remedyAtUtc).toBe(DEADLINE.toISOString());
+    expect(s.nextStep).not.toContain("can take a few minutes");
+  });
+});

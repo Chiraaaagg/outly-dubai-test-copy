@@ -243,6 +243,8 @@ export interface QuoteResponseLine {
   ticketValidityCopy?: string | null;
   /** Doc 29 Batch 5: an open-dated ticket; `freeCancellationCopy` then says the tickets are non-refundable once issued. */
   openDatedTicket?: boolean;
+  /** Doc 29 Batch 6: booked through an external supplier; the server-worded statement that confirmation can take a few minutes, else null. */
+  externalConfirmationCopy?: string | null;
 }
 
 /** The client view of `toPublicQuote` (amounts arrive as decimal strings of minor units). */

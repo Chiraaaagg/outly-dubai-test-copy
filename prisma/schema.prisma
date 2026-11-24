@@ -834,6 +834,8 @@ model SupplierBooking {
   pickupTimeMinutes      Int?                   @map("pickup_time_minutes")
   /// The booking's own "tickets valid until" day (doc 29 Batch 5; review 86 B5-07). Kept when a later answer omits it.
   ticketsValidUntil      DateTime?              @map("tickets_valid_until") @db.Date
+  /// Doc 29 Batch 6: the attempt books an offer on the external-supplier route; null or false is internal.
+  externalRoute          Boolean?               @map("external_route")
   lastResponse           Json?                  @map("last_response")
   requestedBy            String?                @map("requested_by") @db.Uuid
   requestSentAt          DateTime?              @map("request_sent_at") @db.Timestamptz(6)

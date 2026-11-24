@@ -225,6 +225,8 @@ export interface QuoteLineSnapshot {
   ticketValidUntil?: string | null;
   /** Doc 29 Batch 5: the line is an open-dated ticket (non-refundable once issued); absent on other lines and older quotes. */
   openDatedTicket?: boolean;
+  /** Doc 29 Batch 6: the line is booked through an external supplier (confirmation can take minutes); absent otherwise. */
+  externalConfirmation?: boolean;
 }
 
 export interface QuoteSnapshot {
@@ -302,6 +304,8 @@ export type SupplierQuoteResult =
       openDatedTicket?: true;
       /** With a pickup: the accepted hotel's name on the supplier's list, when it has one (Batch 3). */
       pickupHotelName?: string | null;
+      /** Doc 29 Batch 6: the offer is booked through an external supplier, whose confirmation can take minutes. Absent otherwise. */
+      externalConfirmation?: true;
     }
   | {
       ok: false;

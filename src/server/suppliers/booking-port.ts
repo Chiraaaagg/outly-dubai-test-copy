@@ -216,6 +216,13 @@ export interface AttemptRequest {
   expected: ExpectedBooking;
   /** Adapter-specific request body fields, already validated by the engine. */
   body: Record<string, unknown>;
+  /**
+   * Doc 29 Batch 6: the offer is booked through an external supplier, whose
+   * hold length varies by provider. The adapter then takes the hold deadline
+   * from the answer only and never assumes its default hold length. Absent
+   * means internal.
+   */
+  externalRoute?: boolean;
 }
 
 export interface SupplierBookingAdapter {

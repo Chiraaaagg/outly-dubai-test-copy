@@ -97,6 +97,7 @@ const NEVER_MESSAGE: Record<string, string> = {
   private_units_inquiry: "Private-unit classes stay inquiry (owner decision, 22 November 2026)",
   date_only_inquiry: "Date-only classes stay inquiry until TravelDesk answers how to book them",
   ticket_booking_refused: "Only the open-dated, self-arrival, internal, per-person ticket class is built; other ticket classes stay inquiry",
+  external_route_unproven: "Only the five per-person external classes of Batch 6 are built; other external classes stay inquiry",
 };
 
 /** References name a test, drill or booking; anything that looks like contact data is refused. */

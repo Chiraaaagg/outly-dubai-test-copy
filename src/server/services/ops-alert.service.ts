@@ -201,6 +201,11 @@ export function bookingReason(b: { state: string; errorCode: string | null; atte
   if ((b.errorCode === "late_acceptance" || b.errorCode === "late_acceptance_duplicate") && b.attention) return "late_acceptance";
   if (b.errorCode === "charged_amount_mismatch" && b.attention) return "charged_amount_mismatch";
   if (b.errorCode === "funds_unverified" && b.attention) return "funds_unverified";
+  // Doc 29 Batch 6 (external-confirmation.ts): an external booking handed to our team at its wait limit, one the
+  // external supplier failed after the confirm (the saga refunds it), and an external hold too short to confirm.
+  if (b.errorCode === "external_confirmation_handoff" && b.attention) return "external_confirmation_handoff";
+  if (b.errorCode === "external_booking_failed" && b.attention) return "external_booking_failed";
+  if (b.errorCode === "external_hold_unusable" && b.attention) return "external_hold_unusable";
   if (b.state === "manual_review") return "manual_review";
   if (b.state === "cancel_refused") return "cancel_refused";
   // Past its first recovery search: still unknown (or proven not found yet), a human must look.
@@ -310,7 +315,8 @@ export async function collectOpsIncidents(since: Date, now: Date, limit = COLLEC
       b.order_id, o.reference, COALESCE(b.attention_required_at, b.updated_at) AS raised_at
     FROM supplier_bookings b LEFT JOIN orders o ON o.id = b.order_id
     WHERE (
-        (b.error_code IN ('late_acceptance', 'late_acceptance_duplicate', 'charged_amount_mismatch', 'funds_unverified') AND b.attention_required_at IS NOT NULL)
+        (b.error_code IN ('late_acceptance', 'late_acceptance_duplicate', 'charged_amount_mismatch', 'funds_unverified',
+            'external_confirmation_handoff', 'external_booking_failed', 'external_hold_unusable') AND b.attention_required_at IS NOT NULL)
         OR b.state IN ('manual_review', 'cancel_refused', 'not_found_unresolved')
         OR (b.state = 'outcome_unknown' AND b.recovery_searches >= 1)
       )

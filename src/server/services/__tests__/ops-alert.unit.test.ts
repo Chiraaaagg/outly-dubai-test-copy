@@ -35,6 +35,12 @@ describe("which bookings need staff", () => {
     ["late acceptance", { state: "outcome_unknown", errorCode: "late_acceptance", attention: true, recoverySearches: 0 }, "late_acceptance"],
     ["late acceptance on a duplicate", { state: "cancelled", errorCode: "late_acceptance_duplicate", attention: true, recoverySearches: 0 }, "late_acceptance"],
     ["a confirmed booking", { state: "confirmed", errorCode: null, attention: false, recoverySearches: 0 }, null],
+    // Doc 29 Batch 6.
+    ["an external booking handed to our team at its wait limit", { state: "awaiting_external", errorCode: "external_confirmation_handoff", attention: true, recoverySearches: 0 }, "external_confirmation_handoff"],
+    ["an external booking still waiting inside its wait limit", { state: "awaiting_external", errorCode: null, attention: false, recoverySearches: 0 }, null],
+    ["an external booking the supplier failed after the confirm", { state: "rejected", errorCode: "external_booking_failed", attention: true, recoverySearches: 0 }, "external_booking_failed"],
+    ["an external booking the supplier failed at the reserve (nothing captured)", { state: "rejected", errorCode: "external_booking_failed", attention: false, recoverySearches: 0 }, null],
+    ["an external hold too short to confirm, released", { state: "cancelled", errorCode: "external_hold_unusable", attention: true, recoverySearches: 0 }, "external_hold_unusable"],
   ])("%s", (_n, b, expected) => {
     expect(bookingReason(b)).toBe(expected);
   });

@@ -83,9 +83,10 @@ export const LISTED_START_CLASS_KEYS: readonly string[] = Object.freeze([
 /**
  * Whether an offer may sell as a choice among its listed starts (Batch 2):
  * the capability gate allowed its exact class key (`gateAllows`), that key is
- * one of the two `LISTED_START_CLASS_KEYS` (self arrival, internal route, per
- * person; a listed-start key with pickup or an external route is never
- * lifted here, even if its flag were on, because Batch 2 never proved it), and
+ * one of `LISTED_START_SELLABLE_KEYS` (Batch 2's two internal self-arrival
+ * keys, and Batch 6's four external listed-start keys; an internal
+ * listed-start key with pickup is never lifted here, even if its flag were
+ * on, because no batch proved it), and
  * every stored slot is an "any time" slot whose end time is known: stored,
  * or start plus the offer's hours when none is stored (`slotEndMinutes`,
  * OpenAPI `TimeSlotPublicDto.endTime`), because the booking sends that end
@@ -97,7 +98,7 @@ export function listedStartsSellable(
   slots: readonly { isAnyTime: boolean; startMinutes: number; endMinutes: number | null }[] | null | undefined,
   durationHours?: number | null,
 ): boolean {
-  if (!gateAllows || !LISTED_START_CLASS_KEYS.includes(classKey) || !slots || slots.length === 0) return false;
+  if (!gateAllows || !LISTED_START_SELLABLE_KEYS.includes(classKey) || !slots || slots.length === 0) return false;
   return slots.every((s) => s.isAnyTime && slotEndMinutes(s, durationHours) !== null);
 }
 
@@ -119,6 +120,41 @@ export function listedStartsSellable(
 export const PICKUP_CLASS_KEYS: readonly string[] = Object.freeze([
   "live.fixed_slot_single.pickup_required.internal.per_person",
   "live.fixed_slot_choice.pickup_required.internal.per_person",
+]);
+
+/**
+ * The five Batch 6 keys (doc 29 §3.3, §7.3 Batch 6, reduced scope of
+ * 24 November 2026): the external-supplier route (`isExternal`: TravelDesk
+ * books through a third party, confirmation may stay "in progress" for
+ * minutes), per-person price only; 57 offers in the coverage ledger
+ * (1 + 31 + 17 + 5 + 3). Batch 4 is skipped, so the three external per-unit
+ * keys (22 offers) stay inquiry (`private_units_inquiry`, and the database
+ * refuses an enabled per-unit flag). **Not seeded**: no flag row means off.
+ * Switching one on goes through the approval path with per-offer evidence
+ * for that exact key, which `capabilityVerdict` always asks of a key outside
+ * `SEEDED_CLASS_KEYS`. The sandbox has no external offer, so the sandbox
+ * drill is "not possible": the proof is one supervised production booking
+ * per key, each approved by the owner on its own. Any other external key
+ * (a time shape or arrival the ledger has no external offer for) stays
+ * refused (`external_route_unproven`). The booking path for these keys is in
+ * `src/server/suppliers/external-confirmation.ts`.
+ */
+export const EXTERNAL_CLASS_KEYS: readonly string[] = Object.freeze([
+  "live.fixed_slot_single.self.external.per_person",
+  "live.listed_start_single.self.external.per_person",
+  "live.listed_starts_customer_selected.self.external.per_person",
+  "live.listed_start_single.pickup_required.external.per_person",
+  "live.listed_starts_customer_selected.pickup_required.external.per_person",
+]);
+
+/**
+ * Keys that may sell as a choice among their listed starts
+ * (`listedStartsSellable`): Batch 2's two internal self-arrival keys and the
+ * four listed-start keys of Batch 6 (external route, self arrival or pickup).
+ */
+export const LISTED_START_SELLABLE_KEYS: readonly string[] = Object.freeze([
+  ...LISTED_START_CLASS_KEYS,
+  ...EXTERNAL_CLASS_KEYS.filter((k) => k.split(".")[1].startsWith("listed_start")),
 ]);
 
 /**
@@ -270,15 +306,20 @@ export function parseClassKey(key: string): CapabilityDimensions | null {
  *    inquiry until TravelDesk answers Q5);
  *  - `ticket_booking_refused`: a ticket class other than the one Batch 5
  *    builds (`TICKET_CLASS_KEYS`: open dated, self arrival, internal, per
- *    person). Pickup and external tickets were never proven.
+ *    person). Pickup and external tickets were never proven;
+ *  - `external_route_unproven`: a live external key other than the five of
+ *    Batch 6 (`EXTERNAL_CLASS_KEYS`).
  * The database refuses an enabled per-unit flag as well (migration 20261122120000).
  */
-export function neverEnabledReason(key: string): "not_a_class" | "private_units_inquiry" | "date_only_inquiry" | "ticket_booking_refused" | null {
+export function neverEnabledReason(
+  key: string,
+): "not_a_class" | "private_units_inquiry" | "date_only_inquiry" | "ticket_booking_refused" | "external_route_unproven" | null {
   const d = parseClassKey(key);
   if (!d) return "not_a_class";
   if (d.pricingUnit === "per_unit" || d.pricingUnit === "mixed_person_plus_unit") return "private_units_inquiry";
   if (d.timeShape === "date_only_no_slot_metadata") return "date_only_inquiry";
   if (d.fulfilment === "ticket" && !TICKET_CLASS_KEYS.includes(key)) return "ticket_booking_refused";
+  if (d.route === "external" && d.fulfilment === "live" && !EXTERNAL_CLASS_KEYS.includes(key)) return "external_route_unproven";
   return null;
 }
 

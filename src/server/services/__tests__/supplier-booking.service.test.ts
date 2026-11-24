@@ -64,8 +64,8 @@ class FakeTravelDesk implements TravelDeskBookingTransport {
   /** Runs inside the cancel call, before it answers (a slow cancel). */
   onCancel: (() => Promise<void>) | null = null;
   chargeOverride: bigint | null = null;
-  /** A reservation deadline this far after the send, instead of 15 minutes. */
-  deadlineMs = 15 * 60_000;
+  /** A reservation deadline this far after the send, instead of 15 minutes; null answers no deadline (doc 29 Batch 6). */
+  deadlineMs: number | null = 15 * 60_000;
   private seq = 50_000 + Math.floor(Math.random() * 1000);
 
   constructor(private readonly clock: () => Date) {}
@@ -96,7 +96,7 @@ class FakeTravelDesk implements TravelDeskBookingTransport {
       totalCostUsdMinor: 0n,
       paidFromBalanceMinor: cost,
       refundMinor: null,
-      reservationDeadline: status === 7 ? new Date(this.clock().getTime() + this.deadlineMs).toISOString() : null,
+      reservationDeadline: status === 7 && this.deadlineMs !== null ? new Date(this.clock().getTime() + this.deadlineMs).toISOString() : null,
       reservationTimeout: null,
       externalInProgress: inProgress,
       externalFailed: false,
@@ -724,18 +724,154 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
     expect((await booking(b.id)).state).toBe("confirmed");
   });
 
-  it("a slow external confirmation backs off and tells a human after 30 minutes, without leaving its state (SUP-17)", async () => {
+  /* -------------------------------------------------------------------------
+   * Doc 29 Batch 6: external-supplier bookings (external-confirmation.ts)
+   * ---------------------------------------------------------------------- */
+
+  /** The poll job queued for a booking, and how long after the clock it is due. */
+  async function pollDueInMs(id: string) {
+    const job = await prisma.supplierJob.findUnique({ where: { dedupeKey: `poll:${id}` } });
+    return job && job.status === "queued" ? job.runAfter.getTime() - clock : null;
+  }
+
+  it("a slow external confirmation is polled every 15 s (never under 10 s), handed to our team at the 30-minute wait limit without leaving its state, then polled more slowly (SUP-17)", async () => {
+    const td = new FakeTravelDesk(now);
+    td.steps.confirm.push("in_progress");
+    // An activity weeks away: the normal limit applies.
+    const b = await create(intent({ serviceDate: "2030-03-01" }));
+    await drain(td, 0);
+    const waiting = await booking(b.id);
+    expect(waiting.state).toBe("awaiting_external");
+    const since = waiting.confirmedAt!.getTime();
+    // The first poll is queued 15 s after the answer that left it waiting.
+    expect((await prisma.supplierJob.findUniqueOrThrow({ where: { dedupeKey: `poll:${b.id}` } })).runAfter.getTime() - since).toBe(15_000);
+    // 29 minutes on a 5-second step: every poll is queued 15 s after the read, and no human is told yet.
+    await drain(td, since + 29 * 60_000 - clock, 5_000);
+    const before = await booking(b.id);
+    expect(before).toMatchObject({ state: "awaiting_external", attentionRequiredAt: null });
+    expect(before.pollCount).toBeLessThanOrEqual((29 * 60) / 10);
+    expect(before.pollCount).toBeGreaterThanOrEqual((29 * 60) / 16 - 2);
+    const due = await pollDueInMs(b.id);
+    expect(due).not.toBeNull();
+    // The next poll is never further away than 15 s inside the limit (it may already be due when the loop stops).
+    expect(due!).toBeLessThanOrEqual(15_000);
+    // Past 30 minutes: handed off, still waiting, nothing cancelled or refunded.
+    await drain(td, since + 31 * 60_000 - clock, 5_000);
+    const handed = await booking(b.id);
+    expect(handed).toMatchObject({ state: "awaiting_external", errorCode: "external_confirmation_handoff", closedAt: null });
+    expect(handed.attentionRequiredAt).not.toBeNull();
+    expect(td.calls).not.toContain("cancel");
+    expect((await events(b.id)).filter((e) => e.kind === "attention").length).toBe(1);
+    // After the hand-off the reads slow down (one minute, growing) and go on.
+    const polls = handed.pollCount;
+    await drain(td, 40 * 60_000, 5_000);
+    const later = await booking(b.id);
+    expect(later.state).toBe("awaiting_external");
+    expect(later.pollCount - polls).toBeGreaterThan(3);
+    expect(later.pollCount - polls).toBeLessThan(40);
+    // The supplier confirms after all: booked, and the hand-off flag is cleared.
+    const id = later.supplierBookingId!;
+    td.store.set(id, { ...td.store.get(id)!, externalInProgress: false });
+    await drain(td, 15 * 60_000, 30_000);
+    expect(await booking(b.id)).toMatchObject({ state: "confirmed", attentionRequiredAt: null, errorCode: null });
+  });
+
+  it("near the activity the wait limit comes earlier: no later than 3 hours before the start", async () => {
+    const td = new FakeTravelDesk(now);
+    td.steps.confirm.push("in_progress");
+    // Today (Dubai) at 15:10: 11:10Z, so 3 hours before is 08:10Z, ten minutes after the test clock's 08:00Z.
+    const day = new Date(clock + 4 * 3_600_000).toISOString().slice(0, 10);
+    const start = (new Date(clock).getUTCHours() + 4) * 60 + new Date(clock).getUTCMinutes() + 3 * 60 + 10;
+    const b = await create(intent({ serviceDate: day, slot: { timeSlotId: 9, startMinutes: start, endMinutes: start + 60 } }));
+    await drain(td, 0);
+    const since = (await booking(b.id)).confirmedAt!.getTime();
+    const limit = since + Math.min(30 * 60_000, Date.parse(`${day}T00:00:00Z`) + start * 60_000 - 4 * 3_600_000 - 3 * 3_600_000 - since);
+    expect(limit - since).toBeLessThan(30 * 60_000);
+    await drain(td, limit - 2_000 - clock, 2_000);
+    expect((await booking(b.id)).attentionRequiredAt).toBeNull();
+    await drain(td, limit + 20_000 - clock, 2_000);
+    expect(await booking(b.id)).toMatchObject({ state: "awaiting_external", errorCode: "external_confirmation_handoff" });
+  });
+
+  it("201 with the failed flag: a confirm the external supplier rejected is `rejected`, our team is told, and nothing is cancelled", async () => {
+    const td = new FakeTravelDesk(now);
+    td.steps.confirm.push("external_failed");
+    const b = await create(intent());
+    await drain(td, 0);
+    const failed = await booking(b.id);
+    expect(failed).toMatchObject({ state: "rejected", errorCode: "external_booking_failed", externalFailed: true });
+    expect(failed.attentionRequiredAt).not.toBeNull();
+    expect(failed.closedAt).not.toBeNull();
+    expect(td.calls).not.toContain("cancel");
+  });
+
+  it("in progress, then failed: the poll that sees the confirmation finished and failed rejects it", async () => {
     const td = new FakeTravelDesk(now);
     td.steps.confirm.push("in_progress");
     const b = await create(intent());
     await drain(td, 0);
-    await drain(td, 40 * 60_000, 15_000);
-    const slow = await booking(b.id);
-    expect(slow).toMatchObject({ state: "awaiting_external", errorCode: "external_confirmation_slow", closedAt: null });
-    expect(slow.attentionRequiredAt).not.toBeNull();
-    // Fewer than one read per 15 s over 40 minutes (160): the interval grows.
-    expect(slow.pollCount).toBeLessThan(40);
-    expect(slow.pollCount).toBeGreaterThan(5);
+    const id = (await booking(b.id)).supplierBookingId!;
+    // Still in progress with the failed flag set: it keeps waiting.
+    td.store.set(id, { ...td.store.get(id)!, externalFailed: true });
+    clock += 16_000;
+    await svc.runDueJobs(deps(td), { budgetMs: 60_000 });
+    expect((await booking(b.id)).state).toBe("awaiting_external");
+    td.store.set(id, { ...td.store.get(id)!, externalInProgress: false, externalFailed: true });
+    await drain(td, 60_000, 16_000);
+    expect(await booking(b.id)).toMatchObject({ state: "rejected", errorCode: "external_booking_failed" });
+  });
+
+  it("documents are never fetched while the external confirmation is in progress (links can appear before it finishes)", async () => {
+    const td = new FakeTravelDesk(now);
+    td.steps.confirm.push("in_progress");
+    const b = await create(intent());
+    await drain(td, 0);
+    expect((await booking(b.id)).state).toBe("awaiting_external");
+    // The document sweep reads confirmed order-item bookings only; this one is neither, and no document row exists.
+    expect(await prisma.supplierDocument.count({ where: { supplierBookingId: b.id } })).toBe(0);
+    expect(td.calls).not.toContain("get");
+  });
+
+  it("an external hold takes its deadline from the answer; a five-minute hold is never confirmed and is left to the release", async () => {
+    const td = new FakeTravelDesk(now);
+    td.deadlineMs = 5 * 60_000;
+    const sent = clock;
+    const b = await create(intent({ externalRoute: true }));
+    await drain(td, 0);
+    const held = await booking(b.id);
+    expect(held.externalRoute).toBe(true);
+    expect(held.reservationDeadline!.getTime()).toBe(sent + 5 * 60_000);
+    expect(held).toMatchObject({ state: "reserved", errorCode: "external_hold_unusable" });
+    expect(held.attentionRequiredAt).not.toBeNull();
+    expect(await svc.confirmSendByFor(b.id, { mutationTimeoutMs: 1_000 })).toBeNull();
+    await drain(td, 10 * 60_000, 30_000);
+    expect(td.calls).not.toContain("confirm");
+    expect(await booking(b.id)).toMatchObject({ state: "expired", errorCode: "external_hold_unusable" });
+  });
+
+  it("an external hold with no deadline and no timeout in the answer is of unknown length: no 15 minutes assumed, never confirmed", async () => {
+    const td = new FakeTravelDesk(now);
+    td.deadlineMs = null;
+    const b = await create(intent({ externalRoute: true }));
+    await drain(td, 0);
+    const held = await booking(b.id);
+    expect(held.reservationDeadline).toBeNull();
+    expect(held).toMatchObject({ state: "reserved", errorCode: "external_hold_unusable" });
+    expect(td.calls).not.toContain("confirm");
+  });
+
+  it("an external hold long enough to confirm (12 minutes, from the answer) is confirmed as before; an internal drill keeps the 15-minute rule", async () => {
+    const td = new FakeTravelDesk(now);
+    td.deadlineMs = 12 * 60_000;
+    const ext = await create(intent({ externalRoute: true }));
+    await drain(td, 0);
+    expect(await booking(ext.id)).toMatchObject({ state: "confirmed", externalRoute: true });
+    td.deadlineMs = null;
+    const internal = await create(intent());
+    await svc.runDueJobs(deps(td), { budgetMs: 60_000, maxJobs: 1 });
+    const r = await booking(internal.id);
+    expect(r.externalRoute).toBeNull();
+    expect(r.reservationDeadline).not.toBeNull();
   });
 
   it("a reservation whose charged amount differs is held for a human, never confirmed, and runs out on its own", async () => {
@@ -2160,6 +2296,19 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
       expect((await booking(drifted.id)).state).toBe("confirmed"); // report only
       const stored = await prisma.setting.findUniqueOrThrow({ where: { key: `supplier_reconcile.${CODE}.test` } });
       expect((stored.value as { ranAt: string }).ranAt).toBe(now().toISOString());
+    });
+
+    it("doc 29 Batch 6: a booking the external supplier failed, still listed with the failed flag, is no late acceptance", async () => {
+      await onlyRecent();
+      const td = new FakeTravelDesk(now);
+      td.steps.confirm.push("external_failed");
+      const b = await create(intent());
+      await drain(td, 0);
+      expect((await booking(b.id)).state).toBe("rejected");
+      const r = await reconcile(td);
+      expect(r.issues.filter((i) => i.bookingId === b.id)).toEqual([]);
+      expect(r.reblocked).toBe(0);
+      expect((await booking(b.id)).state).toBe("rejected");
     });
 
     it("a booking closed as never created that TravelDesk shows live is re-blocked at once, with an alert (late acceptance)", async () => {

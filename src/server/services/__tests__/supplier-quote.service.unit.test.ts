@@ -97,6 +97,17 @@ describe("supplierQuoteService.quote (SUP-14)", () => {
     expect(h.tokens).toEqual(["traveldesk:test:acct-test", "traveldesk:test:acct-test"]);
   });
 
+  it("doc 29 Batch 6: an external offer is read as external (at most 7 days, here one) and its quote is marked; an internal one is not", async () => {
+    expect((await harness(context()).svc.quote(input)) as { externalConfirmation?: true }).not.toHaveProperty("externalConfirmation");
+    const offer = storedOffer({ isExternal: true, timeSlots: [storedSlot({ isExternal: true })] });
+    const ctx = context({ approvedOfferHash: offerTermsHash(offer, storedTour()), externalRef: { tourId: 3001, offerId: 501, bookingKind: "live_book", isExternal: true } }, { offer: { payload: offer, removed: false } });
+    const h = harness(ctx);
+    expect(await h.svc.quote(input)).toMatchObject({ ok: true, externalConfirmation: true });
+    expect(h.calls).toEqual([`availability:501:${SERVICE_DATE}:${SERVICE_DATE}:true`]);
+    // One quote read from the quote share, as for any offer: external reads cost the same token (doc 29 §6.5).
+    expect(h.tokens).toEqual(["traveldesk:test:acct-test"]);
+  });
+
   it("refuses before any supplier read when the mapping is not what was approved", async () => {
     const cases: Array<[Context | null, string]> = [
       [null, "availability_unknown"],

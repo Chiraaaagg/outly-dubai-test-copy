@@ -210,7 +210,9 @@ export function createSupplierQuoteService(deps: SupplierQuoteDeps): SupplierQuo
           return withHotel(quoteTickets({ offer, policy, serviceDate: input.serviceDate, units, stock, now: deps.now(), issuesTicketsAtConfirm }));
         }
         const { rows } = await live.source.getAvailability(ref.data.offerId, input.serviceDate, input.serviceDate, { isExternal: ref.data.isExternal });
-        return withHotel(quoteSlot({ offer, policy, serviceDate: input.serviceDate, slotRef: input.slotRef, units, rows, now: deps.now(), issuesTicketsAtConfirm }));
+        const quoted = withHotel(quoteSlot({ offer, policy, serviceDate: input.serviceDate, slotRef: input.slotRef, units, rows, now: deps.now(), issuesTicketsAtConfirm }));
+        // Doc 29 Batch 6: the checkout says confirmation can take a few minutes for an external supplier's offer.
+        return quoted.ok && offer.isExternal ? { ...quoted, externalConfirmation: true } : quoted;
       } catch {
         // Timeouts, HTTP errors, a non-AED price (codec) and invalid dates all end here. Nothing is retried.
         return refuse("supplier_unavailable");

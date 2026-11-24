@@ -32,7 +32,7 @@ import {
   type UnitDefinition,
 } from "../quotes/contracts";
 import { authoredCouponValue, couponByCode, couponDiscountMinor, type Coupon } from "@/lib/pricing";
-import { dubaiDayStartUtc, dubaiToday, freeCancellationCopy, TICKET_NON_REFUNDABLE_STATEMENT, ticketValidityCopy } from "@/lib/utils";
+import { dubaiDayStartUtc, dubaiToday, EXTERNAL_CONFIRMATION_STATEMENT, freeCancellationCopy, TICKET_NON_REFUNDABLE_STATEMENT, ticketValidityCopy } from "@/lib/utils";
 import type { Activity, Currency } from "@/lib/types";
 
 /**
@@ -368,6 +368,8 @@ export interface PublicQuoteLine {
   ticketValidityCopy: string | null;
   /** Doc 29 Batch 5: an open-dated ticket; `freeCancellationCopy` then says the tickets are non-refundable once issued. */
   openDatedTicket: boolean;
+  /** Doc 29 Batch 6: booked through an external supplier; the statement that its confirmation can take a few minutes, else null. */
+  externalConfirmationCopy: string | null;
 }
 
 export type PublicQuoteResult =
@@ -409,6 +411,7 @@ export function toPublicQuote(result: QuoteResult): PublicQuoteResult {
       ticketValidUntil: l.ticketValidUntil ?? null,
       ticketValidityCopy: ticketValidityCopy(l.ticketValidUntil),
       openDatedTicket: l.openDatedTicket === true,
+      externalConfirmationCopy: l.externalConfirmation === true ? EXTERNAL_CONFIRMATION_STATEMENT : null,
     })),
   };
 }
@@ -641,6 +644,7 @@ export function createQuoteService(deps: QuoteDeps): QuoteServiceImpl {
           nonRefundableAfterConfirm: c.nonRefundableAfterConfirm,
           ticketValidUntil: c.supplier.ticketValidUntil ?? null,
           ...(c.supplier.openDatedTicket === true ? { openDatedTicket: true } : {}),
+          ...(c.supplier.externalConfirmation === true ? { externalConfirmation: true } : {}),
         });
       }
       if (refusals.length) return refused(refusals);

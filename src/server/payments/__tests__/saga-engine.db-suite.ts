@@ -281,4 +281,56 @@ describe.skipIf(!dbEnabled)("B3 payment saga with the real engine and a scripted
     expect(await prisma.refund.findMany({ where: { paymentId: c.paymentId } })).toMatchObject([{ reason: "confirm_too_late", status: "succeeded", amountMinor: 10_000n }]);
     expect(await prisma.customerRemedy.findMany({ where: { orderItemId: c.orderItemId } })).toMatchObject([{ kind: "refund", status: "completed" }]);
   });
+  /* -------------------------------------------------------------------------
+   * Doc 29 Batch 6: external confirmations after the capture
+   * ---------------------------------------------------------------------- */
+
+  it("an external confirmation still in progress past its wait limit is handed to our team and never refunded; once the supplier fails it, the item is refunded in full", async () => {
+    const e = await withEngine();
+    e.td.steps.confirm.push("in_progress");
+    const c = await e.sold();
+    await deliver(e.h, c.gw, "payment.authorized", c.gw.pay(c.providerOrderId));
+    await e.work();
+    expect((await e.booking(c.orderItemId)).state).toBe("awaiting_external");
+    expect((await sagaState(e.h, c.sagaId)).state).toBe("confirm_pending");
+    expect(c.gw.callsOf("capture")).toHaveLength(1);
+
+    // Forty minutes later the supplier is still working: handed off, still waiting, no money moved back.
+    for (let i = 0; i < 10; i++) {
+      e.h.clock.advance(4 * 60_000);
+      await e.work({}, 2);
+      await e.h.saga.advance(c.sagaId);
+    }
+    const handed = await e.booking(c.orderItemId);
+    expect(handed).toMatchObject({ state: "awaiting_external", errorCode: "external_confirmation_handoff" });
+    expect(handed.attentionRequiredAt).not.toBeNull();
+    expect((await sagaState(e.h, c.sagaId)).state).toBe("confirm_pending");
+    expect(await prisma.refund.count({ where: { paymentId: c.paymentId } })).toBe(0);
+
+    // The supplier now shows it failed: rejected, refunded in full through the saga's refund path, no cancel sent.
+    const id = handed.supplierBookingId!;
+    e.td.store.set(id, { ...e.td.store.get(id)!, externalInProgress: false, externalFailed: true });
+    e.h.clock.advance(11 * 60_000);
+    await e.work({}, 3);
+    await e.h.saga.advance(c.sagaId);
+    expect(await e.booking(c.orderItemId)).toMatchObject({ state: "rejected", errorCode: "external_booking_failed" });
+    expect((await sagaState(e.h, c.sagaId)).state).toBe("refunded");
+    expect(await prisma.refund.findMany({ where: { paymentId: c.paymentId } })).toMatchObject([{ reason: "confirm_rejected", status: "succeeded", amountMinor: 10_000n }]);
+    expect(e.td.calls).not.toContain("cancel");
+  });
+
+  it("a confirm answered 201 with the external failed flag after the capture refunds the item in full and tells our team", async () => {
+    const e = await withEngine();
+    e.td.steps.confirm.push("external_failed");
+    const c = await e.sold();
+    await deliver(e.h, c.gw, "payment.authorized", c.gw.pay(c.providerOrderId));
+    await e.work();
+    const b = await e.booking(c.orderItemId);
+    expect(b).toMatchObject({ state: "rejected", errorCode: "external_booking_failed" });
+    expect(b.attentionRequiredAt).not.toBeNull();
+    await e.h.saga.advance(c.sagaId);
+    expect((await sagaState(e.h, c.sagaId)).state).toBe("refunded");
+    expect(await prisma.refund.findMany({ where: { paymentId: c.paymentId } })).toMatchObject([{ reason: "confirm_rejected", status: "succeeded", amountMinor: 10_000n }]);
+    expect(e.td.calls.filter((x) => x === "reserve" || x === "confirm" || x === "cancel")).toEqual(["reserve", "confirm"]);
+  });
 });

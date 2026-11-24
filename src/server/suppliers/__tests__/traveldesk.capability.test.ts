@@ -5,6 +5,11 @@ import choiceFixture from "./fixtures/traveldesk/capability-fixed-slot-choice.js
 import listedChoiceFixture from "./fixtures/traveldesk/capability-listed-starts-choice.json";
 import listedSingleFixture from "./fixtures/traveldesk/capability-listed-start-single.json";
 import ticketFixture from "./fixtures/traveldesk/capability-ticket-open-dated.json";
+import extFixedSingle from "./fixtures/traveldesk/capability-external-fixed-slot-single.json";
+import extListedSingle from "./fixtures/traveldesk/capability-external-listed-start-single.json";
+import extListedChoice from "./fixtures/traveldesk/capability-external-listed-starts-choice.json";
+import extListedSinglePickup from "./fixtures/traveldesk/capability-external-listed-start-single-pickup.json";
+import extListedChoicePickup from "./fixtures/traveldesk/capability-external-listed-starts-choice-pickup.json";
 import tourFixture from "./fixtures/traveldesk/tour-5.json";
 import { storedOffer, storedSlot } from "./fixtures/traveldesk-terms";
 import { tourDetailFrom, tourDetailsWire, type TravelDeskOffer } from "../traveldesk/traveldesk.codec";
@@ -13,6 +18,7 @@ import {
   capabilityVerdict,
   classKeyOf,
   deriveCapabilities,
+  EXTERNAL_CLASS_KEYS,
   INQUIRY_CLASS,
   legacyLiveBookGate,
   LISTED_START_CLASS_KEYS,
@@ -445,14 +451,21 @@ describe("Batch 2 listed-start keys", () => {
     expect(listedStartsSellable(true, choice, [anyTime(null, 22 * 60)], 1)).toBe(true);
   });
 
-  it("only the two Batch 2 keys lift the listed-start refusal: a flagged pickup or external listed-start key never does", () => {
+  it("only the two Batch 2 keys and the four Batch 6 external keys lift the listed-start refusal: a flagged internal pickup key never does", () => {
     const anyTime = (end: number | null, start = 600) => ({ isAnyTime: true, startMinutes: start, endMinutes: end });
     for (const shape of ["listed_start_single", "listed_starts_customer_selected"]) {
-      for (const key of [`live.${shape}.pickup_required.internal.per_person`, `live.${shape}.self.external.per_person`, `live.${shape}.pickup_required.external.per_person`]) {
-        expect(LISTED_START_CLASS_KEYS).not.toContain(key);
-        // Even when the gate allowed the key (its flag on and evidence recorded), the start-time path stays shut.
-        expect(listedStartsSellable(true, key, [anyTime(660), anyTime(720)])).toBe(false);
+      const key = `live.${shape}.pickup_required.internal.per_person`;
+      expect(LISTED_START_CLASS_KEYS).not.toContain(key);
+      // Even when the gate allowed the key (its flag on and evidence recorded), the start-time path stays shut.
+      expect(listedStartsSellable(true, key, [anyTime(660), anyTime(720)])).toBe(false);
+      // Batch 6: the external listed-start keys (self arrival and pickup) are lifted, only when the gate allows them.
+      for (const ext of [`live.${shape}.self.external.per_person`, `live.${shape}.pickup_required.external.per_person`]) {
+        expect(LISTED_START_CLASS_KEYS).not.toContain(ext);
+        expect(listedStartsSellable(true, ext, [anyTime(660), anyTime(720)])).toBe(true);
+        expect(listedStartsSellable(false, ext, [anyTime(660), anyTime(720)])).toBe(false);
       }
+      // A per-unit external listed-start key never is (Batch 4 skipped).
+      expect(listedStartsSellable(true, `live.${shape}.self.external.per_unit`, [anyTime(660), anyTime(720)])).toBe(false);
     }
   });
 
@@ -600,5 +613,126 @@ describe.skipIf(!HAS_LEDGER)("Batch 5 coverage over the 22 November 2026 catalog
     expect(tickets).toHaveLength(54);
     expect(tickets.every((x) => x.cap.classKey === TICKET)).toBe(true);
     expect(rows.find((x) => x.r.offerId === "1592")!.v.instant).toBe(false);
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * Batch 6: the five per-person external keys (doc 29 §3.3, §7.3, reduced scope)
+ * ------------------------------------------------------------------------ */
+
+const B6_KEYS = [
+  "live.fixed_slot_single.self.external.per_person",
+  "live.listed_start_single.self.external.per_person",
+  "live.listed_starts_customer_selected.self.external.per_person",
+  "live.listed_start_single.pickup_required.external.per_person",
+  "live.listed_starts_customer_selected.pickup_required.external.per_person",
+];
+const B6_FLAGS = new Map<string, CapabilityFlagState>([...SEEDED_FLAGS, ...B6_KEYS.map((k) => [k, { enabled: true, requiresOfferEvidence: true }] as const)]);
+const b6Evidence = (classKey: string) => (B6_KEYS.includes(classKey) ? [{ classKey, offerTermsHash: HASH, revokedAt: null }] : []);
+
+describe("Batch 6 external keys", () => {
+  it("are exactly the five per-person external keys, sellable in principle and never seeded; the external per-unit keys stay inquiry", () => {
+    expect([...EXTERNAL_CLASS_KEYS].sort()).toEqual([...B6_KEYS].sort());
+    for (const k of B6_KEYS) {
+      expect(parseClassKey(k)?.route).toBe("external");
+      expect(neverEnabledReason(k), k).toBeNull();
+      expect(SEEDED_CLASS_KEYS).not.toContain(k);
+    }
+    for (const shape of ["listed_start_single", "listed_starts_customer_selected", "fixed_slot_single"]) {
+      for (const arrival of ["self", "pickup_required"]) {
+        expect(neverEnabledReason(`live.${shape}.${arrival}.external.per_unit`)).toBe("private_units_inquiry");
+        expect(neverEnabledReason(`live.${shape}.${arrival}.external.mixed_person_plus_unit`)).toBe("private_units_inquiry");
+      }
+    }
+    // An external key no batch built (no ledger offer has it) stays refused.
+    expect(neverEnabledReason("live.fixed_slot_choice.self.external.per_person")).toBe("external_route_unproven");
+    expect(neverEnabledReason("live.fixed_slot_single.pickup_required.external.per_person")).toBe("external_route_unproven");
+    expect(neverEnabledReason("live.date_only_no_slot_metadata.self.external.per_person")).toBe("date_only_inquiry");
+  });
+
+  it.each([
+    ["fixed single start, self arrival (synthetic, negative advance)", extFixedSingle, B6_KEYS[0], false],
+    ["one listed start, self arrival (synthetic)", extListedSingle, B6_KEYS[1], true],
+    ["several listed starts, self arrival (synthetic, negative advance)", extListedChoice, B6_KEYS[2], true],
+    ["one listed start, hotel pickup (synthetic)", extListedSinglePickup, B6_KEYS[3], true],
+    ["several listed starts, hotel pickup (synthetic)", extListedChoicePickup, B6_KEYS[4], true],
+  ])("contract fixture %s parses with the production schema, derives its key, and is instant only with its flag on and evidence for it", (_name, wire, key, listed) => {
+    const parsed = tourDetailsWire.safeParse(wire);
+    expect(parsed.success).toBe(true);
+    const detail = tourDetailFrom(parsed.data!);
+    expect(detail.warnings).toEqual([]);
+    const payload = asStored(detail.offers[0]);
+    const cap = deriveCapabilities(payload);
+    expect(cap.classKey).toBe(key);
+    expect(cap.reviewReasons).toEqual([]);
+    expect(capabilityVerdict(cap, null, [], HASH)).toMatchObject({ instant: false, reason: "flag_off" });
+    // The flag alone is not enough, even a flag row that claims no evidence is needed.
+    expect(capabilityVerdict(cap, { enabled: true, requiresOfferEvidence: false }, [], HASH)).toMatchObject({ instant: false, reason: "offer_evidence_missing" });
+    expect(capabilityVerdict(cap, { enabled: true, requiresOfferEvidence: true }, [{ classKey: key, offerTermsHash: "c".repeat(64), revokedAt: null }], HASH)).toMatchObject({ instant: false, reason: "offer_evidence_missing" });
+    const v = capabilityVerdict(cap, { enabled: true, requiresOfferEvidence: true }, b6Evidence(key), HASH);
+    expect(v).toEqual({ instant: true, classKey: key });
+    expect(bookingKindSellable("live_book", v)).toBe(true);
+    expect(bookingKindSellable("ticket_only", v)).toBe(false);
+    const stored = payload as { timeSlots: { isAnyTime: boolean; startMinutes: number; endMinutes: number | null }[]; durationHours: number };
+    expect(listedStartsSellable(v.instant, key, stored.timeSlots, stored.durationHours)).toBe(listed);
+  });
+
+  it("the same fixture with a per-trip price is a per-unit external key, and never instant whatever its flag says", () => {
+    const base = (extListedSingle as { offers: Json[] }).offers[0];
+    const periods = (base.pricingPeriods as Json[]).map((p) => ({ ...p, pricePerAdult: 0, pricePerChild: 0, pricePerTrip: 500, pricePerAdultUsd: 0, pricePerChildUsd: 0, pricePerTripUsd: 136.24 }));
+    const detail = tourDetailFrom(tourDetailsWire.parse({ ...extListedSingle, offers: [{ ...base, privateType: 1, pricingPeriods: periods }] }));
+    const cap = deriveCapabilities(asStored(detail.offers[0]));
+    expect(cap.classKey).toBe("live.listed_start_single.self.external.per_unit");
+    expect(capabilityVerdict(cap, { enabled: true, requiresOfferEvidence: false }, [{ classKey: cap.classKey, offerTermsHash: HASH, revokedAt: null }], HASH)).toMatchObject({ instant: false, reason: "class_not_sellable" });
+  });
+});
+
+describe.skipIf(!HAS_LEDGER)("Batch 6 coverage over the 22 November 2026 catalogue", () => {
+  const rows = (flags: Map<string, CapabilityFlagState>, evidence: (k: string) => { classKey: string; offerTermsHash: string; revokedAt: null }[]) =>
+    LEDGER.map((r) => {
+      const payload = offerFromLedger(r);
+      const cap = deriveCapabilities(payload);
+      const v = capabilityVerdict(cap, flags.get(cap.classKey) ?? null, evidence(cap.classKey), HASH);
+      return { r, payload, cap, v, sellable: bookingKindSellable(r.bookingKind, v) };
+    });
+
+  it("the ledger has 57 Batch 6 offers on the five keys (1 + 31 + 17 + 5 + 3), and 22 external per-unit offers that stay inquiry", () => {
+    const b6 = LEDGER.filter((r) => r.planBatch === "B6");
+    const perPerson = b6.filter((r) => B6_KEYS.includes(r.targetCapabilityClass));
+    expect(perPerson).toHaveLength(57);
+    expect(B6_KEYS.map((k) => perPerson.filter((r) => r.targetCapabilityClass === k).length)).toEqual([1, 31, 17, 5, 3]);
+    const perUnit = b6.filter((r) => r.targetCapabilityClass.endsWith(".external.per_unit"));
+    expect(perUnit).toHaveLength(22);
+    expect(b6.length).toBe(57 + 22);
+  });
+
+  it("with the Batch 6 flags off nothing external passes: exactly the 16 Batch 0 offers, as before", () => {
+    const passed = rows(SEEDED_FLAGS, () => []).filter((x) => x.sellable);
+    expect(passed.map((x) => x.r.offerId).sort()).toEqual(LEDGER.filter((r) => r.planBatch === "B0").map((r) => r.offerId).sort());
+    expect(passed.some((x) => x.cap.dimensions.route === "external")).toBe(false);
+  });
+
+  it("with the five flags on and per-offer evidence, exactly the 57 offers are added, never more than the old gate, and no non-Batch-6 key gains", () => {
+    const all = rows(B6_FLAGS, b6Evidence);
+    const passed = all.filter((x) => x.sellable);
+    for (const x of passed) expect(legacyLiveBookGate(x.payload)).toBe(true);
+    const external = passed.filter((x) => x.cap.dimensions.route === "external").map((x) => x.r.offerId);
+    const want = LEDGER.filter((r) => r.planBatch === "B6" && B6_KEYS.includes(r.targetCapabilityClass)).map((r) => r.offerId);
+    expect(external.sort()).toEqual(want.sort());
+    expect(passed).toHaveLength(16 + 57);
+    // Everything else that passes is exactly what passed with the seeded flags alone.
+    const other = passed.filter((x) => x.cap.dimensions.route !== "external").map((x) => x.r.offerId);
+    expect(other.sort()).toEqual(LEDGER.filter((r) => r.planBatch === "B0").map((r) => r.offerId).sort());
+  });
+
+  it("with every external key switched on (per-unit and mixed included) and evidence for each, still only the 57 per-person offers pass; per-unit external stays refused", () => {
+    const keys = new Set(LEDGER.map((r) => r.targetCapabilityClass).filter((k) => k.includes(".external.")));
+    const flags = new Map<string, CapabilityFlagState>([...SEEDED_FLAGS, ...[...keys].map((k) => [k, { enabled: true, requiresOfferEvidence: false }] as const)]);
+    const all = rows(flags, (k) => [{ classKey: k, offerTermsHash: HASH, revokedAt: null }]);
+    const external = all.filter((x) => x.sellable && x.cap.dimensions.route === "external");
+    expect(external).toHaveLength(57);
+    expect(external.every((x) => B6_KEYS.includes(x.cap.classKey))).toBe(true);
+    for (const x of all.filter((x) => x.cap.dimensions.route === "external" && x.cap.dimensions.pricingUnit !== "per_person")) expect(x.v.instant).toBe(false);
+    expect(all.find((x) => x.r.offerId === "1592")!.v.instant).toBe(false);
   });
 });

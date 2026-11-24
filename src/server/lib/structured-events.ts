@@ -145,6 +145,10 @@ export const STRUCTURED_EVENTS = {
   "supplier.quote_budget_refused": ["supplier", "environment", "refusals", "episodeStart"],
   // Admin re-run of readiness without supplier calls (doc 29 §9.4). Counts only.
   "readiness.rerun": ["candidates", "instant", "inquiry", "durationMs"],
+  // External-supplier bookings (doc 29 Batch 6; external-confirmation.ts). Our booking id and codes or counts only.
+  "supplier.external_handoff": ["supplierBookingId", "pollCount"],
+  "supplier.external_failed": ["supplierBookingId", "afterConfirm"],
+  "supplier.external_hold_unusable": ["supplierBookingId", "holdMs"],
 } as const satisfies Record<string, readonly string[]>;
 
 export type StructuredEventName = keyof typeof STRUCTURED_EVENTS;

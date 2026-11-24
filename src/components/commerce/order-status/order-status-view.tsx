@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
-import { Lock, RefreshCw, ShieldCheck, Users, WifiOff } from "lucide-react";
+import { Clock, Lock, RefreshCw, ShieldCheck, Users, WifiOff } from "lucide-react";
 import { MotionConfig } from "motion/react";
 import { DownloadLink } from "@/components/checkout/download-button";
 import { Button, ButtonLink } from "@/components/ui/button";
@@ -455,6 +455,13 @@ export function OrderStatusView({ initial, returnHint = null }: { initial: Custo
                     <p className="mt-3 flex gap-2 text-sm text-ink-700" data-testid="cancellation-terms">
                       <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-lagoon-700" aria-hidden="true" />
                       <span>{item.cancellationTerms}</span>
+                    </p>
+                  )}
+                  {/* Doc 29 Batch 6: an external supplier's booking says, in every state, that its confirmation can take a few minutes. */}
+                  {item.externalConfirmation && (
+                    <p className="mt-2 flex gap-2 text-sm text-ink-700" data-testid="external-confirmation">
+                      <Clock className="mt-0.5 h-4 w-4 shrink-0 text-ink-500" aria-hidden="true" />
+                      <span>{item.externalConfirmation}</span>
                     </p>
                   )}
                   {item.ticket && (item.ticket.validityCopy || item.ticket.types.length > 0 || item.ticket.validityConcern) && (

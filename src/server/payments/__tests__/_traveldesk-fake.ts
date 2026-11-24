@@ -12,7 +12,8 @@ import { TravelDeskApiError } from "../../suppliers/traveldesk/traveldesk.http";
  * deadline is refused. Amounts are synthetic. Not a test file itself.
  */
 
-type Step = "ok" | "lost" | TravelDeskApiError;
+/** `in_progress` and `external_failed` (doc 29 Batch 6): the confirm answers an external confirmation still running, or failed (201 with the flag). */
+type Step = "ok" | "lost" | "in_progress" | "external_failed" | TravelDeskApiError;
 
 export class ScriptedTravelDesk implements TravelDeskBookingTransport {
   calls: string[] = [];
@@ -106,7 +107,7 @@ export class ScriptedTravelDesk implements TravelDeskBookingTransport {
     if (s === "lost") throw new TravelDeskApiError("timeout", "bookings.confirm");
     const held = this.expire(this.store.get(id)!);
     if (held.status !== 7) throw new TravelDeskApiError("bad_request", "bookings.confirm", { status: 400, reason: "The reservation is no longer active" });
-    const b = { ...held, status: 1, reservationDeadline: null };
+    const b = { ...held, status: 1, reservationDeadline: null, externalInProgress: s === "in_progress", externalFailed: s === "external_failed" };
     this.store.set(id, b);
     return b;
   }

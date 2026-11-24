@@ -718,7 +718,7 @@ describe("quote: ticket validity (TicketOnly, Q-T2)", () => {
 describe("quote: the public projection (CR-B2-1)", () => {
   const FORBIDDEN = /supplier|margin|cost|fx|inrPerAed|mapping|offerHash|fingerprint|owner|guestSession|customerId|policyVersion|floorBps|unitDefinitions|readiness|environment|productVersion|checkedAt/i;
   const ALLOWED_TOP = ["ok", "quoteId", "expiresAt", "currency", "totalMinor", "lines"];
-  const ALLOWED_LINE = ["index", "productId", "variantId", "serviceDate", "slotRef", "units", "addonIds", "chargedMinor", "discountAllocMinor", "taxAllocMinor", "freeCancellationUntilUtc", "freeCancellationCopy", "nonRefundableAfterConfirm", "ticketValidUntil", "ticketValidityCopy", "openDatedTicket"];
+  const ALLOWED_LINE = ["index", "productId", "variantId", "serviceDate", "slotRef", "units", "addonIds", "chargedMinor", "discountAllocMinor", "taxAllocMinor", "freeCancellationUntilUtc", "freeCancellationCopy", "nonRefundableAfterConfirm", "ticketValidUntil", "ticketValidityCopy", "openDatedTicket", "externalConfirmationCopy"];
 
   function keysOf(v: unknown, path = ""): string[] {
     if (Array.isArray(v)) return v.flatMap((x, i) => keysOf(x, `${path}[${i}]`));
@@ -744,6 +744,18 @@ describe("quote: the public projection (CR-B2-1)", () => {
     if (!q.ok) return;
     const legacy = { ...q, lines: q.lines.map(({ ticketValidUntil: _drop, ...rest }) => rest) };
     expect(toPublicQuote(legacy)).toMatchObject({ lines: [{ ticketValidUntil: null, ticketValidityCopy: null }] });
+  });
+
+  it("doc 29 Batch 6: an external supplier's line is stored as such and says, before payment, that confirmation can take a few minutes", async () => {
+    const w = world({ supplier: () => okSupplier({ externalConfirmation: true }) });
+    const q = await w.svc.create(GUEST, request());
+    expect(q.ok && q.lines[0].externalConfirmation).toBe(true);
+    expect(w.store.rows[0].snapshot.lines[0].externalConfirmation).toBe(true);
+    const line = (toPublicQuote(q) as { lines: { externalConfirmationCopy: string | null }[] }).lines[0];
+    expect(line.externalConfirmationCopy).toContain("can take a few minutes");
+    // An internal line says nothing of the kind.
+    const n = toPublicQuote(await world().svc.create(GUEST, request())) as { lines: { externalConfirmationCopy: string | null }[] };
+    expect(n.lines[0].externalConfirmationCopy).toBeNull();
   });
 
   it("the supplier USD net is stored on the line for the engine and never reaches the public projection", async () => {

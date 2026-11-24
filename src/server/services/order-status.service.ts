@@ -7,8 +7,9 @@ import { documentService } from "./document.service";
 import { orderAccessService, type OrderAccess } from "./order-access.service";
 import { evaluateCancellation, loadCancellationFacts, serviceStartUtc, type CancellationFacts } from "./cancellation.service";
 import { ticketFactsForOrder } from "./ticket-facts.service";
+import { EXTERNAL_HANDOFF_CODE } from "../suppliers/external-confirmation";
 import type { CustomerTicketFacts } from "@/lib/ticket-validity";
-import { freeCancellationCopy, TICKET_NON_REFUNDABLE_STATEMENT } from "@/lib/utils";
+import { EXTERNAL_CONFIRMATION_STATEMENT, freeCancellationCopy, TICKET_NON_REFUNDABLE_STATEMENT } from "@/lib/utils";
 import {
   formatDubaiAndUtc,
   remedySentence,
@@ -80,7 +81,18 @@ export interface StatusItemSnapshot {
   /** order_items.status */
   status: string;
   /** The item's latest supplier attempt. */
-  booking: { state: string; startMinutes: number | null; confirmedAt: Date | null; cancelledAt: Date | null; updatedAt: Date; pickupTimeMinutes?: number | null } | null;
+  booking: {
+    state: string;
+    startMinutes: number | null;
+    confirmedAt: Date | null;
+    cancelledAt: Date | null;
+    updatedAt: Date;
+    pickupTimeMinutes?: number | null;
+    /** Doc 29 Batch 6: the attempt books through an external supplier; absent or null reads as internal. */
+    externalRoute?: boolean | null;
+    /** Doc 29 Batch 6: still waiting on the external supplier, and handed to our team at the wait limit. */
+    externalHandedOff?: boolean;
+  } | null;
   /** The pickup hotel chosen at checkout (`order_items.pickup_hotel_name_snapshot`); absent or null without pickup. */
   pickupHotelName?: string | null;
   tickets: { fulfilment: TicketFulfilment; documents: DocumentSummary[] };
@@ -469,6 +481,21 @@ function documentsFor(item: StatusItemSnapshot, canDownload: boolean): CustomerD
     .map((d) => ({ id: d.id, kind: d.kind as "tickets_pdf" | "voucher_pdf", version: d.version, contentType: d.contentType, byteSize: d.byteSize, href: `/api/tickets/documents/${d.id}` }));
 }
 
+/**
+ * Doc 29 Batch 6: a single-item order booked through an external supplier.
+ * Its confirmation can take minutes and is never given up on a clock: the
+ * money comes back once the operator shows it cannot confirm, so the page
+ * promises no time for it (no remedy deadline). `handedOff`: still waiting,
+ * and handed to our team at the wait limit. Multi-item orders keep their
+ * per-item words.
+ */
+function externalView(s: StatusSnapshot): { external: boolean; handedOff: boolean } {
+  if (multiItem(s)) return { external: false, handedOff: false };
+  const covered = s.items.filter((i) => sagaCovers(s, i));
+  const external = covered.some((i) => i.booking?.externalRoute === true);
+  return { external, handedOff: external && covered.some((i) => i.booking?.externalHandedOff === true) };
+}
+
 /** "your Desert safari" for one item, "your 3 activities" for several. */
 function whatBooked(s: StatusSnapshot): string {
   const live = s.items.filter((i) => i.status !== "rejected");
@@ -500,8 +527,9 @@ function words(
   const multi = multiItem(s);
   const what = whatBooked(s);
   const by = remedyAt ? formatDubaiAndUtc(remedyAt) : null;
-  const remedy = ` ${remedySentence(by, multi)}`;
   const team = s.saga?.attentionRequiredAt ? " Our team is also checking it." : "";
+  const { external, handedOff } = externalView(s);
+  const remedy = external ? " If the operator cannot confirm it, you get the full amount back automatically, as a released hold or a refund." : ` ${remedySentence(by, multi)}`;
   switch (state) {
     case "awaiting_payment":
       if (!s.saga || s.order.rail === "assisted") {
@@ -517,6 +545,18 @@ function words(
       }
       return { headline: `Payment received. We're booking ${what} with the operator.`, nextStep: `This page updates by itself.${remedy}${team}` };
     case "booking_processing":
+      if (handedOff) {
+        return {
+          headline: `Payment received. The operator is taking longer than usual to confirm ${what}.`,
+          nextStep: `Our team is following it up with them and will contact you. This page updates by itself.${remedy}`,
+        };
+      }
+      if (external) {
+        return {
+          headline: `Payment received. We're booking ${what} with the operator.`,
+          nextStep: `This operator confirms through their own system, so it can take a few minutes. This page updates by itself.${remedy}${team}`,
+        };
+      }
       return { headline: `Payment received. We're booking ${what} with the operator.`, nextStep: `This page updates by itself.${remedy}${team}` };
     case "confirmed_ticket_pending":
       return {
@@ -604,7 +644,7 @@ export function projectCustomerStatus(s: StatusSnapshot, now: Date): CustomerOrd
   const per = s.items.map((item) => ({ item, ...itemState(s, item, now) }));
   const sagaItem = per.find((p) => p.sagaItem);
   const state = !per.length ? recordedState(s.order.status, false) : sagaItem && per.length === 1 ? sagaItem.state : orderState(per.map((p) => p.state));
-  const remedy = ["payment_processing", "booking_processing"].includes(state) ? remedyFor(s) : { at: null, kind: null };
+  const remedy = ["payment_processing", "booking_processing"].includes(state) && !externalView(s).external ? remedyFor(s) : { at: null, kind: null };
   const { headline, nextStep } = words(state, s, remedy.at, s.canDownload);
 
   const items: CustomerItemStatus[] = per.map(({ item, state: itemSt }) => ({
@@ -618,6 +658,7 @@ export function projectCustomerStatus(s: StatusSnapshot, now: Date): CustomerOrd
     refundUntilUtc: refundUntil(item),
     pickup: pickupOf(item),
     cancellationTerms: cancellationTermsOf(item, itemSt),
+    externalConfirmation: item.booking?.externalRoute === true ? EXTERNAL_CONFIRMATION_STATEMENT : null,
     cancellation: cancellationView(item, itemSt, now),
     ...(item.ticket
       ? {
@@ -692,7 +733,19 @@ export async function loadStatusSnapshot(access: Pick<OrderAccess, "orderId" | "
         orderBy: [{ serviceDate: "asc" }, { id: "asc" }],
       },
       supplierBookings: {
-        select: { orderItemId: true, state: true, startMinutes: true, confirmedAt: true, cancelledAt: true, updatedAt: true, createdAt: true, pickupTimeMinutes: true },
+        select: {
+          orderItemId: true,
+          state: true,
+          startMinutes: true,
+          confirmedAt: true,
+          cancelledAt: true,
+          updatedAt: true,
+          createdAt: true,
+          pickupTimeMinutes: true,
+          externalRoute: true,
+          errorCode: true,
+          attentionRequiredAt: true,
+        },
         orderBy: [{ createdAt: "desc" }, { id: "desc" }],
       },
       paymentSaga: { select: { orderItemId: true, state: true, deadlineAt: true, attentionRequiredAt: true, updatedAt: true, paymentId: true } },
@@ -739,7 +792,17 @@ export async function loadStatusSnapshot(access: Pick<OrderAccess, "orderId" | "
         pax: item.pax,
         status: item.status,
         booking: booking
-          ? { state: booking.state, startMinutes: booking.startMinutes, confirmedAt: booking.confirmedAt, cancelledAt: booking.cancelledAt, updatedAt: booking.updatedAt, pickupTimeMinutes: booking.pickupTimeMinutes }
+          ? {
+              state: booking.state,
+              startMinutes: booking.startMinutes,
+              confirmedAt: booking.confirmedAt,
+              cancelledAt: booking.cancelledAt,
+              updatedAt: booking.updatedAt,
+              pickupTimeMinutes: booking.pickupTimeMinutes,
+              externalRoute: booking.externalRoute,
+              // Only the hand-off code (doc 29 Batch 6); no other internal code reaches the projection.
+              externalHandedOff: booking.state === "awaiting_external" && booking.attentionRequiredAt !== null && booking.errorCode === EXTERNAL_HANDOFF_CODE,
+            }
           : null,
         pickupHotelName: item.pickupHotelNameSnapshot,
         tickets: { fulfilment: t?.fulfilment ?? "not_applicable", documents: t?.documents ?? [] },

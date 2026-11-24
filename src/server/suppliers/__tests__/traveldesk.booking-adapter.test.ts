@@ -111,7 +111,8 @@ describe("TravelDesk statuses as the engine sees them", () => {
     expect(travelDeskStatus({ status: 8, externalInProgress: null, externalFailed: null })).toBe("EXPIRED");
     expect(travelDeskStatus({ status: 4, externalInProgress: null, externalFailed: null })).toBe("CANCELLED");
     expect(travelDeskStatus({ status: 1, externalInProgress: true, externalFailed: false })).toBe("PENDING");
-    expect(travelDeskStatus({ status: 1, externalInProgress: true, externalFailed: true })).toBe("CONFIRMED");
+    // Doc 29 Batch 6: while the external confirmation is in progress the booking waits, whatever the failed flag says.
+    expect(travelDeskStatus({ status: 1, externalInProgress: true, externalFailed: true })).toBe("PENDING");
     expect(travelDeskStatus({ status: 5, externalInProgress: null, externalFailed: null })).toBe("CONFIRMED");
     for (const s of [2, 3, 6, 99]) expect(travelDeskStatus({ status: s, externalInProgress: false, externalFailed: false })).toBe("UNKNOWN");
   });
@@ -487,5 +488,94 @@ describe("ticket evidence from confirm and create (TKT-1)", () => {
     type Has<K extends string> = K extends keyof TravelDeskBookingTransport ? true : false;
     const excluded: [Has<"readTicketsById">, Has<"getBooking">, Has<"downloadTickets">, Has<"downloadVoucher">] = [false, false, false, false];
     expect(excluded).toEqual([false, false, false, false]);
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * External-supplier bookings (doc 29 Batch 6)
+ * ------------------------------------------------------------------------ */
+
+describe("external-supplier bookings (doc 29 Batch 6)", () => {
+  /** An AgencyBookingPublicDto list row as TravelDesk documents it; ids and amounts synthetic. */
+  const wire = (over: Record<string, unknown> = {}) => ({
+    id: 100,
+    date: "2026-11-10T00:00:00",
+    offerId: 77,
+    bookingType: 1,
+    bookingReference: "OUTTD-ABC",
+    tourId: 5,
+    timeSlotId: 9,
+    startTime: 600,
+    adults: 2,
+    children: 0,
+    infants: 0,
+    totalCost: 240,
+    totalCostUsd: 66,
+    totalPaidFromBalance: 240,
+    status: 1,
+    isExternalConfirmationInProgress: false,
+    isExternalBookingFailed: false,
+    isExternalVoucherNotReady: false,
+    ...over,
+  });
+  const read = (over: Record<string, unknown>) => snapshotFrom(bookingFrom(bookingWire.parse(wire(over))));
+
+  it("a booking the external supplier rejected is created (201) with the failed flag: once the confirmation is no longer in progress it reads REJECTED", () => {
+    for (const status of [0, 1, 5]) {
+      expect(read({ status, isExternalBookingFailed: true }).status).toBe("REJECTED");
+    }
+    // A reservation the external supplier refused holds nothing either.
+    expect(read({ status: 7, isExternalBookingFailed: true, reservationDeadline: "2026-11-01T08:15:00" }).status).toBe("REJECTED");
+    expect(read({ status: 7, isExternalBookingFailed: false, reservationDeadline: "2026-11-01T08:15:00" }).status).toBe("ON_HOLD");
+  });
+
+  it("while the confirmation is in progress it waits, whatever the failed flag says; a missing flag is never a rejection", () => {
+    expect(read({ isExternalConfirmationInProgress: true }).status).toBe("PENDING");
+    expect(read({ isExternalConfirmationInProgress: true, isExternalBookingFailed: true }).status).toBe("PENDING");
+    expect(read({ isExternalConfirmationInProgress: undefined, isExternalBookingFailed: true }).status).toBe("CONFIRMED");
+    expect(read({ isExternalConfirmationInProgress: undefined, isExternalBookingFailed: true })).toMatchObject({ externalInProgress: null, externalFailed: true });
+  });
+
+  it("document links before the confirmation finished: the booking waits, and no link, Guid or failure text reaches the snapshot", () => {
+    const s = read({
+      isExternalConfirmationInProgress: true,
+      isExternalVoucherNotReady: true,
+      downloadVoucherUrl: "https://example.invalid/voucher/0000",
+      downloadTicketsUrl: "https://example.invalid/tickets/0000",
+      externalBookingFailureMessage: "Synthetic supplier text",
+    });
+    expect(s.status).toBe("PENDING");
+    const json = JSON.stringify(s, (_k, v) => (typeof v === "bigint" ? v.toString() : v));
+    expect(json).not.toContain("example.invalid");
+    expect(json).not.toContain("Synthetic supplier text");
+    expect(s.ticketsIssued).toBeNull();
+  });
+
+  it("a voucher not ready after the confirmation does not stop the confirmation; the download answers not ready (502) until it is", () => {
+    expect(read({ isExternalVoucherNotReady: true }).status).toBe("CONFIRMED");
+  });
+
+  it("takes the hold deadline from the reserve answer, short holds included, and never assumes 15 minutes for an external offer", async () => {
+    const at = (min: number) => new Date(T0 + min * 60_000).toISOString();
+    const hold = async (r: Partial<TravelDeskBooking>, externalRoute?: boolean) => {
+      const { t } = transport({ reserve: async () => booking(r) });
+      const o = await adapterFor(t).hold({ clientRef: "c", expected: {} as never, body: {}, ...(externalRoute ? { externalRoute } : {}) });
+      return o.kind === "accepted" ? o.snapshot.holdExpiresAtUtc : "not accepted";
+    };
+    // A five-minute provider hold: its own deadline, UTC.
+    expect(await hold({ reservationDeadline: at(5), reservationTimeout: null }, true)).toBe(at(5));
+    expect(await hold({ reservationDeadline: at(5), reservationTimeout: 5 }, true)).toBe(at(5));
+    // The answer's timeout alone bounds it.
+    expect(await hold({ reservationDeadline: null, reservationTimeout: 5 }, true)).toBe(at(5));
+    // A later deadline is still capped (CR-9), never trusted past the send plus the timeout.
+    expect(await hold({ reservationDeadline: at(60), reservationTimeout: 7 }, true)).toBe(at(7));
+    // Neither a deadline nor a timeout: the hold has no known end (never confirmed), instead of an assumed 15 minutes.
+    expect(await hold({ reservationDeadline: null, reservationTimeout: null }, true)).toBeNull();
+    // An internal offer keeps today's rule: the documented 15 minutes.
+    expect(await hold({ reservationDeadline: null, reservationTimeout: null })).toBe(at(15));
+  });
+
+  it("reads `reservationDeadline` without a zone as UTC", () => {
+    expect(bookingFrom(bookingWire.parse(wire({ status: 7, reservationDeadline: "2026-11-01T08:05:00" }))).reservationDeadline).toBe("2026-11-01T08:05:00.000Z");
   });
 });

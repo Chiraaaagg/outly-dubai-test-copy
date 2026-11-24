@@ -52,7 +52,7 @@ import type { ProductMappingReadiness, VariantMappingState } from "./supplier-ca
  *    time that does not parse, a page without times or an offer whose starts
  *    are unknown does not pass. An offer with an "any time" slot is
  *    `slot_any_time_unsupported`, unless it sells as a choice among its
- *    listed starts (doc 29 Batch 2, `listedStartsSellable`: its exact
+ *    listed starts (doc 29 Batch 2 and Batch 6, `listedStartsSellable`: its exact
  *    listed-start class key is switched on and every slot has a known end:
  *    stored, or start plus the offer's hours, Batch 3b `slotEndMinutes`);
  *    then the same set equality applies to its listed starts. Never an
@@ -105,6 +105,10 @@ import type { ProductMappingReadiness, VariantMappingState } from "./supplier-ca
  * has no stored end now passes `listedStartsSellable` when the end derives from the offer's hours
  * (start + numberOfHours x 60, not past midnight; `slotEndMinutes`). Bumped at the Batch 3b + 5 merge:
  * Batch 3b changed this fact without a bump, and Batch 5 had taken 10.
+ * Not bumped by doc 29 Batch 6: `listedStartsSellable` now also lifts the four external listed-start keys,
+ * but only when the gate allows them, and no such flag exists before the batch; switching one on re-runs
+ * readiness for its mapped products (supplier-capability.service.ts). No stored verdict can differ, so a bump
+ * would only send every instant product to inquiry until the next re-run.
  */
 export const READINESS_RULES_VERSION = 11;
 

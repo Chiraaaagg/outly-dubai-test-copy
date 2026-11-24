@@ -98,6 +98,8 @@ const NULLABLE_COLUMNS_ONLY = [
   "20261123150000_b3_order_item_pickup_hotel",
   // supplier_bookings.pickup_time_minutes, tickets_valid_until (doc 29 §8.7; review 86 B5-07).
   "20261124130000_supplier_booking_pickup_time_ticket_validity",
+  // supplier_bookings.external_route (doc 29 Batch 6).
+  "20261124140000_b6_supplier_booking_external_route",
 ];
 /*
  * Every other faulted migration takes a lock on an existing table and has its

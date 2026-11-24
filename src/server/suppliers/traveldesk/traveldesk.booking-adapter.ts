@@ -97,7 +97,8 @@ const MAX_LIST_PAGES = 50;
 export function travelDeskStatus(r: Pick<TravelDeskBooking, "status" | "externalInProgress" | "externalFailed">): SupplierStatus {
   switch (r.status) {
     case 7:
-      return "ON_HOLD";
+      // A reservation the external supplier refused is created too; it holds nothing (doc 29 Batch 6).
+      return r.externalInProgress === false && r.externalFailed === true ? "REJECTED" : "ON_HOLD";
     case 8:
       return "EXPIRED";
     case 4:
@@ -105,7 +106,13 @@ export function travelDeskStatus(r: Pick<TravelDeskBooking, "status" | "external
     case 0:
     case 1:
     case 5:
-      return r.externalInProgress === true && r.externalFailed !== true ? "PENDING" : "CONFIRMED";
+      // Doc 29 Batch 6 (TravelDesk §8.6): poll until `isExternalConfirmationInProgress` is false, then read
+      // `isExternalBookingFailed`. While in progress the booking waits, whatever the failed flag says; once
+      // done, a failed flag is TravelDesk's documented rejection (a rejected booking is still created, 201).
+      // A missing flag is neither: it falls to CONFIRMED, where the predicate refuses it (`flag_missing`).
+      if (r.externalInProgress === true) return "PENDING";
+      if (r.externalInProgress === false && r.externalFailed === true) return "REJECTED";
+      return "CONFIRMED";
     default:
       // 2 on-request, 3 payment required, 6 payment failed, codes not in the spec. 6 stays unknown (OpenAPI,
       // 22 Nov 2026: "PaymentFailed", with `paymentErrorMessage`, e.g. balance): the spec does not say the
@@ -334,7 +341,11 @@ export class TravelDeskBookingAdapter implements SupplierBookingAdapter, CallObs
     try {
       const r = await this.t.reserve(a.body);
       const minutes = r.reservationTimeout ?? (TRAVELDESK_BOOKING_CAPABILITIES.holds ? TRAVELDESK_BOOKING_CAPABILITIES.holds.minutes : 0);
-      return { kind: "accepted", snapshot: snapshotFrom(r, new Date(sentAt + minutes * 60_000).toISOString()) };
+      // Doc 29 Batch 6: an external provider's hold may be as short as five minutes, so its length is never assumed.
+      // The deadline comes from the answer (still capped, CR-9); an answer with neither a deadline nor a timeout gives
+      // the hold no known end, and the engine never confirms it.
+      const unknownEnd = a.externalRoute === true && !r.reservationDeadline && r.reservationTimeout === null;
+      return { kind: "accepted", snapshot: snapshotFrom(r, unknownEnd ? null : new Date(sentAt + minutes * 60_000).toISOString()) };
     } catch (e) {
       return outcomeFromError(e);
     }
