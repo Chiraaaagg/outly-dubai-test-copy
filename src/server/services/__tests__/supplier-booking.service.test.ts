@@ -70,6 +70,8 @@ class FakeTravelDesk implements TravelDeskBookingTransport {
   /** Runs inside the cancel call, before it answers (a slow cancel). */
   onCancel: (() => Promise<void>) | null = null;
   chargeOverride: bigint | null = null;
+  /** Doc 29 Batch 7 (review 92 B7-16): when set, the slot id the reserve answer carries instead of the one sent (null: none). */
+  reserveSlotId: number | null | undefined = undefined;
   /** A reservation deadline this far after the send, instead of 15 minutes; null answers no deadline (doc 29 Batch 6). */
   deadlineMs: number | null = 15 * 60_000;
   private seq = 50_000 + Math.floor(Math.random() * 1000);
@@ -125,6 +127,10 @@ class FakeTravelDesk implements TravelDeskBookingTransport {
     if (s instanceof TravelDeskApiError) throw s;
     // Doc 29 Batch 6: a reservation the external provider is still making, or one it refused (201 with the flag).
     let b = this.make(body, 7, s === "in_progress");
+    if (this.reserveSlotId !== undefined) {
+      b = { ...b, timeSlotId: this.reserveSlotId };
+      this.store.set(b.supplierBookingId, b);
+    }
     if (s === "external_failed") {
       b = { ...b, externalFailed: true };
       this.store.set(b.supplierBookingId, b);
@@ -1137,6 +1143,73 @@ describe.skipIf(!enabled)("supplierBookingService (local DB, fake TravelDesk)", 
     await drain(td, 20 * 60_000, 60_000);
     expect((await booking(b.id)).state).toBe("expired");
     expect(td.calls).not.toContain("confirm");
+  });
+
+  /** A stored date-only offer (no slot metadata, doc 29 Batch 7) for the reserve-time slot check cases. */
+  async function dateOnlyOffer(): Promise<number> {
+    const { storedOffer } = await import("../../suppliers/__tests__/fixtures/traveldesk-terms");
+    const offerId = OFFER + 50;
+    await prisma.supplierCatalogueItem.upsert({
+      where: { supplierId_environment_kind_externalId: { supplierId, environment: "test", kind: "offer", externalId: String(offerId) } },
+      create: {
+        id: uuidv7(),
+        supplierId,
+        environment: "test",
+        kind: "offer",
+        externalId: String(offerId),
+        parentExternalId: "1",
+        name: "engine test date-only offer",
+        bookingKind: "live_book",
+        payload: storedOffer({ offerId, tourId: 1, timeSlots: [], durationHours: 3 }) as never,
+        payloadHash: "x",
+      },
+      update: {},
+    });
+    return offerId;
+  }
+  const WHOLE_DAY = { timeSlotId: 0, startMinutes: 0, endMinutes: 1439 };
+
+  it("doc 29 Batch 7 (B7-16): a date-only reservation naming another slot id waits for staff, is never confirmed automatically, and is an ops incident", async () => {
+    const td = new FakeTravelDesk(now);
+    td.reserveSlotId = 5; // the intent sent slot 0
+    const t0 = new Date(clock);
+    const b = await create(intent({ offerId: await dateOnlyOffer(), slot: WHOLE_DAY }));
+    await drain(td, 0);
+    const held = await booking(b.id);
+    expect(held).toMatchObject({ state: "reserved", errorCode: "reservation_slot_mismatch" });
+    expect(held.attentionRequiredAt).not.toBeNull();
+    expect(td.calls).not.toContain("confirm");
+    expect(await prisma.supplierJob.count({ where: { supplierBookingId: b.id, kind: "confirm", status: "queued" } })).toBe(0);
+    const { collectOpsIncidents } = await import("../ops-alert.service");
+    const incidents = await collectOpsIncidents(new Date(t0.getTime() - 60_000), now());
+    expect(incidents.filter((i) => i.entityId === b.id).map((i) => i.reason)).toContain("reservation_slot_mismatch");
+    await drain(td, 20 * 60_000, 60_000);
+    expect((await booking(b.id)).state).toBe("expired");
+    expect(td.calls).not.toContain("confirm");
+  });
+
+  it("doc 29 Batch 7 (B7-16): a date-only reservation that leaves the slot id out passes the reserve check; the confirm check still refuses to confirm it", async () => {
+    const td = new FakeTravelDesk(now);
+    td.reserveSlotId = null;
+    const b = await create(intent({ offerId: await dateOnlyOffer(), slot: WHOLE_DAY }));
+    await drain(td, 0);
+    const after = await booking(b.id);
+    expect(after.errorCode).not.toBe("reservation_slot_mismatch");
+    // The confirm answer carries the reservation's (missing) id: an exact echo is required to confirm (SUP-1).
+    expect(after).toMatchObject({ state: "outcome_unknown", errorCode: "unconfirmed_snapshot", errorMessage: "identity_mismatch" });
+    expect(td.calls.filter((c) => c === "confirm")).toHaveLength(1);
+  });
+
+  it.each([0, 10])("lead decision: a fixed-slot (Batch 0) reservation whose answer carries slot id %s is not held by the reserve check; it behaves as before Batch 7", async (answered) => {
+    const td = new FakeTravelDesk(now);
+    td.reserveSlotId = answered; // the intent sent slot 9 on the stored fixed-slot offer
+    const b = await create(intent());
+    await drain(td, 0);
+    const after = await booking(b.id);
+    expect(after.errorCode).not.toBe("reservation_slot_mismatch");
+    // As at 6518a30: the confirm is sent, and the existing confirm check refuses an answer that does not echo the sent id.
+    expect(td.calls.filter((c) => c === "confirm")).toHaveLength(1);
+    expect(after).toMatchObject({ state: "outcome_unknown", errorCode: "unconfirmed_snapshot", errorMessage: "identity_mismatch" });
   });
 
   it("caps the reservation deadline at the send plus the hold length when TravelDesk's deadline is later (CR-9)", async () => {

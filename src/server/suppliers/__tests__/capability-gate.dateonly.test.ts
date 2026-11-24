@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { storedOffer } from "./fixtures/traveldesk-terms";
 import { gateVerdict, loadCapabilityGate, type CapabilityGateContext } from "../capability-gate";
-import { RESERVATION_SLOT_MISMATCH_CODE, reservationSlotDiffers } from "../traveldesk/traveldesk.confirmation";
+import { RESERVATION_SLOT_MISMATCH_CODE, reservationSlotDiffers, reservationSlotHeld } from "../traveldesk/traveldesk.confirmation";
 import { bookingReason } from "../../services/ops-alert.service";
 
 /**
@@ -58,6 +58,19 @@ describe("reservation slot check (review 92 B7-12)", () => {
     expect(reservationSlotDiffers("7", { timeSlotId: "8" })).toBe(true);
     expect(reservationSlotDiffers("0", { timeSlotId: null })).toBe(false);
     expect(reservationSlotDiffers(null, { timeSlotId: "8" })).toBe(false);
+  });
+
+  it("holds only date-only bookings (lead decision): a Batch 0-6 booking whose reserve answer carries 0 or another id is not held", () => {
+    for (const key of ["live.fixed_slot_single.self.internal.per_person", "live.fixed_slot_choice.self.internal.per_person", "live.listed_start_single.self.internal.per_person", "live.fixed_slot_single.pickup_required.internal.per_person", "live.listed_start_single.self.external.per_person", "ticket.open_dated.self.internal.per_person"]) {
+      expect(reservationSlotHeld(key, "9", { timeSlotId: "0" }), key).toBe(false);
+      expect(reservationSlotHeld(key, "9", { timeSlotId: "10" }), key).toBe(false);
+    }
+    expect(reservationSlotHeld(null, "9", { timeSlotId: "10" })).toBe(false);
+    expect(reservationSlotHeld("unknown", "9", { timeSlotId: "10" })).toBe(false);
+    expect(reservationSlotHeld(SELF, "0", { timeSlotId: "5" })).toBe(true);
+    expect(reservationSlotHeld("live.date_only_no_slot_metadata.pickup_required.internal.per_person", "0", { timeSlotId: "5" })).toBe(true);
+    expect(reservationSlotHeld(SELF, "0", { timeSlotId: "0" })).toBe(false);
+    expect(reservationSlotHeld(SELF, "0", { timeSlotId: null })).toBe(false);
   });
 
   it("is an ops-alert reason while it needs staff", () => {

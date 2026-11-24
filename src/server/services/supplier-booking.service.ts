@@ -36,11 +36,11 @@ import { documentService, reportPersisted, type PersistResult } from "./document
 import { buildBookingRequest } from "../suppliers/traveldesk/traveldesk.booking";
 import { type BrowseRoute, READ_BUDGET, type ReadClass, type ReadLimits } from "../suppliers/read-budget";
 import { mutationHealth, READ_BUDGET_REASON, type ReadGate } from "../suppliers/traveldesk/traveldesk.booking-adapter";
-import { isConfirmedSnapshot, RESERVATION_SLOT_MISMATCH_CODE, reservationSlotDiffers, withinChargeTolerance } from "../suppliers/traveldesk/traveldesk.confirmation";
+import { isConfirmedSnapshot, RESERVATION_SLOT_MISMATCH_CODE, reservationSlotDiffers, reservationSlotHeld, withinChargeTolerance } from "../suppliers/traveldesk/traveldesk.confirmation";
 import { SUPPLIER_WALLET_BOOK, type SupplierRefundFigure, walletEntriesFor, walletPhaseOf } from "../suppliers/wallet-ledger";
 import { bookingAccountId, DEFAULT_BOOKING_ACCOUNT_ID } from "../suppliers/control-account";
 import { checkOfferCapability } from "../suppliers/capability-gate";
-import { bookingKindSellable, parseClassKey } from "../suppliers/traveldesk/traveldesk.capability";
+import { bookingKindSellable, deriveCapabilities, parseClassKey } from "../suppliers/traveldesk/traveldesk.capability";
 import {
   EXTERNAL_CONFIRM_MARGIN_MS,
   EXTERNAL_FAILED_AFTER_CONFIRM_CODE,
@@ -3298,6 +3298,15 @@ export const supplierBookingService = {
     return n > 0;
   },
 
+  /** The capability class key of a booking's stored offer (doc 29 Batch 7), or null when it is not stored or unreadable. */
+  async storedClassKey(b: Pick<SupplierBooking, "supplierId" | "environment" | "offerExternalId">): Promise<string | null> {
+    const row = await prisma.supplierCatalogueItem.findUnique({
+      where: { supplierId_environment_kind_externalId: { supplierId: b.supplierId, environment: b.environment, kind: "offer", externalId: b.offerExternalId } },
+      select: { payload: true },
+    });
+    return row ? deriveCapabilities(row.payload).classKey : null;
+  },
+
   /** Keep a booking blocking in outcome_unknown with attention set, and queue a re-read with backoff — in one transaction. */
   async holdForReread(b: SupplierBooking, s: SupplierSnapshot, deps: Deps, error: { errorCode: string; errorMessage: string }, detail: Record<string, unknown>) {
     const t = deps.now();
@@ -3353,8 +3362,10 @@ export const supplierBookingService = {
     if (holding && !problem && (s.chargedNetMinor === null || !withinChargeTolerance(s.chargedNetMinor, b.expectedNetMinor))) {
       problem = { errorCode: "charged_amount_mismatch", errorMessage: `charged ${s.chargedNetMinor ?? "none"} vs expected ${b.expectedNetMinor}` };
     }
-    // Doc 29 Batch 7 (review 92 B7-12): a reservation naming another slot than the one sent is held for a human the same way.
-    if (holding && !problem && reservationSlotDiffers(b.timeSlotId, s)) {
+    // Doc 29 Batch 7 (review 92 B7-12; lead decision 24 Nov 2026): a date-only booking whose reservation names another
+    // slot than the one sent waits for a human the same way. Only date-only bookings: Batch 0-6 bookings are never held by
+    // it (the reserve echo is unproven), and the offer is read only when the ids differ.
+    if (holding && !problem && reservationSlotDiffers(b.timeSlotId, s) && reservationSlotHeld(await this.storedClassKey(b), b.timeSlotId, s)) {
       problem = { errorCode: RESERVATION_SLOT_MISMATCH_CODE, errorMessage: `reserved slot ${s.timeSlotId} vs sent ${b.timeSlotId}` };
     }
     const deadline = holding ? this.holdDeadline(b, s, deps) : null;

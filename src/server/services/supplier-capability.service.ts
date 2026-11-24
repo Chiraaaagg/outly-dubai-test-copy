@@ -11,6 +11,7 @@ import {
   CAPABILITY_DERIVATION_VERSION,
   deriveCapabilities,
   capabilityKeyNote,
+  DATE_ONLY_CLASS_KEYS,
   environmentRefusal,
   externalFlagsEnabled,
   neverEnabledReason,
@@ -205,7 +206,8 @@ export const supplierCapabilityService = {
       : [];
     const termsByOffer = new Map(caps.map((c) => [c.offerExternalId, c.offerTermsHash]));
 
-    const keys = new Set<string>([...SEEDED_CLASS_KEYS, ...flags.map((f) => f.classKey), ...caps.map((c) => c.classKey)]);
+    // Doc 29 Batch 7: the date-only keys are always listed, so their Q5 note and production lock are visible even with no offer or flag row.
+    const keys = new Set<string>([...SEEDED_CLASS_KEYS, ...DATE_ONLY_CLASS_KEYS, ...flags.map((f) => f.classKey), ...caps.map((c) => c.classKey)]);
     const classes: CapabilityClassRow[] = [...keys].sort().map((classKey) => {
       const f = flags.find((x) => x.classKey === classKey) ?? null;
       const inClass = caps.filter((c) => c.classKey === classKey);

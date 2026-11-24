@@ -249,12 +249,18 @@ describe.skipIf(!enabled)("supplier capability flags and evidence (local DB)", (
     const prodErr = await svc.setFlag(a, { environment: "production", classKey: SELF_DATE_ONLY, enabled: true, reason: "try the locked key" }, { approvalId: uuidv7() }).catch((e) => e);
     expect(code(prodErr)).toBe("CONFLICT");
     expect((prodErr as { details?: { reason?: string } }).details?.reason).toBe("date_only_q5_pending");
+    // The refusal wrote nothing: no production row exists for the key.
+    expect(await prisma.supplierCapabilityFlag.count({ where: { adapter: "traveldesk", environment: "production", classKey: SELF_DATE_ONLY } })).toBe(0);
     // Test: switchable with an applied approval, then switched off and the row removed by its own id.
     const appr = await flagApproval("test", SELF_DATE_ONLY);
     try {
       expect(await svc.setFlag(a, { environment: "test", classKey: SELF_DATE_ONLY, enabled: true, reason: "sandbox drill switch on" }, { approvalId: appr, supplierCode: CODE })).toEqual({ changed: true, enabled: true });
-      const overview = await svc.overview(a, "production");
-      expect(overview.classes.find((c) => c.classKey === SELF_DATE_ONLY)).toMatchObject({ neverEnabled: "date_only_q5_pending" });
+      // The overview always lists both date-only keys (even with no offer or flag row): locked in production, switchable in test.
+      const prodView = await svc.overview(a, "production", { supplierCode: CODE });
+      expect(prodView.classes.find((c) => c.classKey === SELF_DATE_ONLY)).toMatchObject({ neverEnabled: "date_only_q5_pending", note: expect.stringContaining("Q5") });
+      expect(prodView.classes.find((c) => c.classKey === "live.date_only_no_slot_metadata.pickup_required.internal.per_person")).toMatchObject({ neverEnabled: "date_only_q5_pending" });
+      const testView = await svc.overview(a, "test", { supplierCode: CODE });
+      expect(testView.classes.find((c) => c.classKey === SELF_DATE_ONLY)).toMatchObject({ neverEnabled: null, flag: { enabled: true } });
     } finally {
       const rows = await prisma.supplierCapabilityFlag.findMany({ where: { adapter: "traveldesk", environment: "test", classKey: SELF_DATE_ONLY }, select: { id: true } });
       await prisma.supplierCapabilityFlag.deleteMany({ where: { id: { in: rows.map((r) => r.id) } } });
