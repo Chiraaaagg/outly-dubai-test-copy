@@ -701,3 +701,33 @@ describe("CRM worker: a not-found answer is believed only when the deal is gone 
     expect(del).toMatchObject({ status: "dead", lastErrorCode: "refused:linked_deal_not_visible" });
   });
 });
+
+describe("CRM worker and the G11 alert read the same pause (review C2B-06)", () => {
+  it("the stored portal row after a real breaker opening, re-opening and auth refusal gives the exact opening time", async () => {
+    const { crmPortalIncident } = await import("@/server/services/ops-alert.service");
+    const h = harness();
+    for (let i = 0; i < 6; i++) h.put(inquiryState(subjectId()));
+    h.fake.down = true;
+    const openedAt = () => h.fake.calls[h.fake.calls.length - 1].at;
+    await h.run();
+    const row = () => [...h.store.portals.values()][0];
+    const since = new Date(0);
+    let first = openedAt();
+    expect(crmPortalIncident({ environment: "staging", ...row() }, since, h.clock.now())).toMatchObject({ reason: "crm_breaker_open", raisedAt: new Date(first) });
+    // The pause ends, the half-open probe fails: a new opening, again exact.
+    h.clock.t = row().pausedUntil!.getTime() + 1_000;
+    await h.run();
+    first = openedAt();
+    expect(crmPortalIncident({ environment: "staging", ...row() }, since, h.clock.now())).toMatchObject({ reason: "crm_breaker_open", raisedAt: new Date(first) });
+    // Recovery resets the failures: no incident.
+    h.fake.down = false;
+    h.clock.t = row().pausedUntil!.getTime() + 1_000;
+    await h.run();
+    expect(crmPortalIncident({ environment: "staging", ...row() }, since, h.clock.now())).toBeNull();
+    // A refused credential.
+    h.put(inquiryState(subjectId()));
+    h.fake.revoked = true;
+    await h.run();
+    expect(crmPortalIncident({ environment: "staging", ...row() }, since, h.clock.now())).toMatchObject({ reason: "crm_auth_refused", raisedAt: new Date(openedAt()) });
+  });
+});

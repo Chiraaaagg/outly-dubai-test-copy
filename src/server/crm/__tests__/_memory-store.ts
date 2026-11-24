@@ -300,7 +300,7 @@ export class MemoryCrmStore implements CrmStore {
     return n;
   }
 
-  async claimTimeline(scope: CrmScope, holder: string, now: Date, opts: { quietBefore: Date; maxWaitBefore: Date; staleBefore: Date; limit: number }): Promise<CrmTimelineGroup[]> {
+  async claimTimeline(scope: CrmScope, holder: string, now: Date, opts: { quietBefore: Date; maxWaitBefore: Date; staleBefore: Date; limit: number; perLink: number }): Promise<CrmTimelineGroup[]> {
     const inScope = (linkId: string) => this.links.find((l) => l.id === linkId && l.environment === scope.environment && l.portal === scope.portal);
     for (const t of this.timeline) {
       const l = inScope(t.linkId);
@@ -318,7 +318,8 @@ export class MemoryCrmStore implements CrmStore {
       .filter(([, ts]) => Math.max(...ts.map((t) => t.noticedAt.getTime())) <= opts.quietBefore.getTime() || Math.min(...ts.map((t) => t.noticedAt.getTime())) <= opts.maxWaitBefore.getTime())
       .sort((a, b) => Math.min(...a[1].map((t) => t.noticedAt.getTime())) - Math.min(...b[1].map((t) => t.noticedAt.getTime())) || (a[0] < b[0] ? -1 : 1))
       .slice(0, opts.limit);
-    return picked.map(([linkId, ts]) => {
+    return picked.map(([linkId, all]) => {
+      const ts = [...all].sort((a, b) => a.noticedAt.getTime() - b.noticedAt.getTime() || (a.id < b.id ? -1 : 1)).slice(0, opts.perLink);
       for (const t of ts) Object.assign(t, { status: "posting", postingBy: holder, postingSince: now.getTime() });
       return {
         linkId,
@@ -335,6 +336,7 @@ export class MemoryCrmStore implements CrmStore {
       Object.assign(t, { postingBy: null, postingSince: null });
       if (r.status === "posted") Object.assign(t, { status: "posted", postedAt: r.at, crmCommentId: r.crmCommentId, lastErrorCode: null });
       else if (r.status === "pending") Object.assign(t, { status: "pending", nextAttemptAt: r.nextAttemptAt.getTime(), attempts: r.attempts, lastErrorCode: r.code });
+      else if (r.status === "failed") Object.assign(t, { status: "failed", attempts: r.attempts, lastErrorCode: r.code });
       else Object.assign(t, { status: r.status, lastErrorCode: r.code });
     }
   }

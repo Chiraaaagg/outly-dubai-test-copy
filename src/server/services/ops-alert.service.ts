@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupplierEnvironment } from "@prisma/client";
+import { Prisma, type SupplierEnvironment } from "@prisma/client";
 import { prisma, TX_OPTIONS } from "../lib/db";
 import { env } from "../lib/env";
 import { traveldeskConfigFrom } from "../suppliers/traveldesk/traveldesk.config";
@@ -503,7 +503,7 @@ export async function crmDeleteIncidents(since: Date, now: Date, limit = COLLECT
     .$queryRaw<Row[]>`
     SELECT entity_type, entity_id::text AS entity_id, reason, (last_error_code = 'refused:linked_deal_not_visible') AS unverified, max(updated_at) AS raised_at
     FROM crm_outbox
-    WHERE (kind = 'delete' OR last_error_code = 'refused:linked_deal_not_visible') AND status = 'dead' AND updated_at >= ${since} AND updated_at <= ${now}
+    WHERE (kind = 'delete' OR ${CRM_DELETE_CODES_SQL}) AND status = 'dead' AND updated_at >= ${since} AND updated_at <= ${now}
     GROUP BY entity_type, entity_id, reason, unverified
     ORDER BY raised_at DESC LIMIT ${limit}`
     .catch((e: unknown) => {
@@ -525,6 +525,21 @@ export async function crmDeleteIncidents(since: Date, now: Date, limit = COLLECT
     supplierBookingRef: null,
     adminPath: "/admin",
   }));
+}
+
+/**
+ * Codes a sync row can only die with while deleting an erased subject's deal (crm.worker.ts deleteCopies): such a
+ * row is the delete incident, never "sync gave up", because customer data may still be on the portal (C2B-05).
+ */
+export const CRM_DELETE_ERROR_CODES = ["refused:linked_deal_not_visible", "rejected:delete_not_found_visible", "refused:delete_target"] as const;
+export const CRM_DELETE_ERROR_PREFIX = "invalid_response:delete_result_";
+const deleteCodesSql = (col: Prisma.Sql) =>
+  Prisma.sql`(${col} IN (${Prisma.join([...CRM_DELETE_ERROR_CODES])}) OR ${col} LIKE ${`${CRM_DELETE_ERROR_PREFIX}%`})`;
+const CRM_DELETE_CODES_SQL = deleteCodesSql(Prisma.raw("last_error_code"));
+const CRM_DELETE_CODES_SQL_C = deleteCodesSql(Prisma.raw("c.last_error_code"));
+/** Pure, for tests: whether a dead row's code is a delete code. */
+export function isCrmDeleteCode(code: string | null): boolean {
+  return code !== null && ((CRM_DELETE_ERROR_CODES as readonly string[]).includes(code) || code.startsWith(CRM_DELETE_ERROR_PREFIX));
 }
 
 const isMissingTable = (e: unknown, table: string) =>
@@ -549,7 +564,7 @@ export async function crmSyncDeadIncidents(since: Date, now: Date, limit = COLLE
     SELECT c.entity_type, c.entity_id::text AS entity_id, c.last_error_code, max(c.updated_at) AS raised_at, max(o.reference) AS reference
     FROM crm_outbox c LEFT JOIN orders o ON c.entity_type = 'order' AND o.id = c.entity_id
     WHERE c.kind = 'sync' AND c.status = 'dead' AND c.updated_at >= ${since} AND c.updated_at <= ${now}
-      AND (c.last_error_code IS NULL OR c.last_error_code <> 'refused:linked_deal_not_visible')
+      AND (c.last_error_code IS NULL OR NOT (${CRM_DELETE_CODES_SQL_C}))
     GROUP BY c.entity_type, c.entity_id, c.last_error_code
     ORDER BY raised_at DESC LIMIT ${limit}`
     .catch((e: unknown) => {

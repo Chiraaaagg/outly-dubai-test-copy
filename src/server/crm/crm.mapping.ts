@@ -82,6 +82,12 @@ export interface CrmOrderFacts {
   marginAedMinor?: bigint | null;
   /** A counted payment exists in another currency than the order's (never converted; review C2A-05). */
   otherCurrencyPaid?: boolean;
+  /**
+   * Our team took the order over: a supplier booking or the payment saga is flagged for staff (the Batch 6
+   * external-confirmation hand-off, a booking needing staff, a saga needing attention). Drives the timeline's
+   * "handed to the team" moment only (C2B-03); never a deal field.
+   */
+  handedToTeam?: boolean;
 }
 
 export interface CrmInquiryFacts {

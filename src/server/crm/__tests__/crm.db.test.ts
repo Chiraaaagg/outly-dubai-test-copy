@@ -391,7 +391,7 @@ describe.skipIf(!dbEnabled)("CRM outbox, links and worker (C1)", () => {
     // Recorded again (a re-push, a retry): nothing new.
     expect(await store.recordTimelineMoments(linkId, moments, new Date())).toBe(0);
     const now = new Date();
-    const optsAt = (quietMs: number) => ({ quietBefore: new Date(now.getTime() - quietMs), maxWaitBefore: new Date(now.getTime() - 60 * 60_000), staleBefore: new Date(now.getTime() - 120_000), limit: 3 });
+    const optsAt = (quietMs: number) => ({ quietBefore: new Date(now.getTime() - quietMs), maxWaitBefore: new Date(now.getTime() - 60 * 60_000), staleBefore: new Date(now.getTime() - 120_000), limit: 3, perLink: 10 });
     // Noticed 10 minutes ago: not quiet enough for a 20-minute window, quiet enough for 3 minutes.
     expect((await store.claimTimeline(scope, "h1", now, optsAt(20 * 60_000))).filter((g) => g.linkId === linkId)).toEqual([]);
     const [g] = (await store.claimTimeline(scope, "h1", now, optsAt(3 * 60_000))).filter((x) => x.linkId === linkId);
@@ -405,7 +405,7 @@ describe.skipIf(!dbEnabled)("CRM outbox, links and worker (C1)", () => {
     expect(await prisma.crmTimelineComment.findUniqueOrThrow({ where: { id: g.entries[0].id } })).toMatchObject({ status: "posted", crmCommentId: 9_001n, postingBy: null });
     // The other stays posting past the stale limit: the next claim settles it unknown, never re-posted.
     const later = new Date(now.getTime() + 10 * 60_000);
-    await store.claimTimeline(scope, "h3", later, { quietBefore: later, maxWaitBefore: later, staleBefore: new Date(later.getTime() - 120_000), limit: 3 });
+    await store.claimTimeline(scope, "h3", later, { quietBefore: later, maxWaitBefore: later, staleBefore: new Date(later.getTime() - 120_000), limit: 3, perLink: 10 });
     expect(await prisma.crmTimelineComment.findUniqueOrThrow({ where: { id: g.entries[1].id } })).toMatchObject({ status: "unknown", lastErrorCode: "posting_lapsed" });
     // A deleted link drops its pending moments.
     expect(await store.recordTimelineMoments(linkId, [{ key: "confirmed", kind: "confirmed", amountAedMinor: null }], t0)).toBe(1);
@@ -445,6 +445,10 @@ describe.skipIf(!dbEnabled)("CRM outbox, links and worker (C1)", () => {
     await prisma.crmOutbox.update({ where: { id }, data: { lastErrorCode: "refused:linked_deal_not_visible" } });
     expect((await crmSyncDeadIncidents(since, until)).filter((i) => i.entityId === `inquiry:${q.id}`)).toEqual([]);
     expect((await crmDeleteIncidents(since, until)).filter((i) => i.entityId === `inquiry:${q.id}`).map((i) => i.reason)).toEqual(["crm_erasure_deal_not_visible"]);
+    // C2B-05: the same for a sync row that died on another delete code (an unknown delete answer).
+    await prisma.crmOutbox.update({ where: { id }, data: { lastErrorCode: "invalid_response:delete_result_object" } });
+    expect((await crmSyncDeadIncidents(since, until)).filter((i) => i.entityId === `inquiry:${q.id}`)).toEqual([]);
+    expect((await crmDeleteIncidents(since, until)).filter((i) => i.entityId === `inquiry:${q.id}`).map((i) => i.reason)).toEqual(["crm_erasure_delete_dead"]);
     await prisma.crmOutbox.update({ where: { id }, data: { status: "queued", nextAttemptAt: new Date(Date.now() + 3_600_000) } });
 
     const portal = `g11-${HOST}`;
@@ -458,6 +462,55 @@ describe.skipIf(!dbEnabled)("CRM outbox, links and worker (C1)", () => {
       await prisma.$executeRaw`DELETE FROM ops_alerts WHERE id = ${alertId}::uuid`;
     } finally {
       await prisma.crmPortalState.deleteMany({ where: { portal } });
+    }
+  });
+
+  it("C2B-03: a staff flag on a linked paid order is the handed-to-team moment, once, from the flag alone", async () => {
+    const { prismaCrmStore: store } = await import("@/server/crm/crm.store");
+    const { loadSubjectState } = await import("@/server/crm/crm.snapshot");
+    const { uuidv7 } = await import("@/server/lib/ids");
+    const supplier = await prisma.supplier.findFirstOrThrow({ select: { id: true } });
+    const phone = syntheticPhone(run, 17);
+    const guest = await prisma.guest.create({ data: { id: uuidv7(), phoneE164: phone, fullName: `zz-c2b-${run}` } });
+    const combo = await prisma.combo.create({ data: { id: uuidv7(), slug: `zz-c2b-${run}-${uuidv7().slice(-8)}`, name: "zz-c2b", confirmation: "manual" } });
+    const o = await prisma.order.create({
+      data: { id: uuidv7(), reference: `OUT-${String(Math.floor(Math.random() * 9e9) + 1e9)}`, rail: "assisted", guestId: guest.id, currency: "AED", subtotalInr: 0n, subtotalAed: 1000n, totalInr: 0n, totalAed: 1000n, leadName: `zz-c2b-${run}`, leadPhone: phone },
+    });
+    const item = await prisma.orderItem.create({
+      data: {
+        id: uuidv7(), orderId: o.id, comboId: combo.id, titleSnapshot: "zz-c2b", tierSnapshot: "C", slugSnapshot: combo.slug, kindSnapshot: "combo", confirmationSnapshot: "manual",
+        fulfilmentModeSnapshot: "inquiry", freeCancellationHoursSnapshot: 24, durationMinutesSnapshot: 60, serviceDate: new Date("2030-01-15"), pax: { adult: 1 }, unitInr: 0n, unitAed: 1000n, totalInr: 0n, totalAed: 1000n,
+      },
+    });
+    const booking = await prisma.supplierBooking.create({
+      data: {
+        id: uuidv7(), orderId: o.id, orderItemId: item.id, supplierId: supplier.id, environment: "test", idempotencyKey: `c2b-${run}-${uuidv7()}`, clientRef: `OUTTD-C2B${uuidv7().slice(-12)}`,
+        bookingKind: "live_book", afterReserve: "await_payment", state: "awaiting_external", tourExternalId: "1", offerExternalId: "1", serviceDate: new Date("2030-01-15"),
+        adults: 1, guestName: "zz-c2b", expectedNetMinor: 1000n, expectedNetUsdMinor: 270n,
+      },
+    });
+    const linkId = uuidv7();
+    await prisma.crmLink.create({ data: { id: linkId, environment: "development", portal: HOST, entityType: "order", entityId: o.id, crmId: 777_002n, originatorId: "outlyy-development", originId: `ord:${o.id}`, state: "active", localVersion: 1n, pushedVersion: 1n } });
+    const now = new Date();
+    try {
+      // Not flagged yet; then flagged but no paid moment: nothing.
+      expect(await store.recordHandoffMoments!(scope, now)).toBe(0);
+      expect((await loadSubjectState({ type: "order", id: o.id })).order?.handedToTeam).toBe(false);
+      await prisma.supplierBooking.update({ where: { id: booking.id }, data: { attentionRequiredAt: now, errorCode: "external_confirmation_handoff" } });
+      expect((await loadSubjectState({ type: "order", id: o.id })).order?.handedToTeam).toBe(true);
+      expect(await store.recordHandoffMoments!(scope, now)).toBe(0);
+      await store.recordTimelineMoments(linkId, [{ key: "paid", kind: "paid", amountAedMinor: 1000n }], now);
+      expect(await store.recordHandoffMoments!(scope, now)).toBe(1);
+      expect(await store.recordHandoffMoments!(scope, now)).toBe(0);
+      expect(await prisma.crmTimelineComment.findFirstOrThrow({ where: { linkId, momentKey: "handed_to_team" } })).toMatchObject({ kind: "handed_to_team", status: "pending", amountAedMinor: null });
+    } finally {
+      await prisma.crmTimelineComment.deleteMany({ where: { linkId } });
+      await prisma.crmLink.deleteMany({ where: { id: linkId } });
+      await prisma.supplierBooking.deleteMany({ where: { id: booking.id } });
+      await prisma.orderItem.deleteMany({ where: { id: item.id } });
+      await prisma.order.deleteMany({ where: { id: o.id } });
+      await prisma.combo.deleteMany({ where: { id: combo.id } });
+      await prisma.guest.deleteMany({ where: { id: guest.id } });
     }
   });
 

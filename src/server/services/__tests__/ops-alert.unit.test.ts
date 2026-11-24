@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { bookingReason, catalogueStaleIncident, crmPortalIncident, crmSyncDeadReason, incidentContext, latestPerKey, OPS_INCIDENT_TITLES, reasonCode, type OpsIncident } from "../ops-alert.service";
+import { bookingReason, catalogueStaleIncident, crmPortalIncident, crmSyncDeadReason, isCrmDeleteCode, incidentContext, latestPerKey, OPS_INCIDENT_TITLES, reasonCode, type OpsIncident } from "../ops-alert.service";
 import { AUTH_PAUSE_MS, BREAKER_THRESHOLD, breakerPauseMs } from "@/server/crm/crm.worker";
 import { renderTemplate } from "@/server/notifications/templates";
 
@@ -157,6 +157,11 @@ describe("CRM sync alerts (doc 29d G11, CRM C2b)", () => {
     expect(crmSyncDeadReason("rejected:INVALID_ARG_VALUE")).toBe("crm_sync_dead_rejected");
     expect(crmSyncDeadReason("something else")).toBe("crm_sync_dead_other");
     expect(crmSyncDeadReason(null)).toBe("crm_sync_dead_other");
+  });
+
+  it("a sync row that died deleting an erased subject's deal is a delete incident, never 'sync gave up' (C2B-05)", () => {
+    for (const c of ["refused:linked_deal_not_visible", "rejected:delete_not_found_visible", "refused:delete_target", "invalid_response:delete_result_object"]) expect(isCrmDeleteCode(c)).toBe(true);
+    for (const c of ["unavailable:timeout", "refused:uf_customer_email", "invalid_response:schema", null]) expect(isCrmDeleteCode(c)).toBe(false);
   });
 
   it("an open breaker is raised at the moment it opened, exactly, and again at each re-open", () => {

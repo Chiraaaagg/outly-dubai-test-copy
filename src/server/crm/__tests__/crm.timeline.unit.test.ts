@@ -90,8 +90,14 @@ describe("timeline moments (pure)", () => {
       ["paid", 25_000n],
       ["refund:10000", 10_000n],
     ]);
+    // C2B-03 (owner): our team took the paid order over (a booking or the saga flagged for staff).
+    const handed = { ...paid(id), order: { ...paid(id).order!, handedToTeam: true } };
+    expect(momentsFor(handed).map((m) => m.key)).toEqual(["paid", "handed_to_team"]);
+    // A rejected line going to the automatic refund is not a hand-off; nor is a flag before payment.
     const rejected = order(id, { status: "partially_confirmed", authorised: true, capturedMinor: 50_000n, items: [line("confirmed"), line("rejected")] });
-    expect(momentsFor(rejected).map((m) => m.key)).toEqual(["paid", "confirmed", "handed_to_team"]);
+    expect(momentsFor(rejected).map((m) => m.key)).toEqual(["paid", "confirmed"]);
+    const unpaid = order(id, { status: "pending_payment", authorised: true });
+    expect(momentsFor({ ...unpaid, order: { ...unpaid.order!, handedToTeam: true } })).toEqual([]);
     expect(momentsFor(inquiryState(id, { status: "assigned" }))).toEqual([]);
     expect(momentsFor({ ...paid(id), erased: true })).toEqual([]);
   });
@@ -119,7 +125,7 @@ describe("timeline moments (pure)", () => {
         "23 Nov 2026 00:05 - Payment received: AED 250.00",
         "23 Nov 2026 00:05 - Supplier booking confirmed",
         "23 Nov 2026 00:05 - Tickets issued to the customer",
-        "23 Nov 2026 00:05 - Handed to the team: a supplier could not provide part of the order",
+        "23 Nov 2026 00:05 - Handed to the team: a supplier could not confirm part of the order",
         "23 Nov 2026 00:06 - Refund recorded: AED 100.00 refunded in total",
       ].join("\n"),
     );
@@ -146,9 +152,9 @@ describe("timeline moments (pure)", () => {
 
   it("source scan: the text is built from fixed phrases, the time and an AED amount only; the module reads no other fact", () => {
     const src = readFileSync(path.join(process.cwd(), "src/server/crm/crm.timeline.ts"), "utf8");
-    // The only facts read from state: status words (via crm.mapping), money totals, the currency, item statuses.
+    // The only facts read from state: status words (via crm.mapping), money totals, the currency, the hand-off flag.
     const reads = [...src.matchAll(/\bo\.(\w+)/g)].map((m) => m[1]);
-    expect([...new Set(reads)].sort()).toEqual(["authorised", "capturedMinor", "currency", "items", "refundedMinor"]);
+    expect([...new Set(reads)].sort()).toEqual(["capturedMinor", "currency", "handedToTeam", "refundedMinor"]);
     for (const banned of ["contact", "reference", "title", "serviceDate", "note", "phone", "email", "name", "supplierBooking", "consent"]) {
       expect(src).not.toMatch(new RegExp(`\\.${banned}\\b`));
     }
@@ -256,7 +262,7 @@ describe("timeline comments on the fake portal", () => {
     await h.run();
     h.clock.advance(TIMELINE_QUIET_MS);
     // A worker claimed the moment and died before it recorded the answer.
-    const groups = await h.store.claimTimeline(h.scope, "ghost", h.clock.now(), { quietBefore: h.clock.now(), maxWaitBefore: h.clock.now(), staleBefore: new Date(0), limit: 3 });
+    const groups = await h.store.claimTimeline(h.scope, "ghost", h.clock.now(), { quietBefore: h.clock.now(), maxWaitBefore: h.clock.now(), staleBefore: new Date(0), limit: 3, perLink: 10 });
     expect(groups).toHaveLength(1);
     await h.minutes(10);
     expect(h.store.timelineOf(h.scope, s.subject)).toMatchObject([{ status: "unknown", lastErrorCode: "posting_lapsed" }]);
@@ -282,7 +288,7 @@ describe("timeline comments on the fake portal", () => {
       await h.run();
       h.clock.advance(30 * MIN);
     }
-    expect(h.store.timelineOf(h.scope, t.subject)).toMatchObject([{ status: "failed", attempts: TIMELINE_MAX_ATTEMPTS - 1, lastErrorCode: "rejected:INVALID_ARG_VALUE" }]);
+    expect(h.store.timelineOf(h.scope, t.subject)).toMatchObject([{ status: "failed", attempts: TIMELINE_MAX_ATTEMPTS, lastErrorCode: "rejected:INVALID_ARG_VALUE" }]);
     expect(h.fake.callsOf("crm.timeline.comment.add")).toHaveLength(1 + 1 + TIMELINE_MAX_ATTEMPTS);
   });
 
@@ -357,5 +363,154 @@ describe("timeline comments on the fake portal", () => {
     h.fake.deals.clear(); // deleted on the portal; OUTLYY has not noticed yet
     await h.minutes(5);
     expect(h.store.timelineOf(h.scope, t.subject)).toMatchObject([{ status: "dropped" }]);
+  });
+
+  it("handed to the team: a staff flag on a paid order is one comment line (C2B-03)", async () => {
+    const h = harness();
+    const id = subjectId();
+    h.put(paid(id));
+    await h.minutes(5);
+    const p = paid(id);
+    h.put({ ...p, order: { ...p.order!, handedToTeam: true } });
+    await h.minutes(5);
+    const texts = h.fake.commentsOn(h.dealOf(p).id).map((c) => c.text.split("\n").slice(1));
+    expect(texts[1]).toEqual(["22 Nov 2026 12:05 - Handed to the team: a supplier could not confirm part of the order"]);
+  });
+});
+
+describe("timeline comments meet a failing portal like a row does (C2B-01, C2B-02)", () => {
+  const twoDueDeals = async (h: ReturnType<typeof harness>) => {
+    const [a, b] = [subjectId(), subjectId()];
+    h.put(paid(a));
+    const pb = paid(b);
+    h.put({ ...pb, order: { ...pb.order!, reference: "OUT-4829138" } });
+    await h.run();
+    h.clock.advance(TIMELINE_QUIET_MS + 1_000);
+    return [a, b];
+  };
+
+  it("a half-open breaker is never probed by a comment; 1-4 carried failures are proven by a read first", async () => {
+    const h = harness();
+    await twoDueDeals(h);
+    await h.store.setPortalHealth(h.scope, { consecutiveFailures: 5 });
+    expect((await h.run()).comments).toBe(0);
+    expect(h.fake.callsOf("crm.timeline.comment.add")).toHaveLength(0);
+    // Two failures carried, the portal still down: the read fails, no comment is tried, the failure counts.
+    await h.store.setPortalHealth(h.scope, { consecutiveFailures: 2 });
+    h.fake.down = true;
+    expect((await h.run()).comments).toBe(0);
+    expect(h.fake.calls.filter((c) => c.method === "crm.timeline.comment.add")).toHaveLength(0);
+    expect([...h.store.portals.values()][0].consecutiveFailures).toBe(3);
+    expect(h.store.timeline.every((t) => t.status === "pending" && t.attempts === 0)).toBe(true);
+    // Back up: the read succeeds, the count resets, both comments go.
+    h.fake.down = false;
+    expect((await h.run()).comments).toBe(2);
+    expect([...h.store.portals.values()][0].consecutiveFailures).toBe(0);
+  });
+
+  it("an outage met by a comment: that group is unknown (at most once), the rest wait without an attempt, and the failure counts", async () => {
+    const h = harness();
+    const [a, b] = await twoDueDeals(h);
+    h.fake.methodScript.push({ method: "crm.timeline.comment.add", failure: "server_error" });
+    const r = await h.run();
+    expect(r.comments).toBe(0);
+    expect(h.fake.callsOf("crm.timeline.comment.add")).toHaveLength(1);
+    const states = [a, b].map((id) => h.store.timelineOf(h.scope, { type: "order", id })[0]);
+    expect(states.map((t) => [t.status, t.attempts]).sort()).toEqual([
+      ["pending", 0],
+      ["unknown", 0],
+    ]);
+    expect([...h.store.portals.values()][0].consecutiveFailures).toBe(1);
+    expect(h.events.some((e) => e.name === "crm.timeline_failed" && e.fields.settled === "unknown")).toBe(true);
+    // Next run: a read proves the portal, the waiting group posts; the unknown one never does.
+    h.clock.advance(MIN);
+    await h.run();
+    expect(h.fake.callsOf("crm.timeline.comment.add")).toHaveLength(2);
+    expect([a, b].map((id) => h.store.timelineOf(h.scope, { type: "order", id })[0].status).sort()).toEqual(["posted", "unknown"]);
+  });
+
+  it("a throttled comment pauses the portal like a row's throttle", async () => {
+    const h = harness();
+    await twoDueDeals(h);
+    h.fake.methodScript.push({ method: "crm.timeline.comment.add", failure: "throttle503" });
+    const r = await h.run();
+    expect(r).toMatchObject({ throttled: true, comments: 0 });
+    const portal = [...h.store.portals.values()][0];
+    expect(portal).toMatchObject({ pauseReason: "throttled" });
+    expect(portal.pausedUntil!.getTime()).toBeGreaterThan(h.clock.t);
+    expect(h.fake.callsOf("crm.timeline.comment.add")).toHaveLength(1);
+    expect(h.store.timeline.every((t) => t.status === "pending" && t.attempts === 0)).toBe(true);
+  });
+
+  it("a refused credential met by a comment opens the auth circuit (the crm_auth_refused alert reads it) and burns no attempt", async () => {
+    const h = harness();
+    await twoDueDeals(h);
+    h.fake.revoked = true;
+    const r = await h.run();
+    expect(r).toMatchObject({ breakerOpen: true, comments: 0 });
+    expect([...h.store.portals.values()][0]).toMatchObject({ pauseReason: "auth" });
+    expect(h.events.find((e) => e.name === "crm.circuit_open")?.fields).toMatchObject({ reason: "auth" });
+    expect(h.store.timeline.every((t) => t.status === "pending" && t.attempts === 0)).toBe(true);
+  });
+
+  it("an access refusal on one deal while the portal answered rows counts attempts, so it ends", async () => {
+    const h = harness();
+    const s = paid(subjectId());
+    h.put(s);
+    await h.run();
+    for (let i = 0; i < TIMELINE_MAX_ATTEMPTS; i++) {
+      h.clock.advance(2 * 3_600_000);
+      h.put(inquiryState(subjectId(), { reference: `INQ-3000${i}01` })); // a row the portal answers
+      h.fake.methodScript.push({ method: "crm.timeline.comment.add", failure: "access_denied" });
+      await h.run();
+      // The circuit opens each time (the refusal could be the portal's), so wait it out before the next try.
+      await h.store.setPortalHealth(h.scope, { pausedUntil: null, pauseReason: null });
+    }
+    expect(h.store.timelineOf(h.scope, s.subject)[0]).toMatchObject({ status: "failed", attempts: TIMELINE_MAX_ATTEMPTS, lastErrorCode: "auth:ACCESS_DENIED" });
+  });
+});
+
+describe("timeline settle details (C2B-04, C2B-07, C2B-08)", () => {
+  it("more than ten moments: ten in the first comment, the rest in the next; none marked posted unseen", async () => {
+    const h = harness();
+    const id = subjectId();
+    h.put(paid(id));
+    await h.run();
+    for (let i = 1; i <= 11; i++) {
+      h.clock.advance(1_000);
+      h.put(order(id, { status: "paid", authorised: true, capturedMinor: 25_000n, refundedMinor: BigInt(i * 100) }));
+      await h.run();
+    }
+    await h.minutes(10);
+    const texts = h.fake.commentsOn(h.dealOf(paid(id)).id).map((c) => c.text.split("\n").length - 1);
+    expect(texts).toEqual([10, 2]);
+    expect(h.store.timelineOf(h.scope, { type: "order", id }).every((t) => t.status === "posted")).toBe(true);
+    expect(h.fake.commentsOn(h.dealOf(paid(id)).id)[1].text).toContain("AED 11.00 refunded in total");
+  });
+
+  it("a failed record is made good by the next unchanged re-push, without a CRM write", async () => {
+    const h = harness();
+    const s = paid(subjectId());
+    h.store.failTimelineRecord = true;
+    h.put(s);
+    await h.run();
+    h.store.failTimelineRecord = false;
+    h.put(s); // nothing changed for the deal
+    h.clock.advance(1_000);
+    await h.run();
+    expect(h.store.rows[1].outcome).toBe("unchanged");
+    expect(h.fake.callsOf("crm.item.update")).toHaveLength(0);
+    await h.minutes(5);
+    expect(h.fake.commentsOn(h.dealOf(s).id)).toHaveLength(1);
+  });
+
+  it("a comment dropped because the deal is gone leaves an event", async () => {
+    const h = harness();
+    const s = paid(subjectId());
+    h.put(s);
+    await h.run();
+    h.fake.deals.clear();
+    await h.minutes(5);
+    expect(h.events.find((e) => e.name === "crm.timeline_failed" && e.fields.settled === "dropped")).toBeTruthy();
   });
 });

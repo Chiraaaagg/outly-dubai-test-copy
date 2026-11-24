@@ -202,13 +202,17 @@ export const prismaCrmStore: CrmStore = {
         ORDER BY min(c.noticed_at), c.link_id
         LIMIT ${opts.limit}
       ), picked AS (
-        SELECT c.id FROM crm_timeline_comments c JOIN due ON due.link_id = c.link_id
-        WHERE c.status = 'pending' AND c.next_attempt_at <= ${now}
-        FOR UPDATE OF c SKIP LOCKED
+        -- At most perLink moments per deal, oldest first: the rest wait for the next comment (review C2B-04).
+        SELECT id FROM (
+          SELECT c.id, row_number() OVER (PARTITION BY c.link_id ORDER BY c.noticed_at, c.id) AS n
+          FROM crm_timeline_comments c JOIN due ON due.link_id = c.link_id
+          WHERE c.status = 'pending' AND c.next_attempt_at <= ${now}
+        ) ranked WHERE n <= ${opts.perLink}
       )
       UPDATE crm_timeline_comments c SET status = 'posting', posting_by = ${holder}, posting_since = ${now}, updated_at = now()
       FROM picked, crm_links l
-      WHERE c.id = picked.id AND l.id = c.link_id
+      -- Re-checked under the row lock: a moment another claim took meanwhile is not taken twice.
+      WHERE c.id = picked.id AND l.id = c.link_id AND c.status = 'pending'
       RETURNING c.id, c.link_id, l.crm_id, c.kind, c.amount_aed_minor, c.noticed_at, c.attempts`;
     const groups = new Map<string, CrmTimelineGroup>();
     for (const r of rows) {
@@ -228,9 +232,31 @@ export const prismaCrmStore: CrmStore = {
       await prisma.crmTimelineComment.updateMany({ where, data: { ...release, status: "posted", postedAt: r.at, crmCommentId: BigInt(r.crmCommentId), lastErrorCode: null } });
     } else if (r.status === "pending") {
       await prisma.crmTimelineComment.updateMany({ where, data: { ...release, status: "pending", nextAttemptAt: r.nextAttemptAt, attempts: r.attempts, lastErrorCode: r.code } });
+    } else if (r.status === "failed") {
+      await prisma.crmTimelineComment.updateMany({ where, data: { ...release, status: "failed", attempts: r.attempts, lastErrorCode: r.code } });
     } else {
       await prisma.crmTimelineComment.updateMany({ where, data: { ...release, status: r.status, lastErrorCode: r.code } });
     }
+  },
+
+  async recordHandoffMoments(scope, now) {
+    // Same lookback as the ops alerts: a flag older than that is not news. Ids and flags only, no personal data.
+    const since = new Date(now.getTime() - HANDOFF_LOOKBACK_MS);
+    return prisma.$executeRaw`
+      INSERT INTO crm_timeline_comments (id, link_id, moment_key, kind, noticed_at, next_attempt_at, created_at, updated_at)
+      SELECT gen_random_uuid(), l.id, 'handed_to_team', 'handed_to_team', ${now}, ${now}, now(), now()
+      FROM crm_links l
+      LEFT JOIN inquiries q ON l.entity_type = 'inquiry' AND q.id = l.entity_id
+      JOIN orders o ON o.id = (CASE WHEN l.entity_type = 'order' THEN l.entity_id ELSE q.converted_order_id END)
+      WHERE l.environment = ${scope.environment} AND l.portal = ${scope.portal} AND l.state = 'active' AND l.crm_id IS NOT NULL
+        AND EXISTS (SELECT 1 FROM crm_timeline_comments p WHERE p.link_id = l.id AND p.kind = 'paid')
+        AND NOT EXISTS (SELECT 1 FROM crm_timeline_comments h WHERE h.link_id = l.id AND h.moment_key = 'handed_to_team')
+        AND (
+          EXISTS (SELECT 1 FROM supplier_bookings b WHERE b.order_id = o.id
+                  AND (b.attention_required_at >= ${since} OR (b.state::text IN ('manual_review', 'not_found_unresolved') AND b.updated_at >= ${since})))
+          OR EXISTS (SELECT 1 FROM payment_sagas s WHERE s.order_id = o.id AND s.attention_required_at >= ${since})
+        )
+      ON CONFLICT (link_id, moment_key) DO NOTHING`;
   },
 };
 
@@ -249,6 +275,8 @@ export const CRM_OUTBOX_DEAD_DAYS = 90;
 export const CRM_TOMBSTONE_DAYS = 730;
 
 const DAY = 86_400_000;
+/** A staff hand-off flag older than this is not recorded as a new moment (the ops-alert lookback, 72 h). */
+const HANDOFF_LOOKBACK_MS = 72 * 3_600_000;
 
 export interface CrmRetentionResult {
   scheduled: number;

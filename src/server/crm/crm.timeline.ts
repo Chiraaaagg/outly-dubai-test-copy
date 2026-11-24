@@ -16,9 +16,14 @@ import { supplierStatus, ticketStatus, type CrmSubjectState } from "./crm.mappin
  *    customer can open;
  *  - `refund:<total refunded>`: each new refunded total, with that total for
  *    an AED order;
- *  - `handed_to_team`: a paid or authorised order with a line the supplier
- *    could not provide, so OUTLYY staff take over (owner to confirm this
- *    reading of "handed to the team", doc 29d §7).
+ *  - `handed_to_team`: a paid order that our team took over because a
+ *    supplier could not confirm an item: a supplier booking or the payment
+ *    saga flagged for staff (the Batch 6 external-confirmation hand-off, a
+ *    booking needing staff, a saga needing attention). Owner answer, 25
+ *    November 2026 (review C2B-03). A rejected line that goes to the
+ *    automatic refund is not one. The hand-off sets no deal field, so the
+ *    worker also records it from the flags directly (crm.store.ts
+ *    `recordHandoffMoments`), once the deal has its `paid` moment.
  * Inquiries have no moment: their stage already says where they are.
  *
  * The text is fixed English: a header and one line per moment, each with
@@ -72,7 +77,7 @@ export function momentsFor(state: CrmSubjectState): CrmMoment[] {
   if (supplier === "confirmed" || supplier === "partially_confirmed") out.push({ key: "confirmed", kind: "confirmed", amountAedMinor: null });
   if (ticketStatus(o) === "issued") out.push({ key: "tickets_sent", kind: "tickets_sent", amountAedMinor: null });
   if (o.refundedMinor > 0n) out.push({ key: `refund:${o.refundedMinor}`, kind: "refund", amountAedMinor: aed(o.refundedMinor) });
-  if ((o.capturedMinor > 0n || o.authorised) && o.items.some((i) => i.status === "rejected")) out.push({ key: "handed_to_team", kind: "handed_to_team", amountAedMinor: null });
+  if (o.capturedMinor > 0n && o.handedToTeam === true) out.push({ key: "handed_to_team", kind: "handed_to_team", amountAedMinor: null });
   return out;
 }
 
@@ -83,7 +88,7 @@ const PHRASE: Record<CrmTimelineKind, string> = {
   confirmed: "Supplier booking confirmed",
   tickets_sent: "Tickets issued to the customer",
   refund: "Refund recorded",
-  handed_to_team: "Handed to the team: a supplier could not provide part of the order",
+  handed_to_team: "Handed to the team: a supplier could not confirm part of the order",
 };
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];

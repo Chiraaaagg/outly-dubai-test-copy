@@ -22,7 +22,8 @@ import { CRM_FIELD_KEYS } from "@/server/crm/crm.config";
  *      (200 with an unexpected body), network (fails before the method
  *      runs), lose_answer (the method runs, then the answer is lost),
  *      phantom_not_found (a not-found answer although nothing changed and
- *      the record is still there);
+ *      the record is still there), access_denied (403 ACCESS_DENIED on that
+ *      call only, as for a record the service account may not see);
  *  - delete and not-found answer shapes (gap G14; the real portal's were not
  *    seen yet): `deleteAnswer` (default `true`, the documented
  *    `{"result": true}`; `empty_array` was C1's assumption) and
@@ -50,7 +51,7 @@ const STANDARD_FIELDS = new Set(["title", "categoryId", "stageId", "opportunity"
 const DEFAULT_UF_CODES = CRM_FIELD_KEYS.map((k) => `UF_CRM_${k.toUpperCase()}`);
 const BITRIX_DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/;
 
-export type FakeFailure = "throttle503" | "throttle429" | "server_error" | "reject" | "bad_shape" | "network" | "lose_answer" | "phantom_not_found";
+export type FakeFailure = "throttle503" | "throttle429" | "server_error" | "reject" | "bad_shape" | "network" | "lose_answer" | "phantom_not_found" | "access_denied";
 export type FakeDeleteAnswer = "true" | "empty_array" | "empty_object" | "null" | "false" | "object" | "string";
 export type FakeNotFoundShape = "code" | "empty_code_text" | "core_text" | "core_text_ru" | "http404";
 
@@ -204,6 +205,8 @@ export class FakeBitrix24 {
         case "lose_answer":
           this.handle(method, JSON.parse(String(init.body ?? "{}")));
           throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+        case "access_denied":
+          return reply(403, { error: "ACCESS_DENIED", error_description: "Access denied" });
         case "phantom_not_found": {
           const nf = this.notFound();
           return reply(nf.status, nf.body);

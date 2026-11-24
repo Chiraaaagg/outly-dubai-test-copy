@@ -7,6 +7,7 @@ import {
   renderTimelineComment,
   TIMELINE_GROUPS_PER_RUN,
   TIMELINE_MAX_ATTEMPTS,
+  TIMELINE_MAX_LINES,
   TIMELINE_MAX_WAIT_MS,
   TIMELINE_QUIET_MS,
   type CrmMoment,
@@ -145,7 +146,8 @@ export interface CrmTimelineGroup {
 
 export type CrmTimelineFinish =
   | { status: "posted"; crmCommentId: number; at: Date }
-  | { status: "unknown" | "failed" | "dropped"; code: string }
+  | { status: "unknown" | "dropped"; code: string }
+  | { status: "failed"; code: string; attempts: number }
   | { status: "pending"; nextAttemptAt: Date; attempts: number; code: string };
 
 export type CrmLinkPatch = Partial<Pick<CrmLinkRow, "crmId" | "state" | "creatingSince" | "pushedVersion" | "pushedHash" | "pushedAt" | "twinFlaggedAt">> & {
@@ -193,7 +195,13 @@ export interface CrmStore {
    * `maxWaitBefore`. First, `posting` moments older than `staleBefore` become `unknown` (never re-posted) and
    * pending moments of a deleted link become `dropped`.
    */
-  claimTimeline(scope: CrmScope, holder: string, now: Date, opts: { quietBefore: Date; maxWaitBefore: Date; staleBefore: Date; limit: number }): Promise<CrmTimelineGroup[]>;
+  claimTimeline(scope: CrmScope, holder: string, now: Date, opts: { quietBefore: Date; maxWaitBefore: Date; staleBefore: Date; limit: number; perLink: number }): Promise<CrmTimelineGroup[]>;
+  /**
+   * Record `handed_to_team` for active links whose order a team member took over (a supplier booking or the payment
+   * saga flagged for staff, within the alert lookback) and that already have a `paid` moment: the hand-off sets no
+   * deal field, so no push may follow it (C2B-03). Optional: a store without orders (the unit-test store) omits it.
+   */
+  recordHandoffMoments?(scope: CrmScope, now: Date): Promise<number>;
   /** Settle claimed moments; only those still `posting` by this holder change. */
   finishTimeline(ids: string[], holder: string, r: CrmTimelineFinish): Promise<void>;
 }
@@ -417,9 +425,37 @@ export async function runCrmWorker(deps: CrmWorkerDeps, opts: { budgetMs?: numbe
         await store.setPortalHealth(scope, { consecutiveFailures: failures });
       }
     }
-    // Comments only with what the rows left, and never into a portal that just failed, throttled or refused.
-    if (!budgetSpent && !outageSeen && !summary.throttled && !summary.breakerOpen && deps.now().getTime() - started < budgetMs) {
-      summary.comments = await flushTimeline(deps, port, scope, holder, started, budgetMs, random);
+    // Comments only with what the rows left, and only into a healthy portal: no failure carried from earlier runs
+    // (a half-open breaker probes with a row, never a comment), none in this run, no throttle or open circuit.
+    // With 1-4 failures carried and no row to prove the portal again, the flush first reads one deal; only a good
+    // answer lets comments go (and resets the count). A half-open breaker (5+) is never probed by the flush.
+    if (!budgetSpent && !outageSeen && failures < BREAKER_THRESHOLD && !summary.throttled && !summary.breakerOpen && deps.now().getTime() - started < budgetMs) {
+      const flushed = await flushTimeline(deps, port, scope, holder, started, budgetMs, random, summary.pushed + summary.deleted > 0, failures > 0);
+      summary.comments = flushed.posted;
+      if (flushed.probed && failures > 0) {
+        failures = 0;
+        await store.setPortalHealth(scope, { consecutiveFailures: 0 });
+      }
+      const err = flushed.error;
+      const at = deps.now().getTime();
+      // A comment's throttle, auth or outage answer is the portal's, exactly as a row's.
+      if (err?.kind === "throttled") {
+        const pause = backoffMs(1, random, THROTTLE_PAUSE_MS, THROTTLE_PAUSE_MS * 2);
+        summary.throttled = true;
+        await store.setPortalHealth(scope, { pausedUntil: new Date(at + pause), pauseReason: "throttled" });
+      } else if (err?.kind === "auth") {
+        summary.breakerOpen = true;
+        await store.setPortalHealth(scope, { pausedUntil: new Date(at + AUTH_PAUSE_MS), pauseReason: "auth" });
+        emit("crm.circuit_open", { reason: "auth", pausedUntil: new Date(at + AUTH_PAUSE_MS), failures }, "error");
+      } else if (err && (err.kind === "unavailable" || err.kind === "invalid_response")) {
+        failures += 1;
+        if (failures >= BREAKER_THRESHOLD) {
+          const pausedUntil = new Date(at + breakerPauseMs(failures));
+          summary.breakerOpen = true;
+          await store.setPortalHealth(scope, { consecutiveFailures: failures, pausedUntil, pauseReason: "breaker" });
+          emit("crm.circuit_open", { reason: "breaker", pausedUntil, failures }, "error");
+        } else await store.setPortalHealth(scope, { consecutiveFailures: failures });
+      }
     }
   } finally {
     await store.releaseLease(scope, holder);
@@ -475,6 +511,8 @@ async function sync(deps: CrmWorkerDeps, port: CrmPort, holder: string, link: Cr
   }
   if (link.crmId !== null && mapped.hash === link.pushedHash) {
     await store.updateLink(link.id, holder, { pushedVersion: target });
+    // No CRM call: a moment whose earlier record failed (or that sets no deal field) is recorded now (C2B-07).
+    if (link.state === "active") await recordMoments(deps, link, state);
     return { type: "done", outcome: "unchanged" };
   }
   assertSafeCrmPayload(mapped.fields, mapped.rows, config);
@@ -616,32 +654,62 @@ async function recordMoments(deps: CrmWorkerDeps, link: CrmLinkRow, state: CrmSu
 }
 
 /**
- * Post one merged comment per due deal (G7), at most once each. Returns how many were posted. Moments left
- * unposted for budget, throttle or auth go back to `pending` without an attempt.
+ * Post one merged comment per due deal (G7), at most once each. Stops at the first throttle, auth or outage
+ * answer and returns it, so the caller treats it exactly like a row's (pause, circuit, failure count; review
+ * C2B-01, C2B-02). Moments left unposted for that or for budget go back to `pending` without an attempt.
  */
-async function flushTimeline(deps: CrmWorkerDeps, port: CrmPort, scope: CrmScope, holder: string, started: number, budgetMs: number, random: () => number): Promise<number> {
+async function flushTimeline(
+  deps: CrmWorkerDeps,
+  port: CrmPort,
+  scope: CrmScope,
+  holder: string,
+  started: number,
+  budgetMs: number,
+  random: () => number,
+  portalAnswered: boolean,
+  probeFirst: boolean,
+): Promise<{ posted: number; error: CrmCallError | null; probed: boolean }> {
   const { store } = deps;
   const now = deps.now();
   let groups: CrmTimelineGroup[];
+  try {
+    await store.recordHandoffMoments?.(scope, now);
+  } catch {
+    deps.emit?.("crm.timeline_failed", { reason: "handoff_record_failed" }, "warn");
+  }
   try {
     groups = await store.claimTimeline(scope, holder, now, {
       quietBefore: new Date(now.getTime() - TIMELINE_QUIET_MS),
       maxWaitBefore: new Date(now.getTime() - TIMELINE_MAX_WAIT_MS),
       staleBefore: new Date(now.getTime() - ROW_LOCK_MS),
       limit: TIMELINE_GROUPS_PER_RUN,
+      perLink: TIMELINE_MAX_LINES,
     });
   } catch {
     deps.emit?.("crm.timeline_failed", { reason: "claim_failed" }, "warn");
-    return 0;
+    return { posted: 0, error: null, probed: false };
   }
   let posted = 0;
-  let stopAt: { delayMs: number; code: string } | null = null;
+  let stop: { code: string; error: CrmCallError | null } | null = null;
+  let probed = false;
+  if (probeFirst && groups.length) {
+    try {
+      await port.findDealById(groups[0].crmId);
+      probed = true;
+    } catch (e) {
+      stop = e instanceof CrmCallError ? { code: e.code, error: e } : { code: "budget", error: null };
+    }
+  }
   for (const g of groups) {
     const ids = g.entries.map((e) => e.id);
-    const back = (delayMs: number, code: string) => store.finishTimeline(ids, holder, { status: "pending", nextAttemptAt: new Date(deps.now().getTime() + delayMs), attempts: g.attempts, code });
+    const settle = (r: CrmTimelineFinish, emit?: string) => {
+      if (emit) deps.emit?.("crm.timeline_failed", { linkId: g.linkId, reason: "code" in r ? r.code : null, settled: emit }, "warn");
+      return store.finishTimeline(ids, holder, r);
+    };
+    const back = (code: string, attempts = g.attempts, delayMs = 0) => store.finishTimeline(ids, holder, { status: "pending", nextAttemptAt: new Date(deps.now().getTime() + delayMs), attempts, code });
     try {
-      if (stopAt || deps.now().getTime() - started >= budgetMs) {
-        await back(stopAt?.delayMs ?? 0, stopAt?.code ?? "budget");
+      if (stop || deps.now().getTime() - started >= budgetMs) {
+        await back(stop?.code ?? "budget");
         continue;
       }
       let text: string;
@@ -649,8 +717,8 @@ async function flushTimeline(deps: CrmWorkerDeps, port: CrmPort, scope: CrmScope
         text = renderTimelineComment(g.entries);
         assertSafeTimelineText(text);
       } catch {
-        await store.finishTimeline(ids, holder, { status: "failed", code: "refused:timeline_text" });
-        deps.emit?.("crm.timeline_failed", { linkId: g.linkId, reason: "refused:timeline_text" }, "error");
+        await store.finishTimeline(ids, holder, { status: "failed", code: "refused:timeline_text", attempts: g.attempts });
+        deps.emit?.("crm.timeline_failed", { linkId: g.linkId, reason: "refused:timeline_text", settled: "failed" }, "error");
         continue;
       }
       try {
@@ -660,25 +728,35 @@ async function flushTimeline(deps: CrmWorkerDeps, port: CrmPort, scope: CrmScope
         deps.emit?.("crm.timeline_posted", { linkId: g.linkId, moments: g.entries.length });
       } catch (e) {
         if (e instanceof BudgetExhausted) {
-          stopAt = { delayMs: 0, code: "budget" };
-          await back(0, "budget");
+          stop = { code: "budget", error: null };
+          await back("budget");
           continue;
         }
         const err = e instanceof CrmCallError ? e : new CrmCallError("rejected", "worker", { code: "internal" });
-        if (err.kind === "throttled" || err.kind === "auth") {
-          stopAt = { delayMs: err.kind === "auth" ? AUTH_PAUSE_MS : THROTTLE_PAUSE_MS, code: err.code };
-          await back(stopAt.delayMs, err.code);
+        const outage = err.kind === "unavailable" || err.kind === "invalid_response";
+        const attempts = g.attempts + 1;
+        if (err.kind === "throttled") {
+          stop = { code: err.code, error: err };
+          await back(err.code);
+        } else if (err.kind === "auth") {
+          stop = { code: err.code, error: err };
+          // The portal answered other calls in this run: the refusal is this deal's, so it counts (no endless retry).
+          if (portalAnswered || posted > 0) {
+            if (attempts >= TIMELINE_MAX_ATTEMPTS) await settle({ status: "failed", code: err.code, attempts }, "failed");
+            else await back(err.code, attempts, backoffMs(attempts, random));
+          } else await back(err.code);
         } else if (err.kind === "not_found") {
-          await store.finishTimeline(ids, holder, { status: "dropped", code: err.code });
+          await settle({ status: "dropped", code: err.code }, "dropped");
         } else if (err.writeMayHaveHappened) {
-          // The comment may be on the deal already: never post it again.
-          await store.finishTimeline(ids, holder, { status: "unknown", code: err.code });
-          deps.emit?.("crm.timeline_failed", { linkId: g.linkId, reason: err.code, settled: "unknown" }, "warn");
-        } else if (g.attempts + 1 >= TIMELINE_MAX_ATTEMPTS) {
-          await store.finishTimeline(ids, holder, { status: "failed", code: err.code });
-          deps.emit?.("crm.timeline_failed", { linkId: g.linkId, reason: err.code, settled: "failed" }, "warn");
+          // The comment may be on the deal already: never post it again (at most once, owner-confirmed).
+          await settle({ status: "unknown", code: err.code }, "unknown");
+          if (outage) stop = { code: err.code, error: err };
+        } else if (attempts >= TIMELINE_MAX_ATTEMPTS) {
+          await settle({ status: "failed", code: err.code, attempts }, "failed");
+          if (outage) stop = { code: err.code, error: err };
         } else {
-          await store.finishTimeline(ids, holder, { status: "pending", nextAttemptAt: new Date(deps.now().getTime() + backoffMs(g.attempts + 1, random)), attempts: g.attempts + 1, code: err.code });
+          await back(err.code, attempts, backoffMs(attempts, random));
+          if (outage) stop = { code: err.code, error: err };
         }
       }
     } catch {
@@ -686,7 +764,7 @@ async function flushTimeline(deps: CrmWorkerDeps, port: CrmPort, scope: CrmScope
       deps.emit?.("crm.timeline_failed", { linkId: g.linkId, reason: "store_failed" }, "warn");
     }
   }
-  return posted;
+  return { posted, error: stop?.error ?? null, probed };
 }
 
 /**
