@@ -305,4 +305,24 @@ describe("draft builder (doc 30 §3.4, §3.6)", () => {
   it("locks the editorial fields a person changed, never facts", () => {
     expect(lockedFieldsBetween({ title: "A", subtitle: "B", timeSlots: ["09:00"] }, { title: "A2", subtitle: "B", timeSlots: ["10:00"] })).toEqual(["title"]);
   });
+
+describe("own ages (doc 30 N4, review 109 INT-01)", () => {
+  it("writes the offer's child and infant bands on the units; a default offer keeps the page's bands", async () => {
+    const { variantPaxAges, PAGE_PAX_AGES } = await import("@/lib/pax-ages");
+    const { ageBandMismatches } = await import("../traveldesk/traveldesk.quote");
+    const own = stored(1, { childAge: 8, infantsAllowed: false });
+    const l = plan([planOffer({ offerId: 1, childAge: 8, infantsAllowed: false, supplierUnits: ["adult", "child"] }), planOffer({ offerId: 2 })]).listings[0];
+    const b = buildListingDraft(l, new Map([[1, own], [2, stored(2)]]), CONTENT, CTX);
+    expect(b.ok).toBe(true);
+    if (!b.ok) return;
+    const [v1, v2] = b.input.variants;
+    expect(v1.units?.map((u) => [u.unitId, u.ageMin, u.ageMax, u.label])).toEqual([
+      ["adult", 8, null, "Adult (8+)"],
+      ["child", 3, 7, "Child (3–7)"],
+    ]);
+    expect(ageBandMismatches(own, variantPaxAges(v1)!)).toEqual([]);
+    expect(variantPaxAges(v2)).toEqual(PAGE_PAX_AGES);
+    expect(v2.units?.map((u) => u.label)).toEqual(["Adult (12+)", "Child (3–11)", "Infant (under 3)"]);
+  });
+});
 });

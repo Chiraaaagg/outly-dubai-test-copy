@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState, useEffect, useId, useRef } from "react";
+import { useActionState, useEffect, useId, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { Alert } from "@/components/ui/primitives";
@@ -16,7 +16,7 @@ import {
 } from "@/components/ui/shadcn/alert-dialog";
 import { FormCheckbox } from "../../../../_components/select-box";
 import { PublishTable } from "./publish-table";
-import type { PublishRow } from "./import-ui";
+import { BATCHES_HEADING_ID, type PublishRow } from "./import-ui";
 import {
   applyTravelDeskImportAction,
   copyTravelDeskPhotosAction,
@@ -100,16 +100,24 @@ export function PreviewForm({ environment }: { environment: string }) {
  * The services stay authoritative (import.service / traveldesk-import.service).
  */
 function BatchDialog({ batchId, label, verb, act, force, help }: { batchId: string; label: string; verb: string; act: typeof applyTravelDeskImportAction; force?: boolean; help: string }) {
-  const [result, action, pending] = useActionState<BatchActionResult | null, FormData>(act, null);
   const router = useRouter();
-  const id = useId();
-  const heading = useRef<HTMLHeadingElement>(null);
-  const done = result?.ok ? result.data.summary : null;
+  // A fresh form (and action state) per opening, so an earlier attempt's error is not shown again (review 109 INT-04).
+  const [round, setRound] = useState(0);
+  const [done, setDone] = useState(false);
+  // After a successful apply or rollback the trigger unmounts on refresh: focus goes to the stable batches heading.
+  const stable = useRef<HTMLElement | null>(null);
   useEffect(() => {
-    if (done) heading.current?.focus();
-  }, [done]);
+    stable.current = document.getElementById(BATCHES_HEADING_ID);
+  }, []);
   return (
-    <AlertDialog onOpenChange={(open) => !open && router.refresh()}>
+    <AlertDialog
+      onOpenChange={(open) => {
+        if (open) {
+          setDone(false);
+          setRound((r) => r + 1);
+        } else router.refresh();
+      }}
+    >
       <AlertDialogTrigger
         render={
           <Button type="button" size="sm" variant={verb === "apply" ? "primary" : "outline"}>
@@ -117,47 +125,65 @@ function BatchDialog({ batchId, label, verb, act, force, help }: { batchId: stri
           </Button>
         }
       />
-      <AlertDialogContent>
+      <AlertDialogContent finalFocus={done ? stable : undefined}>
         <AlertDialogHeader>
           <AlertDialogTitle>{label}</AlertDialogTitle>
           <AlertDialogDescription>{help}</AlertDialogDescription>
         </AlertDialogHeader>
-        <div role="status" aria-live="polite" aria-atomic="true" className="sr-only">
-          {done ? `${done}.` : ""}
-        </div>
-        {done ? (
-          <div className="grid gap-3">
-            <h3 ref={heading} tabIndex={-1} className="text-sm font-semibold text-ink-900 outline-none focus-visible:outline-2 focus-visible:outline-ink-900">
-              Result
-            </h3>
-            <Alert tone="success" title={`${done}.`} />
-            <AlertDialogFooter>
-              <AlertDialogCancel>Close</AlertDialogCancel>
-            </AlertDialogFooter>
-          </div>
-        ) : (
-          <form action={action} className="grid gap-3">
-            <input type="hidden" name="batchId" value={batchId} />
-            <label htmlFor={`${id}-reason`} className="block text-xs font-semibold text-ink-800">
-              Reason (audit log)
-              <input id={`${id}-reason`} name="reason" required minLength={8} maxLength={500} className={`${INPUT_CLASS} mt-1 min-h-10 text-sm font-normal`} />
-            </label>
-            {force && (
-              <FormCheckbox id={`${id}-force`} name="force">
-                Include published listings (they are unpublished and soft-deleted too)
-              </FormCheckbox>
-            )}
-            <Outcome result={result} />
-            <AlertDialogFooter>
-              <AlertDialogCancel>Cancel</AlertDialogCancel>
-              <Button type="submit" size="sm" variant={verb === "apply" ? "primary" : "danger"} loading={pending} loadingLabel="Working…">
-                {label}
-              </Button>
-            </AlertDialogFooter>
-          </form>
-        )}
+        <BatchDialogBody key={round} batchId={batchId} label={label} verb={verb} act={act} force={force} onDone={() => setDone(true)} />
       </AlertDialogContent>
     </AlertDialog>
+  );
+}
+
+function BatchDialogBody({ batchId, label, verb, act, force, onDone }: { batchId: string; label: string; verb: string; act: typeof applyTravelDeskImportAction; force?: boolean; onDone: () => void }) {
+  const [result, action, pending] = useActionState<BatchActionResult | null, FormData>(act, null);
+  const id = useId();
+  const heading = useRef<HTMLHeadingElement>(null);
+  const done = result?.ok ? result.data.summary : null;
+  useEffect(() => {
+    if (done) {
+      onDone();
+      heading.current?.focus();
+    }
+  }, [done, onDone]);
+  return (
+    <>
+      <div role="status" aria-live="polite" aria-atomic="true" className="sr-only">
+        {done ? `${done}.` : ""}
+      </div>
+      {done ? (
+        <div className="grid gap-3">
+          <h3 ref={heading} tabIndex={-1} className="text-sm font-semibold text-ink-900 outline-none focus-visible:outline-2 focus-visible:outline-ink-900">
+            Result
+          </h3>
+          <Alert tone="success" title={`${done}.`} />
+          <AlertDialogFooter>
+            <AlertDialogCancel>Close</AlertDialogCancel>
+          </AlertDialogFooter>
+        </div>
+      ) : (
+        <form action={action} className="grid gap-3">
+          <input type="hidden" name="batchId" value={batchId} />
+          <label htmlFor={`${id}-reason`} className="block text-xs font-semibold text-ink-800">
+            Reason (audit log)
+            <input id={`${id}-reason`} name="reason" required minLength={8} maxLength={500} className={`${INPUT_CLASS} mt-1 min-h-10 text-sm font-normal`} />
+          </label>
+          {force && (
+            <FormCheckbox id={`${id}-force`} name="force">
+              Include published listings (they are unpublished and soft-deleted too)
+            </FormCheckbox>
+          )}
+          <Outcome result={result} />
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <Button type="submit" size="sm" variant={verb === "apply" ? "primary" : "danger"} loading={pending} loadingLabel="Working…">
+              {label}
+            </Button>
+          </AlertDialogFooter>
+        </form>
+      )}
+    </>
   );
 }
 

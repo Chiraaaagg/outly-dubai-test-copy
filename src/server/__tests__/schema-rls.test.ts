@@ -30,6 +30,10 @@ const TRAVELDESK_TABLES = [
   "supplier_sync_runs",
   // Doc 30 N0.
   "supplier_tour_content",
+  // Doc 30 N2 (review 109 INT-03).
+  "supplier_class_proofs",
+  "bulk_operations",
+  "bulk_operation_items",
   // Doc 30 N1.
   "supplier_listing_links",
   "product_redirects",

@@ -1,7 +1,7 @@
 import { slugify } from "../../imports/parsers";
 import { activityInputSchema, type ActivityInput } from "../../schemas/activity.schema";
 import type { UnitDefinition } from "@/server/quotes/contracts";
-import { PAGE_PAX_AGES } from "@/lib/pricing";
+import { offerPaxAges, PAGE_PAX_AGES, priceLineAges, unitAgesFor, type PaxAgeBands } from "@/lib/pax-ages";
 import type { PlannedListing, PlannedOption } from "./traveldesk.listing-plan";
 import type { StoredOffer } from "./traveldesk.offer-terms";
 import type { TourContentFaq, TourContentItineraryStep } from "./traveldesk.content";
@@ -86,14 +86,22 @@ function maxQty(pair: readonly [number | null, number | null] | undefined, fallb
   return Math.max(1, Math.min(100, v));
 }
 
-function unit(id: "adult" | "child" | "infant", price: { inr: number; aed: number }, qty: number): UnitDefinition {
-  const label = id === "adult" ? "Adult (12+)" : id === "child" ? "Child (3–11)" : "Infant (under 3)";
+/**
+ * One typed unit at the option's own age bands (doc 30 §3.13, N4; integration review 109 INT-01): the offer's
+ * child and infant ages (`offerPaxAges`), capped at the page's, so `variantPaxAges` reads back the same bands and
+ * `ageBandMismatches` passes. An offer whose accepted unit has no known age gets the page's bands: readiness then
+ * keeps it out of instant (`unit_not_mapped`), as before N4.
+ */
+function unit(id: "adult" | "child" | "infant", price: { inr: number; aed: number }, qty: number, bands: PaxAgeBands): UnitDefinition {
+  const words = priceLineAges(bands);
+  const label = id === "adult" ? `Adult (${bands.adult.min}+)` : id === "child" ? words.child : words.infant;
+  const ages = unitAgesFor(bands, id);
   return {
     unitId: id,
     label,
     per: "person",
-    ageMin: PAGE_PAX_AGES[id].min,
-    ageMax: PAGE_PAX_AGES[id].max,
+    ageMin: ages.ageMin,
+    ageMax: ages.ageMax,
     residency: "any",
     heightMinCm: null,
     heightMaxCm: null,
@@ -214,9 +222,10 @@ export function buildListingDraft(
       const delta = { aed: adult.aed - band.aed, inr: adult.inr - band.inr };
       const units: UnitDefinition[] = [];
       const fallbackQty = stored?.maxPax ?? 20;
-      units.push(unit("adult", adult, maxQty(stored?.paxLimits.adults, fallbackQty)));
-      if (sellsChild(o) && price.child) units.push(unit("child", { aed: price.child.aed + delta.aed, inr: price.child.inr + delta.inr }, maxQty(stored?.paxLimits.children, fallbackQty)));
-      if (sellsInfant(o)) units.push(unit("infant", { aed: 0, inr: 0 }, maxQty(stored?.paxLimits.infants, fallbackQty)));
+      const bands = (stored && offerPaxAges(stored)) || PAGE_PAX_AGES;
+      units.push(unit("adult", adult, maxQty(stored?.paxLimits.adults, fallbackQty), bands));
+      if (sellsChild(o) && price.child) units.push(unit("child", { aed: price.child.aed + delta.aed, inr: price.child.inr + delta.inr }, maxQty(stored?.paxLimits.children, fallbackQty), bands));
+      if (sellsInfant(o)) units.push(unit("infant", { aed: 0, inr: 0 }, maxQty(stored?.paxLimits.infants, fallbackQty), bands));
       return {
         id: `td-${o.offerId}`,
         name: names[i],

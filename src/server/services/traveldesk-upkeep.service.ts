@@ -45,6 +45,7 @@ import {
 } from "../suppliers/traveldesk/traveldesk.upkeep";
 import { activityService } from "./activity.service";
 import { recordEditorialLocks } from "./listing-locks";
+import { ownerAlertRecipient } from "./owner-alert";
 import { readinessService } from "./readiness.service";
 import { lastCompleteSync, TRAVELDESK_SUPPLIER_CODE, travelDeskMappingRow } from "./supplier-catalog.service";
 import { contentSummary, planOfferOf, readPlanRules } from "./traveldesk-dry-run.service";
@@ -138,13 +139,8 @@ export interface UpkeepResult {
   touchedProductIds: string[];
 }
 
-const EMAIL = /^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$/;
-
-/** The owner's address (`OWNER_ALERT_EMAIL`, the N2 contract), or null. Never an admin setting. */
-export function ownerDigestRecipient(raw: string | undefined = env().OWNER_ALERT_EMAIL): string | null {
-  const v = raw?.trim();
-  return v && v.length <= 254 && EMAIL.test(v) ? v : null;
-}
+/** The owner's address: N2's own check (`OWNER_ALERT_EMAIL`), one parser for both (review 109 INT-07). */
+export const ownerDigestRecipient = (): string | null => ownerAlertRecipient();
 
 const sha = (v: unknown) => createHash("sha256").update(JSON.stringify(v ?? null)).digest("hex");
 const photoList = (v: unknown): TourContentPhoto[] => (Array.isArray(v) ? (v as TourContentPhoto[]) : []);
@@ -472,6 +468,9 @@ async function upkeepTx(
     const baseline = ((await tx.productVersion.findUnique({ where: { productId_version: { productId: product.id, version: link.importVersion } }, select: { content: true } }))?.content as Record<string, unknown> | null) ?? null;
 
     // Options.
+    // Review 109 INT-02: the row lock `writeTicketEvidence` takes, so a revoke or a ticket answer made during this run
+    // either commits before this read (and is read) or waits for this transaction; nothing re-activates or overwrites it.
+    await tx.$queryRaw`SELECT id FROM product_supplier_mappings WHERE product_id = ${product.id}::uuid AND supplier_id = ${data.supplier.id}::uuid AND environment = ${environment}::"supplier_environment" FOR UPDATE`;
     const mappings = await tx.productSupplierMapping.findMany({ where: { productId: product.id, supplierId: data.supplier.id, environment } });
     const planOf = new Map<number, PlanOffer>();
     const storedOf = new Map<number, StoredOffer>();
@@ -617,7 +616,9 @@ async function upkeepTx(
       }
       if (!factsApplied || !hash || !terms) continue;
       const next = travelDeskMappingRow(row, { externalId: tour.externalId, payload: tour.payload }, environment, m.externalRef);
-      await tx.productSupplierMapping.update({ where: { id: m.id }, data: next.mappingData });
+      // Conditional on the row as read (belt and braces with the lock): still active, same approval, same ticket record.
+      const written = await tx.productSupplierMapping.updateMany({ where: { id: m.id, isActive: true, approvedOfferHash: m.approvedOfferHash, syncStatus: m.syncStatus, externalRef: { equals: m.externalRef as Prisma.InputJsonValue } }, data: next.mappingData });
+      if (written.count !== 1) throw Errors.conflict("A supplier link of this listing changed during the upkeep; it is retried next run");
       const fields = [...termsDiff(approvedTerms[sid] ?? null, terms), ...factDiff];
       await audit(
         opts.actor,
@@ -635,7 +636,7 @@ async function upkeepTx(
       reapproved += 1;
     }
     for (const mid of deactivate) {
-      await tx.productSupplierMapping.update({ where: { id: mid }, data: { isActive: false } });
+      await tx.productSupplierMapping.updateMany({ where: { id: mid, isActive: true }, data: { isActive: false } });
       await audit(opts.actor, "supplier_mapping.deactivate", { type: "product", id: product.id }, { after: { mappingId: mid, reason: "offer_removed_upstream", runId: opts.runId } }, tx);
     }
 

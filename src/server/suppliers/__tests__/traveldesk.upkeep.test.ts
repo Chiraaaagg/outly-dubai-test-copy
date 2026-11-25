@@ -380,3 +380,14 @@ describe("re-review 108 round 2", () => {
     expect(merge({ current, draft: noText, hasContent: true }).next.importantInfo).not.toEqual(current.importantInfo);
   });
 });
+
+describe("own ages follow the offer (doc 30 N4, review 109 INT-01)", () => {
+  it("a child age change on the offer moves the units' bands at the next run", () => {
+    const current = base();
+    const draft = draftOf([planOffer(1, { childAge: 8 }), planOffer(2, { durationHours: 3, childAge: 8 })], CONTENT, { childAge: 8 });
+    const r = merge({ current, draft });
+    const child = r.next.variants[0].units!.find((u) => u.unitId === "child")!;
+    expect([child.ageMin, child.ageMax, child.label]).toEqual([3, 7, "Child (3–7)"]);
+    expect(r.next.variants[0].units!.find((u) => u.unitId === "adult")!.ageMin).toBe(8);
+  });
+});

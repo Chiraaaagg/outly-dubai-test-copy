@@ -3,6 +3,7 @@ import { Alert } from "@/components/ui/primitives";
 import { hasPermission } from "@/server/lib/actor";
 import { traveldeskImportService, type TdPreviewRow } from "@/server/services/traveldesk-import.service";
 import { traveldeskListingService, type ReviewQueueRow } from "@/server/services/traveldesk-listing.service";
+import { BATCHES_HEADING_ID } from "./import-ui";
 import { requirePage } from "../../../../_lib/guard";
 import { DataTable, PageHeader, Panel, StatusPill, fmtDateTime, type DataColumn } from "../../../../_components/ui";
 import { ApplyBatchForm, CopyPhotosForm, PreviewForm, PublishForm, RestoreReplacedForm, ReviewForm, RollbackBatchForm } from "./import-forms";
@@ -147,6 +148,9 @@ export default async function TravelDeskImportPage({ searchParams }: { searchPar
         <Panel className="mb-5" title="1 · Preview and import" sub="Drafts are created in inquiry mode, non-refundable and unindexed. Approving a link never changes mode or price.">
           <PreviewForm environment={env} />
           <div className="mt-4">
+            <h3 id={BATCHES_HEADING_ID} tabIndex={-1} className="mb-2 text-sm font-semibold text-ink-900 outline-none focus-visible:outline-2 focus-visible:outline-ink-900">
+              Import batches
+            </h3>
             <DataTable
               caption="TravelDesk import batches"
               rows={batches}

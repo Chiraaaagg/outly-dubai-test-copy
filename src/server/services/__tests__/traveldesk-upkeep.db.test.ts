@@ -283,6 +283,50 @@ describe.skipIf(!enabled)("TravelDesk listing upkeep, N3 (local DB)", () => {
     expect((await changesOf(instantId)).length).toBe(before);
   });
 
+  it("a ticket answer or a revoke committed during the upkeep survives it (review 109 INT-02)", async () => {
+    const slot = (advance: number) => [{ id: 1, name: null, startTime: 1200, endTime: 1320, daysOffered: 0, isAnyTime: false, isOnRequest: false, minimumAdvancedBooking: advance }];
+    const wires = (advance: number) => [
+      tourT([wireOffer(A, 1200, { maxNumOfPeople: 12, timeSlots: slot(advance) }), wireOffer(B, 1260, { numberOfHours: 3 }), wireOffer(C, 1200, { bookingType: 0 }), wireOffer(E, 1200)], "A brand new first sentence about the dhow cruise. More."),
+      tourOld({ maxNumOfPeople: 9 }),
+      ...fillers(),
+    ];
+    // Another session holds mapping A's row (the lock writeTicketEvidence and a revoke take) while the upkeep starts.
+    const during = async (write: (tx: Parameters<Parameters<typeof prisma.$transaction>[0]>[0], id: string) => Promise<unknown>) => {
+      const m = await mappingOf(A);
+      let release!: () => void;
+      let locked!: () => void;
+      const hold = new Promise<void>((r) => (release = r));
+      const isLocked = new Promise<void>((r) => (locked = r));
+      const other = prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM product_supplier_mappings WHERE id = ${m.id}::uuid FOR UPDATE`;
+        await write(tx, m.id);
+        locked();
+        await hold;
+      }, { timeout: 30_000 });
+      await isLocked;
+      const up = run();
+      await new Promise((r) => setTimeout(r, 300));
+      release();
+      await other;
+      return up;
+    };
+    await sync(wires(30));
+    expect((await mappingOf(A)).syncStatus).toBe("changed");
+    const ref = (await mappingOf(A)).externalRef as Record<string, unknown>;
+    await during((tx, id) => tx.productSupplierMapping.update({ where: { id }, data: { externalRef: { ...ref, ticketEvidence: { issuesTicketsAtConfirm: "yes", source: "zz synthetic test booking", recordedAt: new Date().toISOString() } } } }));
+    const afterAnswer = await mappingOf(A);
+    expect((afterAnswer.externalRef as { ticketEvidence?: { issuesTicketsAtConfirm: string } }).ticketEvidence?.issuesTicketsAtConfirm).toBe("yes");
+    expect(afterAnswer.syncStatus).toBe("ok");
+
+    await sync(wires(36));
+    await during((tx, id) => tx.productSupplierMapping.update({ where: { id }, data: { isActive: false } }));
+    const afterRevoke = await mappingOf(A);
+    expect(afterRevoke.isActive).toBe(false);
+    expect(afterRevoke.syncStatus).toBe("changed");
+    // Back to the state the next tests expect.
+    await prisma.productSupplierMapping.update({ where: { id: afterRevoke.id }, data: { isActive: true, externalRef: ref as never } });
+  });
+
   it("a price move above 20% waits for a person (D18); approving it applies the price and resolves the review", async () => {
     const before = (await prisma.product.findUniqueOrThrow({ where: { id: instantId } })).content as { price: { adult: { aed: number } } };
     const slot = [{ id: 1, name: null, startTime: 1200, endTime: 1320, daysOffered: 0, isAnyTime: false, isOnRequest: false, minimumAdvancedBooking: 24 }];

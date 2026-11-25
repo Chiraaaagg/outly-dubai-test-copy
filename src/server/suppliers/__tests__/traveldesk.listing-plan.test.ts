@@ -1,6 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { offerPaxAges, PAGE_PAX_AGES, unitAgesFor, variantPaxAges } from "@/lib/pax-ages";
+import { ageBandMismatches, ownAgeMismatches } from "../traveldesk/traveldesk.quote";
 import { meetsFloor, ruleAedPrice, ruleInrPrice, type RuleCostLine } from "../../domain/rule-price";
 import { parseClassKey, type CapabilityDimensions } from "../traveldesk/traveldesk.capability";
 import { buildListingPlan, neverInstantReason, stepOfClassKey, type PlanOffer, type PlanRules, type PlanTourContent } from "../traveldesk/traveldesk.listing-plan";
@@ -282,5 +284,20 @@ describe.skipIf(!existsSync(LEDGER))("listing plan against the coverage ledger o
     });
     expect(p.totals).toMatchObject({ offers: 317, stepOffers: 196, instantListings: 95, inquiryListings: 27, inquiryOffers: 62, neverInstant: 121 });
     expect(p.notImported).toMatchObject({ tours: 25, offers: 59 });
+  });
+
+  it("N4 (review 109 INT-01): the 36 offers the page bands blocked carry no age blocker under their own bands", () => {
+    const rows = parseCsv(readFileSync(LEDGER, "utf8"));
+    const ages = (r: Record<string, string>) => ({ childrenAllowed: r.childrenAllowed === "true", childAge: Number(r.childUnderAge) || 0, infantsAllowed: r.infantsAllowed === "true", infantAge: Number(r.infantUnderAge) || 0 });
+    const inStep = rows.filter((r) => stepOfClassKey(r.targetCapabilityClass));
+    const pageBlocked = inStep.filter((r) => ageBandMismatches(ages(r), PAGE_PAX_AGES).length > 0);
+    expect(pageBlocked).toHaveLength(36);
+    expect(pageBlocked.filter((r) => ownAgeMismatches(ages(r)).length > 0)).toEqual([]);
+    // And what the importer writes reads back as the same bands, which the supplier check accepts.
+    for (const r of pageBlocked) {
+      const bands = offerPaxAges(ages(r))!;
+      const variant = { units: (["adult", "child", "infant"] as const).map((u) => ({ unitId: u, per: "person" as const, ...unitAgesFor(bands, u) })) };
+      expect(ageBandMismatches(ages(r), variantPaxAges(variant as never)!)).toEqual([]);
+    }
   });
 });

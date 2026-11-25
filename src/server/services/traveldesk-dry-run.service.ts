@@ -1,6 +1,5 @@
 import "server-only";
 import type { SupplierEnvironment } from "@prisma/client";
-import { PAGE_PAX_AGES } from "@/lib/pricing";
 import { prisma } from "../lib/db";
 import type { Actor } from "../lib/actor";
 import { requirePermission } from "../lib/actor";
@@ -11,7 +10,7 @@ import { gateVerdict, loadCapabilityGate } from "../suppliers/capability-gate";
 import { slotRulesUnknown } from "../suppliers/traveldesk/traveldesk.capability";
 import { buildListingPlan, type ListingPlan, type PlanOffer, type PlanTourContent } from "../suppliers/traveldesk/traveldesk.listing-plan";
 import { offerTermsHash, parseStoredOffer, parseStoredPolicy } from "../suppliers/traveldesk/traveldesk.offer-terms";
-import { ageBandMismatches, offerReadinessFacts } from "../suppliers/traveldesk/traveldesk.quote";
+import { offerReadinessFacts, ownAgeMismatches } from "../suppliers/traveldesk/traveldesk.quote";
 import { costInputsSchema, FX_INR_PER_AED_SETTING_KEY, fxInputSchema, MARGIN_COST_INPUTS_SETTING_KEY, marginPolicySchema } from "./margin.service";
 import { catalogueStale, catalogueSyncedAt, lastCompleteSync, TRAVELDESK_SUPPLIER_CODE } from "./supplier-catalog.service";
 
@@ -132,7 +131,9 @@ export function planOfferOf(
     periodsInForce: inForce.length,
     adultNetRange: adultNets.length ? { min: adultNets.reduce((a, b) => (b < a ? b : a)), max: adultNets.reduce((a, b) => (b > a ? b : a)) } : null,
     freeCancellationHours: facts.supplierFreeCancellationHours,
-    ageBandMismatches: stored ? ageBandMismatches(stored, PAGE_PAX_AGES) : [],
+    // Doc 30 N4 (review 109 INT-01): the importer writes the offer's own ages, so only an offer whose ages are unknown
+    // (an accepted unit aged 0, or no room for a child) is blocked, and nothing the own bands cover.
+    ageBandMismatches: stored ? ownAgeMismatches(stored) : [],
     slotRulesUnknown: slotRulesUnknown(stored, check.verdict.instant, check.verdict.classKey),
     catalogueStale: catalogueStale(catalogueSyncedAt(lastComplete, item.lastSeenAt), at),
     activeLinks: ctx.activeLinks,

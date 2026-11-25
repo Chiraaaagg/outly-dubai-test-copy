@@ -1,3 +1,4 @@
+import { offerPaxAges } from "@/lib/pax-ages";
 import { dubaiToday } from "@/lib/utils";
 import type { SupplierQuoteResult } from "../../quotes/contracts";
 import type { Tristate } from "../booking-port";
@@ -292,6 +293,18 @@ export function ageBandMismatches(
   if (offer.childrenAllowed && !covers(offer.childAge, page.child)) out.push("child");
   if (offer.infantsAllowed && !covers(offer.infantAge, page.infant)) out.push("infant");
   return out;
+}
+
+/**
+ * The units a listing cannot sell under the offer's OWN age bands (doc 30 N4;
+ * integration review 109 INT-01): what the importer writes (`offerPaxAges`)
+ * covers the offer by construction, so this is empty unless the offer gives
+ * no usable ages (an accepted unit aged 0, or no room for a child): `ages`.
+ * The dry run and the plan's `age_band:` blocker read it.
+ */
+export function ownAgeMismatches(offer: Pick<StoredOffer, "childrenAllowed" | "childAge" | "infantsAllowed" | "infantAge">): string[] {
+  const bands = offerPaxAges(offer);
+  return bands ? ageBandMismatches(offer, bands) : ["ages"];
 }
 
 /**

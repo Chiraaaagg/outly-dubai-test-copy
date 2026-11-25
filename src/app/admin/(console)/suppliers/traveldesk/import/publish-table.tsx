@@ -64,7 +64,8 @@ function PublishDialogBody({ ids, titles, onFinished }: { ids: string[]; titles:
             Result
           </h3>
           <Alert tone={failed ? "warning" : "success"} title={message} />
-          <ul className="max-h-60 space-y-1 overflow-y-auto rounded-[var(--radius-control)] border border-ink-200 p-2 text-xs text-ink-700">
+          {/* Review 109 INT-09: a scrollable list keyboard users can reach in every browser. */}
+          <ul tabIndex={0} aria-label="Publish results" className="max-h-60 space-y-1 overflow-y-auto rounded-[var(--radius-control)] border border-ink-200 p-2 text-xs text-ink-700 focus-visible:outline-2 focus-visible:outline-ink-900">
             {rows.map((r) => (
               <li key={r.linkId} className="flex flex-wrap gap-x-2">
                 <span className={r.state === "applied" ? "font-semibold text-[var(--color-success)]" : "font-semibold text-[var(--color-danger)]"}>{r.state === "applied" ? "applied" : "failed"}</span>

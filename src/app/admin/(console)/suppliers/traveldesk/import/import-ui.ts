@@ -58,3 +58,6 @@ export function publishResultRows(results: readonly PublishOutcome[], titles: Re
     return { state: "failed" as const, linkId: r.linkId, title, detail: `${r.reason}${r.references?.length ? ` (${r.references.join(", ")})` : ""}` };
   });
 }
+
+/** The batches table's heading (page.tsx): focus lands here when an import or rollback dialog closes after its batch changed, since the dialog's own trigger is gone (review 109 INT-04). */
+export const BATCHES_HEADING_ID = "td-import-batches-heading";

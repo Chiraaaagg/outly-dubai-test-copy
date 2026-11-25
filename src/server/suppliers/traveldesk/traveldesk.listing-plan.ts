@@ -103,7 +103,7 @@ export interface PlanOffer {
   adultNetRange: { min: bigint; max: bigint } | null;
   /** The tour's free-cancellation window in hours (0: none; null: unknown). */
   freeCancellationHours: number | null;
-  /** Child and infant units whose age band the page cannot show today (`ageBandMismatches`); N4 removes these. */
+  /** Units the listing cannot sell under the offer's own age bands (N4, `ownAgeMismatches`): `ages` when the offer gives no usable ages. */
   ageBandMismatches: string[];
   /** Live-book offer without slots that no date-only key covers (`slot_rules_unknown`). */
   slotRulesUnknown: boolean;
