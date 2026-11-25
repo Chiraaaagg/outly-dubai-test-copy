@@ -247,7 +247,8 @@ function csvRows(text: string): string[][] {
 }
 
 describe.skipIf(!existsSync(LEDGER))("the doc 29a ledger: own ages open the 36 blocked offers and change no other page", () => {
-  const [header, ...body] = csvRows(readFileSync(LEDGER, "utf8"));
+  // describe.skipIf still runs this body while collecting, so read only when the ledger exists.
+  const [header, ...body] = existsSync(LEDGER) ? csvRows(readFileSync(LEDGER, "utf8")) : [[] as string[]];
   const rows = body.filter((r) => r.length === header.length).map((r) => Object.fromEntries(header.map((h, i) => [h, r[i]])));
   // Instant-capable: priced per person and planned in a batch (doc 30 §1.2: 196).
   const capable = rows.filter((r) => r.dimPricingUnit === "per_person" && r.planBatch !== "INQUIRY" && r.planBatch !== "REVIEW");
