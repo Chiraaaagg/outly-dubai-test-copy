@@ -261,13 +261,13 @@ describe.skipIf(!dbEnabled)("doc 30 N2: class proofs and bulk runs (local DB)", 
     await prisma.supplierClassProof.create({ data: proofRow({ classKey: "live.listed_start_single.self.internal.per_person", revokedAt: new Date(), revokeReason: "zz n2 neighbour" }) });
   });
 
-  it("database: a non-owner role holding DELETE cannot delete a proof, set its way past the guard, or disable it (N2-16)", async () => {
+  it("database: a non-owner role holding DELETE and TRUNCATE cannot delete or truncate proofs, set its way past the guards, or disable them (N2-16, N2-22)", async () => {
     const role = `zz_np_${RUN}`.toLowerCase().replace(/[^a-z0-9_]/g, "_");
     const p = await prisma.supplierClassProof.create({ data: proofRow({ revokedAt: new Date(), revokeReason: "zz n2 delete guard" }) });
     await prisma.$executeRawUnsafe(`CREATE ROLE ${role} NOLOGIN NOSUPERUSER NOBYPASSRLS`);
     try {
       await prisma.$executeRawUnsafe(`GRANT USAGE ON SCHEMA public TO ${role}`);
-      await prisma.$executeRawUnsafe(`GRANT SELECT, DELETE ON "supplier_class_proofs" TO ${role}`);
+      await prisma.$executeRawUnsafe(`GRANT SELECT, DELETE, TRUNCATE ON "supplier_class_proofs" TO ${role}`);
       await prisma.$executeRawUnsafe(`CREATE POLICY ${role}_all ON "supplier_class_proofs" FOR ALL TO ${role} USING (true)`);
       const asRole = (...sql: string[]) =>
         prisma.$transaction(async (tx) => {
@@ -277,6 +277,10 @@ describe.skipIf(!dbEnabled)("doc 30 N2: class proofs and bulk runs (local DB)", 
       await expect(asRole(`DELETE FROM "supplier_class_proofs" WHERE id = '${p.id}'`)).rejects.toThrow(/never deleted/);
       await expect(asRole(`SELECT set_config('outly.purge_class_proofs', 'on', true)`, `DELETE FROM "supplier_class_proofs" WHERE id = '${p.id}'`)).rejects.toThrow(/never deleted/);
       await expect(asRole(`ALTER TABLE "supplier_class_proofs" DISABLE TRIGGER "supplier_class_proofs_no_delete"`)).rejects.toThrow(/owner/);
+      await expect(asRole(`TRUNCATE "supplier_class_proofs"`)).rejects.toThrow(/never truncated/);
+      await expect(asRole(`ALTER TABLE "supplier_class_proofs" DISABLE TRIGGER "supplier_class_proofs_no_truncate"`)).rejects.toThrow(/owner/);
+      // The owner's own TRUNCATE is refused too (rolled back with its transaction).
+      await expect(prisma.$transaction(async (tx) => tx.$executeRawUnsafe(`TRUNCATE "supplier_class_proofs"`))).rejects.toThrow(/never truncated/);
       expect(await prisma.supplierClassProof.count({ where: { id: p.id } })).toBe(1);
     } finally {
       await prisma.$executeRawUnsafe(`DROP POLICY IF EXISTS ${role}_all ON "supplier_class_proofs"`).catch(() => {});
@@ -459,7 +463,11 @@ describe.skipIf(!dbEnabled)("doc 30 N2: class proofs and bulk runs (local DB)", 
     expect(first.status).toBe("pending");
     const approvalId = (first as { approvalId: string }).approvalId;
     const pending = await bulk.openApprovals(admin("p"), t1);
-    expect(pending.find((o) => o.approvalId === approvalId)).toMatchObject({ state: "pending", action: "arm", itemCount: 2, items: [...items].sort() });
+    const listed = pending.find((o) => o.approvalId === approvalId);
+    expect(listed).toMatchObject({ state: "pending", action: "arm", itemCount: 2, items: [...items].sort() });
+    // N2-24: the titles come from the approval's frozen list, in its order.
+    const byId = new Map((await prisma.product.findMany({ where: { id: { in: items } }, select: { id: true, title: true } })).map((p) => [p.id, p.title]));
+    expect(listed?.titles).toEqual([...items].sort().map((id) => byId.get(id)));
     expect(await bulk.readyApproval(admin("p"), "arm", "production", items, t1)).toBeNull();
     const t2 = tick();
     const second = await approvals.requestPrivileged(admin("q"), "instant.activate.bulk", "products.activate_instant", bulkApprovalPayload("arm", "production", items), {

@@ -115,6 +115,8 @@ export interface OpenBulkApproval {
   action: BulkAction;
   itemCount: number;
   items: string[];
+  /** Titles of the frozen list's listings, in list order (deleted ones say so; review N2-24). */
+  titles: string[];
   /** `pending`: waiting for a second administrator; `approved`: ready to start. */
   state: "pending" | "approved";
   /** Until when it can still be approved (pending) or started (approved). */
@@ -334,12 +336,26 @@ export const bulkListingService = {
     const used = new Set(
       (await prisma.idempotencyKey.findMany({ where: { key: { in: rows.map((r) => `privileged_use:${r.id}`) } }, select: { key: true } })).map((k) => k.key.slice("privileged_use:".length)),
     );
-    return rows.flatMap((r) => {
+    const open = rows.flatMap((r) => {
       const p = payloadItems(r.payload);
       if (!p || used.has(r.id)) return [];
       const until = r.status === "pending" ? r.expiresAt : new Date(r.appliedAt!.getTime() + APPROVAL_TTL_MS);
-      return [{ approvalId: r.id, action: p.action, itemCount: p.items.length, items: p.items, state: r.status === "pending" ? ("pending" as const) : ("approved" as const), until: until.toISOString() }];
+      return [{ r, p, until }];
     });
+    const products = await prisma.product.findMany({ where: { id: { in: [...new Set(open.flatMap((o) => o.p.items))] } }, select: { id: true, title: true, deletedAt: true } });
+    const title = (id: string) => {
+      const row = products.find((x) => x.id === id);
+      return row ? `${row.title}${row.deletedAt ? " (deleted)" : ""}` : `${id.slice(-8)} (no longer exists)`;
+    };
+    return open.map(({ r, p, until }) => ({
+      approvalId: r.id,
+      action: p.action,
+      itemCount: p.items.length,
+      items: p.items,
+      titles: p.items.map(title),
+      state: r.status === "pending" ? ("pending" as const) : ("approved" as const),
+      until: until.toISOString(),
+    }));
   },
 
   /** This person's approved, unused approval for exactly this run, if any: asking again then starts it, never a new request (N2-21). */

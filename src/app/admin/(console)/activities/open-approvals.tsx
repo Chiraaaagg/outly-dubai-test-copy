@@ -30,6 +30,8 @@ export interface OpenApprovalRow {
   approvalId: string;
   action: "arm" | "inquiry" | "free_cancellation";
   itemCount: number;
+  /** Titles from the approval's frozen list (review N2-24). */
+  titles: string[];
   state: "pending" | "approved";
   until: string;
 }
@@ -119,6 +121,16 @@ export function OpenApprovals({ rows }: { rows: OpenApprovalRow[] }) {
                       <AlertDialogTitle>Start: {label}</AlertDialogTitle>
                       <AlertDialogDescription>Runs over exactly the listings that were approved. No new code is needed: the approval carries it.</AlertDialogDescription>
                     </AlertDialogHeader>
+                    <div>
+                      <h3 className="text-xs font-semibold text-ink-800">Approved listings</h3>
+                      <ul className="mt-1 max-h-40 list-disc space-y-0.5 overflow-y-auto pl-5 text-sm text-ink-700">
+                        {r.titles.map((t, i) => (
+                          <li key={`${i}-${t}`} className="break-words">
+                            {t}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
                     <StartBody row={r} />
                   </AlertDialogContent>
                 </AlertDialog>

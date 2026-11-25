@@ -126,7 +126,7 @@ export default async function ActivitiesPage({ searchParams }: { searchParams: P
         </button>
       </form>
 
-      <OpenApprovals rows={approvals.map((a) => ({ approvalId: a.approvalId, action: a.action, itemCount: a.itemCount, state: a.state, until: a.until }))} />
+      <OpenApprovals rows={approvals.map((a) => ({ approvalId: a.approvalId, action: a.action, itemCount: a.itemCount, titles: a.titles, state: a.state, until: a.until }))} />
 
       <ActivitiesTable
         rows={rows}
