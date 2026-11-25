@@ -52,7 +52,11 @@ export const fxInputSchema = z
   .object({
     version: z.number().int().min(1),
     /** Decimal string with at most two places, e.g. "24.10". */
-    inrPerAed: z.string().regex(/^\d{1,6}(\.\d{1,2})?$/),
+    inrPerAed: z
+      .string()
+      .regex(/^\d{1,6}(\.\d{1,2})?$/)
+      // A zero rate would price INR lines at nothing and makes the conversion throw (review 103 N0-12).
+      .refine((v) => Number(v) > 0, "must be positive"),
     /** Who recorded the rate and from what (an owner or accountant input). */
     source: z.string().trim().min(1).max(200),
     recordedAt: isoInstant,

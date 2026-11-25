@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { Alert } from "@/components/ui/primitives";
+import { hasPermission } from "@/server/lib/actor";
 import { traveldeskDryRunService } from "@/server/services/traveldesk-dry-run.service";
 import type { PlanMoney, PlannedListing, PlannedOption, PlanStepSummary } from "@/server/suppliers/traveldesk/traveldesk.listing-plan";
 import { requirePage } from "../../../../_lib/guard";
@@ -178,9 +179,12 @@ export default async function DryRunPage({ searchParams }: { searchParams: Promi
             {e}
           </Link>
         ))}
-        <Link href={`/admin/suppliers/traveldesk?env=${env}`} className="ml-auto self-center text-sm underline underline-offset-2">
-          Back to mapping review
-        </Link>
+        {/* Finance holds costs.view without suppliers.manage; the mapping review would refuse them (review 103 N0-13). */}
+        {hasPermission(actor, "suppliers.manage") && (
+          <Link href={`/admin/suppliers/traveldesk?env=${env}`} className="ml-auto self-center text-sm underline underline-offset-2">
+            Back to mapping review
+          </Link>
+        )}
       </nav>
 
       <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">

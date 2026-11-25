@@ -5,6 +5,8 @@ import { tourCataloguePayload, tourDetailFrom, tourDetailsWire } from "../travel
 import {
   CONTENT_LIMITS,
   htmlToPlainText,
+  newTextBudget,
+  safeTourContentFrom,
   parseFaq,
   parseItinerary,
   parsePhotos,
@@ -58,7 +60,95 @@ describe("htmlToPlainText", () => {
   });
 });
 
+describe("htmlToPlainText is linear and bounded (review 103 N0-01, N0-02, N0-09, N0-10)", () => {
+  const ms = (f: () => unknown) => {
+    const t = performance.now();
+    f();
+    return performance.now() - t;
+  };
+
+  it("strips adversarial unclosed markup in linear time", () => {
+    // Each of these took over a second per field with the old regex chain.
+    for (const bad of ["<a".repeat(40_000), "<!".repeat(40_000), "<p ".repeat(26_000), "<script>".repeat(10_000), "<!--".repeat(20_000)]) {
+      expect(ms(() => htmlToPlainText(bad))).toBeLessThan(200);
+    }
+  });
+
+  it("bounds a whole tour: 100 hostile FAQ answers and 100 itinerary texts stay fast and within the tour budget", () => {
+    const bad = "<a".repeat(40_000);
+    const wire = {
+      salesDescription: bad,
+      termsAndConditions: bad,
+      faqList: Array.from({ length: 100 }, () => ({ question: "Q?", answer: bad })),
+      itineraries: Array.from({ length: 100 }, () => bad),
+    };
+    let warnings: string[] = [];
+    expect(ms(() => (warnings = tourContentFrom(wire).warnings))).toBeLessThan(1_500);
+    expect(warnings).toContain(`content: input over ${CONTENT_LIMITS.tourInputChars} characters, the rest read as empty`);
+  });
+
+  it("spends a shared budget and then reads fields as empty", () => {
+    const budget = newTextBudget(10);
+    expect(htmlToPlainText("abcdefgh", 100, budget)).toBe("abcdefgh");
+    expect(htmlToPlainText("abcdefgh", 100, budget)).toBe("ab");
+    expect(budget.exhausted).toBe(true);
+    expect(htmlToPlainText("more", 100, budget)).toBe("");
+  });
+
+  it("drops a tag cut off at the end instead of keeping it as text", () => {
+    expect(htmlToPlainText('Before <img src="data:image/png;base64,AAAA')).toBe("Before");
+    expect(htmlToPlainText("a < b and c<5")).toBe("a < b and c<5");
+  });
+
+  it("never leaves a lone surrogate, at the cap or from the supplier", () => {
+    const capped = htmlToPlainText(`${"a".repeat(19_998)}😀😀😀`);
+    expect(capped.isWellFormed()).toBe(true);
+    expect(capped.length).toBeLessThanOrEqual(CONTENT_LIMITS.textChars);
+    expect(htmlToPlainText("x\ud83dy").isWellFormed()).toBe(true);
+    expect((sanitiseRaw(`${"b".repeat(19_999)}😀`) as string).isWellFormed()).toBe(true);
+    expect((sanitiseRaw({ ["k\udc00"]: "v\ud800" }) as Record<string, string>)["k\ufffd"]).toBe("v\ufffd");
+  });
+
+  it("removes directional marks and turns line separators into line breaks", () => {
+    expect(htmlToPlainText("a\u200eb\u200fc\u061cd\u2028e\u2029f")).toBe("abcd\ne\nf");
+  });
+});
+
+describe("safeTourContentFrom (review 103 N0-01)", () => {
+  it("returns undefined with a warning instead of failing the tour read", () => {
+    const warnings: string[] = [];
+    const hostile = {
+      get salesDescription(): string {
+        throw new TypeError("boom");
+      },
+    };
+    expect(safeTourContentFrom(hostile, warnings)).toBeUndefined();
+    expect(warnings).toEqual(["content: unreadable (TypeError)"]);
+  });
+});
+
 describe("safeHttpsUrl", () => {
+  it("refuses IP literals, local and single-label hosts and non-default ports (review 103 N0-05)", () => {
+    for (const bad of [
+      "https://169.254.169.254/latest",
+      "https://10.0.0.1/a.jpg",
+      "https://2130706433/a.jpg",
+      "https://0x7f.1/a.jpg",
+      "https://[::1]/a.jpg",
+      "https://[fe80::1]/a.jpg",
+      "https://localhost/a.jpg",
+      "https://cdn.localhost/a.jpg",
+      "https://printer.local/a.jpg",
+      "https://metadata.google.internal/a.jpg",
+      "https://intranet/a.jpg",
+      "https://media.example.test:8443/a.jpg",
+      "https://media.example.test:22/a.jpg",
+    ]) {
+      expect(safeHttpsUrl(bad), bad).toBeNull();
+    }
+    expect(safeHttpsUrl("https://media.example.test:443/a.jpg")).toBe("https://media.example.test/a.jpg");
+  });
+
   it("keeps https only, without credentials", () => {
     expect(safeHttpsUrl("https://media.example.test/p/1.webp")).toBe("https://media.example.test/p/1.webp");
     expect(safeHttpsUrl("http://media.example.test/p/1.webp")).toBeNull();
@@ -94,7 +184,12 @@ describe("parsePhotos", () => {
       warnings,
     );
     expect(photos.map((p) => p.variants.map((v) => v.url))).toEqual([["https://media.example.test/b.jpg"], ["https://media.example.test/c.jpg"]]);
-    expect(warnings).toEqual(["photo 1: 1 source(s) not https, dropped", "photo 2: 1 source(s) not https, dropped", "photo 2: no usable source (id,srcSet)", "photo 4: unreadable (number)"]);
+    expect(warnings).toEqual([
+      "photo 1: 1 source(s) not an allowed https address, dropped",
+      "photo 2: 1 source(s) not an allowed https address, dropped",
+      "photo 2: no usable source (id,srcSet)",
+      "photo 4: unreadable (number)",
+    ]);
   });
 });
 
@@ -165,7 +260,7 @@ describe("tourContentFrom", () => {
     expect(c.photos).toEqual([]);
     expect(c.videoUrl).toBeNull();
     expect(c.warnings).toEqual([
-      "video: not an https address",
+      "video: not an allowed https address",
       "faq 1: unreadable (number)",
       "faq 2: unreadable (object)",
       "itinerary 1: unreadable (array)",

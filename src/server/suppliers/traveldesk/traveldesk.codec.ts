@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { decimalToMinor } from "../../domain/decimal";
-import { tourContentFrom, type TourContent } from "./traveldesk.content";
+import { safeTourContentFrom, type TourContent } from "./traveldesk.content";
 
 /**
  * TravelDesk wire schemas (read DTOs only) and their normalised OUTLY shapes.
@@ -500,7 +500,7 @@ export function tourDetailFrom(wire: z.infer<typeof tourDetailsWire>): TravelDes
     itineraryCount: wire.itineraries?.length ?? 0,
     photoCount: wire.photos?.length ?? 0,
     warnings,
-    content: tourContentFrom(wire),
+    content: safeTourContentFrom(wire, warnings),
   };
 }
 

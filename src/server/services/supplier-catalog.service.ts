@@ -218,12 +218,16 @@ async function storeCapability(
  * unchanged hash only moves `fetchedAt`; a changed one rewrites the row and
  * moves `changedAt`. Returns whether the content changed. Never touches the
  * catalogue payload or any mapping.
+ *
+ * Times only move forward (review 103 N0-03): `fetched_at` is
+ * `GREATEST(fetched_at, at)` in SQL, so an older, slower run writing after a
+ * newer one never breaks `stc_times_check` (`changed_at <= fetched_at`).
  */
 async function storeTourContent(supplierId: string, environment: SupplierEnvironment, tourExternalId: string, c: TourContent, at: Date): Promise<boolean> {
   const where = { supplierId_environment_tourExternalId: { supplierId, environment, tourExternalId } };
   const existing = await prisma.supplierTourContent.findUnique({ where, select: { id: true, contentHash: true } });
   if (existing && existing.contentHash === c.contentHash) {
-    await prisma.supplierTourContent.update({ where: { id: existing.id }, data: { fetchedAt: at } });
+    await prisma.$executeRaw`UPDATE "supplier_tour_content" SET "fetched_at" = GREATEST("fetched_at", ${at}::timestamptz) WHERE "id" = ${existing.id}::uuid`;
     return false;
   }
   const data = {
@@ -238,11 +242,15 @@ async function storeTourContent(supplierId: string, environment: SupplierEnviron
     raw: toJson(c.raw),
     warnings: c.warnings.slice(0, 500),
     contentHash: c.contentHash,
-    fetchedAt: at,
-    changedAt: at,
   };
-  if (existing) await prisma.supplierTourContent.update({ where: { id: existing.id }, data });
-  else await prisma.supplierTourContent.create({ data: { id: uuidv7(), supplierId, environment, tourExternalId, firstFetchedAt: at, ...data } });
+  if (existing) {
+    await prisma.$transaction([
+      prisma.supplierTourContent.update({ where: { id: existing.id }, data }),
+      prisma.$executeRaw`UPDATE "supplier_tour_content" SET "fetched_at" = GREATEST("fetched_at", ${at}::timestamptz), "changed_at" = ${at}::timestamptz WHERE "id" = ${existing.id}::uuid`,
+    ]);
+  } else {
+    await prisma.supplierTourContent.create({ data: { id: uuidv7(), supplierId, environment, tourExternalId, firstFetchedAt: at, fetchedAt: at, changedAt: at, ...data } });
+  }
   return true;
 }
 

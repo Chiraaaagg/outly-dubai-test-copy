@@ -99,7 +99,10 @@ export interface CatalogueSyncResult {
   agencyId: string;
   /** `TRAVELDESK_AGENCY_ID` on this deployment, or null when unset. */
   pinnedAgencyId: string | null;
-  sync: Pick<SyncResult, "tours" | "offers" | "added" | "changed" | "removed" | "revived" | "failedTours" | "removalsApplied" | "removalsSkipped" | "mappingsChanged" | "incomplete">;
+  sync: Pick<
+    SyncResult,
+    "tours" | "offers" | "added" | "changed" | "removed" | "revived" | "failedTours" | "removalsApplied" | "removalsSkipped" | "mappingsChanged" | "incomplete" | "contentStored" | "contentChanged" | "contentFailed"
+  >;
   candidates: CandidateCounts | { skipped: "incomplete" };
   snapshots: { offers: number; rows: number; failed: number; incomplete: boolean } | { skipped: "time_budget" | "no_offers" | "incomplete" };
   /** The `supplier_sync_runs` row; `resumedFromRunId` is set when this run continued an incomplete pass. */
@@ -335,6 +338,10 @@ async function runSync(actor: Actor, trigger: CatalogueSyncTrigger, config: Trav
       removalsSkipped: sync.removalsSkipped,
       mappingsChanged: sync.mappingsChanged,
       incomplete: sync.incomplete,
+      // Doc 30 N0 (review 103 N0-04): tour content stored apart; a failure here never fails the sync, so it is shown.
+      contentStored: sync.contentStored ?? 0,
+      contentChanged: sync.contentChanged ?? 0,
+      contentFailed: sync.contentFailed ?? [],
     };
     const today = dubaiToday(new Date(started));
     // A partial pull would drop suggestions for tours it did not read: refresh them only after a complete one.

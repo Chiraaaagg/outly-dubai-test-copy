@@ -42,6 +42,8 @@ export const CONTENT_LIMITS = Object.freeze({
   urlChars: 2_048,
   rawDepth: 6,
   rawKeys: 50,
+  /** Input characters one tour's text fields may read in total (`TextBudget`, N0-01). */
+  tourInputChars: 200_000,
 });
 
 export interface TourContentFaq {
@@ -139,40 +141,154 @@ function decodeEntities(text: string): string {
   });
 }
 
-/** Control characters other than newline and tab, and the Unicode bidi overrides. */
-const CONTROL = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f​‪-‮⁦-⁩﻿]/g;
+/**
+ * Control characters other than newline and tab, the Unicode bidi overrides
+ * and isolates, the directional marks (U+200E, U+200F, U+061C), zero-width
+ * space and the byte-order mark. Line and paragraph separators become "\n"
+ * (`LINE_SEPARATORS`).
+ */
+const CONTROL = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u061c\u200b\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g;
+const LINE_SEPARATORS = /[\u2028\u2029]/g;
+
+/** Replace lone UTF-16 surrogates (Postgres `jsonb` and `text` refuse them) with U+FFFD. Applied after every cut. */
+export function wellFormed(s: string): string {
+  return s.toWellFormed();
+}
+
+/**
+ * Cut to at most `max` UTF-16 units without splitting a surrogate pair,
+ * marking the cut with "…". The result is always well formed.
+ */
+function capText(s: string, max: number): string {
+  if (s.length <= max) return wellFormed(s);
+  let cut = max - 1;
+  const c = s.charCodeAt(cut - 1);
+  if (c >= 0xd800 && c <= 0xdbff) cut -= 1;
+  return wellFormed(`${s.slice(0, cut).trimEnd()}…`);
+}
+
+/**
+ * How many input characters one tour's content may still read (N0-01). Each
+ * text field takes from it before it is parsed; once it is spent, further
+ * fields read as empty and `exhausted` is set, so one tour's parse is bounded
+ * whatever TravelDesk sends.
+ */
+export interface TextBudget {
+  left: number;
+  exhausted: boolean;
+}
+
+export function newTextBudget(chars: number = CONTENT_LIMITS.tourInputChars): TextBudget {
+  return { left: chars, exhausted: false };
+}
+
+/** Elements dropped with everything inside them. */
+const DROP_WITH_CONTENT = new Set(["script", "style", "iframe", "object", "embed", "noscript", "template", "svg", "math", "textarea", "title", "head"]);
+/** Elements whose start and end become a line break. */
+const BLOCK = new Set(["p", "div", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6", "tr", "table", "section", "article", "blockquote"]);
+const TAG_START = /[A-Za-z/!?]/;
+const TAG_NAME = /^(\/?)([A-Za-z][A-Za-z0-9]*)/;
+
+/**
+ * Remove tags in one left-to-right pass (N0-01): every `indexOf` starts after
+ * the previous match, and an unclosed tag, comment or dropped element ends the
+ * text there (N0-09), so the work is linear in the input whatever the markup.
+ * A "<" not followed by a tag start is kept as text.
+ */
+function stripTags(s: string): string {
+  const parts: string[] = [];
+  let i = 0;
+  while (i < s.length) {
+    const lt = s.indexOf("<", i);
+    if (lt === -1) {
+      parts.push(s.slice(i));
+      break;
+    }
+    parts.push(s.slice(i, lt));
+    const next = s[lt + 1];
+    if (next === undefined || !TAG_START.test(next)) {
+      parts.push("<");
+      i = lt + 1;
+      continue;
+    }
+    if (s.startsWith("<!--", lt)) {
+      const end = s.indexOf("-->", lt + 4);
+      if (end === -1) break;
+      parts.push(" ");
+      i = end + 3;
+      continue;
+    }
+    const gt = s.indexOf(">", lt + 1);
+    if (gt === -1) break;
+    i = gt + 1;
+    const m = TAG_NAME.exec(s.slice(lt + 1, Math.min(gt, lt + 40)));
+    if (!m) {
+      parts.push(" ");
+      continue;
+    }
+    const closing = m[1] === "/";
+    const name = m[2].toLowerCase();
+    if (!closing && DROP_WITH_CONTENT.has(name)) {
+      const close = new RegExp(`</${name}\\s*>`, "gi");
+      close.lastIndex = i;
+      const found = close.exec(s);
+      if (!found) break;
+      parts.push(" ");
+      i = found.index + found[0].length;
+      continue;
+    }
+    if (name === "br") parts.push("\n");
+    else if (name === "li") parts.push(closing ? "" : "\n• ");
+    else if (BLOCK.has(name)) parts.push("\n");
+    else parts.push(" ");
+  }
+  return parts.join("");
+}
 
 /**
  * Supplier HTML (or plain text) → plain text. Script, style and comment
  * content is dropped; block ends become line breaks and list items "• ";
  * every other tag is removed; entities are decoded once (the result is text,
  * so a decoded "<" stays a character and is never parsed again); control
- * characters are removed and whitespace collapsed. Capped at `maxChars`.
+ * characters are removed and whitespace collapsed. Linear in the input
+ * (`stripTags`); the input read is capped at `maxChars × 4` and by `budget`;
+ * the result at `maxChars`, always well formed.
  */
-export function htmlToPlainText(value: unknown, maxChars: number = CONTENT_LIMITS.textChars): string {
+export function htmlToPlainText(value: unknown, maxChars: number = CONTENT_LIMITS.textChars, budget?: TextBudget): string {
   if (typeof value !== "string" || value.length === 0) return "";
-  let s = value.length > maxChars * 4 ? value.slice(0, maxChars * 4) : value;
-  s = s
-    .replace(/<!--[\s\S]*?(-->|$)/g, " ")
-    .replace(/<(script|style|iframe|object|embed|noscript|template|svg|math)\b[\s\S]*?(<\/\1\s*>|$)/gi, " ")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<li\b[^>]*>/gi, "\n• ")
-    .replace(/<\/(p|div|ul|ol|h[1-6]|tr|table|section|article|blockquote)\s*>/gi, "\n")
-    .replace(/<(p|div|ul|ol|h[1-6]|tr|table|section|article|blockquote)\b[^>]*>/gi, "\n")
-    .replace(/<\/?[a-z][^>]*>/gi, " ")
-    .replace(/<[!?/][^>]*>/g, " ");
-  s = decodeEntities(s).replace(/\r\n?/g, "\n").replace(CONTROL, "");
+  let take = Math.min(value.length, maxChars * 4);
+  if (budget) {
+    if (budget.left < take) {
+      budget.exhausted = true;
+      take = budget.left;
+    }
+    budget.left -= take;
+    if (take <= 0) return "";
+  }
+  let s = stripTags(take < value.length ? value.slice(0, take) : value);
+  s = wellFormed(decodeEntities(s).replace(/\r\n?/g, "\n").replace(LINE_SEPARATORS, "\n").replace(CONTROL, ""));
   s = s
     .split("\n")
-    .map((line) => line.replace(/[ \t ]+/g, " ").trim())
+    .map((line) => line.replace(/[ \t\u00a0]+/g, " ").trim())
     .join("\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
-  if (s.length > maxChars) s = `${s.slice(0, maxChars - 1).trimEnd()}…`;
-  return s;
+  return capText(s, maxChars);
 }
 
-/** An https address of at most `CONTENT_LIMITS.urlChars`, without credentials; null otherwise. */
+/** Hosts that are never a public media host (N0-05). Suffix match on whole labels. */
+const PRIVATE_HOST_SUFFIXES = ["localhost", "local", "localdomain", "internal", "intranet", "lan", "home", "corp", "arpa"];
+
+/**
+ * An https address of at most `CONTENT_LIMITS.urlChars`, on the default port,
+ * without credentials, whose host is a public-looking DNS name (N0-05): IP
+ * literals (v4 in any spelling the URL parser normalises, v6), single-label
+ * hosts, `localhost` and private suffixes are refused. Null otherwise.
+ *
+ * This is capture hygiene only. N1's checked fetch must still allow-list the
+ * TravelDesk media hosts, check the resolved address and refuse or re-check
+ * redirects (doc 30 §3.8; N1 acceptance item).
+ */
 export function safeHttpsUrl(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const s = value.trim();
@@ -183,7 +299,12 @@ export function safeHttpsUrl(value: unknown): string | null {
   } catch {
     return null;
   }
-  if (u.protocol !== "https:" || u.username || u.password || !u.hostname) return null;
+  if (u.protocol !== "https:" || u.username || u.password || u.port !== "") return null;
+  const host = u.hostname.toLowerCase().replace(/\.$/, "");
+  if (!host || host.startsWith("[") || host.includes(":") || /^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return null;
+  const labels = host.split(".");
+  if (labels.length < 2 || /^\d+$/.test(labels[labels.length - 1])) return null;
+  if (PRIVATE_HOST_SUFFIXES.includes(labels[labels.length - 1]) || labels.includes("localhost")) return null;
   return u.toString();
 }
 
@@ -195,13 +316,14 @@ const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "obj
 
 /**
  * A JSON-safe copy of an unknown value for storage: strings lose control
- * characters and are capped; numbers must be finite; depth, list length and
- * key count are capped; anything else becomes null. Kept for re-parsing only,
- * never displayed.
+ * characters, are capped and made well formed; numbers must be finite; depth,
+ * list length and key count are capped; anything else becomes null. HTML and
+ * any address stay as received: `raw` is for re-parsing only, never rendered,
+ * copied into a listing or selected by any other reader (review 103 N0-06).
  */
 export function sanitiseRaw(value: unknown, depth = 0): unknown {
   if (value === null || value === undefined) return null;
-  if (typeof value === "string") return value.replace(CONTROL, "").slice(0, CONTENT_LIMITS.textChars);
+  if (typeof value === "string") return wellFormed(value.replace(CONTROL, "").slice(0, CONTENT_LIMITS.textChars));
   if (typeof value === "number") return Number.isFinite(value) ? value : null;
   if (typeof value === "boolean") return value;
   if (depth >= CONTENT_LIMITS.rawDepth) return null;
@@ -209,7 +331,7 @@ export function sanitiseRaw(value: unknown, depth = 0): unknown {
   if (isRecord(value)) {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value).slice(0, CONTENT_LIMITS.rawKeys)) {
-      const key = k.replace(CONTROL, "").slice(0, 64);
+      const key = wellFormed(k.replace(CONTROL, "").slice(0, 64));
       if (key && key !== "__proto__" && key !== "constructor" && key !== "prototype") out[key] = sanitiseRaw(v, depth + 1);
     }
     return out;
@@ -224,9 +346,9 @@ function keysOf(item: unknown): string {
   return keys.length ? keys.join(",") : "no keys";
 }
 
-function firstText(item: Record<string, unknown>, keys: readonly string[], maxChars: number): string {
+function firstText(item: Record<string, unknown>, keys: readonly string[], maxChars: number, budget?: TextBudget): string {
   for (const k of keys) {
-    const t = htmlToPlainText(item[k], maxChars);
+    const t = htmlToPlainText(item[k], maxChars, budget);
     if (t) return t;
   }
   return "";
@@ -244,15 +366,15 @@ const FAQ_QUESTION_KEYS = ["question", "title", "q", "name", "header"] as const;
 const FAQ_ANSWER_KEYS = ["answer", "description", "text", "a", "content", "body"] as const;
 
 /** FAQ items with a question and an answer; anything else is skipped with a warning. */
-export function parseFaq(list: unknown[] | null | undefined, warnings: string[]): TourContentFaq[] {
+export function parseFaq(list: unknown[] | null | undefined, warnings: string[], budget?: TextBudget): TourContentFaq[] {
   const out: TourContentFaq[] = [];
   (list ?? []).slice(0, CONTENT_LIMITS.listItems).forEach((item, i) => {
     if (!isRecord(item)) {
       warnings.push(`faq ${i + 1}: unreadable (${keysOf(item)})`);
       return;
     }
-    const question = firstText(item, FAQ_QUESTION_KEYS, CONTENT_LIMITS.shortTextChars);
-    const answer = firstText(item, FAQ_ANSWER_KEYS, CONTENT_LIMITS.textChars);
+    const question = firstText(item, FAQ_QUESTION_KEYS, CONTENT_LIMITS.shortTextChars, budget);
+    const answer = firstText(item, FAQ_ANSWER_KEYS, CONTENT_LIMITS.textChars, budget);
     if (!question || !answer) {
       warnings.push(`faq ${i + 1}: unknown shape (${keysOf(item)})`);
       return;
@@ -268,11 +390,11 @@ const STEP_TEXT_KEYS = ["description", "text", "details", "content", "body"] as 
 const STEP_ORDER_KEYS = ["order", "sortOrder", "position", "sequence", "day", "dayNumber"] as const;
 
 /** Itinerary steps with a title or a description; ordered by the supplier's order field when every step has one. */
-export function parseItinerary(list: unknown[] | null | undefined, warnings: string[]): TourContentItineraryStep[] {
+export function parseItinerary(list: unknown[] | null | undefined, warnings: string[], budget?: TextBudget): TourContentItineraryStep[] {
   const steps: (TourContentItineraryStep & { order: number | null })[] = [];
   (list ?? []).slice(0, CONTENT_LIMITS.listItems).forEach((item, i) => {
     if (typeof item === "string") {
-      const text = htmlToPlainText(item);
+      const text = htmlToPlainText(item, CONTENT_LIMITS.textChars, budget);
       if (text) steps.push({ position: i + 1, order: null, title: "", description: text });
       else warnings.push(`itinerary ${i + 1}: empty`);
       return;
@@ -281,8 +403,8 @@ export function parseItinerary(list: unknown[] | null | undefined, warnings: str
       warnings.push(`itinerary ${i + 1}: unreadable (${keysOf(item)})`);
       return;
     }
-    const title = firstText(item, STEP_TITLE_KEYS, CONTENT_LIMITS.shortTextChars);
-    const description = firstText(item, STEP_TEXT_KEYS, CONTENT_LIMITS.textChars);
+    const title = firstText(item, STEP_TITLE_KEYS, CONTENT_LIMITS.shortTextChars, budget);
+    const description = firstText(item, STEP_TEXT_KEYS, CONTENT_LIMITS.textChars, budget);
     if (!title && !description) {
       warnings.push(`itinerary ${i + 1}: unknown shape (${keysOf(item)})`);
       return;
@@ -301,13 +423,13 @@ export function parseItinerary(list: unknown[] | null | undefined, warnings: str
  * Only https sources are kept; a photo without one is skipped with a warning.
  * A plain https string is accepted as a one-variant photo.
  */
-export function parsePhotos(list: unknown[] | null | undefined, warnings: string[]): TourContentPhoto[] {
+export function parsePhotos(list: unknown[] | null | undefined, warnings: string[], budget?: TextBudget): TourContentPhoto[] {
   const out: TourContentPhoto[] = [];
   (list ?? []).slice(0, CONTENT_LIMITS.photos).forEach((item, i) => {
     if (typeof item === "string") {
       const url = safeHttpsUrl(item);
       if (url) out.push({ supplierPhotoId: null, caption: "", description: "", variants: [{ type: null, url, width: null, height: null }] });
-      else warnings.push(`photo ${i + 1}: not an https address`);
+      else warnings.push(`photo ${i + 1}: not an allowed https address`);
       return;
     }
     if (!isRecord(item)) {
@@ -335,15 +457,15 @@ export function parsePhotos(list: unknown[] | null | undefined, warnings: string
       const url = safeHttpsUrl(item.src) ?? safeHttpsUrl(item.url);
       if (url) variants.push({ type: null, url, width: intOrNull(item.width), height: intOrNull(item.height) });
     }
-    if (dropped) warnings.push(`photo ${i + 1}: ${dropped} source(s) not https, dropped`);
+    if (dropped) warnings.push(`photo ${i + 1}: ${dropped} source(s) not an allowed https address, dropped`);
     if (variants.length === 0) {
       warnings.push(`photo ${i + 1}: no usable source (${keysOf(item)})`);
       return;
     }
     out.push({
       supplierPhotoId: intOrNull(item.id),
-      caption: htmlToPlainText(item.caption, CONTENT_LIMITS.shortTextChars),
-      description: htmlToPlainText(item.description, CONTENT_LIMITS.shortTextChars),
+      caption: htmlToPlainText(item.caption, CONTENT_LIMITS.shortTextChars, budget),
+      description: htmlToPlainText(item.description, CONTENT_LIMITS.shortTextChars, budget),
       variants,
     });
   });
@@ -358,7 +480,7 @@ export function parsePhotos(list: unknown[] | null | undefined, warnings: string
 function canonicalJson(value: unknown): string {
   return JSON.stringify(value, (_k, v) => {
     if (v && typeof v === "object" && !Array.isArray(v)) {
-      return Object.fromEntries(Object.entries(v as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)));
+      return Object.fromEntries(Object.entries(v as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
     }
     return v;
   });
@@ -367,18 +489,26 @@ function canonicalJson(value: unknown): string {
 /** Read the content part of a tour detail answer. Never throws: what cannot be read is empty, with a warning. */
 export function tourContentFrom(wire: TourContentWire): TourContent {
   const warnings: string[] = [];
+  const budget = newTextBudget();
   const videoRaw = typeof wire.videoUrl === "string" ? wire.videoUrl.trim() : "";
   const videoUrl = videoRaw ? safeHttpsUrl(videoRaw) : null;
-  if (videoRaw && !videoUrl) warnings.push("video: not an https address");
+  if (videoRaw && !videoUrl) warnings.push("video: not an allowed https address");
+  const name = htmlToPlainText(wire.name, CONTENT_LIMITS.shortTextChars, budget);
+  const salesDescription = htmlToPlainText(wire.salesDescription, CONTENT_LIMITS.textChars, budget);
+  const terms = htmlToPlainText(wire.termsAndConditions, CONTENT_LIMITS.textChars, budget);
+  const faq = parseFaq(wire.faqList, warnings, budget);
+  const itinerary = parseItinerary(wire.itineraries, warnings, budget);
+  const photos = parsePhotos(wire.photos, warnings, budget);
+  if (budget.exhausted) warnings.push(`content: input over ${CONTENT_LIMITS.tourInputChars} characters, the rest read as empty`);
   const body = {
     schemaVersion: TOUR_CONTENT_SCHEMA_VERSION,
-    name: htmlToPlainText(wire.name, CONTENT_LIMITS.shortTextChars),
-    salesDescription: htmlToPlainText(wire.salesDescription),
-    terms: htmlToPlainText(wire.termsAndConditions),
+    name,
+    salesDescription,
+    terms,
     videoUrl,
-    faq: parseFaq(wire.faqList, warnings),
-    itinerary: parseItinerary(wire.itineraries, warnings),
-    photos: parsePhotos(wire.photos, warnings),
+    faq,
+    itinerary,
+    photos,
     raw: {
       faqList: sanitiseRaw(wire.faqList ?? []),
       itineraries: sanitiseRaw(wire.itineraries ?? []),
@@ -388,4 +518,19 @@ export function tourContentFrom(wire: TourContentWire): TourContent {
   };
   const contentHash = createHash("sha256").update(canonicalJson(body)).digest("hex");
   return { ...body, contentHash };
+}
+
+/**
+ * `tourContentFrom` for the tour read (N0-01): content can never fail the
+ * read of a tour's structure and offers. On any error it returns undefined
+ * and adds a warning to `warnings` (the tour detail's own, never stored in
+ * the payload); the sync then stores no content for that tour this run.
+ */
+export function safeTourContentFrom(wire: TourContentWire, warnings: string[]): TourContent | undefined {
+  try {
+    return tourContentFrom(wire);
+  } catch (error) {
+    warnings.push(`content: unreadable (${error instanceof Error ? error.name : "unknown"})`);
+    return undefined;
+  }
 }

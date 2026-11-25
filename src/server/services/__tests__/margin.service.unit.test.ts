@@ -255,3 +255,13 @@ describe("marginService.allocate", () => {
     expect(out).toHaveLength(3);
   });
 });
+
+describe("fxInputSchema (review 103 N0-12)", () => {
+  it("refuses a zero rate", async () => {
+    const { fxInputSchema } = await import("../margin.service");
+    const base = { version: 1, source: "synthetic", recordedAt: "2026-11-01T00:00:00Z", expiresAt: "2026-12-01T00:00:00Z" };
+    expect(fxInputSchema.safeParse({ ...base, inrPerAed: "0" }).success).toBe(false);
+    expect(fxInputSchema.safeParse({ ...base, inrPerAed: "0.00" }).success).toBe(false);
+    expect(fxInputSchema.safeParse({ ...base, inrPerAed: "24.10" }).success).toBe(true);
+  });
+});

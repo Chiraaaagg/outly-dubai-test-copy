@@ -92,6 +92,10 @@ export function CatalogueSync({ environment }: { environment: "test" | "producti
               </li>
               {data.sync.mappingsChanged > 0 && <li>{data.sync.mappingsChanged} approved mapping(s) changed terms and need review.</li>}
               <li>
+                Tour content: {data.sync.contentStored ?? 0} stored, {data.sync.contentChanged ?? 0} changed.
+                {(data.sync.contentFailed?.length ?? 0) > 0 && ` ${data.sync.contentFailed!.length} tour(s): content not stored; their offers were still read.`}
+              </li>
+              <li>
                 Price snapshots:{" "}
                 {"skipped" in data.snapshots
                   ? data.snapshots.skipped === "no_offers"

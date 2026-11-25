@@ -630,9 +630,11 @@ model SupplierCatalogueItem {
 /// TravelDesk tour content (doc 30 §3.2, build N0; migration 20261127120000;
 /// owner decision D3 allows storing and using it). One row per supplier,
 /// environment and tour, written by the catalogue sync from the tour detail
-/// (`traveldesk.content.ts`): plain text (supplier HTML is never kept as
-/// HTML), FAQ, itinerary, photo references (https addresses, not copies) and
-/// the sanitised raw lists with the parser's `schemaVersion`. Kept apart from
+/// (`traveldesk.content.ts`): plain text in the parsed fields (supplier HTML
+/// is never kept as HTML there), FAQ, itinerary, photo references (https
+/// addresses, not copies) and, in `raw` only, the lists as received with the
+/// parser's `schemaVersion`. The migration's header says HTML is never stored;
+/// that holds for every column except `raw`. Kept apart from
 /// `SupplierCatalogueItem.payload` so it never enters the offer terms hash.
 /// No prices and no personal data. Nothing customer-facing reads it in N0.
 model SupplierTourContent {
@@ -651,7 +653,9 @@ model SupplierTourContent {
   itinerary        Json                @default("[]")
   /// `TourContentPhoto[]`: references only.
   photos           Json                @default("[]")
-  /// `{ faqList, itineraries, photos }` as received, sanitised, for re-parsing under a later schema version.
+  /// `{ faqList, itineraries, photos }` as received, for re-parsing under a later schema version only. Only size,
+  /// control characters and lone surrogates are cleaned: it still holds supplier HTML and addresses the parsed
+  /// lists dropped. Never render, copy or select it outside the re-parser (review 103 N0-06).
   raw              Json                @default("{}")
   warnings         String[]            @default([])
   /// sha256 of the parsed content (`tourContentFrom`); a change moves `changedAt`.

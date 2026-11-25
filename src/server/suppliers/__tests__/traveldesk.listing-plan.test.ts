@@ -194,6 +194,21 @@ describe("listing plan (doc 30 §3.3)", () => {
     expect(mixedAges.listings[0].agesDiffer).toBe(true);
   });
 
+  it("checks every AED price against the floor even without an INR rate (review 103 N0-07)", () => {
+    // Floor above the 17% target: adult and child AED prices both miss it; no rate, so INR is unknown.
+    const p = plan([offer({ offerId: 1 })], { ...RULES, floorBps: 1_800, inrPerAed: null });
+    expect(p.listings[0].options[0].floorOk).toBe(false);
+    expect(p.listings[0].options[0].blockers).toContain("margin_below_floor");
+    expect(p.listings[0].options[0].blockers).toContain("fx_input_missing");
+    expect(plan([offer({ offerId: 1 })], { ...RULES, inrPerAed: null }).listings[0].options[0].floorOk).toBeNull();
+  });
+
+  it("says when no price can keep the margin (review 103 N0-08)", () => {
+    const p = plan([offer({ offerId: 1 })], { ...RULES, costs: [{ name: "fee", kind: "percent_of_charge", bps: 8_300 }] });
+    expect(p.listings[0].options[0].rulePrice.adult).toBeNull();
+    expect(p.listings[0].options[0].blockers).toContain("price_unreachable");
+  });
+
   it("flags external listings: the payload does not name the provider", () => {
     const p = plan([offer({ offerId: 1, classKey: "live.fixed_slot_single.self.external.per_person", isExternal: true })]);
     expect(p.listings[0].step).toBe("S2");

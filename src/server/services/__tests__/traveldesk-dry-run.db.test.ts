@@ -204,6 +204,22 @@ describe.skipIf(!enabled)("TravelDesk content and dry run, N0 (local DB)", () =>
     expect(third.contentChanged).toBeUndefined();
     const unchanged = await prisma.supplierTourContent.findUniqueOrThrow({ where: { id: row.id } });
     expect(unchanged.changedAt.getTime()).toBe(after.changedAt.getTime());
+
+    // Review 103 N0-03: an older, slower run writing after a newer one never moves times back or trips stc_times_check.
+    const earlier = new Date(unchanged.fetchedAt.getTime() - 3_600_000);
+    for (const text of ["Rewritten text", "Older run's text"]) {
+      const late = await catalog.syncTravelDeskCatalogue(source([wireTour(TOUR, { salesDescription: text, photos: [], faqList: [{ unknownField: 1 }] })]), "test", {
+        supplierCode: CODE,
+        lane: LANE,
+        now: () => earlier,
+      });
+      expect(late.contentFailed).toBeUndefined();
+      expect(late.contentStored).toBe(1);
+    }
+    const late = await prisma.supplierTourContent.findUniqueOrThrow({ where: { id: row.id } });
+    expect(late.fetchedAt.getTime()).toBe(unchanged.fetchedAt.getTime());
+    expect(late.changedAt.getTime()).toBe(earlier.getTime());
+    expect(late.salesDescription).toBe("Older run's text");
   });
 
   it("the dry run needs suppliers.costs.view and writes nothing", async () => {

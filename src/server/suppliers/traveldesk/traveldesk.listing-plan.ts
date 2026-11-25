@@ -233,13 +233,18 @@ function priceOf(net: bigint | undefined, rules: PlanRules): { aed: bigint; inr:
 
 const money = (p: { aed: bigint; inr: bigint | null } | null): PlanMoney | null => (p ? { aed: p.aed.toString(), inr: p.inr === null ? null : p.inr.toString() } : null);
 
+/**
+ * Every AED price is checked first (review 103 N0-07): any AED failure is
+ * false even when an INR price is missing; then null when an INR price is
+ * missing (no rate), else the INR checks decide.
+ */
 function floorOk(prices: { price: { aed: bigint; inr: bigint | null }; net: bigint }[], rules: PlanRules): boolean | null {
   if (!rules.costs || rules.floorBps === null) return null;
-  for (const { price, net } of prices) {
-    if (!meetsFloor({ priceMajor: price.aed, currency: "AED", netAedMinor: net, costs: rules.costs, floorBps: rules.floorBps, inrPerAed: rules.inrPerAed })) return false;
-    if (price.inr === null) return null;
-    if (!meetsFloor({ priceMajor: price.inr, currency: "INR", netAedMinor: net, costs: rules.costs, floorBps: rules.floorBps, inrPerAed: rules.inrPerAed })) return false;
-  }
+  const check = (priceMajor: bigint, currency: "AED" | "INR", net: bigint) =>
+    meetsFloor({ priceMajor, currency, netAedMinor: net, costs: rules.costs!, floorBps: rules.floorBps!, inrPerAed: rules.inrPerAed });
+  for (const { price, net } of prices) if (!check(price.aed, "AED", net)) return false;
+  if (prices.some((p) => p.price.inr === null)) return null;
+  for (const { price, net } of prices) if (!check(price.inr!, "INR", net)) return false;
   return true;
 }
 
@@ -266,7 +271,12 @@ function optionBase(o: PlanOffer, rules: PlanRules, kind: "instant" | "inquiry")
   }
   if (!nets) blockers.push("net_unknown");
   else if (!rules.costs) blockers.push("cost_inputs_missing");
-  else if (!rules.inrPerAed) blockers.push("fx_input_missing");
+  else {
+    // Review 103 N0-08: fees plus the target reach 100%, so no price keeps the margin.
+    const unpriced = (has("adult") && !adult) || (has("child") && !child) || (has("trip") && nets.trip > 0n && !trip);
+    if (unpriced) blockers.push("price_unreachable");
+    if (!rules.inrPerAed) blockers.push("fx_input_missing");
+  }
   if (rules.floorBps === null) blockers.push("margin_policy_missing");
   const option: PlannedOption = {
     optionId: `td-${o.offerId}`,
@@ -450,6 +460,8 @@ function instantListing(tourId: number, classKey: string, splitNumber: number, g
     const checks: { price: { aed: bigint; inr: bigint | null }; net: bigint }[] = [];
     const nets = b.o.netAedMinorByUnit;
     if (b.adult && nets) checks.push({ price: b.adult, net: nets.adult });
+    // Review 103 N0-11: a per-trip part is never instant by class key today; check it anyway so N1 cannot inherit a gap.
+    if (b.trip && nets) checks.push({ price: b.trip, net: nets.trip });
     if (b.adult && b.child && nets && gapAed !== null) {
       const child = { aed: b.adult.aed - gapAed, inr: b.adult.inr !== null && gapInr !== null ? b.adult.inr - gapInr : null };
       b.option.childUnderGap = money(child);
