@@ -13,7 +13,7 @@ import { ConfirmFirstNote, IndicativePriceNote, ResponsePromise } from "./inquir
 import { track } from "@/lib/analytics";
 import { ctaFor } from "@/lib/cta";
 import { computeBreakdown, guestRowsFor, toCartItem, variantById } from "@/lib/pricing";
-import { guestRowAges, paxForAges } from "@/lib/pax-ages";
+import { guestAgesNotice, guestRowAges, paxForAges } from "@/lib/pax-ages";
 import { fetchStartTimes, type StartTimesAnswer } from "@/lib/api/start-times";
 import { dateOnlyStartView } from "@/lib/start-time-retry";
 import { startMark } from "@/lib/perf-mark";
@@ -109,6 +109,16 @@ export function BookingWidget({
   const guestRows = guestRowsFor(activity, variantId);
   // Ages follow the selected option (doc 30 N4, D22): its own child and infant ages, else the page's.
   const guestAges = guestRowAges(variantById(activity, variantId));
+  // Review 102 N4-02, N4-06: switching option says when the ages behind a count already set change, or a row closes;
+  // a closed row's count is dropped from the party itself, so switching back never brings it back unseen.
+  const [ageNotice, setAgeNotice] = useState<string | null>(null);
+  const [agesVariant, setAgesVariant] = useState(variantId);
+  if (agesVariant !== variantId) {
+    setAgesVariant(variantId);
+    setAgeNotice(guestAgesNotice(variantById(activity, agesVariant), variantById(activity, variantId), pax));
+    const kept = paxForAges(pax, guestAges);
+    if (kept !== pax) setPax(kept);
+  }
   const shownPax: PaxCount = paxForAges(guestRows.includes("senior") || pax.senior === 0 ? pax : { ...pax, senior: 0 }, guestAges);
 
   // Listed start times for the date (Batch 2). Inquiry products never ask: their times are preferences.
@@ -480,7 +490,16 @@ export function BookingWidget({
         {/* Guests: rows follow the offer (owner decision 5) */}
         <div>
           <p className="mb-1 text-sm font-bold text-ink-900">Guests</p>
-          <GuestSelector value={shownPax} onChange={setPax} rows={guestRows} ages={guestAges} />
+          <GuestSelector
+            value={shownPax}
+            onChange={(next) => {
+              setPax(next);
+              setAgeNotice(null);
+            }}
+            rows={guestRows}
+            ages={guestAges}
+            notice={ageNotice}
+          />
         </div>
 
         {/* Add-ons */}

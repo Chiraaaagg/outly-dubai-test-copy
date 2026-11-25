@@ -292,7 +292,7 @@ describe("policyWithinSupplier (TKT-7, ISSUED_TICKET_REFUND_POLICY)", () => {
 function harness(opts: { products?: ReadinessProduct[]; mappings?: MappingReadiness[] | null; rows?: Map<string, EligibilityRow>; release?: boolean; failLoad?: boolean; candidates?: string[] | "fail" } = {}) {
   const rows = opts.rows ?? new Map<string, EligibilityRow>();
   let products = opts.products ?? [product()];
-  const calls = { writes: [] as unknown[], audits: [] as unknown[], invalidations: 0, mappingReads: 0 };
+  const calls = { writes: [] as unknown[], audits: [] as unknown[], invalidations: 0, mappingReads: 0, mappingContent: [] as unknown[] };
   const deps: ReadinessDeps = {
     async loadProducts(ids) {
       if (opts.failLoad) throw new Error("database unreachable");
@@ -301,8 +301,9 @@ function harness(opts: { products?: ReadinessProduct[]; mappings?: MappingReadin
     async mappingSource() {
       if (opts.mappings === null) return null;
       return {
-        async mappingReadinessFor() {
+        async mappingReadinessFor(_id, o) {
           calls.mappingReads++;
+          calls.mappingContent.push(o?.content);
           return opts.mappings ?? [mapping()];
         },
       };
@@ -331,6 +332,13 @@ function harness(opts: { products?: ReadinessProduct[]; mappings?: MappingReadin
 }
 
 describe("readiness service", () => {
+  it("the supplier half reads the content readiness judges (doc 30 N4, review 102 N4-03)", async () => {
+    const doc = instantDoc();
+    const h = harness({ products: [product({}, doc)] });
+    await h.svc.evaluate(PRODUCT_ID);
+    expect(h.calls.mappingContent).toEqual([doc]);
+  });
+
   it("evaluate is a read: it returns the contract shape and writes nothing", async () => {
     const h = harness();
     const r = await h.svc.evaluate(PRODUCT_ID);

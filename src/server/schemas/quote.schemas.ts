@@ -28,6 +28,8 @@ export const quoteLineSchema = z
       .refine((u) => Object.keys(u).length <= 10, "Too many units"),
     addonIds: z.array(idPart).max(20),
     pickup: z.object({ hotelRef: z.string().trim().min(1).max(120) }).strict().nullable(),
+    // Doc 30 N4 (review 102 N4-01): the band edges the picker showed; absent on carts from before N4.
+    ages: z.object({ childMax: z.number().int().min(0).max(120), infantMax: z.number().int().min(0).max(120) }).strict().optional(),
   })
   .strict();
 

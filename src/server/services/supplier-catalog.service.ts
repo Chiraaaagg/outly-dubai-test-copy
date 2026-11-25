@@ -1,9 +1,7 @@
 import "server-only";
 import { createHash } from "node:crypto";
 import { Prisma, type SupplierEnvironment } from "@prisma/client";
-import { z } from "zod";
-import { PAGE_PAX_AGES, variantPaxAges, type PaxAgeBands } from "@/lib/pax-ages";
-import { unitDefinitionSchema } from "../schemas/activity.schema";
+import { variantPaxAgesOf } from "../domain/variant-pax-ages";
 import { prisma, TX_OPTIONS } from "../lib/db";
 import type { Actor } from "../lib/actor";
 import { requirePermission } from "../lib/actor";
@@ -502,20 +500,6 @@ function variantCodesOf(content: unknown): (string | null)[] {
   return ids.length ? [...new Set(ids)] : [null];
 }
 
-/**
- * The age bands a stored variant sells (doc 30 N4, `variantPaxAges`), read
- * from raw content: its typed units when they parse, else the page's own
- * bands. Readiness parses the whole document and refuses it when invalid,
- * so a lenient read here can never make a product instant.
- */
-function variantPaxAgesOf(content: unknown, variantCode: string | null): PaxAgeBands {
-  if (variantCode === null) return PAGE_PAX_AGES;
-  const raw = (content as { variants?: unknown } | null)?.variants;
-  const variant = Array.isArray(raw) ? raw.find((v) => (v as { id?: unknown })?.id === variantCode) : undefined;
-  const units = z.array(unitDefinitionSchema).safeParse((variant as { units?: unknown } | undefined)?.units ?? []);
-  return (units.success ? variantPaxAges({ units: units.data }) : null) ?? PAGE_PAX_AGES;
-}
-
 export const supplierCatalogService = {
   /**
    * The mapping half of readiness (SUP-15, doc 22 §23 B2), for
@@ -549,16 +533,22 @@ export const supplierCatalogService = {
    *    is older than `CATALOGUE_STALE_AFTER_MS`, or its age is unknown
    *    (`catalogueSyncedAt`).
    */
-  async mappingReadinessFor(productId: string, environment: SupplierEnvironment, opts: { supplierCode?: string; now?: () => Date } = {}): Promise<ProductMappingReadiness> {
+  async mappingReadinessFor(
+    productId: string,
+    environment: SupplierEnvironment,
+    opts: { supplierCode?: string; now?: () => Date; content?: unknown } = {},
+  ): Promise<ProductMappingReadiness> {
     const product = await prisma.product.findUnique({ where: { id: productId }, select: { id: true, content: true } });
     if (!product) throw Errors.notFound("Product");
+    // Readiness passes the content it judges, so variants and age bands come from one snapshot (doc 30 N4, review 102 N4-03).
+    const content = opts.content !== undefined ? opts.content : product.content;
     const code = opts.supplierCode ?? TRAVELDESK_SUPPLIER_CODE;
     const at = (opts.now ?? (() => new Date()))();
     const evaluatedAt = at.toISOString();
     // Pricing periods are dated in Asia/Dubai (UTC+4).
     const today = new Date(at.getTime() + 4 * 3_600_000).toISOString().slice(0, 10);
     const supplier = await prisma.supplier.findUnique({ where: { code } });
-    const variants = variantCodesOf(product.content);
+    const variants = variantCodesOf(content);
     if (!supplier) return { productId, environment, variants: variants.map((v) => ({ variantCode: v, mapping: null, blockers: ["variant_without_mapping"] })), evaluatedAt };
 
     const mappings = await prisma.productSupplierMapping.findMany({ where: { productId, supplierId: supplier.id, environment } });
@@ -593,7 +583,7 @@ export const supplierCatalogService = {
       const ref = travelDeskExternalRefSchema.safeParse(m.externalRef);
       const stored = offer ? parseStoredOffer(offer.payload) : null;
       const offerFacts = offerReadinessFacts(stored, tourRow ? parseStoredPolicy(tourRow.payload) : null, today);
-      const bandMismatch = stored ? ageBandMismatches(stored, variantPaxAgesOf(product.content, variantCode)) : [];
+      const bandMismatch = stored ? ageBandMismatches(stored, variantPaxAgesOf(content, variantCode)) : [];
       const facts = { ...offerFacts, supplierUnits: offerFacts.supplierUnits.filter((u) => !(bandMismatch as string[]).includes(u)) };
 
       const blockers: MappingBlocker[] = [];

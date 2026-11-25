@@ -140,7 +140,8 @@ export function guestRowAges(variant: Pick<Variant, "units"> | undefined): Recor
   const bands = variantPaxAges(variant) ?? PAGE_PAX_AGES;
   const own = hasOwnAges(bands);
   const units = variant?.units ?? [];
-  const sells = (id: PaxAgeType) => !own || units.length === 0 || units.some((u) => u.unitId === id);
+  // The same units `variantPaxAges` reads: per person only (review 102 N4-07).
+  const sells = (id: PaxAgeType) => !own || units.length === 0 || units.some((u) => u.per === "person" && u.unitId === id);
   const adultMin = bands.adult.min as number;
   const child = bands.child as { min: number; max: number };
   const infantUnder = (bands.infant.max as number) + 1;
@@ -167,4 +168,57 @@ export function paxForAges(pax: PaxCount, ages: Record<PaxAgeType, GuestRowAge>)
 export function priceLineAges(bands: PaxAgeBands | null): { child: string; infant: string } {
   if (!bands) return { child: "Child (age by option)", infant: "Infant (age by option)" };
   return { child: `Child (${bands.child.min}–${bands.child.max})`, infant: `Infant (under ${(bands.infant.max as number) + 1})` };
+}
+
+/**
+ * Whether any option of the listing can book infants (review 102 N4-05):
+ * false only when every option has its own ages and no infant row (the
+ * picker closes it on each). The page then shows no "Infant … Free" line.
+ */
+export function listingSellsInfants(activity: { variants: Pick<Variant, "units">[] }): boolean {
+  return activity.variants.length === 0 || activity.variants.some((v) => guestRowAges(v).infant.allowed);
+}
+
+const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+
+/**
+ * What the guest is told when they switch option and the ages behind a
+ * count they already set change (review 102 N4-02, N4-06): a row the new
+ * option cannot book, and its count dropped, or a band that now reads
+ * differently. Null when nothing they set is affected. The booking widget
+ * shows it above the guest rows in a polite live region.
+ */
+export function guestAgesNotice(before: Pick<Variant, "units"> | undefined, after: Pick<Variant, "units"> | undefined, pax: PaxCount): string | null {
+  const was = variantPaxAges(before) ?? PAGE_PAX_AGES;
+  const now = variantPaxAges(after) ?? PAGE_PAX_AGES;
+  const rows = guestRowAges(after);
+  const parts: string[] = [];
+  const dropped = (n: number, one: string, many: string) =>
+    parts.push(`This option doesn't take ${many}, so ${plural(n, one, many)} ${n === 1 ? "was" : "were"} removed from your guests.`);
+  if (pax.child > 0 && !rows.child.allowed) dropped(pax.child, "child", "children");
+  if (pax.infant > 0 && !rows.infant.allowed) dropped(pax.infant, "infant", "infants");
+  const counts: string[] = [];
+  // Adults only when the band starts later: a guest counted as an adult may now be a child. Earlier never misplaces one.
+  if (pax.adult > 0 && (now.adult.min as number) > (was.adult.min as number)) counts.push(`adults as age ${now.adult.min} and over`);
+  if (pax.child > 0 && rows.child.allowed && (was.child.min !== now.child.min || was.child.max !== now.child.max)) counts.push(`children as ages ${now.child.min} to ${now.child.max}`);
+  if (pax.infant > 0 && rows.infant.allowed && was.infant.max !== now.infant.max) counts.push(`infants as under ${(now.infant.max as number) + 1}`);
+  if (counts.length) parts.push(`This option counts ${counts.join(", ")}. Check your guest numbers.`);
+  return parts.length ? parts.join(" ") : null;
+}
+
+/** The two band edges a quote line carries (review 102 N4-01): the ages the guest chose their rows against. */
+export interface QuoteLineAges {
+  childMax: number;
+  infantMax: number;
+}
+
+/** The band edges of a variant as the picker showed them (the page's own when its ages leave no child age). */
+export function quoteLineAges(variant: Pick<Variant, "units"> | undefined): QuoteLineAges {
+  const bands = variantPaxAges(variant) ?? PAGE_PAX_AGES;
+  return { childMax: bands.child.max as number, infantMax: bands.infant.max as number };
+}
+
+/** Whether a line's shown ages are still the variant's bands; a null band (no child age left) never matches. */
+export function quoteLineAgesMatch(shown: QuoteLineAges, bands: PaxAgeBands | null): boolean {
+  return bands !== null && bands.child.max === shown.childMax && bands.infant.max === shown.infantMax;
 }

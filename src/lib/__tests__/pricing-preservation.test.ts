@@ -167,6 +167,8 @@ describe("toCartItem", () => {
       fulfilmentMode: "inquiry",
       freeCancellationHours: 24,
       durationMinutes: 360,
+      // Doc 30 N4 (review 102 N4-01): the ages the guests were chosen against; the page's own here.
+      ages: { childMax: 11, infantMax: 2 },
     });
   });
 

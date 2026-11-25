@@ -210,6 +210,7 @@ export type QuoteRefusalReason =
   | "unknown_variant"
   | "unknown_unit"
   | "unit_rule_failed"
+  | "ages_changed"
   | "unknown_addon"
   | "pickup_unavailable"
   | "coupon_not_available_in_currency"
@@ -260,6 +261,8 @@ export interface QuoteLineInput {
   units: Record<string, number>;
   addonIds: string[];
   pickup: { hotelRef: string } | null;
+  /** Doc 30 N4: the band edges the guest picker showed (`CartItem.ages`); absent for carts from before N4. */
+  ages?: { childMax: number; infantMax: number };
 }
 
 /** POST /api/quotes. Every figure is recomputed on the server; a refusal names the lines that need a quick check. */
@@ -293,6 +296,8 @@ export function quoteLinesFor(items: CartItem[], activities: Activity[]): QuoteL
       addonIds: item.addOnIds,
       // Batch 3: the TravelDesk hotel id chosen from the offer's list; a typed name is never sent (the server refuses it).
       pickup: activity.pickupIncluded && item.pickupHotel?.hotelId ? { hotelRef: item.pickupHotel.hotelId } : null,
+      // Doc 30 N4 (review 102 N4-01): the server refuses the line if the option's ages changed since the guests were chosen.
+      ...(item.ages ? { ages: { childMax: item.ages.childMax, infantMax: item.ages.infantMax } } : {}),
     });
   }
   return lines.length ? lines : null;

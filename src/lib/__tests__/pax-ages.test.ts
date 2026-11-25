@@ -2,20 +2,27 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  guestAgesNotice,
   guestRowAges,
   hasOwnAges,
   listingPaxAges,
+  listingSellsInfants,
   offerPaxAges,
   PAGE_PAX_AGES,
   paxForAges,
   priceLineAges,
+  quoteLineAges,
+  quoteLineAgesMatch,
   sameBands,
   unitAgesFor,
   variantPaxAges,
   type OfferAgeTerms,
   type PaxAgeBands,
 } from "../pax-ages";
-import { PAGE_PAX_AGES as PRICING_PAGE_PAX_AGES } from "../pricing";
+import { PAGE_PAX_AGES as PRICING_PAGE_PAX_AGES, toCartItem } from "../pricing";
+import { quoteLinesFor } from "../api";
+import { inquiryHref, inquiryReasonForQuote, inquiryReasonText, parseInquiryReason } from "../inquiry-handoff";
+import type { Activity, Variant } from "../types";
 import type { UnitDefinition } from "@/server/quotes/contracts";
 import { ageBandMismatches } from "@/server/suppliers/traveldesk/traveldesk.quote";
 
@@ -283,5 +290,113 @@ describe.skipIf(!existsSync(LEDGER))("the doc 29a ledger: own ages open the 36 b
     }
     expect([...raw.values()].filter((s) => s.size > 1)).toHaveLength(15);
     expect([...shown.values()].filter((s) => s.size > 1)).toHaveLength(2);
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * Review 102 fix round: shown ages on the cart and quote line (N4-01),
+ * option switching (N4-02, N4-06, N4-10), infants on the price lines (N4-05)
+ * ------------------------------------------------------------------------ */
+
+describe("the ages the guests were chosen against travel with the line (N4-01)", () => {
+  const own = { id: "kids-under-8", name: "Kids under 8", delta: { inr: 0, aed: 0 }, units: unitsFor(terms(8, true, 3), band(2, 7)) } as unknown as Variant;
+  const plain = { id: "std", name: "Standard", delta: { inr: 0, aed: 0 }, units: [unit("adult", null, null), unit("child", null, null)] } as unknown as Variant;
+  const activity = {
+    slug: "zz-synthetic",
+    title: "Synthetic",
+    images: ["/img/x.jpg"],
+    productId: "0190a000-0000-7000-8000-000000000001",
+    price: { adult: { inr: 1000, aed: 40 }, child: { inr: 800, aed: 32 } },
+    variants: [own, plain],
+    addOns: [],
+    quoteOnly: false,
+    confirmation: "instant",
+    fulfilmentMode: "instant",
+    freeCancellationHours: 0,
+    durationMinutes: 60,
+    pickupIncluded: false,
+    timeSlots: ["09:00"],
+  } as unknown as Activity;
+  const pax = { adult: 2, child: 1, infant: 0, senior: 0 };
+
+  it("the cart line records the option's band edges, the page's own for a page-band option", () => {
+    expect(quoteLineAges(own)).toEqual({ childMax: 7, infantMax: 2 });
+    expect(quoteLineAges(plain)).toEqual({ childMax: 11, infantMax: 2 });
+    expect(quoteLineAges(undefined)).toEqual({ childMax: 11, infantMax: 2 });
+    expect(toCartItem(activity, { date: "2026-12-01", time: "09:00", pax, variantId: own.id }).ages).toEqual({ childMax: 7, infantMax: 2 });
+  });
+
+  it("the quote line carries the cart line's ages; a cart from before N4 sends none", () => {
+    const line = toCartItem(activity, { date: "2026-12-01", time: "09:00", pax, variantId: own.id });
+    const { ages: _drop, ...old } = line;
+    void _drop;
+    const lines = quoteLinesFor([line, { ...old, id: "old", date: "2026-12-02" }], [activity])!;
+    expect(lines[0].ages).toEqual({ childMax: 7, infantMax: 2 });
+    expect(lines[1]).not.toHaveProperty("ages");
+  });
+
+  it("matching is exact on both edges; bands with no child age never match", () => {
+    expect(quoteLineAgesMatch({ childMax: 7, infantMax: 2 }, band(2, 7))).toBe(true);
+    expect(quoteLineAgesMatch({ childMax: 7, infantMax: 2 }, band(2, 5))).toBe(false);
+    expect(quoteLineAgesMatch({ childMax: 7, infantMax: 2 }, band(1, 7))).toBe(false);
+    expect(quoteLineAgesMatch({ childMax: 11, infantMax: 2 }, null)).toBe(false);
+  });
+
+  it("a refused line says the ages changed", () => {
+    expect(inquiryReasonForQuote(["ages_changed"])).toBe("ages");
+    expect(inquiryReasonText("ages")).toMatch(/changed since you chose your guests/);
+    expect(parseInquiryReason(new URL(inquiryHref("ages"), "https://outlyy.test").searchParams.get("reason"))).toBe("ages");
+  });
+});
+
+describe("switching option tells the guest when a count they set is affected (N4-02, N4-06)", () => {
+  const p = (adult: number, child: number, infant: number) => ({ adult, child, infant, senior: 0 });
+  const page = { units: [unit("adult", null, null), unit("child", null, null), unit("infant", null, null)] };
+  const under8 = { units: unitsFor(terms(8, true, 3), band(2, 7)) };
+  const under8NoInfants = { units: unitsFor(terms(8, false, 3), band(2, 7)) };
+  const infantUnder2 = { units: unitsFor(terms(12, true, 2), band(1, 11)) };
+
+  it("nothing to say: same bands, or the changed rows have no guests", () => {
+    expect(guestAgesNotice(page, page, p(2, 1, 1))).toBeNull();
+    expect(guestAgesNotice(undefined, { units: [unit("adult", null, null)] }, p(2, 1, 0))).toBeNull();
+    // Adults from 12 to 8: nobody counted as an adult can now be a child.
+    expect(guestAgesNotice(page, under8, p(2, 0, 0))).toBeNull();
+  });
+
+  it("a child band that changes while children are set", () => {
+    expect(guestAgesNotice(page, under8, p(2, 1, 0))).toBe("This option counts children as ages 3 to 7. Check your guest numbers.");
+  });
+
+  it("adults whose band now starts later, as a guest counted as an adult may now be a child", () => {
+    expect(guestAgesNotice(under8, page, p(2, 0, 0))).toBe("This option counts adults as age 12 and over. Check your guest numbers.");
+    expect(guestAgesNotice(under8, page, p(2, 1, 0))).toBe("This option counts adults as age 12 and over, children as ages 3 to 11. Check your guest numbers.");
+  });
+
+  it("an infant band that changes while infants are set", () => {
+    expect(guestAgesNotice(page, infantUnder2, p(1, 0, 1))).toBe("This option counts infants as under 2. Check your guest numbers.");
+  });
+
+  it("a row the option cannot book: its count is dropped and said in words", () => {
+    expect(guestAgesNotice(under8, under8NoInfants, p(2, 0, 1))).toBe("This option doesn't take infants, so 1 infant was removed from your guests.");
+    expect(guestAgesNotice(page, under8NoInfants, p(2, 2, 2))).toBe(
+      "This option doesn't take infants, so 2 infants were removed from your guests. This option counts children as ages 3 to 7. Check your guest numbers.",
+    );
+    expect(paxForAges(p(2, 2, 2), guestRowAges(under8NoInfants))).toEqual(p(2, 2, 0));
+  });
+
+  it("closed rows read the same units as the bands: a per-booking unit never opens a row (N4-07)", () => {
+    const units = [...under8NoInfants.units, unit("infant", null, null, { per: "booking" })];
+    expect(guestRowAges({ units }).infant.allowed).toBe(false);
+  });
+});
+
+describe("the page's infant price line (N4-05)", () => {
+  const under8 = { units: unitsFor(terms(8, true, 3), band(2, 7)) };
+  const under8NoInfants = { units: unitsFor(terms(8, false, 3), band(2, 7)) };
+  it("is shown unless no option can book infants", () => {
+    expect(listingSellsInfants({ variants: [] })).toBe(true);
+    expect(listingSellsInfants({ variants: [{}, { units: [unit("adult", null, null)] }] })).toBe(true);
+    expect(listingSellsInfants({ variants: [under8NoInfants, under8] })).toBe(true);
+    expect(listingSellsInfants({ variants: [under8NoInfants, under8NoInfants] })).toBe(false);
   });
 });

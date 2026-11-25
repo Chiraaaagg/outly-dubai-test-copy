@@ -7,6 +7,7 @@ import { uuidv7 } from "../lib/ids";
 import { log } from "../lib/logger";
 import { parseWith } from "../lib/http";
 import { quoteRequestSchema } from "../schemas/quote.schemas";
+import { quoteLineAgesMatch, variantPaxAges } from "@/lib/pax-ages";
 import { marginService } from "./margin.service";
 import { instantOrderCapVerdict, readInstantOrderCapInputs, type InstantOrderCapInputs } from "../payments/exposure-limits";
 import { PICKUP_HOTEL_REF, supplierQuoteService } from "./supplier-quote.service";
@@ -48,7 +49,9 @@ import type { Activity, Currency } from "@/lib/types";
  *     must be published, valid and effectively instant. Anything else is
  *     `requires_inquiry` (or `not_published`), so the client sends the whole
  *     cart to the inquiry path. Combos cannot be expressed in a quote line.
- *  2. Selection: the variant exists and is not sold out; every unit is one of
+ *  2. Selection: the variant exists and is not sold out; the child and
+ *     infant ages the line says the guests were chosen against, when it
+ *     says, are still the variant's (`ages_changed`, doc 30 N4); every unit is one of
  *     the variant's typed units, within its min/max, at least one seat;
  *     instant lines take no add-ons (readiness already refuses products with
  *     add-ons); a product with time slots needs a slot. Pickup: a product or
@@ -179,6 +182,7 @@ export function canonicalRequest(r: QuoteRequest): QuoteRequest {
       units: sortedRecord(l.units),
       addonIds: [...new Set(l.addonIds)].sort(),
       pickup: l.pickup ? { hotelRef: l.pickup.hotelRef } : null,
+      ...(l.ages ? { ages: { childMax: l.ages.childMax, infantMax: l.ages.infantMax } } : {}),
     })),
     currency: r.currency,
     couponCode: r.couponCode ? r.couponCode.trim().toUpperCase() : null,
@@ -449,6 +453,8 @@ export function createQuoteService(deps: QuoteDeps): QuoteServiceImpl {
     const variants = activeVariants(activity);
     const variant = variants.find((v) => v.id === line.variantId);
     if (!variant) return "unknown_variant";
+    // Doc 30 N4 (review 102 N4-01): the guests were chosen against these ages; if the option's ages changed since, ask again.
+    if (line.ages && !quoteLineAgesMatch(line.ages, variantPaxAges(variant))) return "ages_changed";
     const units = variant.units ?? [];
     const unitProblem = checkUnits(units, line.units);
     if (unitProblem) return unitProblem;

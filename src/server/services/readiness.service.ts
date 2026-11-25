@@ -173,7 +173,8 @@ export interface MappingReadiness {
 }
 
 export interface MappingReadinessSource {
-  mappingReadinessFor(productId: string, opts?: { environment?: "test" | "production" }): Promise<MappingReadiness[]>;
+  /** `content`: the product content readiness judges, so the supplier age check reads the same snapshot (doc 30 N4, review 102 N4-03). */
+  mappingReadinessFor(productId: string, opts?: { environment?: "test" | "production"; content?: unknown }): Promise<MappingReadiness[]>;
 }
 
 export interface ReadinessProduct {
@@ -529,7 +530,7 @@ export function demotedForTrigger(result: ReadinessResult, trigger: ReadinessTri
 export function createReadinessService(deps: ReadinessDeps): ReadinessServiceImpl {
   async function assessOne(product: ReadinessProduct | null, productId: string, environment?: "test" | "production") {
     const source = await deps.mappingSource();
-    const mappings = source && product ? await source.mappingReadinessFor(productId, { environment }) : null;
+    const mappings = source && product ? await source.mappingReadinessFor(productId, { environment, content: product.content }) : null;
     const assessment = await assessReadiness({ product, mappings, releaseEnabled: deps.releaseEnabled(), margin: deps.margin() });
     const result: ReadinessResult = {
       productId,
@@ -729,7 +730,7 @@ async function supplierMappingSource(): Promise<MappingReadinessSource> {
   return {
     async mappingReadinessFor(productId, opts) {
       const environment = opts?.environment ?? env().TRAVELDESK_ENV ?? "production";
-      return fromCatalogReadiness(await supplierCatalogService.mappingReadinessFor(productId, environment));
+      return fromCatalogReadiness(await supplierCatalogService.mappingReadinessFor(productId, environment, { content: opts?.content }));
     },
   };
 }

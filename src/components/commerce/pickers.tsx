@@ -238,6 +238,7 @@ export function GuestSelector({
   max = 20,
   rows,
   ages = PAGE_ROW_AGES,
+  notice,
   className,
 }: {
   value: PaxCount;
@@ -250,10 +251,19 @@ export function GuestSelector({
    * own. A row the option cannot book shows why and cannot be increased.
    */
   ages?: Record<PaxAgeType, GuestRowAge>;
+  /**
+   * What changed for the guests already set when the option changed (`guestAgesNotice`, review 102 N4-02).
+   * Given (even null), a polite live region stays mounted above the rows, so the text is announced when it arrives.
+   */
+  notice?: string | null;
   className?: string;
 }) {
   const total = paxTotal(value);
   const uid = useId();
+  const shown = PAX_ROWS.filter((row) => !rows || rows.includes(row.key));
+  // A closed row has no control to focus, so its reason is the group's description, read on entering the steppers (N4-06).
+  const closed = shown.filter((row) => !ages[row.key].allowed);
+  const closedId = `${uid}-closed`;
 
   const set = (key: keyof PaxCount, next: number) => {
     const updated = { ...value, [key]: next };
@@ -265,8 +275,18 @@ export function GuestSelector({
   };
 
   return (
-    <div className={cn("space-y-1", className)}>
-      {PAX_ROWS.filter((row) => !rows || rows.includes(row.key)).map((row) => {
+    <div role="group" aria-label="Guests" aria-describedby={closed.length ? closedId : undefined} className={cn("space-y-1", className)}>
+      {notice !== undefined && (
+        <div role="status" aria-live="polite">
+          {notice ? <p className="mb-2 rounded-[var(--radius-control)] bg-sun-50 p-3 text-xs font-semibold leading-relaxed text-sun-800">{notice}</p> : null}
+        </div>
+      )}
+      {closed.length > 0 && (
+        <p id={closedId} className="sr-only">
+          {closed.map((row) => `${row.label}: ${ages[row.key].srHint}.`).join(" ")}
+        </p>
+      )}
+      {shown.map((row) => {
         const age = ages[row.key];
         const hintId = `${uid}-${row.key}-age`;
         return (

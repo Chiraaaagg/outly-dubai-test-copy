@@ -1,6 +1,7 @@
 import type { Activity, AddOn, CartItem, Currency, Money, PaxCount, Variant } from "./types";
 import { ZERO, addMoney, scaleMoney } from "./utils";
 import { MAX_INSTANT_ITEMS_PER_ORDER } from "@/server/quotes/contracts";
+import { quoteLineAges } from "./pax-ages";
 
 /** The fields pricing reads — a full `Activity` or the card projection both satisfy it. */
 export type PricedActivity = Pick<Activity, "slug" | "title" | "images" | "price" | "variants" | "addOns" | "quoteOnly" | "confirmation" | "fulfilmentMode" | "freeCancellationHours" | "durationMinutes"> &
@@ -186,6 +187,8 @@ export function toCartItem(
     freeCancellationHours: activity.freeCancellationHours,
     ...(activity.openDatedTicket ? { openDatedTicket: true } : {}),
     durationMinutes: activity.durationMinutes,
+    // Doc 30 N4: the ages the guests were chosen against, so a later change of the option's ages is caught by the quote.
+    ages: quoteLineAges(variant),
   };
 }
 

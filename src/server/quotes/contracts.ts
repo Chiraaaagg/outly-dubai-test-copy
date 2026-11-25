@@ -136,6 +136,14 @@ export interface QuoteLineRequest {
   units: Record<string, number>;
   addonIds: string[];
   pickup: { hotelRef: string } | null;
+  /**
+   * The child and infant band edges the guest picker showed when the guests
+   * were chosen (doc 30 N4, review 102 N4-01): the oldest child and the oldest
+   * infant, whole years. Optional: carts written before N4 carry none and are
+   * not checked. When given and no longer the variant's bands, the line is
+   * refused `ages_changed`.
+   */
+  ages?: { childMax: number; infantMax: number };
 }
 
 export interface QuoteRequest {
@@ -152,6 +160,8 @@ export type QuoteRefusalReason =
   | "unknown_variant"
   | "unknown_unit"
   | "unit_rule_failed"
+  /** Doc 30 N4 (review 102 N4-01): the option's child or infant ages changed after the guests were chosen against them. */
+  | "ages_changed"
   | "unknown_addon"
   | "pickup_unavailable"
   | "coupon_not_available_in_currency"

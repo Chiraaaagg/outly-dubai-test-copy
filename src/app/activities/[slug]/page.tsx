@@ -20,7 +20,7 @@ import { TicketTerms } from "@/components/commerce/ticket-terms";
 import { parseRetimeId } from "@/lib/start-time-retry";
 import { Gallery } from "@/components/commerce/gallery";
 import { PriceBlock } from "@/components/commerce/price";
-import { listingPaxAges } from "@/lib/pax-ages";
+import { listingPaxAges, listingSellsInfants } from "@/lib/pax-ages";
 import { IndicativePriceNote } from "@/components/commerce/inquiry-ui";
 import { SisterBrandReviews } from "@/components/commerce/sister-reviews";
 import { TrustSummary } from "@/components/commerce/trust";
@@ -210,7 +210,7 @@ export default async function ActivityPage({
 
           {/* Mobile price + booking entry */}
           <div className="mt-6 lg:hidden">
-            <PriceBlock band={activity.price} ages={listingPaxAges(activity)} size="xl" />
+            <PriceBlock band={activity.price} ages={listingPaxAges(activity)} infantsSold={listingSellsInfants(activity)} size="xl" />
             {activity.fulfilmentMode !== "instant" && <IndicativePriceNote className="mt-2" />}
           </div>
 
@@ -444,7 +444,7 @@ export default async function ActivityPage({
         {/* ---------------------------------------------------------- SIDEBAR */}
         <aside className="lg:sticky lg:top-28" id="book">
           <div className="hidden lg:block">
-            <PriceBlock band={activity.price} ages={listingPaxAges(activity)} size="xl" className="mb-4" />
+            <PriceBlock band={activity.price} ages={listingPaxAges(activity)} infantsSold={listingSellsInfants(activity)} size="xl" className="mb-4" />
           </div>
           <BookingWidget activity={activity} initialDate={date} retimeItemId={parseRetimeId(retime) ?? undefined} />
           <Card className="mt-4 p-5">

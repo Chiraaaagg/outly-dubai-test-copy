@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { GuestSelector } from "../pickers";
 import { PriceBlock } from "../price";
-import { guestRowAges, offerPaxAges, PAGE_PAX_AGES, unitAgesFor } from "@/lib/pax-ages";
+import { guestAgesNotice, guestRowAges, offerPaxAges, PAGE_PAX_AGES, unitAgesFor } from "@/lib/pax-ages";
 import type { UnitDefinition } from "@/server/quotes/contracts";
 import type { PaxCount, PriceBand } from "@/lib/types";
 
@@ -93,6 +93,38 @@ describe("guest picker ages", () => {
   });
 });
 
+describe("option switch notice and closed rows (review 102 N4-02, N4-06)", () => {
+  const bands = offerPaxAges({ childrenAllowed: true, childAge: 8, infantsAllowed: false, infantAge: 3 })!;
+  const noInfants = { units: [unit("adult", unitAgesFor(bands, "adult")), unit("child", unitAgesFor(bands, "child"))] };
+  const page = { units: [unit("adult", { ageMin: null, ageMax: null }), unit("child", { ageMin: null, ageMax: null }), unit("infant", { ageMin: null, ageMax: null })] };
+
+  it("a caller that shows notices gets one polite live region, mounted while empty", () => {
+    const empty = picker({ notice: null });
+    expect(empty).toContain('<div role="status" aria-live="polite"></div>');
+    // Callers that never pass a notice (combo, design system) render no region: their markup is unchanged.
+    expect(picker()).not.toContain('role="status"');
+  });
+
+  it("the notice for an option switch is shown inline, inside the live region, above the rows", () => {
+    const notice = guestAgesNotice(page, noInfants, { adult: 2, child: 1, infant: 1, senior: 0 })!;
+    expect(notice).toBe("This option doesn't take infants, so 1 infant was removed from your guests. This option counts children as ages 3 to 7. Check your guest numbers.");
+    const html = picker({ notice, ages: guestRowAges(noInfants) });
+    const region = html.match(/<div role="status" aria-live="polite">(.*?)<\/div>/)![1];
+    expect(region).toContain(notice.replace(/'/g, "&#x27;"));
+    expect(html.indexOf('role="status"')).toBeLessThan(html.indexOf("Adults"));
+  });
+
+  it("the guests are one named group; a closed row's reason is its description, with no fake control", () => {
+    const html = picker({ ages: guestRowAges(noInfants) });
+    const group = html.match(/<div role="group" aria-label="Guests" aria-describedby="([^"]+)"/)!;
+    expect(html).toContain(`<p id="${group[1]}" class="sr-only">Infants: Under 3, not available on this option.</p>`);
+    // Every stepper is still a native button; the closed row adds no focusable element.
+    expect(html.match(/<button/g)).toHaveLength(8);
+    // Without closed rows the group has no description.
+    expect(picker()).toContain('<div role="group" aria-label="Guests" class="space-y-1">');
+  });
+});
+
 describe("page price lines", () => {
   const band: PriceBand = { adult: { inr: 5000, aed: 200 }, child: { inr: 4000, aed: 160 }, infant: { inr: 0, aed: 0 } } as PriceBand;
   const block = (ages?: Parameters<typeof PriceBlock>[0]["ages"]) => visible(renderToStaticMarkup(h(PriceBlock, { band, ...(ages !== undefined ? { ages } : {}) })));
@@ -108,5 +140,14 @@ describe("page price lines", () => {
     expect(block(bands)).toContain("Child (2–9):");
     expect(block(bands)).toContain("Infant (under 2): Free");
     expect(block(null)).toContain("Child (age by option):");
+  });
+
+  it("no infant line when no option books infants (review 102 N4-05)", () => {
+    const html = visible(renderToStaticMarkup(h(PriceBlock, { band, infantsSold: false })));
+    expect(html).not.toContain("Infant");
+    expect(html).toContain("Child (3–11):");
+    // Only an infant line to show: no empty list.
+    const onlyInfant = renderToStaticMarkup(h(PriceBlock, { band: { adult: band.adult, infant: band.infant } as PriceBand, infantsSold: false }));
+    expect(onlyInfant).not.toContain("<ul");
   });
 });

@@ -307,6 +307,13 @@ export interface CartItem {
    * our team when it was not on the list (`hotelId` null; never quoted).
    */
   pickupHotel?: PickupHotelChoice;
+  /**
+   * Doc 30 N4 (review 102 N4-01): the child and infant band edges the guest
+   * picker showed when this line was added (`quoteLineAges`). The quote
+   * refuses the line (`ages_changed`) when the option's ages differ now.
+   * Absent on lines added before N4, which are not checked.
+   */
+  ages?: { childMax: number; infantMax: number };
 }
 
 export interface PickupHotelChoice {

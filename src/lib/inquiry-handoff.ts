@@ -10,7 +10,7 @@
  * inquiry form (`hotelForInquiry`, src/lib/pickup-selection.ts), never the URL.
  */
 
-export type InquiryReason = "mixed" | "over_limit" | "cutoff" | "time_slot" | "sold_out" | "pickup" | "ticket_validity" | "unavailable" | "external_hold";
+export type InquiryReason = "mixed" | "over_limit" | "cutoff" | "time_slot" | "sold_out" | "pickup" | "ticket_validity" | "ages" | "unavailable" | "external_hold";
 
 const TEXT: Record<InquiryReason, string> = {
   mixed: "Some activities in your trip are confirmed by our team before you pay, so the whole trip goes to them in one message.",
@@ -20,6 +20,8 @@ const TEXT: Record<InquiryReason, string> = {
   sold_out: "The time you picked is no longer available online.",
   pickup: "This activity includes hotel pickup, and our team confirms the pickup point with you before you pay.",
   ticket_validity: "The tickets on sale now can't be used on the date you picked. Pick an earlier visit date, or our team finds tickets for your date.",
+  // Doc 30 N4 (review 102 N4-01): the option's child or infant ages changed after the guests were chosen. Wording pending owner review (K10).
+  ages: "The ages this activity counts as children or infants have changed since you chose your guests. Check your guest numbers on the activity page, or our team confirms them with you before you pay.",
   unavailable: "This trip can't be booked online as it is, so our team confirms it with the operator before you pay.",
   // Doc 29 Batch 6 (owner decision d): from the status page, after an external hold too short to book online was released.
   external_hold: "The operator couldn't hold your place long enough to book it online, so our team books it with them for you before you pay.",
@@ -37,6 +39,7 @@ export function parseInquiryReason(raw: string | null | undefined): InquiryReaso
 export function inquiryReasonForQuote(reasons: readonly string[]): InquiryReason {
   if (reasons.some((r) => r === "pickup_unavailable")) return "pickup";
   if (reasons.some((r) => r === "ticket_validity_ended")) return "ticket_validity";
+  if (reasons.some((r) => r === "ages_changed")) return "ages";
   if (reasons.some((r) => r === "past_cutoff" || r === "same_day_inquiry_only" || r === "closed")) return "cutoff";
   // The time is not one the operator's live availability lists. Not a cut-off: calling it one sent customers
   // looking for a later date when the date was fine.

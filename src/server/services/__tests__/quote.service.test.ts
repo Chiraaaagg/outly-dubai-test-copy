@@ -1040,3 +1040,41 @@ describe("doc 29 Batch 5: open-dated ticket lines", () => {
     expect(w.supplierCalls).toEqual([]);
   });
 });
+
+/* ---------------------------------------------------------------------------
+ * Doc 30 N4 (review 102 N4-01): the ages the guests were chosen against
+ * ------------------------------------------------------------------------ */
+
+describe("quote: the ages the guest picker showed", () => {
+  const ownAges = (childMax: number) => product({}, instantDoc({ variants: [{ ...instantDoc().variants[0], units: [{ ...ADULT, ageMin: childMax + 1 }, { ...CHILD, ageMax: childMax }] }] }));
+
+  it("a line without ages (a cart from before N4) is not checked", async () => {
+    const w = world({ products: new Map([[PRODUCT_ID, ownAges(7)]]) });
+    expect((await w.svc.create(GUEST, request())).ok).toBe(true);
+  });
+
+  it("a line whose ages are still the option's sells; the page's own ages match a page-band option", async () => {
+    expect((await world().svc.create(GUEST, request({ lines: [line({ ages: { childMax: 11, infantMax: 2 } })] }))).ok).toBe(true);
+    const w = world({ products: new Map([[PRODUCT_ID, ownAges(7)]]) });
+    expect((await w.svc.create(GUEST, request({ lines: [line({ ages: { childMax: 7, infantMax: 2 } })] }))).ok).toBe(true);
+  });
+
+  it("ages that changed since the guests were chosen refuse the line before any supplier call", async () => {
+    // The tab showed children 3–7; the option was re-imported as 3–5.
+    const w = world({ products: new Map([[PRODUCT_ID, ownAges(5)]]) });
+    expect(await refusal(w, request({ lines: [line({ ages: { childMax: 7, infantMax: 2 } })] }))).toEqual([{ index: 0, reason: "ages_changed" }]);
+    expect(w.supplierCalls).toEqual([]);
+    // The page's own option, a line that saw other ages.
+    expect(await refusal(world(), request({ lines: [line({ ages: { childMax: 11, infantMax: 1 } })] }))).toEqual([{ index: 0, reason: "ages_changed" }]);
+  });
+
+  it("the ages are part of the request shape and of the fingerprint", async () => {
+    await expect(world().svc.create(GUEST, request({ lines: [line({ ages: { childMax: 11 } as never })] }))).rejects.toSatisfy(isAppError);
+    await expect(world().svc.create(GUEST, request({ lines: [line({ ages: { childMax: 11, infantMax: 2, adultMin: 12 } as never })] }))).rejects.toSatisfy(isAppError);
+    const without = canonicalRequest(request());
+    const withAges = canonicalRequest(request({ lines: [line({ ages: { childMax: 11, infantMax: 2 } })] }));
+    expect(without.lines[0]).not.toHaveProperty("ages");
+    expect(withAges.lines[0].ages).toEqual({ childMax: 11, infantMax: 2 });
+    expect(quoteFingerprint(GUEST, without)).not.toBe(quoteFingerprint(GUEST, withAges));
+  });
+});
