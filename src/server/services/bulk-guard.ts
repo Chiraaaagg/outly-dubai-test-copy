@@ -45,20 +45,36 @@ export async function assertBulkItemInTx(tx: Tx, actor: Actor, bulkId: string, p
 /** Outcome prefix of a free-cancellation item that failed after disarming and could not arm the listing again. */
 export const DISARMED_OUTCOME = "failed_after_disarm:";
 
-/** Ops incidents: listings a free-cancellation run left on inquiry after a failure (review N2-04). Ids only. */
-export async function bulkDisarmIncidents(since: Date, _now: Date, limit = 100, db: Tx | typeof prisma = prisma): Promise<OpsIncident[]> {
-  const rows = await db.bulkOperationItem.findMany({
+/**
+ * Ops incidents (review N2-04, N2-17), ids only:
+ *  - a free-cancellation item that failed after disarming and could not arm
+ *    the listing again (`failed_after_disarm:`);
+ *  - an item still `running` after its run's window closed, whose listing was
+ *    armed when first claimed and is not armed now (a crash between the
+ *    disarm and the re-arm, never resumed).
+ */
+export async function bulkDisarmIncidents(since: Date, now: Date, limit = 100, db: Tx | typeof prisma = prisma): Promise<OpsIncident[]> {
+  const failed = await db.bulkOperationItem.findMany({
     where: { state: "failed", outcome: { startsWith: DISARMED_OUTCOME }, finishedAt: { gt: since } },
     select: { id: true, finishedAt: true, productId: true },
     orderBy: { finishedAt: "asc" },
     take: limit,
   });
+  const stranded = await db.bulkOperationItem.findMany({
+    where: { state: "running", wasInstant: true, product: { fulfilmentMode: { not: "instant" } }, bulk: { expiresAt: { gt: since, lte: now } } },
+    select: { id: true, productId: true, bulk: { select: { expiresAt: true } } },
+    take: limit,
+  });
+  const rows = [
+    ...failed.map((r) => ({ id: r.id, productId: r.productId, at: r.finishedAt!, reason: "disarmed_not_rearmed" })),
+    ...stranded.map((r) => ({ id: r.id, productId: r.productId, at: r.bulk.expiresAt, reason: "disarmed_run_expired" })),
+  ];
   return rows.map((r) => ({
     kind: "bulk_item_disarmed" as const,
     entityKind: "bulk_operation_item" as const,
     entityId: r.id,
-    reason: "disarmed_not_rearmed",
-    raisedAt: r.finishedAt!,
+    reason: r.reason,
+    raisedAt: r.at,
     orderId: null,
     orderReference: null,
     bookingId: null,

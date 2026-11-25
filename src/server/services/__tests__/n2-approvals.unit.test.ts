@@ -113,7 +113,7 @@ describe("bulk runs: frozen list and cancellation text (§3.12, D6)", () => {
     expect(freezeItems([b, a, b])).toEqual([a, b]);
     expect(bulkItemsHash([b, a])).toBe(bulkItemsHash([a, b]));
     expect(bulkItemsHash([a])).not.toBe(bulkItemsHash([a, b]));
-    expect(bulkApprovalPayload("arm", "production", [b, a])).toEqual({ kind: "bulk_listings", action: "arm", environment: "production", itemsHash: bulkItemsHash([a, b]), itemCount: 2 });
+    expect(bulkApprovalPayload("arm", "production", [b, a])).toEqual({ kind: "bulk_listings", action: "arm", environment: "production", items: [a, b], itemsHash: bulkItemsHash([a, b]), itemCount: 2 });
     expect(bulkApprovalPayload("arm", "production", [a])).not.toEqual(bulkApprovalPayload("free_cancellation", "production", [a]));
   });
 

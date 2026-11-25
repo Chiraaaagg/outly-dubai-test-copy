@@ -14,40 +14,39 @@ import { INPUT_CLASS } from "../../../../_components/ui";
 type Environment = "test" | "production";
 
 export function Feedback({ result, saved }: { result: CapabilityActionResult | null; saved: string }) {
-  if (result?.ok && result.data.status === "pending")
-    return (
-      <p className="text-2xs font-semibold text-[var(--color-warning)]" role="status">
-        Pending second approver. Nothing has changed yet: another administrator must make the same change with their own code within 30 minutes.
+  // Review N2-19: the status region is always mounted; only its text changes. Errors use role="alert".
+  let message = "";
+  let tone = "text-[var(--color-success)]";
+  if (result?.ok && result.data.status === "pending") {
+    message = "Pending second approver. Nothing has changed yet: another administrator must make the same change with their own code within 30 minutes.";
+    tone = "text-[var(--color-warning)]";
+  } else if (result?.ok && result.data.status === "unchanged") {
+    message = "Already in that state; nothing changed.";
+    tone = "text-ink-600";
+  } else if (result?.ok) {
+    message = saved;
+  }
+  return (
+    <>
+      <p className={`text-2xs font-semibold ${tone}`} role="status" aria-live="polite" aria-atomic="true">
+        {message}
       </p>
-    );
-  if (result?.ok && result.data.status === "unchanged")
-    return (
-      <p className="text-2xs font-semibold text-ink-600" role="status">
-        Already in that state; nothing changed.
-      </p>
-    );
-  if (result?.ok)
-    return (
-      <p className="text-2xs font-semibold text-[var(--color-success)]" role="status">
-        {saved}
-      </p>
-    );
-  if (result && !result.ok)
-    return (
-      <p className="text-xs font-semibold text-[var(--color-danger)]" role="alert">
-        {result.fields?.note ??
-          result.fields?.totpCode ??
-          result.fields?.reference ??
-          result.fields?.offerExternalId ??
-          result.fields?.scopeTourIds ??
-          result.fields?.scopeProvider ??
-          result.fields?.basisClassKey ??
-          result.fields?.bookedTourId ??
-          result.fields?.confirmDemotions ??
-          result.message}
-      </p>
-    );
-  return null;
+      {result && !result.ok && (
+        <p className="text-xs font-semibold text-[var(--color-danger)]" role="alert">
+          {result.fields?.note ??
+            result.fields?.totpCode ??
+            result.fields?.reference ??
+            result.fields?.offerExternalId ??
+            result.fields?.scopeTourIds ??
+            result.fields?.scopeProvider ??
+            result.fields?.basisClassKey ??
+            result.fields?.bookedTourId ??
+            result.fields?.confirmDemotions ??
+            result.message}
+        </p>
+      )}
+    </>
+  );
 }
 
 /** The capability forms' authenticator code field (reused by the bulk listing form, doc 30 N2). */

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { Check, Columns3, Minus, Search, X } from "lucide-react";
 import { Checkbox } from "@base-ui/react/checkbox";
@@ -99,6 +99,8 @@ export function ActivitiesTable({
   const [hidden, setHidden] = useState<Set<string>>(new Set(["version"]));
   const [dialog, setDialog] = useState<BulkActionKind | null>(null);
   const [finished, setFinished] = useState(false);
+  // Review N2-18: focus returns here after a run, since the bar's buttons may be gone by then.
+  const countRef = useRef<HTMLSpanElement>(null);
 
   // A selection that no longer exists on the page must not survive a refresh or a filter change.
   const rowIds = useMemo(() => new Set(rows.map((r) => r.id)), [rows]);
@@ -216,8 +218,8 @@ export function ActivitiesTable({
         <Menu.Root>
           <Menu.Trigger
             render={
-              <Button type="button" size="sm" variant="outline" aria-label="Choose visible columns">
-                <Columns3 className="size-4" aria-hidden /> View
+              <Button type="button" size="sm" variant="outline">
+                <Columns3 className="size-4" aria-hidden /> View<span className="sr-only"> visible columns</span>
               </Button>
             }
           />
@@ -256,16 +258,11 @@ export function ActivitiesTable({
         </Menu.Root>
       </div>
 
-      {/* Bulk action bar: shown while something is selected. The count is announced. */}
-      <div
-        className={cn(
-          "mb-3 flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius-card)] border border-ink-200 bg-shell/60 px-3 py-2.5",
-          count === 0 && "sr-only",
-        )}
-      >
+      {/* Bulk action bar: always there (focus returns to its count after a run, N2-18); actions appear with a selection. The count is announced. */}
+      <div className={cn("mb-3 flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius-card)] border border-ink-200 px-3 py-2.5", count > 0 ? "bg-shell/60" : "bg-paper")}>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="text-sm font-semibold text-ink-900 tabular-nums" aria-live="polite" aria-atomic="true">
-            {count === 0 ? "No listings selected" : `${count.toLocaleString("en-IN")} selected${allMatching ? " (all matching these filters)" : ""}`}
+          <span ref={countRef} tabIndex={-1} className="text-sm font-semibold text-ink-900 tabular-nums outline-none focus-visible:outline-2 focus-visible:outline-ink-900" aria-live="polite" aria-atomic="true">
+            {count === 0 ? "Select listings for bulk actions" : `${count.toLocaleString("en-IN")} selected${allMatching ? " (all matching these filters)" : ""}`}
           </span>
           {visibleSelected.size > 0 && !allMatching && total > selectable.length && (
             <button type="button" onClick={() => setAllMatching(true)} className="text-sm font-semibold text-sun-700 underline underline-offset-2">
@@ -307,6 +304,7 @@ export function ActivitiesTable({
           if (finished) clear();
         }}
         onFinished={onFinished}
+        finalFocus={countRef}
         selection={{ ids: [...visibleSelected].sort(), allMatching, filters, count, titles }}
       />
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState, useEffect, useId, useState } from "react";
+import { useActionState, useEffect, useId, useRef, useState, type RefObject } from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { Alert } from "@/components/ui/primitives";
@@ -76,7 +76,7 @@ const OUTCOME_LABEL: Record<string, string> = {
   mixed_date_only_options: "options mix date-only and timed starts",
 };
 
-function outcomeLabel(code: string | null): string {
+export function outcomeLabel(code: string | null): string {
   if (!code) return "";
   if (OUTCOME_LABEL[code]) return OUTCOME_LABEL[code];
   if (code.startsWith("failed_after_disarm_rearmed:")) return `failed and armed again (${code.split(":").slice(1).join(":")})`;
@@ -121,7 +121,7 @@ function Summary({ selection }: { selection: BulkSelection }) {
   );
 }
 
-function ResultList({ data }: { data: NonNullable<Extract<BulkListingResult, { ok: true }>["data"]["result"]> }) {
+export function ResultList({ data }: { data: NonNullable<Extract<BulkListingResult, { ok: true }>["data"]["result"]> }) {
   const rows = [...data.failed, ...data.skipped, ...data.applied];
   return (
     <div className="grid gap-2">
@@ -162,9 +162,19 @@ function InstantRun({ kind, selection, onFinished }: { kind: "arm" | "inquiry" |
   const counts = ran?.result
     ? `${ran.result.applied.length} applied, ${ran.result.skipped.length} skipped, ${ran.result.failed.length} failed${ran.result.remaining.length ? `, ${ran.result.remaining.length} not run` : ""}`
     : null;
+  // Review N2-19: one live region, mounted empty, gets each message; N2-18: focus moves to the result title.
+  const waiting = state?.ok && state.data.status === "pending" ? "Waiting for a second administrator. Nothing has changed yet." : state?.ok && state.data.status === "approved" ? "Approved. The administrator who asked starts the run." : "";
+  const message = counts ? `${meta.label}: ${counts}` : waiting;
+  const resultTitle = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    if (ran?.result) resultTitle.current?.focus();
+  }, [ran]);
 
   return (
     <>
+      <div role="status" aria-live="polite" aria-atomic="true" className="sr-only">
+        {message}
+      </div>
       {!ran && (
         <form action={submit} className="grid gap-3" aria-describedby={`${id}-help`}>
           <SelectionFields selection={selection} />
@@ -189,12 +199,13 @@ function InstantRun({ kind, selection, onFinished }: { kind: "arm" | "inquiry" |
             </Alert>
           )}
           {state?.ok && state.data.status === "pending" && (
-            <Alert tone="warning" title="Waiting for a second administrator" role="status">
-              Nothing has changed yet. Another administrator must ask for the same run on the same listings with their own code within 30 minutes. Then start it here.
+            <Alert tone="warning" title="Waiting for a second administrator">
+              Nothing has changed yet. Another administrator must ask for the same run on the same listings with their own code within 30 minutes. Then start it here, or later from
+              &quot;Your bulk approvals&quot; on this page.
             </Alert>
           )}
           {state?.ok && state.data.status === "approved" && (
-            <Alert tone="success" title="Approved" role="status">
+            <Alert tone="success" title="Approved">
               Your request approved another administrator&apos;s run. They start it from their own dialog.
             </Alert>
           )}
@@ -212,12 +223,8 @@ function InstantRun({ kind, selection, onFinished }: { kind: "arm" | "inquiry" |
       {state?.ok && state.data.status === "pending" && !ran && (
         <form action={start} className="grid gap-2">
           <input type="hidden" name="approvalId" value={state.data.approvalId ?? ""} />
-          <input type="hidden" name="action" value={kind} />
           <input type="hidden" name="reason" value={reason} />
           {kind === "free_cancellation" && <input type="hidden" name="source" value={source} />}
-          {state.data.ids.map((i) => (
-            <input key={i} type="hidden" name="ids" value={i} />
-          ))}
           {started && !started.ok && (
             <Alert tone="danger" title={started.message} role="alert">
               {started.recovery}
@@ -231,9 +238,10 @@ function InstantRun({ kind, selection, onFinished }: { kind: "arm" | "inquiry" |
 
       {ran?.result && (
         <div className="grid gap-3">
-          <div role="status" aria-live="polite">
-            <Alert tone={ran.result.failed.length ? "warning" : "success"} title={`${meta.label}: ${counts}`} />
-          </div>
+          <h3 ref={resultTitle} tabIndex={-1} className="text-sm font-semibold text-ink-900 outline-none focus-visible:outline-2 focus-visible:outline-ink-900">
+            Result
+          </h3>
+          <Alert tone={ran.result.failed.length ? "warning" : "success"} title={`${meta.label}: ${counts}`} />
           <ResultList data={ran.result} />
           {ran.result.expired && ran.result.remaining.length > 0 && ran.bulkId && (
             <form action={resume} className="grid gap-2">
@@ -264,20 +272,35 @@ function StatusRun({ kind, selection, onFinished }: { kind: "published" | "draft
   const meta = BULK_ACTION_META[kind];
   const [state, submit, pending] = useActionState<BulkResult | null, FormData>(bulkSetActivityStatusAction, null);
   const id = useId();
+  const resultTitle = useRef<HTMLHeadingElement>(null);
   useEffect(() => {
-    if (state?.ok) onFinished();
+    if (state?.ok) {
+      onFinished();
+      resultTitle.current?.focus();
+    }
   }, [state, onFinished]);
+  let message = "";
   if (state?.ok) {
     const d = state.data;
     const parts = [`${d.changed} changed`];
     if (d.skipped) parts.push(`${d.skipped} already there`);
     if (d.invalid) parts.push(`${d.invalid} skipped, content needs fixing`);
     if (d.remaining) parts.push(`${d.remaining} still matching, run it again`);
+    message = `${meta.label}: ${parts.join(", ")}`;
+  }
+  const live = (
+    <div role="status" aria-live="polite" aria-atomic="true" className="sr-only">
+      {message}
+    </div>
+  );
+  if (state?.ok) {
     return (
       <div className="grid gap-3">
-        <div role="status" aria-live="polite">
-          <Alert tone={d.changed > 0 ? "success" : "info"} title={`${meta.label}: ${parts.join(", ")}`} />
-        </div>
+        {live}
+        <h3 ref={resultTitle} tabIndex={-1} className="text-sm font-semibold text-ink-900 outline-none focus-visible:outline-2 focus-visible:outline-ink-900">
+          Result
+        </h3>
+        <Alert tone={state.data.changed > 0 ? "success" : "info"} title={message} />
         <AlertDialogFooter>
           <AlertDialogCancel>Close</AlertDialogCancel>
         </AlertDialogFooter>
@@ -286,6 +309,7 @@ function StatusRun({ kind, selection, onFinished }: { kind: "published" | "draft
   }
   return (
     <form action={submit} className="grid gap-3">
+      {live}
       <SelectionFields selection={selection} />
       <input type="hidden" name="status" value={kind} />
       <p className="text-xs text-ink-500">{meta.help}</p>
@@ -314,11 +338,14 @@ export function BulkActionDialog({
   open,
   onOpenChange,
   onFinished,
+  finalFocus,
 }: {
   kind: BulkActionKind | null;
   selection: BulkSelection;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /** A stable element focus returns to on close (review N2-18): the bar's buttons may be gone by then. */
+  finalFocus: RefObject<HTMLElement | null>;
   /** Called once a run finished (clear the selection after the dialog closes). */
   onFinished: () => void;
 }) {
@@ -333,7 +360,7 @@ export function BulkActionDialog({
       }}
     >
       {kind && meta && (
-        <AlertDialogContent>
+        <AlertDialogContent finalFocus={finalFocus}>
           <AlertDialogHeader>
             <AlertDialogTitle>
               {meta.label}: {selection.count.toLocaleString("en-IN")} listing{selection.count === 1 ? "" : "s"}

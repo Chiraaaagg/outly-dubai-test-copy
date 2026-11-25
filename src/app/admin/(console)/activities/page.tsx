@@ -4,6 +4,8 @@ import { hasPermission } from "@/server/lib/actor";
 import { requirePage } from "../../_lib/guard";
 import { INPUT_CLASS, PageHeader, Pagination } from "../../_components/ui";
 import { ActivitiesTable, type ActivityTableRow } from "./activities-table";
+import { OpenApprovals } from "./open-approvals";
+import { bulkListingService } from "@/server/services/bulk-listing.service";
 
 /**
  * /admin/activities — every listing the storefront can show, with its
@@ -33,9 +35,11 @@ export default async function ActivitiesPage({ searchParams }: { searchParams: P
   const pageSize = PAGE_SIZES.includes(sizeRaw) ? sizeRaw : PAGE_SIZES[0];
   const filters: ActivityListFilters = { q: q || undefined, status, tier: tier && /^[A-E]$/.test(tier) ? tier : undefined, category };
 
-  const [list, categories] = await Promise.all([
+  const [list, categories, approvals] = await Promise.all([
     activityService.list(actor, { ...filters, page, pageSize }),
     activityService.listCategories(actor),
+    // Review N2-21: this administrator's bulk approvals that no run has used yet.
+    hasPermission(actor, "products.activate_instant") ? bulkListingService.openApprovals(actor) : Promise.resolve([]),
   ]);
   // A published listing whose category is still a draft has no category page
   // to sit on, so the table flags it rather than letting it go quietly live.
@@ -121,6 +125,8 @@ export default async function ActivitiesPage({ searchParams }: { searchParams: P
           Filter
         </button>
       </form>
+
+      <OpenApprovals rows={approvals.map((a) => ({ approvalId: a.approvalId, action: a.action, itemCount: a.itemCount, state: a.state, until: a.until }))} />
 
       <ActivitiesTable
         rows={rows}

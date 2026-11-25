@@ -71,6 +71,8 @@ const LOCK_FREE = [
   "20261101140000_refund_cap_counts_provider_refunds",
   // Only ALTER FUNCTION ... SET search_path (A4): no lock on any table.
   "20261103120000_function_search_path",
+  // Doc 30 N2 re-review N2-16: only CREATE OR REPLACE FUNCTION (the proof delete guard's body): no lock on any table.
+  "20261127170000_n2_proof_delete_guard",
 ];
 /**
  * Migrations that only create new tables (with their own indexes, RLS and

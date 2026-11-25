@@ -99,7 +99,10 @@ export async function bulkListingAction(_prev: BulkListingResult | null, fd: For
     const env = environment();
 
     let approvalId: string | null = null;
-    if (input.action !== "inquiry") {
+    // Review N2-21: an approved, unused approval of this person for exactly this run is started, never asked for again.
+    const ready = input.action !== "inquiry" ? await bulkListingService.readyApproval(actor, input.action, env, ids) : null;
+    if (ready) approvalId = ready;
+    if (input.action !== "inquiry" && !ready) {
       if (!input.totpCode) throw Errors.validation({ totpCode: "This run needs a code from your authenticator app" });
       const r = await approvalService.requestPrivileged(actor, "instant.activate.bulk", OPERATION_PERMISSION["instant.activate.bulk"], bulkApprovalPayload(input.action, env, ids), {
         environment: env,
@@ -123,11 +126,14 @@ export async function bulkListingAction(_prev: BulkListingResult | null, fd: For
 export async function startApprovedBulkAction(_prev: BulkListingResult | null, fd: FormData): Promise<BulkListingResult> {
   return runAction(async () => {
     const { actor } = await authService.requireCookies("products.activate_instant");
-    const action = parseWith(z.enum(BULK_ACTIONS).exclude(["inquiry"]), form.str(fd, "action")) as BulkAction;
     const approvalId = parseWith(z.uuid(), form.str(fd, "approvalId"));
     const reason = parseWith(reasonField, form.str(fd, "reason") ?? "");
     const source = parseWith(sourceField, form.str(fd, "source"));
-    const ids = await bulkListingService.resolveSelection(actor, selectionOf(fd));
+    // The approved list comes from the approval itself (review N2-21), never from the page.
+    const { action, items } = await bulkListingService.approvalItems(actor, approvalId);
+    if (action === "inquiry") throw Errors.validation({ action: "Back to inquiry needs no approval" });
+    if (action === "free_cancellation" && !source) throw Errors.validation({ source: "Name TravelDesk's written answer first" });
+    const ids = await bulkListingService.resolveSelection(actor, { ids: items });
     const started = await bulkListingService.start(actor, { action, productIds: ids, reason, source }, { environment: environment(), approvalId });
     const result = await bulkListingService.run(actor, started.bulkId, { source });
     revalidatePath(PATH);

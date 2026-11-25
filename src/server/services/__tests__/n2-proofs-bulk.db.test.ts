@@ -19,9 +19,9 @@ import { offerTermsHash } from "../../suppliers/traveldesk/traveldesk.offer-term
  *
  * Bulk: `zz-test-<run>` products with an empty document (only the requested
  * mode is written), synthetic staff with random TOTP secrets. Every row is
- * removed in afterAll; proof rows through the transaction-local purge
- * setting of the delete guard (migration 20261127160000). Audit rows stay
- * (append-only).
+ * removed in afterAll; proof rows by the table owner disabling the delete
+ * guard inside the cleanup transaction (DDL, owner only; migration
+ * 20261127170000). Audit rows stay (append-only).
  */
 
 const RUN = runId();
@@ -192,10 +192,11 @@ describe.skipIf(!dbEnabled)("doc 30 N2: class proofs and bulk runs (local DB)", 
     await prisma.productSupplierMapping.deleteMany({ where: { supplierId } });
     await prisma.supplierCatalogueItem.deleteMany({ where: { supplierId } });
     await prisma.supplierOfferEnablement.deleteMany({ where: { supplierId } });
-    // Proofs are never deleted, except by this cleanup through the guard's transaction-local purge setting.
+    // Proofs are never deleted. Only the table owner can, by disabling the guard inside this cleanup transaction (re-review N2-16).
     await prisma.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT set_config('outly.purge_class_proofs', 'on', true)`;
+      await tx.$executeRawUnsafe(`ALTER TABLE "supplier_class_proofs" DISABLE TRIGGER "supplier_class_proofs_no_delete"`);
       await tx.supplierClassProof.deleteMany({ where: { supplierId } });
+      await tx.$executeRawUnsafe(`ALTER TABLE "supplier_class_proofs" ENABLE TRIGGER "supplier_class_proofs_no_delete"`);
     });
     await prisma.supplier.deleteMany({ where: { id: supplierId } });
     await prisma.productEligibility.deleteMany({ where: { productId: { in: products } } });
@@ -258,6 +259,31 @@ describe.skipIf(!dbEnabled)("doc 30 N2: class proofs and bulk runs (local DB)", 
     await expect(prisma.supplierClassProof.create({ data: proofRow({ bookedTourId: String(TOUR) }) })).rejects.toThrow(/scp_booked_tour_check/);
     // A neighbour differing in time shape alone is accepted (decision 22).
     await prisma.supplierClassProof.create({ data: proofRow({ classKey: "live.listed_start_single.self.internal.per_person", revokedAt: new Date(), revokeReason: "zz n2 neighbour" }) });
+  });
+
+  it("database: a non-owner role holding DELETE cannot delete a proof, set its way past the guard, or disable it (N2-16)", async () => {
+    const role = `zz_np_${RUN}`.toLowerCase().replace(/[^a-z0-9_]/g, "_");
+    const p = await prisma.supplierClassProof.create({ data: proofRow({ revokedAt: new Date(), revokeReason: "zz n2 delete guard" }) });
+    await prisma.$executeRawUnsafe(`CREATE ROLE ${role} NOLOGIN NOSUPERUSER NOBYPASSRLS`);
+    try {
+      await prisma.$executeRawUnsafe(`GRANT USAGE ON SCHEMA public TO ${role}`);
+      await prisma.$executeRawUnsafe(`GRANT SELECT, DELETE ON "supplier_class_proofs" TO ${role}`);
+      await prisma.$executeRawUnsafe(`CREATE POLICY ${role}_all ON "supplier_class_proofs" FOR ALL TO ${role} USING (true)`);
+      const asRole = (...sql: string[]) =>
+        prisma.$transaction(async (tx) => {
+          await tx.$executeRawUnsafe(`SET LOCAL ROLE ${role}`);
+          for (const q of sql) await tx.$executeRawUnsafe(q);
+        });
+      await expect(asRole(`DELETE FROM "supplier_class_proofs" WHERE id = '${p.id}'`)).rejects.toThrow(/never deleted/);
+      await expect(asRole(`SELECT set_config('outly.purge_class_proofs', 'on', true)`, `DELETE FROM "supplier_class_proofs" WHERE id = '${p.id}'`)).rejects.toThrow(/never deleted/);
+      await expect(asRole(`ALTER TABLE "supplier_class_proofs" DISABLE TRIGGER "supplier_class_proofs_no_delete"`)).rejects.toThrow(/owner/);
+      expect(await prisma.supplierClassProof.count({ where: { id: p.id } })).toBe(1);
+    } finally {
+      await prisma.$executeRawUnsafe(`DROP POLICY IF EXISTS ${role}_all ON "supplier_class_proofs"`).catch(() => {});
+      await prisma.$executeRawUnsafe(`REVOKE ALL ON "supplier_class_proofs" FROM ${role}`).catch(() => {});
+      await prisma.$executeRawUnsafe(`REVOKE ALL ON SCHEMA public FROM ${role}`).catch(() => {});
+      await prisma.$executeRawUnsafe(`DROP ROLE IF EXISTS ${role}`).catch(() => {});
+    }
   });
 
   it("service: scope rules tied to the booked tour (D21 external, D24 tickets, provider fallback, catalogue, neighbours)", async () => {
@@ -405,6 +431,53 @@ describe.skipIf(!dbEnabled)("doc 30 N2: class proofs and bulk runs (local DB)", 
     const r = await bulk.run(admin("p"), bulkId, { now: late });
     expect(r).toMatchObject({ expired: true, remaining: [products[3]], applied: [], skipped: [], failed: [] });
     expect(await bulk.remainingItems(admin("p"), bulkId)).toEqual([products[3]]);
+  });
+
+  it("an item left running after its window, armed when first claimed and not armed now, raises the disarm alert (N2-17)", async () => {
+    const { bulkDisarmIncidents } = await import("../bulk-guard");
+    const at = tick();
+    const { bulkId } = await bulk.start(admin("p"), { action: "inquiry", productIds: [products[2]], reason: "zz n2 stranded run" }, { environment: "test", now: at });
+    await prisma.bulkOperationItem.updateMany({ where: { bulkId }, data: { state: "running", claimedUntil: at, wasInstant: true } });
+    await prisma.product.update({ where: { id: products[2] }, data: { fulfilmentMode: "inquiry" } });
+    const item = await prisma.bulkOperationItem.findFirstOrThrow({ where: { bulkId } });
+    const inside = await bulkDisarmIncidents(new Date(at.getTime() - 60_000), new Date(at.getTime() + 60_000));
+    expect(inside.map((i) => i.entityId)).not.toContain(item.id);
+    const after = await bulkDisarmIncidents(new Date(at.getTime() - 60_000), new Date(at.getTime() + 31 * 60_000));
+    expect(after.find((i) => i.entityId === item.id)).toMatchObject({ kind: "bulk_item_disarmed", entityKind: "bulk_operation_item", reason: "disarmed_run_expired" });
+  });
+
+  it("an approval waiting for a second administrator is listed; once approved it starts later over its own list, never a new request (N2-21)", async () => {
+    const t1 = tick();
+    const items = [products[1], products[3]];
+    // Production approval environment: the first request waits for a second administrator.
+    const first = await approvals.requestPrivileged(admin("p"), "instant.activate.bulk", "products.activate_instant", bulkApprovalPayload("arm", "production", items), {
+      environment: "production",
+      totpCode: code("p", t1),
+      now: t1,
+      itemCount: items.length,
+    });
+    expect(first.status).toBe("pending");
+    const approvalId = (first as { approvalId: string }).approvalId;
+    const pending = await bulk.openApprovals(admin("p"), t1);
+    expect(pending.find((o) => o.approvalId === approvalId)).toMatchObject({ state: "pending", action: "arm", itemCount: 2, items: [...items].sort() });
+    expect(await bulk.readyApproval(admin("p"), "arm", "production", items, t1)).toBeNull();
+    const t2 = tick();
+    const second = await approvals.requestPrivileged(admin("q"), "instant.activate.bulk", "products.activate_instant", bulkApprovalPayload("arm", "production", items), {
+      environment: "production",
+      totpCode: code("q", t2),
+      now: t2,
+      itemCount: items.length,
+    });
+    expect(second).toMatchObject({ status: "applied", approvalId });
+    // The second administrator only approved it; the requester's listing shows it ready, for exactly that run.
+    expect(await bulk.isRequester(admin("q"), approvalId)).toBe(false);
+    expect((await bulk.openApprovals(admin("p"), t2)).find((o) => o.approvalId === approvalId)?.state).toBe("approved");
+    expect(await bulk.readyApproval(admin("p"), "arm", "production", [...items].reverse(), t2)).toBe(approvalId);
+    expect(await bulk.readyApproval(admin("p"), "arm", "production", [products[1]], t2)).toBeNull();
+    await expect(bulk.approvalItems(admin("q"), approvalId)).rejects.toMatchObject({ details: { reason: "requester_starts" } });
+    expect(await bulk.approvalItems(admin("p"), approvalId)).toEqual({ action: "arm", items: [...items].sort() });
+    await bulk.start(admin("p"), { action: "arm", productIds: items, reason: "zz n2 approved later" }, { environment: "production", approvalId, now: t2 });
+    expect((await bulk.openApprovals(admin("p"), t2)).find((o) => o.approvalId === approvalId)).toBeUndefined();
   });
 
   it("caps a run at 50 listings and refuses unknown listings", async () => {

@@ -101,11 +101,31 @@ export function bulkItemsHash(ids: readonly string[]): string {
 
 /**
  * The approval payload of a loosening run: the action, the approval
- * environment and the frozen list's hash and size. Asked for once, used once.
+ * environment, the frozen list (so the requester can start an approved run
+ * later, review N2-21) and its hash and size. Asked for once, used once.
  */
 export function bulkApprovalPayload(action: BulkAction, environment: ApprovalEnvironment, ids: readonly string[]) {
   const items = freezeItems(ids);
-  return { kind: "bulk_listings", action, environment, itemsHash: bulkItemsHash(items), itemCount: items.length };
+  return { kind: "bulk_listings", action, environment, items, itemsHash: bulkItemsHash(items), itemCount: items.length };
+}
+
+/** A bulk approval of this person that no run has used yet (review N2-21). */
+export interface OpenBulkApproval {
+  approvalId: string;
+  action: BulkAction;
+  itemCount: number;
+  items: string[];
+  /** `pending`: waiting for a second administrator; `approved`: ready to start. */
+  state: "pending" | "approved";
+  /** Until when it can still be approved (pending) or started (approved). */
+  until: string;
+}
+
+function payloadItems(payload: unknown): { action: BulkAction; items: string[] } | null {
+  const p = payload as { kind?: unknown; action?: unknown; items?: unknown } | null;
+  if (!p || p.kind !== "bulk_listings" || !(BULK_ACTIONS as readonly string[]).includes(p.action as string) || !Array.isArray(p.items)) return null;
+  const items = p.items.filter((i): i is string => typeof i === "string" && UUID.test(i));
+  return items.length === p.items.length && items.length > 0 ? { action: p.action as BulkAction, items } : null;
 }
 
 function checkReason(reason: string): string {
@@ -292,6 +312,56 @@ export const bulkListingService = {
     };
   },
 
+  /**
+   * This person's bulk approvals that no run has used: waiting for a second
+   * administrator, or approved and ready to start (review N2-21). Read-only.
+   */
+  async openApprovals(actor: Actor, now: Date = new Date()): Promise<OpenBulkApproval[]> {
+    if (!actor.id) return [];
+    const rows = await prisma.privilegedApproval.findMany({
+      where: {
+        requestedBy: actor.id,
+        operation: "instant.activate.bulk",
+        bulkRuns: { none: {} },
+        OR: [
+          { status: "pending", expiresAt: { gt: now } },
+          { status: "applied", appliedAt: { gt: new Date(now.getTime() - APPROVAL_TTL_MS) } },
+        ],
+      },
+      orderBy: { requestedAt: "desc" },
+      take: 20,
+    });
+    const used = new Set(
+      (await prisma.idempotencyKey.findMany({ where: { key: { in: rows.map((r) => `privileged_use:${r.id}`) } }, select: { key: true } })).map((k) => k.key.slice("privileged_use:".length)),
+    );
+    return rows.flatMap((r) => {
+      const p = payloadItems(r.payload);
+      if (!p || used.has(r.id)) return [];
+      const until = r.status === "pending" ? r.expiresAt : new Date(r.appliedAt!.getTime() + APPROVAL_TTL_MS);
+      return [{ approvalId: r.id, action: p.action, itemCount: p.items.length, items: p.items, state: r.status === "pending" ? ("pending" as const) : ("approved" as const), until: until.toISOString() }];
+    });
+  },
+
+  /** This person's approved, unused approval for exactly this run, if any: asking again then starts it, never a new request (N2-21). */
+  async readyApproval(actor: Actor, action: BulkAction, environment: ApprovalEnvironment, ids: readonly string[], now: Date = new Date()): Promise<string | null> {
+    const hash = bulkItemsHash(ids);
+    const open = await bulkListingService.openApprovals(actor, now);
+    const match = open.find((o) => o.state === "approved" && o.action === action && bulkItemsHash(o.items) === hash);
+    if (!match) return null;
+    const row = await prisma.privilegedApproval.findUnique({ where: { id: match.approvalId }, select: { environment: true } });
+    return row?.environment === environment ? match.approvalId : null;
+  },
+
+  /** The frozen list an approval was asked for (start reads it from the approval, never from the client). */
+  async approvalItems(actor: Actor, approvalId: string): Promise<{ action: BulkAction; items: string[] }> {
+    const row = await prisma.privilegedApproval.findUnique({ where: { id: approvalId }, select: { requestedBy: true, operation: true, payload: true } });
+    if (!row || row.operation !== "instant.activate.bulk") throw Errors.notFound("Bulk approval");
+    if (row.requestedBy !== actor.id) throw Errors.conflict("The administrator who asked for this run starts it", { reason: "requester_starts" });
+    const p = payloadItems(row.payload);
+    if (!p) throw Errors.conflict("This approval names no listings");
+    return p;
+  },
+
   /** Whether `actor` asked for the approval (the person who starts a run under it, review N2-10). */
   async isRequester(actor: Actor, approvalId: string): Promise<boolean> {
     const row = await prisma.privilegedApproval.findUnique({ where: { id: approvalId }, select: { requestedBy: true } });
@@ -408,7 +478,18 @@ async function freeCancellationItem(
   const parsed = activitySchema.safeParse(product.content);
   if (!parsed.success) return { state: "failed", outcome: "content_invalid" };
   const doc = parsed.data as Activity;
-  if (doc.freeCancellationHours === window && doc.cancellationPolicy === text && links.every((l) => l.issuesTicketsAtConfirm === "no")) return { state: "skipped", outcome: "already_confirmed" };
+  if (doc.freeCancellationHours === window && doc.cancellationPolicy === text && links.every((l) => l.issuesTicketsAtConfirm === "no")) {
+    // Review N2-17: a resumed item whose earlier attempt rewrote the text but stopped before re-arming arms it now.
+    if (wasInstant && product.fulfilmentMode === "inquiry") {
+      try {
+        const r = await catalogService.setProductModeForBulk(actor, productId, "instant", why, run);
+        return { state: "applied", outcome: r.effectiveMode === "instant" ? "confirmed_rearmed_instant" : "confirmed_rearmed_inquiry_until_ready" };
+      } catch (error) {
+        return { state: "failed", outcome: `${DISARMED_OUTCOME}rearm_${reasonOf(error)}`.slice(0, 120) };
+      }
+    }
+    return { state: "skipped", outcome: "already_confirmed" };
+  }
   const { id: _id, rating: _r, reviewCount: _rc, bookedThisMonth: _b, ...input } = doc;
   const next = { ...input, freeCancellationHours: window, cancellationPolicy: text };
   if (!activityInputSchema.safeParse(next).success) return { state: "failed", outcome: "content_invalid" };

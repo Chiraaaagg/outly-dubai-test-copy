@@ -61,19 +61,38 @@ function useDemotions(proofId: string) {
   return { count, error, checking, check };
 }
 
+function demotionMessage(count: number | null, checking: boolean): string {
+  if (checking) return "Checking which listings this changes.";
+  if (count === null) return "";
+  if (count === 0) return "No listing selling instantly today changes.";
+  return `${count} listing${count === 1 ? "" : "s"} selling instantly today would go to inquiry. Type ${count} to confirm.`;
+}
+
+/**
+ * The demotion count. Review N2-19: the live region is mounted empty with the
+ * dialog and only its text changes, so the count is announced; errors use
+ * role="alert".
+ */
 function DemotionNotice({ count, error, checking, inputId }: { count: number | null; error: string | null; checking: boolean; inputId: string }) {
-  if (checking) return <p className="text-xs text-ink-600" role="status">Checking which listings this changes…</p>;
-  if (error) return <p className="text-xs font-semibold text-[var(--color-danger)]" role="alert">{error}</p>;
-  if (count === null) return null;
-  if (count === 0) return <p className="text-xs text-ink-600" role="status">No listing selling instantly today changes.</p>;
+  const message = error ? "" : demotionMessage(count, checking);
   return (
-    <label htmlFor={inputId} className="block text-xs font-semibold text-[var(--color-danger)]">
-      <span role="status">
-        {count} listing{count === 1 ? "" : "s"} selling instantly today would go to inquiry.
-      </span>{" "}
-      Type {count} to confirm.
-      <input id={inputId} name="confirmDemotions" required inputMode="numeric" pattern={String(count)} className={`${INPUT_CLASS} mt-1 min-h-10 w-32 font-mono text-sm font-normal`} />
-    </label>
+    <>
+      <div role="status" aria-live="polite" aria-atomic="true" className="sr-only">
+        {message}
+      </div>
+      {error && (
+        <p className="text-xs font-semibold text-[var(--color-danger)]" role="alert">
+          {error}
+        </p>
+      )}
+      {!error && (checking || count === 0) && <p className="text-xs text-ink-600">{message}</p>}
+      {!error && !checking && count !== null && count > 0 && (
+        <label htmlFor={inputId} className="block text-xs font-semibold text-[var(--color-danger)]">
+          {message}
+          <input id={inputId} name="confirmDemotions" required inputMode="numeric" pattern={String(count)} className={`${INPUT_CLASS} mt-1 min-h-10 w-32 font-mono text-sm font-normal`} />
+        </label>
+      )}
+    </>
   );
 }
 
