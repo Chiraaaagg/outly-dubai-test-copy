@@ -5,7 +5,9 @@ import { sha256Hex } from "../lib/crypto";
 import { prisma, TX_OPTIONS } from "../lib/db";
 import { Errors } from "../lib/errors";
 import { uuidv7 } from "../lib/ids";
-import { activitySchema } from "../schemas/activity.schema";
+import { activityInputSchema, activitySchema } from "../schemas/activity.schema";
+import { travelDeskExternalRefSchema } from "../suppliers/traveldesk/traveldesk.adapter";
+import { DISARMED_OUTCOME } from "./bulk-guard";
 import type { Activity } from "@/lib/types";
 import { activityService, type ActivityListFilters } from "./activity.service";
 import { APPROVAL_TTL_MS, MAX_ITEMS_PER_RUN, type ApprovalEnvironment } from "./approval.service";
@@ -58,7 +60,9 @@ export const BULK_RUN_MAX = MAX_ITEMS_PER_RUN;
 /** How long a run may execute its items after it was started. */
 export const BULK_WINDOW_MS = APPROVAL_TTL_MS;
 
-export type BulkItemState = "pending" | "applied" | "skipped" | "failed";
+export type BulkItemState = "pending" | "running" | "applied" | "skipped" | "failed";
+/** How long one run holds an item it is executing; a lapsed claim (a crash) can be taken again. */
+const CLAIM_MS = 5 * 60_000;
 
 export interface BulkItemResult {
   productId: string;
@@ -190,7 +194,10 @@ export const bulkListingService = {
       let approvalMode: string | null = null;
       if (loosening) {
         await useApproval(tx, actor, opts.approvalId!, "instant.activate.bulk", bulkApprovalPayload(input.action, opts.environment, items), opts.environment, now);
-        approvalMode = (await tx.privilegedApproval.findUniqueOrThrow({ where: { id: opts.approvalId! }, select: { approvalMode: true } })).approvalMode;
+        const approval = await tx.privilegedApproval.findUniqueOrThrow({ where: { id: opts.approvalId! }, select: { approvalMode: true, requestedBy: true } });
+        // Review N2-10: the person who asked for the run starts and runs it; a second administrator only approves.
+        if (approval.requestedBy !== actor.id) throw Errors.conflict("The administrator who asked for this run starts it; your request approved it", { reason: "requester_starts" });
+        approvalMode = approval.approvalMode;
       }
       await tx.bulkOperation.create({
         data: {
@@ -220,10 +227,13 @@ export const bulkListingService = {
   },
 
   /**
-   * Run the pending items of a run. Only the person who started it, only in
-   * its window. Each item commits alone and is never re-run once finished.
-   * `source` is the written answer for `free_cancellation` (not stored on
-   * the run; each link records it).
+   * Run the open items of a run. Only the person who started it, only in its
+   * window. Each item is claimed first (`pending` → `running` with a lease,
+   * recording the listing's requested mode on the first claim), so two runs
+   * never execute one item; a claim whose lease lapsed (a crash) can be taken
+   * again. Each item commits alone and is never re-run once finished.
+   * `source` is the written answer for `free_cancellation` (not stored on the
+   * run; each link records it).
    */
   async run(actor: Actor, bulkId: string, opts: { source?: string; now?: Date } = {}): Promise<BulkRunResult> {
     const bulk = await prisma.bulkOperation.findUnique({ where: { id: bulkId }, include: { items: { orderBy: { position: "asc" } } } });
@@ -237,114 +247,196 @@ export const bulkListingService = {
 
     if (!expired) {
       for (const item of bulk.items) {
-        if (item.state !== "pending") continue;
+        if (item.state !== "pending" && item.state !== "running") continue;
+        const now = clock();
         // The window is checked before each item: a run never starts an item after it closed.
-        if (clock().getTime() >= bulk.expiresAt.getTime()) break;
-        let state: Exclude<BulkItemState, "pending">;
+        if (now.getTime() >= bulk.expiresAt.getTime()) break;
+        const claim = await prisma.$queryRaw<{ was_instant: boolean | null }[]>`
+          UPDATE bulk_operation_items i
+          SET state = 'running', claimed_until = ${new Date(now.getTime() + CLAIM_MS)},
+              was_instant = COALESCE(i.was_instant, (SELECT p.fulfilment_mode = 'instant' FROM products p WHERE p.id = i.product_id))
+          WHERE i.id = ${item.id}::uuid AND (i.state = 'pending' OR (i.state = 'running' AND i.claimed_until < ${now}))
+          RETURNING i.was_instant`;
+        if (claim.length === 0) continue; // another run holds it
+        const wasInstant = claim[0].was_instant === true;
+        let state: FinishedState;
         let outcome: string;
         try {
-          const r = await runItem(actor, action, item.productId, bulk, source);
+          const r = await runItem(actor, action, item.productId, bulk, source, wasInstant, now);
           state = r.state;
           outcome = r.outcome;
         } catch (error) {
           state = "failed";
           outcome = reasonOf(error);
         }
-        const finished = await prisma.bulkOperationItem.updateMany({ where: { id: item.id, state: "pending" }, data: { state, outcome, finishedAt: new Date() } });
+        const finished = await prisma.bulkOperationItem.updateMany({ where: { id: item.id, state: "running" }, data: { state, outcome, finishedAt: new Date(), claimedUntil: null } });
         if (finished.count === 1) {
           await audit(actor, "bulk_operation.item", { type: "product", id: item.productId }, { after: { bulkId, action, state, outcome } });
         }
       }
-      const open = await prisma.bulkOperationItem.count({ where: { bulkId, state: "pending" } });
+      const open = await prisma.bulkOperationItem.count({ where: { bulkId, state: { in: ["pending", "running"] } } });
       if (open === 0) await prisma.bulkOperation.updateMany({ where: { id: bulkId, finishedAt: null }, data: { finishedAt: new Date() } });
     }
 
     const items = await prisma.bulkOperationItem.findMany({ where: { bulkId }, orderBy: { position: "asc" } });
     const pick = (s: BulkItemState) => items.filter((i) => i.state === s).map((i) => ({ productId: i.productId, state: s, outcome: i.outcome }));
+    const unfinished = items.filter((i) => i.state === "pending" || i.state === "running");
     return {
       bulkId,
       action,
-      expired: expired || items.some((i) => i.state === "pending"),
+      expired: expired || unfinished.length > 0,
       applied: pick("applied"),
       skipped: pick("skipped"),
       failed: pick("failed"),
-      remaining: items.filter((i) => i.state === "pending").map((i) => i.productId),
+      remaining: unfinished.map((i) => i.productId),
     };
   },
 
-  /** The pending items of an expired run: what a new approval would cover. */
+  /** Whether `actor` asked for the approval (the person who starts a run under it, review N2-10). */
+  async isRequester(actor: Actor, approvalId: string): Promise<boolean> {
+    const row = await prisma.privilegedApproval.findUnique({ where: { id: approvalId }, select: { requestedBy: true } });
+    return Boolean(row && actor.id && row.requestedBy === actor.id);
+  },
+
+  /** The unfinished items of an expired run: what a new approval would cover. */
   async remainingItems(actor: Actor, bulkId: string): Promise<string[]> {
     requirePermission(actor, "products.edit");
-    const items = await prisma.bulkOperationItem.findMany({ where: { bulkId, state: "pending" }, select: { productId: true } });
+    const items = await prisma.bulkOperationItem.findMany({ where: { bulkId, state: { in: ["pending", "running"] } }, select: { productId: true } });
     return freezeItems(items.map((i) => i.productId));
   },
 };
+
+type FinishedState = "applied" | "skipped" | "failed";
 
 async function runItem(
   actor: Actor,
   action: BulkAction,
   productId: string,
-  bulk: { id: string; approvalId: string | null; reason: string },
+  bulk: { id: string; reason: string },
   source: string | null,
-): Promise<{ state: "applied" | "skipped" | "failed"; outcome: string }> {
+  wasInstant: boolean,
+  now: Date,
+): Promise<{ state: FinishedState; outcome: string }> {
   const why = `${bulk.reason} (bulk ${bulk.id})`;
+  const run = { bulkId: bulk.id, now };
   if (action === "arm") {
-    const r = await catalogService.setProductModeForBulk(actor, productId, "instant", why, { bulkId: bulk.id, approvalId: bulk.approvalId });
+    const r = await catalogService.setProductModeForBulk(actor, productId, "instant", why, run);
     return { state: r.state, outcome: r.state === "applied" ? (r.effectiveMode === "instant" ? "armed_instant" : "armed_inquiry_until_ready") : r.outcome };
   }
   if (action === "inquiry") {
-    const r = await catalogService.setProductModeForBulk(actor, productId, "inquiry", why, { bulkId: bulk.id, approvalId: null });
+    const r = await catalogService.setProductModeForBulk(actor, productId, "inquiry", why, run);
     return { state: r.state, outcome: r.outcome };
   }
-  return freeCancellationItem(actor, productId, bulk, source!, why);
+  return freeCancellationItem(actor, productId, run, source!, why, wasInstant);
 }
 
-/** One listing of a "free cancellation confirmed" run (D6). Stops at the first refusal; the listing is then left on inquiry. */
+/** A free-cancellation link as the pre-check reads it. */
+export interface FreeCancellationLink {
+  mappingId: string;
+  /** The stored mapping row, or null when readiness named a mapping the database no longer has. */
+  row: { isActive: boolean; adapter: string; bookingKind: string | null; refBookingKind: string | null; refReadable: boolean } | null;
+  issuesTicketsAtConfirm: "yes" | "no" | "unknown";
+  supplierFreeCancellationHours: number | null;
+  dateOnlySellable: boolean;
+}
+
+/**
+ * Pre-check of one free-cancellation listing, before anything is written
+ * (review N2-02, N2-04). Pure. `skip`: nothing to do for a good reason;
+ * `fail`: a link the run could not write. Tickets (by booking kind, whatever
+ * their key's state) and links with a recorded "yes" are never confirmed.
+ */
+export function freeCancellationPrecheck(links: readonly FreeCancellationLink[]): { skip?: string; fail?: string; window?: number; dateOnly?: boolean } {
+  if (links.length === 0) return { skip: "no_traveldesk_link" };
+  if (links.some((l) => l.row?.bookingKind === "ticket_only" || l.row?.refBookingKind === "ticket_only")) return { skip: "ticket_never_refundable" };
+  if (links.some((l) => l.issuesTicketsAtConfirm === "yes")) return { skip: "ticket_issued_recorded" };
+  if (links.some((l) => !l.row || !l.row.isActive)) return { fail: "link_inactive" };
+  if (links.some((l) => l.row!.adapter !== "traveldesk" || !l.row!.refReadable)) return { fail: "link_unreadable" };
+  const hours = links.map((l) => l.supplierFreeCancellationHours);
+  if (hours.some((h) => h === null)) return { fail: "supplier_policy_unknown" };
+  if (hours.some((h) => h === 0)) return { skip: "supplier_non_refundable" };
+  const dateOnly = links.every((l) => l.dateOnlySellable);
+  if (!dateOnly && links.some((l) => l.dateOnlySellable)) return { fail: "mixed_date_only_options" };
+  // The page's window must be at least every option's supplier window (policyWithinSupplier).
+  return { window: Math.max(...(hours as number[])), dateOnly };
+}
+
+/**
+ * One listing of a "free cancellation confirmed" run (D6). Every check runs
+ * before the first write: the links (active, readable, not a ticket, no
+ * recorded "yes"), the supplier windows and the new content. Then: disarm,
+ * record "no ticket at confirmation" per link, rewrite the text, arm again if
+ * the listing was armed when the item was first claimed (`wasInstant`, kept on
+ * the item, so a resumed item still re-arms). A failure after the disarm
+ * re-arms the listing when it can (`failed_after_disarm_rearmed:<code>`);
+ * when it cannot, the item is `failed_after_disarm:<code>`, which raises an
+ * ops alert (bulk-guard.ts).
+ */
 async function freeCancellationItem(
   actor: Actor,
   productId: string,
-  bulk: { id: string; approvalId: string | null },
+  run: { bulkId: string; now: Date },
   source: string,
   why: string,
-): Promise<{ state: "applied" | "skipped" | "failed"; outcome: string }> {
+  wasInstant: boolean,
+): Promise<{ state: FinishedState; outcome: string }> {
   const assessed = await readinessService.assess(productId);
   const product = await prisma.product.findUnique({ where: { id: productId }, select: { id: true, fulfilmentMode: true, deletedAt: true, version: true, content: true } });
   if (!product || product.deletedAt) return { state: "failed", outcome: "not_found" };
-  const links = assessed.mappings;
-  if (links.length === 0) return { state: "skipped", outcome: "no_traveldesk_link" };
-  // Tickets are non-refundable once issued, whatever evidence says (Batch 5).
-  if (links.some((m) => m.openDatedSellable === true)) return { state: "skipped", outcome: "ticket_never_refundable" };
-  const hours = links.map((m) => m.supplierFreeCancellationHours);
-  if (hours.some((h) => h === null)) return { state: "failed", outcome: "supplier_policy_unknown" };
-  if (hours.some((h) => h === 0)) return { state: "skipped", outcome: "supplier_non_refundable" };
-  // The page's window must be at least every option's supplier window (policyWithinSupplier).
-  const window = Math.max(...(hours as number[]));
-  const dateOnly = links.every((m) => m.dateOnlySellable === true);
-  if (!dateOnly && links.some((m) => m.dateOnlySellable === true)) return { state: "failed", outcome: "mixed_date_only_options" };
+  const rows = await prisma.productSupplierMapping.findMany({
+    where: { id: { in: assessed.mappings.map((m) => m.mappingId) } },
+    select: { id: true, isActive: true, bookingKind: true, externalRef: true, supplier: { select: { adapter: true } } },
+  });
+  const links: FreeCancellationLink[] = assessed.mappings.map((m) => {
+    const row = rows.find((r) => r.id === m.mappingId);
+    const ref = row ? travelDeskExternalRefSchema.safeParse(row.externalRef) : null;
+    return {
+      mappingId: m.mappingId,
+      row: row
+        ? { isActive: row.isActive, adapter: row.supplier.adapter, bookingKind: row.bookingKind, refBookingKind: ref?.success ? ref.data.bookingKind : null, refReadable: Boolean(ref?.success) }
+        : null,
+      issuesTicketsAtConfirm: m.issuesTicketsAtConfirm,
+      supplierFreeCancellationHours: m.supplierFreeCancellationHours,
+      dateOnlySellable: m.dateOnlySellable === true,
+    };
+  });
+  const pre = freeCancellationPrecheck(links);
+  if (pre.skip) return { state: "skipped", outcome: pre.skip };
+  if (pre.fail) return { state: "failed", outcome: pre.fail };
+  const window = pre.window!;
+  const text = freeCancellationText(window, pre.dateOnly!);
   const parsed = activitySchema.safeParse(product.content);
   if (!parsed.success) return { state: "failed", outcome: "content_invalid" };
-  const text = freeCancellationText(window, dateOnly);
   const doc = parsed.data as Activity;
-  const alreadyDone = doc.freeCancellationHours === window && doc.cancellationPolicy === text && links.every((m) => m.issuesTicketsAtConfirm === "no");
-  if (alreadyDone) return { state: "skipped", outcome: "already_confirmed" };
-
-  const wasArmed = product.fulfilmentMode === "instant";
-  // 1. Disarm: `setTicketEvidence` refuses "no" while a listing is instant.
-  if (wasArmed) await catalogService.setProductModeForBulk(actor, productId, "inquiry", why, { bulkId: bulk.id, approvalId: null });
-  // 2. Record the answer with its source on every link.
-  for (const m of links) {
-    await supplierCatalogService.recordNoTicketForBulk(actor, m.mappingId, source, why, { bulkId: bulk.id, approvalId: bulk.approvalId! });
-  }
-  // 3. Rewrite the cancellation text (a version row and an audit row through the activity service).
+  if (doc.freeCancellationHours === window && doc.cancellationPolicy === text && links.every((l) => l.issuesTicketsAtConfirm === "no")) return { state: "skipped", outcome: "already_confirmed" };
   const { id: _id, rating: _r, reviewCount: _rc, bookedThisMonth: _b, ...input } = doc;
-  await activityService.update(actor, productId, { ...input, freeCancellationHours: window, cancellationPolicy: text }, {
-    reason: why,
-    expectedVersion: product.version,
-  });
-  // 4. Arm again, under the same approval, if it was armed.
-  if (wasArmed) {
-    const r = await catalogService.setProductModeForBulk(actor, productId, "instant", why, { bulkId: bulk.id, approvalId: bulk.approvalId });
-    return { state: "applied", outcome: r.effectiveMode === "instant" ? "confirmed_rearmed_instant" : "confirmed_rearmed_inquiry_until_ready" };
+  const next = { ...input, freeCancellationHours: window, cancellationPolicy: text };
+  if (!activityInputSchema.safeParse(next).success) return { state: "failed", outcome: "content_invalid" };
+
+  // 1. Disarm: `setTicketEvidence` refuses "no" while a listing is instant.
+  if (product.fulfilmentMode === "instant") await catalogService.setProductModeForBulk(actor, productId, "inquiry", why, run);
+  try {
+    // 2. Record the answer with its source on every link.
+    for (const l of links) await supplierCatalogService.recordNoTicketForBulk(actor, l.mappingId, source, why, { bulkId: run.bulkId }, run.now);
+    // 3. Rewrite the cancellation text (a version row and an audit row through the activity service).
+    await activityService.update(actor, productId, next, { reason: why, expectedVersion: product.version });
+  } catch (error) {
+    if (!wasInstant) return { state: "failed", outcome: reasonOf(error) };
+    try {
+      await catalogService.setProductModeForBulk(actor, productId, "instant", why, run);
+      return { state: "failed", outcome: `failed_after_disarm_rearmed:${reasonOf(error)}`.slice(0, 120) };
+    } catch {
+      return { state: "failed", outcome: `${DISARMED_OUTCOME}${reasonOf(error)}`.slice(0, 120) };
+    }
+  }
+  // 4. Arm again, under the same approval, if it was armed when first claimed.
+  if (wasInstant) {
+    try {
+      const r = await catalogService.setProductModeForBulk(actor, productId, "instant", why, run);
+      return { state: "applied", outcome: r.effectiveMode === "instant" ? "confirmed_rearmed_instant" : "confirmed_rearmed_inquiry_until_ready" };
+    } catch (error) {
+      return { state: "failed", outcome: `${DISARMED_OUTCOME}rearm_${reasonOf(error)}`.slice(0, 120) };
+    }
   }
   return { state: "applied", outcome: "confirmed" };
 }

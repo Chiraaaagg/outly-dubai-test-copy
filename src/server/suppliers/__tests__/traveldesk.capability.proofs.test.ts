@@ -113,6 +113,10 @@ describe("class proofs in capabilityVerdict (doc 30 N2)", () => {
     expect(proofCovers(proof({ revokedAt: "2026-11-27T00:00:00.000Z" }), SINGLE, "3001", null)).toBe(false);
     expect(proofCovers(proof(), PICKUP, "3001", null)).toBe(false);
     expect(proofCovers(proof({ scopeKind: "unexpected" }), SINGLE, "3001", null)).toBe(false);
+    // D21 (review N2-08): an all-offers row on an external key covers nothing, whatever a row says.
+    const ext = "live.fixed_slot_single.self.external.per_person";
+    expect(proofCovers(proof({ classKey: ext }), ext, "3001", null)).toBe(false);
+    expect(proofCovers(proof({ classKey: ext, scopeKind: "tours", scopeTourIds: ["3001"] }), ext, "3001", null)).toBe(true);
   });
 
   it("no TravelDesk payload names a provider today, so a provider scope covers nothing (condition 3)", () => {

@@ -333,6 +333,7 @@ model AdminUser {
   waConversations    WaConversation[]
   approvalsRequested PrivilegedApproval[] @relation("ApprovalRequestedBy")
   approvalsApproved  PrivilegedApproval[] @relation("ApprovalApprovedBy")
+  bulkOperations     BulkOperation[]
   refundsRequested   Refund[]
 
   @@index([status], map: "admin_users_status_idx")
@@ -545,6 +546,7 @@ model Supplier {
   bookings          SupplierBooking[]
   offerCapabilities SupplierOfferCapability[]
   offerEnablements  SupplierOfferEnablement[]
+  classProofs       SupplierClassProof[]
 
   @@map("suppliers")
 }
@@ -588,6 +590,7 @@ model Product {
   orderItems        OrderItem[]
   versions          ProductVersion[]
   importItems       ImportBatchItem[]
+  bulkItems         BulkOperationItem[]
   eligibility       ProductEligibility?
 
   @@index([tier, status], map: "products_tier_status_idx")
@@ -1027,6 +1030,7 @@ model PrivilegedApproval {
   itemCount    Int                 @default(1) @map("item_count")
   requester    AdminUser           @relation("ApprovalRequestedBy", fields: [requestedBy], references: [id], onDelete: Restrict)
   approver     AdminUser?          @relation("ApprovalApprovedBy", fields: [approvedBy], references: [id], onDelete: Restrict)
+  bulkRuns     BulkOperation[]
 
   @@index([payloadHash, status], map: "pa_payload_status_idx")
   @@index([requestedBy, requestedAt(sort: Desc)], map: "pa_requested_by_idx")
@@ -2447,40 +2451,45 @@ model CrmReturnFinding {
   @@map("crm_return_findings")
 }
 
-/// Doc 30 N2 (migration 20261127150000): one proof per offer type (D14), with a scope: every offer of the key,
-/// one external provider (D21) or named tours (D24). Fixed once recorded (database trigger); revoked, never edited.
-/// `basisClassKey` is the key the supervised booking was made on: the key itself, or a neighbour differing in time
-/// shape alone (decision 22, D20). No Prisma relation: the foreign key to suppliers lives in the migration.
+/// Doc 30 N2 (migrations 20261127150000, 20261127160000): one proof per offer type (D14), with a scope: every
+/// offer of the key, one external provider (D21) or named tours (D24). Fixed once recorded and never deleted
+/// (database triggers); revoked, never edited. `basisClassKey` is the key the supervised booking was made on: the
+/// key itself, or a neighbour differing in time shape alone (decision 22, D20).
 model SupplierClassProof {
-  id            String              @id @db.Uuid
-  supplierId    String              @map("supplier_id") @db.Uuid
-  environment   SupplierEnvironment
-  classKey      String              @map("class_key")
-  basisClassKey String              @map("basis_class_key")
+  id             String              @id @db.Uuid
+  supplierId     String              @map("supplier_id") @db.Uuid
+  environment    SupplierEnvironment
+  classKey       String              @map("class_key")
+  basisClassKey  String              @map("basis_class_key")
   /// all | provider | tours
-  scopeKind     String              @map("scope_kind")
-  scopeProvider String?             @map("scope_provider")
+  scopeKind      String              @map("scope_kind")
+  scopeProvider  String?             @map("scope_provider")
   /// TravelDesk tour ids (decimal strings) for the `tours` scope; empty otherwise.
-  scopeTourIds  String[]            @default([]) @map("scope_tour_ids")
+  scopeTourIds   String[]            @default([]) @map("scope_tour_ids")
   /// production_booking | sandbox_drill
-  evidenceKind  String              @map("evidence_kind")
+  evidenceKind   String              @map("evidence_kind")
   /// The supervised booking (or drill) reference. Never a price or personal data.
-  reference     String
+  reference      String
   /// The proof this row widens, when it is a widening (informational; the wider row stands alone).
-  widensProofId String?             @map("widens_proof_id") @db.Uuid
-  approvalId    String?             @map("approval_id") @db.Uuid
-  recordedBy    String?             @map("recorded_by") @db.Uuid
-  recordedAt    DateTime            @default(now()) @map("recorded_at") @db.Timestamptz(6)
-  revokedAt     DateTime?           @map("revoked_at") @db.Timestamptz(6)
-  revokedBy     String?             @map("revoked_by") @db.Uuid
-  revokeReason  String?             @map("revoke_reason")
+  widensProofId  String?             @map("widens_proof_id") @db.Uuid
+  /// The proof this row replaced by narrowing it; that proof was revoked in the same transaction (review N2-01).
+  narrowsProofId String?             @map("narrows_proof_id") @db.Uuid
+  /// The TravelDesk tour the supervised booking was made on; a named-tours scope contains it (review N2-03).
+  bookedTourId   String?             @map("booked_tour_id")
+  approvalId     String?             @map("approval_id") @db.Uuid
+  recordedBy     String?             @map("recorded_by") @db.Uuid
+  recordedAt     DateTime            @default(now()) @map("recorded_at") @db.Timestamptz(6)
+  revokedAt      DateTime?           @map("revoked_at") @db.Timestamptz(6)
+  revokedBy      String?             @map("revoked_by") @db.Uuid
+  revokeReason   String?             @map("revoke_reason")
+  supplier       Supplier            @relation(fields: [supplierId], references: [id], onDelete: Restrict)
 
   @@index([supplierId, environment, classKey], map: "scp_key_idx")
   @@map("supplier_class_proofs")
 }
 
-/// Doc 30 N2 (migration 20261127150000): one bulk run over at most 50 listings. Loosening actions (arm,
-/// free_cancellation) burn one approval when the row is created (unique approval id); `inquiry` needs none.
+/// Doc 30 N2 (migrations 20261127150000, 20261127160000): one bulk run over at most 50 listings. Loosening actions
+/// (arm, free_cancellation) burn one approval when the row is created (unique approval id); `inquiry` needs none.
 /// Items run only by `requestedBy`, only until `expiresAt` (30 minutes).
 model BulkOperation {
   id           String              @id @db.Uuid
@@ -2498,21 +2507,29 @@ model BulkOperation {
   expiresAt    DateTime            @map("expires_at") @db.Timestamptz(6)
   finishedAt   DateTime?           @map("finished_at") @db.Timestamptz(6)
   items        BulkOperationItem[]
+  requester    AdminUser           @relation(fields: [requestedBy], references: [id], onDelete: Restrict)
+  approval     PrivilegedApproval? @relation(fields: [approvalId], references: [id], onDelete: Restrict)
 
   @@index([requestedBy, createdAt(sort: Desc)], map: "bo_requested_by_idx")
   @@map("bulk_operations")
 }
 
-/// One listing of a bulk run. pending | applied | skipped | failed; `outcome` is a short reason code.
+/// One listing of a bulk run. pending | running (claimed until `claimedUntil`) | applied | skipped | failed;
+/// `outcome` is a short reason code.
 model BulkOperationItem {
-  id         String        @id @db.Uuid
-  bulkId     String        @map("bulk_id") @db.Uuid
-  productId  String        @map("product_id") @db.Uuid
-  position   Int
-  state      String        @default("pending")
-  outcome    String?
-  finishedAt DateTime?     @map("finished_at") @db.Timestamptz(6)
-  bulk       BulkOperation @relation(fields: [bulkId], references: [id], onDelete: Restrict)
+  id           String        @id @db.Uuid
+  bulkId       String        @map("bulk_id") @db.Uuid
+  productId    String        @map("product_id") @db.Uuid
+  position     Int
+  state        String        @default("pending")
+  outcome      String?
+  finishedAt   DateTime?     @map("finished_at") @db.Timestamptz(6)
+  /// A claim: another run never executes a running item before this time (review N2-04).
+  claimedUntil DateTime?     @map("claimed_until") @db.Timestamptz(6)
+  /// The requested mode was instant when the item was first claimed (review N2-04).
+  wasInstant   Boolean?      @map("was_instant")
+  bulk         BulkOperation @relation(fields: [bulkId], references: [id], onDelete: Restrict)
+  product      Product       @relation(fields: [productId], references: [id], onDelete: Restrict)
 
   @@unique([bulkId, productId], map: "boi_bulk_product_key")
   @@index([productId], map: "boi_product_idx")

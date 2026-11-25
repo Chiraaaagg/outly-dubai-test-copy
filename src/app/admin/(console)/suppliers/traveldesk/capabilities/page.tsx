@@ -6,7 +6,8 @@ import { ownerAlertRecipient } from "@/server/services/owner-alert";
 import { supplierCapabilityService, type CapabilityClassRow, type ClassProofRow, type EvidenceRow } from "@/server/services/supplier-capability.service";
 import { requirePage } from "../../../../_lib/guard";
 import { DataTable, PageHeader, Panel, StatCard, StatusPill, fmtDateTime, type DataColumn } from "../../../../_components/ui";
-import { EvidenceForm, FlagForm, ProofForm, RevokeEvidenceForm, RevokeProofForm } from "./capability-forms";
+import { EvidenceForm, FlagForm, RevokeEvidenceForm } from "./capability-forms";
+import { ProofActions, RecordProofDialog } from "./proof-dialogs";
 
 /**
  * /admin/suppliers/traveldesk/capabilities — capability-class flags and
@@ -130,7 +131,29 @@ export default async function CapabilityFlagsPage({ searchParams }: { searchPara
           <StatusPill tone="success">active</StatusPill>
         ),
     },
-    { key: "action", header: <span className="sr-only">Revoke</span>, cell: (p) => (p.revokedAt ? null : <RevokeProofForm proofId={p.id} />) },
+    {
+      key: "action",
+      header: <span className="sr-only">Actions</span>,
+      cell: (p) =>
+        p.revokedAt || !canEnable ? null : (
+          <ProofActions
+            environment={env}
+            oneStep={oneStep}
+            classKeys={proofKeys}
+            proof={{
+              id: p.id,
+              widensProofId: p.id,
+              classKey: p.classKey,
+              basisClassKey: p.basisClassKey,
+              scopeKind: p.scopeKind,
+              scopeTourIds: p.scopeTourIds,
+              bookedTourId: p.bookedTourId,
+              evidenceKind: p.evidenceKind,
+              reference: p.reference,
+            }}
+          />
+        ),
+    },
   ];
 
   const evidenceColumns: DataColumn<EvidenceRow>[] = [
@@ -155,7 +178,7 @@ export default async function CapabilityFlagsPage({ searchParams }: { searchPara
           </StatusPill>
         ),
     },
-    { key: "action", header: <span className="sr-only">Revoke</span>, cell: (e) => (e.revokedAt ? null : <RevokeEvidenceForm evidenceId={e.id} />) },
+    { key: "action", header: <span className="sr-only">Revoke</span>, cell: (e) => (e.revokedAt ? null : <RevokeEvidenceForm evidenceId={e.id} label={`Revoke evidence for offer ${e.offerExternalId}, ${e.classKey}`} />) },
   ];
 
   return (
@@ -228,12 +251,11 @@ export default async function CapabilityFlagsPage({ searchParams }: { searchPara
         title="Class proofs"
         sub="One proof per offer type (doc 30 §3.12): every offer of the key, one external provider, or named tours. A proof does not lapse when terms change. Recording the first proof for a seeded key ends its no-evidence exception."
       >
-        {/* TODO(doc 30 decision 23): widen and revoke move into the owner-picked confirm dialog with code field and result list. */}
         <DataTable columns={proofColumns} rows={view.proofs} rowKey={(p) => p.id} caption={`Class proofs, ${env}`} empty="No class proof recorded in this environment." />
         {canEnable && (
-          <div className="mt-5 border-t border-ink-100 pt-4">
-            <h3 className="mb-3 text-sm font-semibold text-ink-900">Record or widen a proof</h3>
-            <ProofForm environment={env} classKeys={proofKeys} oneStep={oneStep} />
+          <div className="mt-4 flex flex-wrap items-center gap-3 border-t border-ink-100 pt-4">
+            <RecordProofDialog environment={env} classKeys={proofKeys} oneStep={oneStep} />
+            <p className="text-xs text-ink-600">Widen, narrow or revoke a proof from its row.</p>
           </div>
         )}
       </Panel>

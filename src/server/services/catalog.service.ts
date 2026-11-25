@@ -1,6 +1,6 @@
 import "server-only";
 import type { Prisma } from "@prisma/client";
-import { prisma } from "../lib/db";
+import { prisma, TX_OPTIONS } from "../lib/db";
 import type { Actor } from "../lib/actor";
 import { requirePermission } from "../lib/actor";
 import { audit } from "../lib/audit";
@@ -12,6 +12,7 @@ import { supplierFor } from "../suppliers/registry";
 import type { PrivilegedApproval } from "../suppliers/booking-port";
 import { approvalService, type ApprovalEnvironment } from "./approval.service";
 import { readinessService } from "./readiness.service";
+import { assertBulkItemInTx } from "./bulk-guard";
 import { log } from "../lib/logger";
 import type { ReadinessResult } from "../quotes/contracts";
 import { activityBySlug as fixtureActivityBySlug } from "@/lib/data/activities";
@@ -412,37 +413,43 @@ export const catalogService = {
 
   /**
    * One item of a bulk run (doc 30 §3.12; bulk-listing.service.ts): write the
-   * requested mode of one product under a run that already burned its
-   * approval (`bulk.approvalId`; null for back to inquiry, which needs none).
-   * Instant ("arm") re-runs every check of the single flip before writing;
-   * the effective mode stays readiness's verdict, so an armed listing sells
-   * as inquiry until every check passes. A product already in the mode is
-   * skipped. The audit row names the bulk run. Throws on a refusal; the run
-   * records it as that item's failure.
+   * requested mode of one product for run `bulk.bulkId`. The run itself is
+   * checked here, in the transaction of the write (review N2-06,
+   * `assertBulkItemInTx`): started by this person, inside its window, this
+   * product a running item of it, and for instant an `arm` or
+   * `free_cancellation` run with an applied approval. Instant ("arm") re-runs
+   * every check of the single flip before writing; the effective mode stays
+   * readiness's verdict, so an armed listing sells as inquiry until every
+   * check passes. A product already in the mode is skipped. The audit row
+   * names the run. Throws on a refusal; the run records it as that item's
+   * failure.
    */
-  async setProductModeForBulk(
-    actor: Actor,
-    productId: string,
-    mode: FulfilmentMode,
-    reason: string,
-    bulk: { bulkId: string; approvalId: string | null },
-  ): Promise<BulkModeOutcome> {
+  async setProductModeForBulk(actor: Actor, productId: string, mode: FulfilmentMode, reason: string, bulk: { bulkId: string; now?: Date }): Promise<BulkModeOutcome> {
     requirePermission(actor, mode === "instant" ? "products.activate_instant" : "products.publish");
-    if (mode === "instant" && !bulk.approvalId) throw Errors.forbidden("products.activate_instant");
+    const now = bulk.now ?? new Date();
     const before = await prisma.product.findUnique({ where: { id: productId }, include: { mappings: { include: { supplier: true } } } });
     if (!before || before.deletedAt) throw Errors.notFound("Product");
-    if (before.fulfilmentMode === mode) return { state: "skipped", outcome: `already_${mode}`, effectiveMode: null };
     if (mode === "instant") assertInstantAllowed(before);
-    // Conditional on the mode it was read in: a concurrent flip makes this item a skip, never a double write.
-    const won = await prisma.product.updateMany({ where: { id: productId, fulfilmentMode: before.fulfilmentMode, deletedAt: null }, data: { fulfilmentMode: mode } });
-    if (won.count !== 1) return { state: "skipped", outcome: "changed_concurrently", effectiveMode: null };
-    await audit(actor, "product.fulfilment_mode", { type: "product", id: productId }, {
-      before: { fulfilmentMode: before.fulfilmentMode },
-      after: { fulfilmentMode: mode, bulkId: bulk.bulkId, ...(bulk.approvalId ? { approvalId: bulk.approvalId } : {}) },
-      reason,
-    });
+    const written = await prisma.$transaction(async (tx) => {
+      const { approvalId } = await assertBulkItemInTx(tx, actor, bulk.bulkId, productId, mode === "instant" ? "instant" : "inquiry", now);
+      const current = await tx.product.findUnique({ where: { id: productId }, select: { fulfilmentMode: true, deletedAt: true } });
+      if (!current || current.deletedAt) throw Errors.notFound("Product");
+      if (current.fulfilmentMode === mode) return { state: "skipped" as const, outcome: `already_${mode}` };
+      // Conditional on the mode it was read in: a concurrent flip makes this item a skip, never a double write.
+      const won = await tx.product.updateMany({ where: { id: productId, fulfilmentMode: current.fulfilmentMode, deletedAt: null }, data: { fulfilmentMode: mode } });
+      if (won.count !== 1) return { state: "skipped" as const, outcome: "changed_concurrently" };
+      await audit(
+        actor,
+        "product.fulfilment_mode",
+        { type: "product", id: productId },
+        { before: { fulfilmentMode: current.fulfilmentMode }, after: { fulfilmentMode: mode, bulkId: bulk.bulkId, ...(mode === "instant" && approvalId ? { approvalId } : {}) }, reason },
+        tx,
+      );
+      return { state: "applied" as const, outcome: mode === "instant" ? "armed" : "inquiry" };
+    }, TX_OPTIONS);
+    if (written.state !== "applied") return { ...written, effectiveMode: null };
     revalidateCatalog();
     const readiness = await readinessService.reevaluate(productId, "flip");
-    return { state: "applied", outcome: mode === "instant" ? "armed" : "inquiry", effectiveMode: readiness?.effective ?? null };
+    return { ...written, effectiveMode: readiness?.effective ?? null };
   },
 };

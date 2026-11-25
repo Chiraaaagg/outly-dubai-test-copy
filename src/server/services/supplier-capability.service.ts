@@ -9,6 +9,7 @@ import type { PrivilegedOperation } from "../suppliers/booking-port";
 import { CAPABILITY_ADAPTER } from "../suppliers/capability-gate";
 import {
   CAPABILITY_DERIVATION_VERSION,
+  capabilityVerdict,
   deriveCapabilities,
   capabilityKeyNote,
   DATE_ONLY_CLASS_KEYS,
@@ -165,6 +166,8 @@ export interface ClassProofInput {
   reference: string;
   /** The active proof this one widens, when it is a widening. */
   widensProofId?: string | null;
+  /** The TravelDesk tour the supervised booking was made on (review N2-03). */
+  bookedTourId: string;
 }
 
 /** The approval payload of recording a class proof: every fact of the row, normalised. */
@@ -181,6 +184,7 @@ export function classProofApprovalPayload(supplierCode: string, input: ClassProo
     evidenceKind: input.evidenceKind,
     reference: input.reference.trim(),
     widensProofId: input.widensProofId ?? null,
+    bookedTourId: (input.bookedTourId ?? "").trim(),
   };
 }
 
@@ -209,6 +213,8 @@ export interface ClassProofRow {
   evidenceKind: string;
   reference: string;
   widensProofId: string | null;
+  narrowsProofId: string | null;
+  bookedTourId: string | null;
   recordedAt: string;
   recordedBy: string | null;
   approvalId: string | null;
@@ -268,6 +274,61 @@ export interface CapabilityOverview {
   proofs: ClassProofRow[];
   /** Review 89 B6-09: enabled flag rows on the external route (none is expected before a Batch 6 switch-on). */
   externalFlagsEnabled: string[];
+}
+
+/** Listings a proof change would send to inquiry (review N2-05). */
+export interface Demotions {
+  count: number;
+  productIds: string[];
+}
+
+/** Refuses a change that demotes live listings unless the caller confirmed exactly that many. */
+function confirmDemotions(d: Demotions, confirmed: number | undefined): void {
+  if (d.count > 0 && confirmed !== d.count) {
+    throw Errors.conflict(`This change sends ${d.count} listing${d.count === 1 ? "" : "s"} selling instantly today to inquiry. Confirm that number to go ahead.`, {
+      reason: "demotions_unconfirmed",
+      demotions: d.count,
+      productIds: d.productIds.slice(0, 50),
+    });
+  }
+}
+
+type ProofLike = { id?: string; classKey: string; scopeKind: string; scopeProvider: string | null; scopeTourIds: readonly string[]; revokedAt: Date | string | null };
+
+/**
+ * Products effective instant today, mapped to an offer of `classKey`, that
+ * the gate would refuse once the key's proofs are `change(current proofs)`.
+ * Same rules as `capabilityVerdict` (flag, evidence for the approved terms,
+ * proofs, the seeded exception). Read-only.
+ */
+async function demotionsAfter(supplierId: string, environment: SupplierEnvironment, classKey: string, change: (rows: ProofLike[]) => ProofLike[]): Promise<Demotions> {
+  const mappings = await prisma.productSupplierMapping.findMany({
+    where: { supplierId, environment, isActive: true, supplierOfferId: { not: null }, product: { deletedAt: null, eligibility: { effectiveMode: "instant" } } },
+    select: { productId: true, supplierOfferId: true, approvedOfferHash: true },
+  });
+  if (mappings.length === 0) return { count: 0, productIds: [] };
+  const offerIds = [...new Set(mappings.map((m) => m.supplierOfferId!))];
+  const [offers, flag, evidence, proofs] = await Promise.all([
+    prisma.supplierCatalogueItem.findMany({ where: { supplierId, environment, kind: "offer", externalId: { in: offerIds } }, select: { externalId: true, parentExternalId: true, payload: true } }),
+    prisma.supplierCapabilityFlag.findUnique({ where: { adapter_environment_classKey: { adapter: CAPABILITY_ADAPTER, environment, classKey } } }),
+    prisma.supplierOfferEnablement.findMany({ where: { supplierId, environment, classKey, offerExternalId: { in: offerIds }, revokedAt: null } }),
+    prisma.supplierClassProof.findMany({ where: { supplierId, environment, classKey } }),
+  ]);
+  const after = change(proofs);
+  const out = new Set<string>();
+  for (const m of mappings) {
+    const offer = offers.find((o) => o.externalId === m.supplierOfferId);
+    if (!offer) continue;
+    const cap = deriveCapabilities(offer.payload);
+    if (cap.classKey !== classKey) continue;
+    const ev = evidence.filter((e) => e.offerExternalId === m.supplierOfferId);
+    const flagState = flag ? { enabled: flag.enabled, requiresOfferEvidence: flag.requiresOfferEvidence } : null;
+    const ctx = (rows: ProofLike[]) => ({ proofs: rows, tourExternalId: offer.parentExternalId, provider: offerProvider(offer.payload) });
+    const now = capabilityVerdict(cap, flagState, ev, m.approvedOfferHash, ctx(proofs));
+    const later = capabilityVerdict(cap, flagState, ev, m.approvedOfferHash, ctx(after));
+    if (now.instant && !later.instant) out.add(m.productId);
+  }
+  return { count: out.size, productIds: [...out].sort() };
 }
 
 export const supplierCapabilityService = {
@@ -337,6 +398,8 @@ export const supplierCapabilityService = {
         evidenceKind: p.evidenceKind,
         reference: p.reference,
         widensProofId: p.widensProofId,
+        narrowsProofId: p.narrowsProofId,
+        bookedTourId: p.bookedTourId,
         recordedAt: p.recordedAt.toISOString(),
         recordedBy: p.recordedBy,
         approvalId: p.approvalId,
@@ -499,10 +562,20 @@ export const supplierCapabilityService = {
   },
 
   /**
-   * Check a class proof before it is asked for or recorded (doc 30 §3.12).
-   * Returns the approval payload it would be recorded under, and `needs`:
-   * the approval operation, or null when an active proof of the key already
-   * covers the scope (narrowing loosens nothing).
+   * Check a class proof before it is asked for or recorded (doc 30 §3.12;
+   * review 105 N2-01, N2-03, N2-05). Recording always needs the approval
+   * operation returned in `needs`; narrowing is a separate atomic replace
+   * (`narrowClassProof`). Scope rules, tied to the booked tour:
+   *  - `bookedTourId` is a stored tour with an offer of the booked key; a
+   *    named-tours scope contains it;
+   *  - external keys (D21): named tours only; a first proof names the booked
+   *    tour alone, each widening adds exactly its own newly booked tour;
+   *  - ticket keys (D24): the first proof names the booked attraction alone;
+   *    every later proof widens an active one;
+   *  - a widening's scope contains the scope it widens.
+   * `demotions` lists the listings effective instant today that the proof
+   * would send to inquiry (a first proof on a seeded key ends its
+   * exception); recording them needs an explicit confirmation of that count.
    */
   async classProofRequest(input: ClassProofInput, opts: { supplierCode?: string } = {}) {
     const code = opts.supplierCode ?? TRAVELDESK_SUPPLIER_CODE;
@@ -517,14 +590,41 @@ export const supplierCapabilityService = {
     if (!(PROOF_SCOPE_KINDS as readonly string[]).includes(input.scopeKind)) throw Errors.validation({ scopeKind: "Unknown scope" });
     checkReference(input.reference);
     const payload = classProofApprovalPayload(code, input);
+    if (payload.scopeKind === "all" && d.route === "external") {
+      throw Errors.conflict("External keys are proven per provider, never for all offers (owner decision D21). Use the booked tour.");
+    }
+    if (!payload.bookedTourId || !/^[1-9][0-9]{0,9}$/.test(payload.bookedTourId)) throw Errors.validation({ bookedTourId: "Name the TravelDesk tour the supervised booking was made on" });
     const supplier = await supplierFor(code);
     const active = await prisma.supplierClassProof.findMany({ where: { supplierId: supplier.id, environment: input.environment, classKey: input.classKey, revokedAt: null } });
 
-    if (payload.scopeKind === "all") {
-      // D21: one external booking proves its own provider only.
-      if (d.route === "external") throw Errors.conflict("External keys are proven per provider, never for all offers (owner decision D21). Use the provider or named tours scope.");
-      // D24: tickets start with the booked attraction; "all" is a later widening of an existing proof.
-      if (d.fulfilment === "ticket" && active.length === 0) throw Errors.conflict("A ticket key's first proof names the booked attraction's tours (owner decision D24); widen it after a clean week.");
+    // The booked tour: stored, with an offer of the key the booking was made on.
+    const bookedOffers = await prisma.supplierCatalogueItem.findMany({
+      where: { supplierId: supplier.id, environment: input.environment, kind: "offer", parentExternalId: payload.bookedTourId, removedAt: null },
+      select: { payload: true },
+    });
+    if (!bookedOffers.some((o) => deriveCapabilities(o.payload).classKey === input.basisClassKey)) {
+      throw Errors.validation({ bookedTourId: "That tour has no stored offer of the booked key" });
+    }
+
+    const widened = payload.widensProofId ? active.find((p) => p.id === payload.widensProofId) : null;
+    if (payload.widensProofId && !widened) throw Errors.validation({ widensProofId: "The proof to widen must be an active proof of the same key" });
+    if (widened && !scopeCovers(payload, widened)) throw Errors.validation({ widensProofId: "A widening's scope must contain the scope it widens" });
+
+    if (d.route === "external") {
+      // D21 while no payload names a provider: one booked tour per proof; each further tour is its own widening.
+      if (payload.scopeKind !== "tours") throw Errors.conflict("External keys are proven for the booked tour (owner decision D21): use the named tours scope.");
+      const expected = widened ? normaliseTours([...widened.scopeTourIds, payload.bookedTourId]) : [payload.bookedTourId];
+      if (widened && widened.scopeTourIds.includes(payload.bookedTourId)) throw Errors.validation({ bookedTourId: "A widening adds the tour of its own booking, which the proof does not cover yet" });
+      if (JSON.stringify(payload.scopeTourIds) !== JSON.stringify(expected)) {
+        throw Errors.conflict(`An external proof covers the booked tour only${widened ? ", added to the proof it widens" : ""} (owner decision D21): ${expected.join(", ")}.`);
+      }
+    }
+    if (d.fulfilment === "ticket") {
+      // D24: the booked attraction first; anything more is a widening of an active proof.
+      if (active.length === 0 && !(payload.scopeKind === "tours" && payload.scopeTourIds.length === 1 && payload.scopeTourIds[0] === payload.bookedTourId)) {
+        throw Errors.conflict("A ticket key's first proof names the booked attraction only (owner decision D24); widen it after a clean week.");
+      }
+      if (active.length > 0 && !widened) throw Errors.conflict("This ticket key has a proof: record a widening of it (owner decision D24).");
     }
     if (payload.scopeKind === "provider") {
       if (!payload.scopeProvider || payload.scopeProvider.length > 120) throw Errors.validation({ scopeProvider: "Name the provider (1 to 120 characters)" });
@@ -534,12 +634,13 @@ export const supplierCapabilityService = {
         select: { catalogueItem: { select: { payload: true } } },
       });
       if (!offers.some((o) => offerProvider(o.catalogueItem.payload) === payload.scopeProvider)) {
-        throw Errors.conflict("TravelDesk's offer data does not name this provider, so a provider scope would cover nothing. Scope the proof to the booked tours instead (doc 30 §3.12).");
+        throw Errors.conflict("TravelDesk's offer data does not name this provider, so a provider scope would cover nothing. Scope the proof to the booked tour instead (doc 30 §3.12).");
       }
     }
     if (payload.scopeKind === "tours") {
       if (payload.scopeTourIds.length === 0 || payload.scopeTourIds.length > MAX_PROOF_TOURS) throw Errors.validation({ scopeTourIds: `Name 1 to ${MAX_PROOF_TOURS} TravelDesk tour ids` });
       if (payload.scopeTourIds.some((t) => !/^[1-9][0-9]{0,9}$/.test(t))) throw Errors.validation({ scopeTourIds: "Tour ids are TravelDesk numbers" });
+      if (!payload.scopeTourIds.includes(payload.bookedTourId)) throw Errors.validation({ scopeTourIds: "The named tours must include the booked tour" });
       const found = await prisma.supplierCatalogueItem.findMany({
         where: { supplierId: supplier.id, environment: input.environment, kind: "tour", externalId: { in: payload.scopeTourIds }, removedAt: null },
         select: { externalId: true },
@@ -547,29 +648,38 @@ export const supplierCapabilityService = {
       const missing = payload.scopeTourIds.filter((t) => !found.some((f) => f.externalId === t));
       if (missing.length) throw Errors.validation({ scopeTourIds: `Not in the stored catalogue: ${missing.slice(0, 10).join(", ")}` });
     }
-    if (payload.widensProofId) {
-      const w = active.find((p) => p.id === payload.widensProofId);
-      if (!w) throw Errors.validation({ widensProofId: "The proof to widen must be an active proof of the same key" });
-    }
-    const covered = active.some((p) => scopeCovers(p, payload));
-    return { supplierId: supplier.id, payload, needs: covered ? null : CAPABILITY_OPERATION };
+    const demotions = await demotionsAfter(supplier.id, input.environment, input.classKey, (rows) => [...rows, { ...payload, revokedAt: null }]);
+    return { supplierId: supplier.id, payload, needs: CAPABILITY_OPERATION as PrivilegedOperation, demotions };
   },
 
   /**
-   * Record one class proof. Loosening (unless an active proof of the key
-   * already covers the scope): needs an applied approval for exactly this
-   * proof, used once. The row is fixed once written (database guard).
+   * Record one class proof. Loosening: an applied approval for exactly this
+   * proof, used once, and `products.activate_instant` as well as
+   * `suppliers.manage`. When the proof would send live listings to inquiry
+   * (`demotions`), `confirmDemotions` must equal their count. The row is
+   * fixed once written (database guard).
    */
-  async recordClassProof(actor: Actor, input: ClassProofInput & { note: string }, opts: { approvalId?: string; now?: Date; supplierCode?: string } = {}) {
+  async recordClassProof(
+    actor: Actor,
+    input: ClassProofInput & { note: string; confirmDemotions?: number },
+    opts: { approvalId?: string; now?: Date; supplierCode?: string } = {},
+  ) {
     requirePermission(actor, "suppliers.manage");
+    requirePermission(actor, "products.activate_instant");
     const note = checkReason(input.note);
     const now = opts.now ?? new Date();
     const req = await supplierCapabilityService.classProofRequest(input, opts);
-    if (req.needs && !opts.approvalId) throw Errors.forbidden(OPERATION_PERMISSION[CAPABILITY_OPERATION]);
+    confirmDemotions(req.demotions, input.confirmDemotions);
+    if (!opts.approvalId) throw Errors.forbidden(OPERATION_PERMISSION[CAPABILITY_OPERATION]);
     const id = uuidv7();
     const p = req.payload;
     await prisma.$transaction(async (tx) => {
-      if (req.needs) await useApproval(tx, actor, opts.approvalId!, CAPABILITY_OPERATION, p, input.environment, now);
+      await useApproval(tx, actor, opts.approvalId!, CAPABILITY_OPERATION, p, input.environment, now);
+      if (p.widensProofId) {
+        // The proof it widens must still be active when the wider row is written.
+        const [w] = await tx.$queryRaw<{ id: string }[]>`SELECT id FROM supplier_class_proofs WHERE id = ${p.widensProofId}::uuid AND revoked_at IS NULL FOR UPDATE`;
+        if (!w) throw Errors.conflict("The proof to widen was revoked meanwhile");
+      }
       await tx.supplierClassProof.create({
         data: {
           id,
@@ -583,7 +693,8 @@ export const supplierCapabilityService = {
           evidenceKind: p.evidenceKind,
           reference: p.reference,
           widensProofId: p.widensProofId,
-          approvalId: req.needs ? opts.approvalId! : null,
+          bookedTourId: p.bookedTourId,
+          approvalId: opts.approvalId!,
           recordedBy: actor.id ?? null,
           recordedAt: now,
         },
@@ -599,10 +710,11 @@ export const supplierCapabilityService = {
             basisClassKey: p.basisClassKey,
             scopeKind: p.scopeKind,
             scopeTours: p.scopeTourIds.length,
+            bookedTourId: p.bookedTourId,
             evidenceKind: p.evidenceKind,
             widensProofId: p.widensProofId,
-            approvalId: req.needs ? opts.approvalId : null,
-            narrowing: req.needs === null,
+            approvalId: opts.approvalId,
+            demotions: req.demotions.count,
           },
           reason: note,
         },
@@ -610,25 +722,119 @@ export const supplierCapabilityService = {
       );
     }, TX_OPTIONS);
     await reevaluateMapped(opts.supplierCode ?? TRAVELDESK_SUPPLIER_CODE, input.environment, "offer_evidence");
-    return { id, approvalUsed: req.needs !== null };
+    return { id, approvalUsed: true, demotions: req.demotions.count };
   },
 
-  /** Withdraw a class proof. Tightening: no approval. A revoked proof stays revoked, and the seeded exception does not come back. */
-  async revokeClassProof(actor: Actor, proofId: string, reason: string, opts: { now?: Date; supplierCode?: string } = {}) {
+  /**
+   * Listings a narrowing or a revoke would send to inquiry (review N2-05),
+   * for the confirmation the console asks for. Read-only.
+   */
+  async proofChangeDemotions(proofId: string, change: { kind: "revoke" } | { kind: "narrow"; scopeTourIds: readonly string[] }): Promise<Demotions> {
+    const row = await prisma.supplierClassProof.findUnique({ where: { id: proofId } });
+    if (!row || row.revokedAt) return { count: 0, productIds: [] };
+    const tours = change.kind === "narrow" ? normaliseTours(change.scopeTourIds) : [];
+    return demotionsAfter(row.supplierId, row.environment, row.classKey, (rows) =>
+      rows.map((r) => (r.id === proofId ? { ...r, revokedAt: new Date() } : r)).concat(change.kind === "narrow" ? [{ ...row, scopeKind: "tours", scopeProvider: null, scopeTourIds: tours, revokedAt: null }] : []),
+    );
+  },
+
+  /**
+   * Narrow a proof (review N2-01): one atomic replace. Under a row lock on the
+   * proof, a new row with the same facts (key, booked key, evidence,
+   * reference, booked tour) and a named-tours scope inside the old one is
+   * written, and the old row is revoked in the same transaction, so a
+   * narrower row never outlives the proof it replaced. Tightening, so no
+   * approval, but `products.activate_instant` and `suppliers.manage`. The
+   * booked tour stays in the scope (to drop it, revoke). Listings it would
+   * send to inquiry need `confirmDemotions`.
+   */
+  async narrowClassProof(
+    actor: Actor,
+    input: { proofId: string; scopeTourIds: readonly string[]; note: string; confirmDemotions?: number },
+    opts: { now?: Date; supplierCode?: string } = {},
+  ) {
     requirePermission(actor, "suppliers.manage");
+    requirePermission(actor, "products.activate_instant");
+    const note = checkReason(input.note);
+    const now = opts.now ?? new Date();
+    const tours = normaliseTours(input.scopeTourIds);
+    if (tours.length === 0 || tours.some((t) => !/^[1-9][0-9]{0,9}$/.test(t))) throw Errors.validation({ scopeTourIds: "Name the TravelDesk tour ids to keep" });
+    const demotions = await supplierCapabilityService.proofChangeDemotions(input.proofId, { kind: "narrow", scopeTourIds: tours });
+    confirmDemotions(demotions, input.confirmDemotions);
+    const id = uuidv7();
+    const env = await prisma.$transaction(async (tx) => {
+      const [locked] = await tx.$queryRaw<{ id: string }[]>`SELECT id FROM supplier_class_proofs WHERE id = ${input.proofId}::uuid FOR UPDATE`;
+      if (!locked) throw Errors.notFound("Class proof");
+      const old = await tx.supplierClassProof.findUniqueOrThrow({ where: { id: input.proofId } });
+      if (old.revokedAt) throw Errors.conflict("This proof was revoked; record a new one");
+      const narrower = { scopeKind: "tours", scopeProvider: null, scopeTourIds: tours };
+      if (!scopeCovers(old, narrower) || (old.scopeKind === "tours" && tours.length === old.scopeTourIds.length)) {
+        throw Errors.validation({ scopeTourIds: "Keep a strict subset of the proof's tours" });
+      }
+      if (old.bookedTourId && !tours.includes(old.bookedTourId)) throw Errors.validation({ scopeTourIds: "The booked tour stays in the scope; to drop it, revoke the proof" });
+      await tx.supplierClassProof.create({
+        data: {
+          id,
+          supplierId: old.supplierId,
+          environment: old.environment,
+          classKey: old.classKey,
+          basisClassKey: old.basisClassKey,
+          scopeKind: "tours",
+          scopeProvider: null,
+          scopeTourIds: tours,
+          evidenceKind: old.evidenceKind,
+          reference: old.reference,
+          narrowsProofId: old.id,
+          bookedTourId: old.bookedTourId,
+          approvalId: null,
+          recordedBy: actor.id ?? null,
+          recordedAt: now,
+        },
+      });
+      await tx.supplierClassProof.update({ where: { id: old.id }, data: { revokedAt: now, revokedBy: actor.id ?? null, revokeReason: `Narrowed to proof ${id}: ${note}`.slice(0, 500) } });
+      await audit(
+        actor,
+        "supplier_capability.class_proof_narrowed",
+        { type: "supplier_class_proof", id },
+        { before: { proofId: old.id, scopeKind: old.scopeKind, scopeTours: old.scopeTourIds.length }, after: { proofId: id, scopeKind: "tours", scopeTours: tours.length, demotions: demotions.count }, reason: note },
+        tx,
+      );
+      return old.environment;
+    }, TX_OPTIONS);
+    await reevaluateMapped(opts.supplierCode ?? TRAVELDESK_SUPPLIER_CODE, env, "offer_evidence");
+    return { id, demotions: demotions.count };
+  },
+
+  /**
+   * Withdraw a class proof. Tightening: no approval, but `products.activate_instant`
+   * as for recording. A revoked proof stays revoked, and the seeded exception
+   * does not come back. Listings it would send to inquiry need
+   * `confirmDemotions` (never demoted silently, review N2-05).
+   */
+  async revokeClassProof(actor: Actor, proofId: string, reason: string, opts: { now?: Date; supplierCode?: string; confirmDemotions?: number } = {}) {
+    requirePermission(actor, "suppliers.manage");
+    requirePermission(actor, "products.activate_instant");
     const r = checkReason(reason);
     const now = opts.now ?? new Date();
     const row = await prisma.supplierClassProof.findUnique({ where: { id: proofId } });
     if (!row) throw Errors.notFound("Class proof");
-    if (row.revokedAt) return { revoked: false };
+    if (row.revokedAt) return { revoked: false, demotions: 0 };
+    const demotions = await supplierCapabilityService.proofChangeDemotions(proofId, { kind: "revoke" });
+    confirmDemotions(demotions, opts.confirmDemotions);
     await prisma.$transaction(async (tx) => {
       const done = await tx.supplierClassProof.updateMany({ where: { id: proofId, revokedAt: null }, data: { revokedAt: now, revokedBy: actor.id ?? null, revokeReason: r } });
       if (done.count === 1) {
-        await audit(actor, "supplier_capability.class_proof_revoked", { type: "supplier_class_proof", id: proofId }, { before: { revokedAt: null }, after: { revokedAt: now.toISOString(), classKey: row.classKey }, reason: r }, tx);
+        await audit(
+          actor,
+          "supplier_capability.class_proof_revoked",
+          { type: "supplier_class_proof", id: proofId },
+          { before: { revokedAt: null }, after: { revokedAt: now.toISOString(), classKey: row.classKey, demotions: demotions.count }, reason: r },
+          tx,
+        );
       }
     }, TX_OPTIONS);
     await reevaluateMapped(opts.supplierCode ?? TRAVELDESK_SUPPLIER_CODE, row.environment, "offer_evidence");
-    return { revoked: true };
+    return { revoked: true, demotions: demotions.count };
   },
 
   /** Withdraw evidence. Tightening: no approval. A revoked row stays revoked. */

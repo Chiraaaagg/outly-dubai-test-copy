@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { Prisma, type SupplierEnvironment } from "@prisma/client";
 import { PAGE_PAX_AGES } from "@/lib/pricing";
 import { prisma, TX_OPTIONS, type Tx } from "../lib/db";
+import { assertBulkItemInTx } from "./bulk-guard";
 import type { Actor } from "../lib/actor";
 import { requirePermission } from "../lib/actor";
 import { audit } from "../lib/audit";
@@ -509,7 +510,7 @@ async function writeTicketEvidence(
   source: string,
   note: string,
   now: Date,
-  bulk: { bulkId: string; approvalId: string } | null,
+  bulk: { bulkId: string } | null,
 ): Promise<{ productId: string; record: TicketEvidenceRecord | null }> {
   // Serialise with approve and revoke, which rewrite the same row.
   await tx.$queryRaw`SELECT id FROM product_supplier_mappings WHERE id = ${mappingId}::uuid FOR UPDATE`;
@@ -518,9 +519,15 @@ async function writeTicketEvidence(
   if (!m.isActive || m.product.deletedAt) throw Errors.conflict("This mapping is not active");
   const ref = travelDeskExternalRefSchema.safeParse(m.externalRef);
   if (!ref.success) throw Errors.conflict("This mapping's TravelDesk reference is unreadable; approve it again first");
+  // Doc 30 review N2-02: a ticket is issued at confirmation by nature, so "no" is never recorded for a TicketOnly mapping.
+  if (answer === "no" && (m.bookingKind === "ticket_only" || ref.data.bookingKind === "ticket_only")) {
+    throw Errors.conflict("This is a ticket offer: tickets are issued at confirmation and stay non-refundable", { productId: m.product.id, reason: "ticket_offer" });
+  }
   if (answer === "no" && m.product.fulfilmentMode === "instant") {
     throw Errors.conflict("This product is instant. Switch it to inquiry, record the answer, then activate it again", { productId: m.product.id });
   }
+  // Doc 30 review N2-06: a bulk write is bound to its run (person, window, running item, applied approval).
+  const guard = bulk ? await assertBulkItemInTx(tx, actor, bulk.bulkId, m.product.id, "no_ticket", now) : null;
   const before = ref.data.ticketEvidence ?? null;
   const record: TicketEvidenceRecord | null = answer === "unknown" ? null : { issuesTicketsAtConfirm: answer, source, recordedAt: now.toISOString() };
   const { ticketEvidence: _old, ...rest } = ref.data;
@@ -530,7 +537,7 @@ async function writeTicketEvidence(
     actor,
     "supplier_mapping.ticket_evidence",
     { type: "product", id: m.product.id },
-    { before: { mappingId: m.id, ticketEvidence: before }, after: { mappingId: m.id, ticketEvidence: record, ...(bulk ? { bulkId: bulk.bulkId, approvalId: bulk.approvalId } : {}) }, reason: note },
+    { before: { mappingId: m.id, ticketEvidence: before }, after: { mappingId: m.id, ticketEvidence: record, ...(bulk ? { bulkId: bulk.bulkId, approvalId: guard?.approvalId ?? null } : {}) }, reason: note },
     tx,
   );
   return { productId: m.product.id, record };
@@ -1143,12 +1150,14 @@ export const supplierCatalogService = {
    * Doc 30 §3.12 (D6): one item of a bulk "free cancellation confirmed" run
    * records "no ticket issued at confirmation" with its source on one
    * mapping. The run burned its approval (and the person's fresh code) when
-   * it started, so no second code is asked here; every other rule of
-   * `setTicketEvidence` holds, including the refusal while the product is
+   * it started, so no second code is asked here; the run, its approval and
+   * this listing's claimed item are checked in the write's transaction
+   * (`assertBulkItemInTx`). Every rule of `setTicketEvidence` holds,
+   * including the refusals for a ticket offer and while the product is
    * instant. The audit row names the bulk run. Readiness re-runs after the
    * run's own content write.
    */
-  async recordNoTicketForBulk(actor: Actor, mappingId: string, source: string, note: string, bulk: { bulkId: string; approvalId: string }, now: Date = new Date()): Promise<TicketEvidenceRecord | null> {
+  async recordNoTicketForBulk(actor: Actor, mappingId: string, source: string, note: string, bulk: { bulkId: string }, now: Date = new Date()): Promise<TicketEvidenceRecord | null> {
     requirePermission(actor, "products.activate_instant");
     if (!actor.id) throw Errors.forbidden("products.activate_instant");
     const s = source.trim();

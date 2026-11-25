@@ -5,7 +5,7 @@ import type { Actor } from "../../lib/actor";
 import { PERMISSIONS, ROLE_PERMISSIONS } from "../../lib/permissions";
 import { renderTemplate, type TemplateContext } from "../../notifications/templates";
 import { hasFullRights, MAX_ITEMS_PER_HOUR, MAX_ITEMS_PER_RUN, OPERATION_PERMISSION, SINGLE_STEP_OPERATIONS } from "../approval.service";
-import { bulkApprovalPayload, bulkItemsHash, freeCancellationText, freezeItems } from "../bulk-listing.service";
+import { bulkApprovalPayload, bulkItemsHash, freeCancellationPrecheck, freeCancellationText, freezeItems, type FreeCancellationLink } from "../bulk-listing.service";
 import { alertFacts, ownerAlertContext, ownerAlertProblem, ownerAlertRecipient, OWNER_ALERT_LATE_MS } from "../owner-alert";
 import { policyTextAgrees } from "../readiness.service";
 
@@ -126,5 +126,37 @@ describe("bulk runs: frozen list and cancellation text (§3.12, D6)", () => {
       }
     }
     expect(freeCancellationText(24, true)).toBe("Free cancellation up to 24 hours before 00:00 Dubai time on the day");
+  });
+});
+
+describe("free cancellation pre-check (review N2-02, N2-04)", () => {
+  const link = (over: Partial<FreeCancellationLink> = {}, row: Partial<NonNullable<FreeCancellationLink["row"]>> = {}): FreeCancellationLink => ({
+    mappingId: "m1",
+    row: { isActive: true, adapter: "traveldesk", bookingKind: "live_book", refBookingKind: "live_book", refReadable: true, ...row },
+    issuesTicketsAtConfirm: "unknown",
+    supplierFreeCancellationHours: 24,
+    dateOnlySellable: false,
+    ...over,
+  });
+
+  it("tickets are skipped by booking kind whatever their key's state, and a recorded yes is never overwritten", () => {
+    expect(freeCancellationPrecheck([link({}, { bookingKind: "ticket_only" })])).toEqual({ skip: "ticket_never_refundable" });
+    expect(freeCancellationPrecheck([link(), link({}, { refBookingKind: "ticket_only" })])).toEqual({ skip: "ticket_never_refundable" });
+    expect(freeCancellationPrecheck([link({ issuesTicketsAtConfirm: "yes" })])).toEqual({ skip: "ticket_issued_recorded" });
+  });
+
+  it("links the run could not write fail before anything is disarmed", () => {
+    expect(freeCancellationPrecheck([link({ row: null })])).toEqual({ fail: "link_inactive" });
+    expect(freeCancellationPrecheck([link({}, { isActive: false })])).toEqual({ fail: "link_inactive" });
+    expect(freeCancellationPrecheck([link({}, { refReadable: false })])).toEqual({ fail: "link_unreadable" });
+    expect(freeCancellationPrecheck([link({ supplierFreeCancellationHours: null })])).toEqual({ fail: "supplier_policy_unknown" });
+    expect(freeCancellationPrecheck([link({ dateOnlySellable: true }), link()])).toEqual({ fail: "mixed_date_only_options" });
+  });
+
+  it("otherwise the window is the longest supplier window", () => {
+    expect(freeCancellationPrecheck([])).toEqual({ skip: "no_traveldesk_link" });
+    expect(freeCancellationPrecheck([link({ supplierFreeCancellationHours: 0 })])).toEqual({ skip: "supplier_non_refundable" });
+    expect(freeCancellationPrecheck([link(), link({ supplierFreeCancellationHours: 48 })])).toEqual({ window: 48, dateOnly: false });
+    expect(freeCancellationPrecheck([link({ dateOnlySellable: true })])).toEqual({ window: 24, dateOnly: true });
   });
 });

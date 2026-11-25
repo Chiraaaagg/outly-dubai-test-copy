@@ -19,22 +19,22 @@ import { form, runAction, type ActionResult } from "./result";
  *  - Back to inquiry: a reason only (tightening).
  *  - Arm and free cancellation: one fresh code for the whole run. In
  *    production an administrator with full rights is applied at once with an
- *    owner alert (D15, D16); otherwise the run waits for a second
- *    administrator asking for the identical run (same action and items), and
- *    then starts with `startApprovedBulkAction`.
+ *    owner alert (D15, D16). Otherwise the run waits for a second
+ *    administrator asking for the identical run (same action and items): that
+ *    request only approves it (`approved`), and the administrator who asked
+ *    starts and runs it with `startApprovedBulkAction` (review N2-10).
  *  - Every run reports applied, skipped and failed listings with reasons.
- *
- * TODO(doc 30 decision 23): the console still needs the owner-picked table
- * with row selection and a bulk action bar, and a confirm dialog with the
- * code field and the result list. Until then the minimal form in
- * `activities/bulk-instant-form.tsx` posts here with existing components.
  */
 
 export type BulkListingResult = ActionResult<{
-  status: "applied" | "pending";
+  /** `pending`: waiting for a second administrator; `approved`: this request approved someone else's run, which they start. */
+  status: "applied" | "pending" | "approved";
   approvalId: string | null;
   bulkId: string | null;
   result: BulkRunResult | null;
+  action: BulkAction;
+  /** The frozen item list the approval covers (for the requester's start). */
+  ids: string[];
 }>;
 
 const PATH = "/admin/activities";
@@ -107,17 +107,19 @@ export async function bulkListingAction(_prev: BulkListingResult | null, fd: For
         itemCount: ids.length,
       });
       if (r.status === "refused") refused(r.reason);
-      if (r.status === "pending") return { status: "pending" as const, approvalId: r.approvalId, bulkId: null, result: null };
+      if (r.status === "pending") return { status: "pending" as const, approvalId: r.approvalId, bulkId: null, result: null, action: input.action, ids };
       approvalId = r.approvalId;
+      // A second administrator's identical request approves the first one's run; the first one starts it.
+      if (!(await bulkListingService.isRequester(actor, approvalId))) return { status: "approved" as const, approvalId, bulkId: null, result: null, action: input.action, ids };
     }
     const started = await bulkListingService.start(actor, { action: input.action, productIds: ids, reason: input.reason, source: input.source }, { environment: env, approvalId });
     const result = await bulkListingService.run(actor, started.bulkId, { source: input.source });
     revalidatePath(PATH);
-    return { status: "applied" as const, approvalId, bulkId: started.bulkId, result };
+    return { status: "applied" as const, approvalId, bulkId: started.bulkId, result, action: input.action, ids };
   });
 }
 
-/** Start a run whose approval a second administrator has given (two-person rule), over exactly the approved items. */
+/** Start a run whose approval a second administrator has given (two-person rule): the requester, over exactly the approved items. */
 export async function startApprovedBulkAction(_prev: BulkListingResult | null, fd: FormData): Promise<BulkListingResult> {
   return runAction(async () => {
     const { actor } = await authService.requireCookies("products.activate_instant");
@@ -129,7 +131,7 @@ export async function startApprovedBulkAction(_prev: BulkListingResult | null, f
     const started = await bulkListingService.start(actor, { action, productIds: ids, reason, source }, { environment: environment(), approvalId });
     const result = await bulkListingService.run(actor, started.bulkId, { source });
     revalidatePath(PATH);
-    return { status: "applied" as const, approvalId, bulkId: started.bulkId, result };
+    return { status: "applied" as const, approvalId, bulkId: started.bulkId, result, action, ids };
   });
 }
 
@@ -140,6 +142,6 @@ export async function resumeBulkAction(_prev: BulkListingResult | null, fd: Form
     const bulkId = parseWith(z.uuid(), form.str(fd, "bulkId"));
     const result = await bulkListingService.run(actor, bulkId, { source: parseWith(sourceField, form.str(fd, "source")) });
     revalidatePath(PATH);
-    return { status: "applied" as const, approvalId: null, bulkId, result };
+    return { status: "applied" as const, approvalId: null, bulkId, result, action: result.action, ids: [...result.applied, ...result.skipped, ...result.failed].map((i) => i.productId).concat(result.remaining) };
   });
 }

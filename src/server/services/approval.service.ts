@@ -228,7 +228,8 @@ export const approvalService = {
           data: { id, operation, permission, payload: stored, payloadHash, environment, status: "applied", requestedBy: userId, requestedAt: now, appliedAt: now, expiresAt, itemCount },
         });
         await audit(actor, "privileged.applied", { type: "privileged_approval", id }, { after: { ...summary, approvers: [] } }, tx);
-        return { status: "applied", approvalId: id, mode: "dual" };
+        // Review N2-14: outside production one person is applied at once, as before; say so rather than "dual".
+        return { status: "applied", approvalId: id, mode: "test" };
       }
 
       if (singleStep) {

@@ -561,7 +561,8 @@ export function isTimeShapeNeighbour(a: string, b: string): boolean {
 /** Whether one active proof row covers an offer of `classKey`, in `tourExternalId`, from `provider`. */
 export function proofCovers(p: ClassProofState, classKey: string, tourExternalId: string | null, provider: string | null): boolean {
   if (p.revokedAt !== null || p.classKey !== classKey) return false;
-  if (p.scopeKind === "all") return true;
+  // D21 (review N2-08): one external booking never proves every offer of its key, whatever a row says.
+  if (p.scopeKind === "all") return parseClassKey(classKey)?.route !== "external";
   if (p.scopeKind === "provider") return provider !== null && p.scopeProvider !== null && p.scopeProvider === provider;
   if (p.scopeKind === "tours") return tourExternalId !== null && p.scopeTourIds.includes(tourExternalId);
   return false;

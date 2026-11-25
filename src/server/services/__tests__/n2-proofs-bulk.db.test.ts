@@ -5,7 +5,7 @@ import { ROLE_PERMISSIONS } from "../../lib/permissions";
 import { assertDisposableDb, cleanupPeople, createStaff, dbEnabled, runId, type StaffFixture } from "../../__tests__/helpers/fixtures";
 import { assertDisposableDbLive } from "../../__tests__/helpers/target-guard";
 import { uuidv7 } from "../../lib/ids";
-import { storedOffer, storedTour } from "../../suppliers/__tests__/fixtures/traveldesk-terms";
+import { storedOffer, storedSlot, storedTour } from "../../suppliers/__tests__/fixtures/traveldesk-terms";
 import { offerTermsHash } from "../../suppliers/traveldesk/traveldesk.offer-terms";
 
 /**
@@ -19,7 +19,9 @@ import { offerTermsHash } from "../../suppliers/traveldesk/traveldesk.offer-term
  *
  * Bulk: `zz-test-<run>` products with an empty document (only the requested
  * mode is written), synthetic staff with random TOTP secrets. Every row is
- * removed in afterAll; audit rows stay (append-only).
+ * removed in afterAll; proof rows through the transaction-local purge
+ * setting of the delete guard (migration 20261127160000). Audit rows stay
+ * (append-only).
  */
 
 const RUN = runId();
@@ -55,8 +57,10 @@ describe.skipIf(!dbEnabled)("doc 30 N2: class proofs and bulk runs (local DB)", 
   let approvals: typeof import("../approval.service").approvalService;
   let bulk: typeof import("../bulk-listing.service").bulkListingService;
   let bulkApprovalPayload: typeof import("../bulk-listing.service").bulkApprovalPayload;
+  let catalogService: typeof import("../catalog.service").catalogService;
   let supplierId: string;
   let productId: string;
+  let ticketMappingId: string;
   const staff: Record<string, StaffFixture> = {};
   const secrets = new Map<string, string>();
   let clock = Date.UTC(2026, 10, 27, 12, 0, 0);
@@ -64,6 +68,13 @@ describe.skipIf(!dbEnabled)("doc 30 N2: class proofs and bulk runs (local DB)", 
   const TOUR = BASE;
   const OFFER = BASE + 1;
   const OTHER_TOUR = BASE + 2;
+  const OTHER_OFFER = BASE + 3;
+  const EXT_TOUR = BASE + 4;
+  const EXT_OFFER = BASE + 5;
+  const TICKET_TOUR = BASE + 6;
+  const TICKET_OFFER = BASE + 7;
+  const EXT = "live.fixed_slot_single.self.external.per_person";
+  const TICKET = "ticket.open_dated.self.internal.per_person";
   const offerPayload = storedOffer({ offerId: OFFER, tourId: TOUR });
   const tourPayload = storedTour({ tourId: TOUR });
   const terms = offerTermsHash(offerPayload, tourPayload)!;
@@ -72,6 +83,7 @@ describe.skipIf(!dbEnabled)("doc 30 N2: class proofs and bulk runs (local DB)", 
     return m ? (m.capabilityRefusal ?? null) : "no_mapping";
   };
   const admin = (label: string): Actor => ({ type: "admin", id: staff[label].id, displayName: `Fixture ${label}`, roles: ["admin"], permissions: new Set(ROLE_PERMISSIONS.admin) });
+  const ops = (label: string): Actor => ({ type: "admin", id: staff[label].id, roles: ["ops"], permissions: new Set(ROLE_PERMISSIONS.ops) });
   const code = (label: string, at: Date) => totpAt(secrets.get(label)!, at);
   const proofRow = (over: Record<string, unknown> = {}) => ({
     id: uuidv7(),
@@ -86,6 +98,7 @@ describe.skipIf(!dbEnabled)("doc 30 N2: class proofs and bulk runs (local DB)", 
     reference: "zz n2 drill reference",
     ...over,
   });
+  const base = { environment: "test" as const, evidenceKind: "sandbox_drill" as const, reference: "zz n2 drill reference" };
   const products: string[] = [];
 
   beforeAll(async () => {
@@ -96,22 +109,29 @@ describe.skipIf(!dbEnabled)("doc 30 N2: class proofs and bulk runs (local DB)", 
     ({ supplierCapabilityService: caps } = await import("../supplier-capability.service"));
     ({ approvalService: approvals } = await import("../approval.service"));
     ({ bulkListingService: bulk, bulkApprovalPayload } = await import("../bulk-listing.service"));
+    ({ catalogService } = await import("../catalog.service"));
     const seeded = await prisma.supplierCapabilityFlag.findUnique({ where: { adapter_environment_classKey: { adapter: "traveldesk", environment: "test", classKey: SEEDED } } });
     if (!seeded?.enabled || seeded.requiresOfferEvidence) throw new Error("the seeded test-environment flag for the fixed-start key is not as migration 20261122120000 wrote it");
 
     supplierId = uuidv7();
     await prisma.supplier.create({ data: { id: supplierId, code: CODE, name: "zz n2 test", source: "api", adapter: "traveldesk" } });
-    for (const [kind, externalId, parent, payload] of [
-      ["tour", String(TOUR), null, tourPayload],
-      ["tour", String(OTHER_TOUR), null, storedTour({ tourId: OTHER_TOUR })],
-      ["offer", String(OFFER), String(TOUR), offerPayload],
+    const extSlot = storedSlot({ isExternal: true });
+    for (const [kind, externalId, parent, payload, bookingKind] of [
+      ["tour", String(TOUR), null, tourPayload, null],
+      ["tour", String(OTHER_TOUR), null, storedTour({ tourId: OTHER_TOUR }), null],
+      ["tour", String(EXT_TOUR), null, storedTour({ tourId: EXT_TOUR, isExternal: true }), null],
+      ["tour", String(TICKET_TOUR), null, storedTour({ tourId: TICKET_TOUR }), null],
+      ["offer", String(OFFER), String(TOUR), offerPayload, "live_book"],
+      ["offer", String(OTHER_OFFER), String(OTHER_TOUR), storedOffer({ offerId: OTHER_OFFER, tourId: OTHER_TOUR }), "live_book"],
+      ["offer", String(EXT_OFFER), String(EXT_TOUR), storedOffer({ offerId: EXT_OFFER, tourId: EXT_TOUR, isExternal: true, timeSlots: [extSlot] }), "live_book"],
+      ["offer", String(TICKET_OFFER), String(TICKET_TOUR), storedOffer({ offerId: TICKET_OFFER, tourId: TICKET_TOUR, bookingKind: "ticket_only", bookingTypeRaw: 2, timeSlots: [] }), "ticket_only"],
     ] as const) {
       await prisma.supplierCatalogueItem.create({
-        data: { id: uuidv7(), supplierId, environment: "test", kind, externalId, parentExternalId: parent, name: `zz n2 ${kind}`, bookingKind: kind === "offer" ? "live_book" : null, payload: payload as never, payloadHash: "x" },
+        data: { id: uuidv7(), supplierId, environment: "test", kind, externalId, parentExternalId: parent, name: `zz n2 ${kind}`, bookingKind, payload: payload as never, payloadHash: "x" },
       });
     }
     const any = await prisma.product.findFirstOrThrow({ select: { categorySlug: true } });
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < 5; i++) {
       const id = uuidv7();
       products.push(id);
       await prisma.product.create({ data: { id, slug: `zz-test-${RUN}-n2-${i}`, title: `zz n2 product ${i}`, tier: "C", status: "draft", categorySlug: any.categorySlug, confirmation: "instant", content: {} } });
@@ -132,9 +152,28 @@ describe.skipIf(!dbEnabled)("doc 30 N2: class proofs and bulk runs (local DB)", 
         approvedOfferHash: terms,
       },
     });
+    ticketMappingId = uuidv7();
+    await prisma.productSupplierMapping.create({
+      data: {
+        id: ticketMappingId,
+        productId: products[4],
+        supplierId,
+        variantCode: null,
+        externalRef: { tourId: TICKET_TOUR, offerId: TICKET_OFFER, bookingKind: "ticket_only", isExternal: false },
+        supplierProductId: String(TICKET_TOUR),
+        supplierOfferId: String(TICKET_OFFER),
+        bookingKind: "ticket_only",
+        environment: "test",
+        syncStatus: "ok",
+      },
+    });
     const { encryptSecret, generateTotpSecret } = await import("../../lib/crypto");
-    for (const label of ["p", "q"]) {
-      staff[label] = await createStaff(RUN, label, ["admin"]);
+    for (const [label, role] of [
+      ["p", "admin"],
+      ["q", "admin"],
+      ["o", "ops"],
+    ] as const) {
+      staff[label] = await createStaff(RUN, label, [role]);
       const secret = generateTotpSecret();
       secrets.set(label, secret);
       await prisma.adminUser.update({ where: { id: staff[label].id }, data: { totpSecretEncrypted: encryptSecret(secret) } });
@@ -152,7 +191,12 @@ describe.skipIf(!dbEnabled)("doc 30 N2: class proofs and bulk runs (local DB)", 
     await prisma.rateLimitBucket.deleteMany({ where: { key: { in: ids.map((id) => `admin_totp:${id}`) } } }).catch(() => {});
     await prisma.productSupplierMapping.deleteMany({ where: { supplierId } });
     await prisma.supplierCatalogueItem.deleteMany({ where: { supplierId } });
-    // Proof rows cascade with the supplier.
+    await prisma.supplierOfferEnablement.deleteMany({ where: { supplierId } });
+    // Proofs are never deleted, except by this cleanup through the guard's transaction-local purge setting.
+    await prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT set_config('outly.purge_class_proofs', 'on', true)`;
+      await tx.supplierClassProof.deleteMany({ where: { supplierId } });
+    });
     await prisma.supplier.deleteMany({ where: { id: supplierId } });
     await prisma.productEligibility.deleteMany({ where: { productId: { in: products } } });
     await prisma.product.deleteMany({ where: { slug: { startsWith: `zz-test-${RUN}` } } });
@@ -165,8 +209,22 @@ describe.skipIf(!dbEnabled)("doc 30 N2: class proofs and bulk runs (local DB)", 
     expect(await refusal()).toBeNull();
   });
 
-  it("the first proof for the seeded key ends its exception: an offer outside the proof's tours needs evidence", async () => {
-    await prisma.supplierClassProof.create({ data: proofRow() });
+  it("the Dhow case (N2-05): a first narrow proof on the seeded key that leaves a live listing out needs that count confirmed", async () => {
+    await prisma.productEligibility.upsert({
+      where: { productId },
+      create: { productId, effectiveMode: "instant", reasons: [], readinessVersion: 1, evaluatedAt: new Date() },
+      update: { effectiveMode: "instant" },
+    });
+    const input = { ...base, classKey: SEEDED, basisClassKey: SEEDED, scopeKind: "tours" as const, scopeTourIds: [String(OTHER_TOUR)], bookedTourId: String(OTHER_TOUR), note: "zz n2 first proof" };
+    const req = await caps.classProofRequest(input, { supplierCode: CODE });
+    expect(req.demotions).toEqual({ count: 1, productIds: [productId] });
+    const at = tick();
+    const ap = await approvals.requestPrivileged(admin("p"), "supplier.capability.enable", "products.activate_instant", req.payload, { environment: "test", totpCode: code("p", at), now: at });
+    const approvalId = (ap as { approvalId: string }).approvalId;
+    await expect(caps.recordClassProof(admin("p"), input, { supplierCode: CODE, approvalId, now: at })).rejects.toMatchObject({ code: "CONFLICT", details: { reason: "demotions_unconfirmed", demotions: 1 } });
+    expect(await refusal()).toBeNull();
+    await expect(caps.recordClassProof(admin("p"), { ...input, confirmDemotions: 1 }, { supplierCode: CODE, approvalId, now: at })).resolves.toMatchObject({ demotions: 1 });
+    // The exception is over and the listing's tour is outside the proof: it needs evidence now.
     expect(await refusal()).toBe("offer_evidence_missing");
   });
 
@@ -183,9 +241,11 @@ describe.skipIf(!dbEnabled)("doc 30 N2: class proofs and bulk runs (local DB)", 
     expect(await refusal()).toBeNull();
   });
 
-  it("database: a proof is fixed once recorded, a revoked proof stays revoked, and its shape is checked", async () => {
+  it("database: a proof is fixed once recorded, never deleted, a revoked proof stays revoked, and its shape is checked", async () => {
     const p = await prisma.supplierClassProof.create({ data: proofRow() });
     await expect(prisma.supplierClassProof.update({ where: { id: p.id }, data: { scopeKind: "all", scopeTourIds: [] } })).rejects.toThrow(/fixed once recorded/);
+    await expect(prisma.supplierClassProof.delete({ where: { id: p.id } })).rejects.toThrow(/never deleted/);
+    await expect(prisma.supplier.delete({ where: { id: supplierId } })).rejects.toThrow();
     await prisma.supplierClassProof.update({ where: { id: p.id }, data: { revokedAt: new Date(), revokeReason: "zz n2 guard test" } });
     await expect(prisma.supplierClassProof.update({ where: { id: p.id }, data: { revokedAt: null, revokeReason: null } })).rejects.toThrow(/stays revoked/);
     await expect(prisma.supplierClassProof.create({ data: proofRow({ scopeKind: "all" }) })).rejects.toThrow(/scp_scope_shape_check/);
@@ -194,44 +254,70 @@ describe.skipIf(!dbEnabled)("doc 30 N2: class proofs and bulk runs (local DB)", 
     await expect(prisma.supplierClassProof.create({ data: proofRow({ classKey: "live.fixed_slot_single.self.internal.per_unit", basisClassKey: "live.fixed_slot_single.self.internal.per_unit" }) })).rejects.toThrow(
       /scp_per_unit_never_check/,
     );
+    await expect(prisma.supplierClassProof.create({ data: proofRow({ classKey: EXT, basisClassKey: EXT, scopeKind: "all", scopeTourIds: [] }) })).rejects.toThrow(/scp_external_never_all_check/);
+    await expect(prisma.supplierClassProof.create({ data: proofRow({ bookedTourId: String(TOUR) }) })).rejects.toThrow(/scp_booked_tour_check/);
     // A neighbour differing in time shape alone is accepted (decision 22).
     await prisma.supplierClassProof.create({ data: proofRow({ classKey: "live.listed_start_single.self.internal.per_person", revokedAt: new Date(), revokeReason: "zz n2 neighbour" }) });
   });
 
-  it("service: scope rules (D21 external, D24 tickets, provider fallback, tours in the catalogue, neighbours)", async () => {
-    const base = { environment: "test" as const, evidenceKind: "sandbox_drill" as const, reference: "zz n2 drill reference" };
-    const ext = "live.fixed_slot_single.self.external.per_person";
-    await expect(caps.classProofRequest({ ...base, classKey: ext, basisClassKey: ext, scopeKind: "all" }, { supplierCode: CODE })).rejects.toMatchObject({ code: "CONFLICT" });
-    const ticket = "ticket.open_dated.self.internal.per_person";
-    await expect(caps.classProofRequest({ ...base, classKey: ticket, basisClassKey: ticket, scopeKind: "all" }, { supplierCode: CODE })).rejects.toMatchObject({ code: "CONFLICT" });
-    await expect(caps.classProofRequest({ ...base, classKey: SEEDED, basisClassKey: SEEDED, scopeKind: "provider", scopeProvider: "Synthetic provider" }, { supplierCode: CODE })).rejects.toThrow(/does not name this provider/);
-    await expect(caps.classProofRequest({ ...base, classKey: SEEDED, basisClassKey: SEEDED, scopeKind: "tours", scopeTourIds: [String(BASE + 99)] }, { supplierCode: CODE })).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
+  it("service: scope rules tied to the booked tour (D21 external, D24 tickets, provider fallback, catalogue, neighbours)", async () => {
+    const ext = { ...base, classKey: EXT, basisClassKey: EXT };
+    await expect(caps.classProofRequest({ ...ext, scopeKind: "all", bookedTourId: String(EXT_TOUR) }, { supplierCode: CODE })).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(caps.classProofRequest({ ...ext, scopeKind: "tours", scopeTourIds: [String(EXT_TOUR), String(TOUR)], bookedTourId: String(EXT_TOUR) }, { supplierCode: CODE })).rejects.toThrow(/booked tour only/);
+    await expect(caps.classProofRequest({ ...ext, scopeKind: "tours", scopeTourIds: [String(EXT_TOUR)], bookedTourId: String(EXT_TOUR) }, { supplierCode: CODE })).resolves.toMatchObject({ needs: "supplier.capability.enable" });
+    const ticket = { ...base, classKey: TICKET, basisClassKey: TICKET };
+    await expect(caps.classProofRequest({ ...ticket, scopeKind: "all", bookedTourId: String(TICKET_TOUR) }, { supplierCode: CODE })).rejects.toThrow(/booked attraction only/);
+    await expect(caps.classProofRequest({ ...ticket, scopeKind: "tours", scopeTourIds: [String(TICKET_TOUR), String(TOUR)], bookedTourId: String(TICKET_TOUR) }, { supplierCode: CODE })).rejects.toThrow(/booked attraction only/);
+    await expect(caps.classProofRequest({ ...ticket, scopeKind: "tours", scopeTourIds: [String(TICKET_TOUR)], bookedTourId: String(TICKET_TOUR) }, { supplierCode: CODE })).resolves.toMatchObject({ needs: "supplier.capability.enable" });
+    const seeded = { ...base, classKey: SEEDED, basisClassKey: SEEDED };
+    await expect(caps.classProofRequest({ ...seeded, scopeKind: "provider", scopeProvider: "Synthetic provider", bookedTourId: String(TOUR) }, { supplierCode: CODE })).rejects.toThrow(/does not name this provider/);
+    await expect(caps.classProofRequest({ ...seeded, scopeKind: "tours", scopeTourIds: [String(BASE + 99), String(TOUR)], bookedTourId: String(TOUR) }, { supplierCode: CODE })).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
+    await expect(caps.classProofRequest({ ...seeded, scopeKind: "tours", scopeTourIds: [String(OTHER_TOUR)], bookedTourId: String(TOUR) }, { supplierCode: CODE })).rejects.toMatchObject({ details: { fields: { scopeTourIds: expect.stringMatching(/include the booked tour/) } } });
+    await expect(caps.classProofRequest({ ...seeded, scopeKind: "tours", scopeTourIds: [String(TICKET_TOUR)], bookedTourId: String(TICKET_TOUR) }, { supplierCode: CODE })).rejects.toMatchObject({ details: { fields: { bookedTourId: expect.stringMatching(/no stored offer of the booked key/) } } });
     await expect(
-      caps.classProofRequest({ ...base, classKey: SEEDED, basisClassKey: "live.fixed_slot_single.pickup_required.internal.per_person", scopeKind: "tours", scopeTourIds: [String(TOUR)] }, { supplierCode: CODE }),
+      caps.classProofRequest({ ...seeded, basisClassKey: "live.fixed_slot_single.pickup_required.internal.per_person", scopeKind: "tours", scopeTourIds: [String(TOUR)], bookedTourId: String(TOUR) }, { supplierCode: CODE }),
     ).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
-    const ok = await caps.classProofRequest({ ...base, classKey: SEEDED, basisClassKey: "live.listed_start_single.self.internal.per_person", scopeKind: "tours", scopeTourIds: [String(TOUR), String(TOUR)] }, { supplierCode: CODE });
+    const ok = await caps.classProofRequest({ ...seeded, scopeKind: "tours", scopeTourIds: [String(TOUR), String(TOUR)], bookedTourId: String(TOUR) }, { supplierCode: CODE });
     expect(ok.needs).toBe("supplier.capability.enable");
     expect(ok.payload.scopeTourIds).toEqual([String(TOUR)]);
   });
 
-  it("service: recording needs an approval for exactly that proof, used once; a narrower scope needs none", async () => {
+  it("recording always needs its own approval and instant rights; narrowing is an atomic replace; revoke needs the demotion count", async () => {
     const at = tick();
-    const input = { environment: "test" as const, classKey: SEEDED, basisClassKey: SEEDED, scopeKind: "tours" as const, scopeTourIds: [String(TOUR), String(OTHER_TOUR)], evidenceKind: "sandbox_drill" as const, reference: "zz n2 drill reference", note: "zz n2 record proof" };
+    const input = { ...base, classKey: SEEDED, basisClassKey: SEEDED, scopeKind: "tours" as const, scopeTourIds: [String(TOUR), String(OTHER_TOUR)], bookedTourId: String(TOUR), note: "zz n2 record proof" };
     const req = await caps.classProofRequest(input, { supplierCode: CODE });
     const ap = await approvals.requestPrivileged(admin("p"), "supplier.capability.enable", "products.activate_instant", req.payload, { environment: "test", totpCode: code("p", at), now: at });
-    expect(ap.status).toBe("applied");
     const approvalId = (ap as { approvalId: string }).approvalId;
     await expect(caps.recordClassProof(admin("p"), input, { supplierCode: CODE })).rejects.toMatchObject({ code: "FORBIDDEN" });
-    await expect(caps.recordClassProof(admin("p"), input, { supplierCode: CODE, approvalId, now: at })).resolves.toMatchObject({ approvalUsed: true });
-    // The approval is spent: it cannot record a wider proof (or anything else) a second time.
-    await expect(caps.recordClassProof(admin("p"), { ...input, scopeKind: "all", scopeTourIds: [] }, { supplierCode: CODE, approvalId, now: at })).rejects.toThrow(/different change|used already/);
-    // A scope the active proof already covers loosens nothing: no approval.
-    const narrower = await caps.classProofRequest({ ...input, scopeTourIds: [String(OTHER_TOUR)] }, { supplierCode: CODE });
-    expect(narrower.needs).toBeNull();
-    await expect(caps.recordClassProof(admin("p"), { ...input, scopeTourIds: [String(OTHER_TOUR)] }, { supplierCode: CODE, now: at })).resolves.toMatchObject({ approvalUsed: false });
-    // A wider scope (every offer of the key) is a new loosening.
-    expect((await caps.classProofRequest({ ...input, scopeKind: "all", scopeTourIds: [] }, { supplierCode: CODE })).needs).toBe("supplier.capability.enable");
+    await expect(caps.recordClassProof(ops("o"), input, { supplierCode: CODE, approvalId, now: at })).rejects.toMatchObject({ code: "FORBIDDEN" });
+    const { id } = await caps.recordClassProof(admin("p"), input, { supplierCode: CODE, approvalId, now: at });
+    // The same scope again is no longer free: it needs a new approval (N2-01).
+    await expect(caps.recordClassProof(admin("p"), input, { supplierCode: CODE, approvalId, now: at })).rejects.toThrow(/used already/);
+
+    // Narrowing: ops cannot; the booked tour stays; one replace, the old row revoked in the same transaction.
+    await expect(caps.narrowClassProof(ops("o"), { proofId: id, scopeTourIds: [String(TOUR)], note: "zz n2 narrow" }, { supplierCode: CODE })).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(caps.narrowClassProof(admin("p"), { proofId: id, scopeTourIds: [String(OTHER_TOUR)], note: "zz n2 narrow" }, { supplierCode: CODE })).rejects.toMatchObject({ details: { fields: { scopeTourIds: expect.stringMatching(/booked tour stays/) } } });
+    const narrowed = await caps.narrowClassProof(admin("p"), { proofId: id, scopeTourIds: [String(TOUR)], note: "zz n2 narrow" }, { supplierCode: CODE });
+    const [oldRow, newRow] = await Promise.all([prisma.supplierClassProof.findUniqueOrThrow({ where: { id } }), prisma.supplierClassProof.findUniqueOrThrow({ where: { id: narrowed.id } })]);
+    expect(oldRow.revokedAt).not.toBeNull();
+    expect(newRow).toMatchObject({ narrowsProofId: id, scopeTourIds: [String(TOUR)], reference: oldRow.reference, evidenceKind: oldRow.evidenceKind, bookedTourId: String(TOUR), approvalId: null, revokedAt: null });
+    await expect(caps.narrowClassProof(admin("p"), { proofId: id, scopeTourIds: [String(TOUR)], note: "zz n2 narrow" }, { supplierCode: CODE })).rejects.toThrow(/revoked/);
     expect(await refusal()).toBeNull();
+
+    // Revoking the narrower row is the off switch. The listing sells instantly now (written straight in: the draft fixture never passes readiness).
+    await prisma.productEligibility.update({ where: { productId }, data: { effectiveMode: "instant" } });
+    await prisma.supplierOfferEnablement.updateMany({ where: { supplierId, revokedAt: null }, data: { revokedAt: new Date(), revokeReason: "zz n2 evidence off" } });
+    expect(await refusal()).toBeNull();
+    await expect(caps.revokeClassProof(admin("p"), narrowed.id, "zz n2 revoke", { supplierCode: CODE })).rejects.toMatchObject({ details: { reason: "demotions_unconfirmed", demotions: 1 } });
+    await expect(caps.revokeClassProof(admin("p"), narrowed.id, "zz n2 revoke", { supplierCode: CODE, confirmDemotions: 1 })).resolves.toMatchObject({ revoked: true, demotions: 1 });
+    expect(await refusal()).toBe("offer_evidence_missing");
+  });
+
+  it("tickets: \"no ticket at confirmation\" is refused for a ticket mapping, even with its key off (N2-02)", async () => {
+    const at = tick();
+    await expect(
+      catalog.setTicketEvidence(admin("p"), ticketMappingId, { issuesTicketsAtConfirm: "no", source: "zz n2 written answer reference", note: "zz n2 ticket test", totpCode: code("p", at) }, at),
+    ).rejects.toMatchObject({ code: "CONFLICT", details: { reason: "ticket_offer" } });
   });
 
   /* ------------------------------------------------------------ bulk runs */
@@ -247,6 +333,9 @@ describe.skipIf(!dbEnabled)("doc 30 N2: class proofs and bulk runs (local DB)", 
     expect(await prisma.product.count({ where: { id: { in: [products[1], products[2]] }, fulfilmentMode: "inquiry" } })).toBe(2);
     const audits = await prisma.auditLog.findMany({ where: { action: "product.fulfilment_mode", entityId: { in: [products[1], products[2]] } } });
     expect(audits.every((a) => (a.after as { bulkId?: string }).bulkId === bulkId)).toBe(true);
+    const items = await prisma.bulkOperationItem.findMany({ where: { bulkId } });
+    expect(items.find((i) => i.productId === products[1])?.wasInstant).toBe(true);
+    expect(items.find((i) => i.productId === products[3])?.wasInstant).toBe(false);
 
     // Replay of a finished run: nothing runs again.
     const before = await prisma.auditLog.count({ where: { action: "bulk_operation.item", entityId: { in: products } } });
@@ -258,7 +347,33 @@ describe.skipIf(!dbEnabled)("doc 30 N2: class proofs and bulk runs (local DB)", 
     await expect(bulk.run(admin("q"), bulkId)).rejects.toMatchObject({ code: "FORBIDDEN" });
   });
 
-  it("arm burns one approval for the frozen list: a changed list or a second use is refused; failures are per item", async () => {
+  it("an item another run holds is not executed twice; a lapsed claim is taken again", async () => {
+    const at = tick();
+    await prisma.product.update({ where: { id: products[3] }, data: { fulfilmentMode: "instant" } });
+    const { bulkId } = await bulk.start(admin("p"), { action: "inquiry", productIds: [products[3]], reason: "zz n2 claim test" }, { environment: "test", now: at });
+    await prisma.bulkOperationItem.updateMany({ where: { bulkId }, data: { state: "running", claimedUntil: new Date(at.getTime() + 60_000) } });
+    const held = await bulk.run(admin("p"), bulkId, { now: at });
+    expect(held).toMatchObject({ applied: [], remaining: [products[3]] });
+    expect((await prisma.product.findUniqueOrThrow({ where: { id: products[3] } })).fulfilmentMode).toBe("instant");
+    const later = new Date(at.getTime() + 2 * 60_000);
+    const taken = await bulk.run(admin("p"), bulkId, { now: later });
+    expect(taken.applied.map((i) => i.productId)).toEqual([products[3]]);
+  });
+
+  it("the item writers check the run themselves (N2-06): wrong person, not a running item, no approval", async () => {
+    const at = tick();
+    const { bulkId } = await bulk.start(admin("p"), { action: "inquiry", productIds: [products[2]], reason: "zz n2 guard run" }, { environment: "test", now: at });
+    // Pending, not claimed: refused.
+    await expect(catalogService.setProductModeForBulk(admin("p"), products[2], "inquiry", "zz n2 guard", { bulkId, now: at })).rejects.toThrow(/not a running item/);
+    await prisma.bulkOperationItem.updateMany({ where: { bulkId }, data: { state: "running", claimedUntil: new Date(at.getTime() + 60_000) } });
+    await expect(catalogService.setProductModeForBulk(admin("q"), products[2], "inquiry", "zz n2 guard", { bulkId, now: at })).rejects.toMatchObject({ code: "FORBIDDEN" });
+    // An inquiry run carries no approval: it can never write instant.
+    await expect(catalogService.setProductModeForBulk(admin("p"), products[2], "instant", "zz n2 guard", { bulkId, now: at })).rejects.toThrow();
+    await expect(catalogService.setProductModeForBulk(admin("p"), products[2], "inquiry", "zz n2 guard", { bulkId: uuidv7(), now: at })).rejects.toThrow(/does not exist/);
+    await expect(catalogService.setProductModeForBulk(admin("p"), products[2], "inquiry", "zz n2 guard", { bulkId, now: new Date(at.getTime() + 31 * 60_000) })).rejects.toThrow(/window/);
+  });
+
+  it("arm burns one approval for the frozen list: a changed list, another person or a second use is refused; failures are per item", async () => {
     const at = tick();
     const items = [products[1], products[2]];
     const ap = await approvals.requestPrivileged(admin("p"), "instant.activate.bulk", "products.activate_instant", bulkApprovalPayload("arm", "test", items), {
@@ -271,6 +386,9 @@ describe.skipIf(!dbEnabled)("doc 30 N2: class proofs and bulk runs (local DB)", 
     const approvalId = (ap as { approvalId: string }).approvalId;
     await expect(bulk.start(admin("p"), { action: "arm", productIds: [products[1], products[3]], reason: "zz n2 arm run" }, { environment: "test", approvalId, now: at })).rejects.toThrow(/different change/);
     await expect(bulk.start(admin("p"), { action: "arm", productIds: items, reason: "zz n2 arm run" }, { environment: "test", now: at })).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(bulk.start(admin("q"), { action: "arm", productIds: items, reason: "zz n2 arm run" }, { environment: "test", approvalId, now: at })).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(await bulk.isRequester(admin("p"), approvalId)).toBe(true);
+    expect(await bulk.isRequester(admin("q"), approvalId)).toBe(false);
     const { bulkId } = await bulk.start(admin("p"), { action: "arm", productIds: [...items].reverse(), reason: "zz n2 arm run" }, { environment: "test", approvalId, now: at });
     await expect(bulk.start(admin("p"), { action: "arm", productIds: items, reason: "zz n2 arm run" }, { environment: "test", approvalId, now: at })).rejects.toThrow(/used already/);
     const r = await bulk.run(admin("p"), bulkId, { now: at });

@@ -503,7 +503,7 @@ function renderOwnerActionAlert(raw: TemplateContext): Rendered {
     `Approval: ${opsField(ctx, "approvalId")}`,
     `Applied: ${opsField(ctx, "appliedAt")}`,
     ``,
-    `It took effect at once, approved by one administrator with a fresh authenticator code (owner decisions D15, D16).`,
+    `Approved at once by one administrator with a fresh authenticator code (owner decisions D15, D16). The action follows the approval; its outcome is in the audit log.`,
     `To undo: switch the class off or send the listings back to inquiry in admin. Neither needs an approval.`,
     ``,
     `Admin: ${adminUrl}`,

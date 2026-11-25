@@ -1,11 +1,10 @@
 "use client";
 
-import { useActionState } from "react";
+import { useActionState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import {
   recordClassProofAction,
   recordOfferEvidenceAction,
-  revokeClassProofAction,
   revokeOfferEvidenceAction,
   setCapabilityFlagAction,
   type CapabilityActionResult,
@@ -14,7 +13,7 @@ import { INPUT_CLASS } from "../../../../_components/ui";
 
 type Environment = "test" | "production";
 
-function Feedback({ result, saved }: { result: CapabilityActionResult | null; saved: string }) {
+export function Feedback({ result, saved }: { result: CapabilityActionResult | null; saved: string }) {
   if (result?.ok && result.data.status === "pending")
     return (
       <p className="text-2xs font-semibold text-[var(--color-warning)]" role="status">
@@ -43,6 +42,8 @@ function Feedback({ result, saved }: { result: CapabilityActionResult | null; sa
           result.fields?.scopeTourIds ??
           result.fields?.scopeProvider ??
           result.fields?.basisClassKey ??
+          result.fields?.bookedTourId ??
+          result.fields?.confirmDemotions ??
           result.message}
       </p>
     );
@@ -182,7 +183,7 @@ export function EvidenceForm({ environment, classKeys, oneStep = false }: { envi
 }
 
 /** Withdraw one evidence row (tightening: a reason only). */
-export function RevokeEvidenceForm({ evidenceId }: { evidenceId: string }) {
+export function RevokeEvidenceForm({ evidenceId, label }: { evidenceId: string; label: string }) {
   const [result, action, pending] = useActionState<CapabilityActionResult | null, FormData>(revokeOfferEvidenceAction, null);
   return (
     <form action={action} className="flex flex-wrap items-end gap-2">
@@ -191,7 +192,7 @@ export function RevokeEvidenceForm({ evidenceId }: { evidenceId: string }) {
         Reason
         <input id={`rv-${evidenceId}`} name="note" required minLength={8} maxLength={500} className={`${INPUT_CLASS} mt-1 min-h-9 w-48 text-xs font-normal`} />
       </label>
-      <Button type="submit" size="sm" variant="secondary" loading={pending} loadingLabel="Saving…">
+      <Button type="submit" size="sm" variant="secondary" loading={pending} loadingLabel="Saving…" aria-label={label}>
         Revoke
       </Button>
       <Feedback result={result} saved="Revoked." />
@@ -199,37 +200,75 @@ export function RevokeEvidenceForm({ evidenceId }: { evidenceId: string }) {
   );
 }
 
+/** What a widening starts from: the proof it widens. */
+export interface ProofPreset {
+  widensProofId: string;
+  classKey: string;
+  basisClassKey: string;
+  scopeKind: string;
+  scopeTourIds: string[];
+  bookedTourId: string | null;
+  evidenceKind: string;
+  reference: string;
+}
+
 /**
- * Record a class proof with its scope (doc 30 §3.12, D14). Loosening: a code
- * (one administrator with full rights in production once the owner alert is
- * configured, otherwise a second administrator). A scope an active proof
- * already covers needs no code. Fixed once recorded: widen with a new proof.
- *
- * TODO(doc 30 decision 23): the confirm dialog with code field and result
- * list is chosen by the owner; this form uses existing controls only.
+ * Record or widen a class proof with its scope (doc 30 §3.12, D14). Always a
+ * loosening: a fresh code (one administrator with full rights in production
+ * once the owner alert is configured, otherwise a second administrator), and
+ * the count of listings it would send to inquiry when there are any. Fixed
+ * once recorded: widen with a new proof, narrow or revoke from the proof's
+ * own dialog. Shown inside the confirm dialog (proof-dialogs.tsx).
  */
-export function ProofForm({ environment, classKeys, oneStep = false }: { environment: Environment; classKeys: string[]; oneStep?: boolean }) {
+export function ProofForm({
+  environment,
+  classKeys,
+  oneStep = false,
+  preset,
+  idPrefix = "pf",
+  footer,
+}: {
+  environment: Environment;
+  classKeys: string[];
+  oneStep?: boolean;
+  preset?: ProofPreset;
+  idPrefix?: string;
+  /** The dialog's cancel control, placed beside the submit button. */
+  footer?: ReactNode;
+}) {
   const [result, action, pending] = useActionState<CapabilityActionResult | null, FormData>(recordClassProofAction, null);
   const dual = environment !== "production" ? "" : oneStep ? " It applies at once and the owner is emailed." : " In production a second administrator must also record it.";
-  if (classKeys.length === 0) return <p className="text-sm text-ink-600">No class in this environment can take a proof yet.</p>;
+  if (classKeys.length === 0 && !preset) return <p className="text-sm text-ink-600">No class in this environment can take a proof yet.</p>;
+  const id = (k: string) => `${idPrefix}-${k}`;
+  const needsCount = Boolean(result && !result.ok && result.fields?.confirmDemotions);
   return (
     <form action={action} className="grid gap-3 sm:grid-cols-2">
       <input type="hidden" name="environment" value={environment} />
-      <label htmlFor="pf-class" className="block text-xs font-semibold text-ink-800">
-        Class key proven
-        <select id="pf-class" name="classKey" required className={`${INPUT_CLASS} mt-1 min-h-10 font-mono text-xs font-normal`}>
-          {classKeys.map((k) => (
-            <option key={k} value={k}>
-              {k}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label htmlFor="pf-basis" className="block text-xs font-semibold text-ink-800">
+      {preset ? (
+        <>
+          <input type="hidden" name="classKey" value={preset.classKey} />
+          <input type="hidden" name="widensProofId" value={preset.widensProofId} />
+          <p className="text-xs text-ink-700 sm:col-span-2">
+            Widens the proof for <span className="break-all font-mono">{preset.classKey}</span>. The new row stands alone; the old one stays until you revoke it.
+          </p>
+        </>
+      ) : (
+        <label htmlFor={id("class")} className="block text-xs font-semibold text-ink-800">
+          Class key proven
+          <select id={id("class")} name="classKey" required className={`${INPUT_CLASS} mt-1 min-h-10 font-mono text-xs font-normal`}>
+            {classKeys.map((k) => (
+              <option key={k} value={k}>
+                {k}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+      <label htmlFor={id("basis")} className="block text-xs font-semibold text-ink-800">
         Key the booking was made on
-        <select id="pf-basis" name="basisClassKey" className={`${INPUT_CLASS} mt-1 min-h-10 font-mono text-xs font-normal`} defaultValue="">
+        <select id={id("basis")} name="basisClassKey" className={`${INPUT_CLASS} mt-1 min-h-10 font-mono text-xs font-normal`} defaultValue={preset && preset.basisClassKey !== preset.classKey ? preset.basisClassKey : ""}>
           <option value="">The same key</option>
-          {classKeys.map((k) => (
+          {[...new Set([...classKeys, ...(preset ? [preset.basisClassKey] : [])])].map((k) => (
             <option key={k} value={k}>
               {k}
             </option>
@@ -241,71 +280,78 @@ export function ProofForm({ environment, classKeys, oneStep = false }: { environ
         <legend className="text-xs font-semibold text-ink-800">Scope</legend>
         <div className="mt-1 flex flex-wrap gap-4 text-sm">
           <label className="flex items-center gap-2">
-            <input type="radio" name="scopeKind" value="tours" defaultChecked required /> Named tours
+            <input type="radio" name="scopeKind" value="tours" defaultChecked={!preset || preset.scopeKind === "tours"} required /> Named tours
           </label>
           <label className="flex items-center gap-2">
-            <input type="radio" name="scopeKind" value="all" /> Every offer of the key
+            <input type="radio" name="scopeKind" value="all" defaultChecked={preset?.scopeKind === "all"} /> Every offer of the key
           </label>
           <label className="flex items-center gap-2">
             <input type="radio" name="scopeKind" value="provider" /> One external provider
           </label>
         </div>
-        <span className="mt-1 block text-2xs text-ink-500">External keys: the booked provider only (D21). Tickets: the booked attraction first (D24).</span>
+        <span className="mt-1 block text-2xs text-ink-500">External keys: the booked tour only, one more per widening (D21). Tickets: the booked attraction first (D24).</span>
       </fieldset>
-      <label htmlFor="pf-tours" className="block text-xs font-semibold text-ink-800">
-        TravelDesk tour ids (named tours)
-        <input id="pf-tours" name="scopeTourIds" inputMode="numeric" placeholder="3001, 3002" className={`${INPUT_CLASS} mt-1 min-h-10 font-mono text-sm font-normal`} />
+      <label htmlFor={id("booked")} className="block text-xs font-semibold text-ink-800">
+        Booked tour (TravelDesk tour id)
+        <input
+          id={id("booked")}
+          name="bookedTourId"
+          required
+          inputMode="numeric"
+          pattern="[1-9][0-9]{0,9}"
+          defaultValue={preset?.bookedTourId ?? ""}
+          className={`${INPUT_CLASS} mt-1 min-h-10 font-mono text-sm font-normal`}
+        />
+        <span className="mt-1 block text-2xs font-normal text-ink-500">The tour the supervised booking was made on. Named tours must include it.</span>
       </label>
-      <label htmlFor="pf-provider" className="block text-xs font-semibold text-ink-800">
+      <label htmlFor={id("tours")} className="block text-xs font-semibold text-ink-800">
+        TravelDesk tour ids (named tours)
+        <input
+          id={id("tours")}
+          name="scopeTourIds"
+          inputMode="numeric"
+          placeholder="3001, 3002"
+          defaultValue={preset?.scopeTourIds.join(", ") ?? ""}
+          className={`${INPUT_CLASS} mt-1 min-h-10 font-mono text-sm font-normal`}
+        />
+      </label>
+      <label htmlFor={id("provider")} className="block text-xs font-semibold text-ink-800">
         Provider (one external provider)
-        <input id="pf-provider" name="scopeProvider" maxLength={120} className={`${INPUT_CLASS} mt-1 min-h-10 text-sm font-normal`} />
+        <input id={id("provider")} name="scopeProvider" maxLength={120} className={`${INPUT_CLASS} mt-1 min-h-10 text-sm font-normal`} />
         <span className="mt-1 block text-2xs font-normal text-ink-500">Only where TravelDesk&apos;s offer data names the provider.</span>
       </label>
-      <label htmlFor="pf-kind" className="block text-xs font-semibold text-ink-800">
+      <label htmlFor={id("kind")} className="block text-xs font-semibold text-ink-800">
         Proof
-        <select id="pf-kind" name="evidenceKind" required className={`${INPUT_CLASS} mt-1 min-h-10 text-sm font-normal`}>
+        <select id={id("kind")} name="evidenceKind" required defaultValue={preset?.evidenceKind ?? "production_booking"} className={`${INPUT_CLASS} mt-1 min-h-10 text-sm font-normal`}>
           <option value="production_booking">Supervised production booking</option>
           <option value="sandbox_drill">Sandbox drill</option>
         </select>
       </label>
-      <label htmlFor="pf-ref" className="block text-xs font-semibold text-ink-800">
+      <label htmlFor={id("ref")} className="block text-xs font-semibold text-ink-800">
         Booking reference
-        <input id="pf-ref" name="reference" required minLength={3} maxLength={200} className={`${INPUT_CLASS} mt-1 min-h-10 text-sm font-normal`} />
+        <input id={id("ref")} name="reference" required minLength={3} maxLength={200} defaultValue={preset?.reference ?? ""} className={`${INPUT_CLASS} mt-1 min-h-10 text-sm font-normal`} />
         <span className="mt-1 block text-2xs font-normal text-ink-500">Never an email, phone number or price.</span>
       </label>
-      <label htmlFor="pf-widens" className="block text-xs font-semibold text-ink-800">
-        Widens proof (optional)
-        <input id="pf-widens" name="widensProofId" className={`${INPUT_CLASS} mt-1 min-h-10 font-mono text-xs font-normal`} placeholder="proof id" />
-      </label>
-      <label htmlFor="pf-note" className="block text-xs font-semibold text-ink-800">
+      <label htmlFor={id("note")} className="block text-xs font-semibold text-ink-800">
         Reason (audit log)
-        <input id="pf-note" name="note" required minLength={8} maxLength={500} className={`${INPUT_CLASS} mt-1 min-h-10 text-sm font-normal`} />
+        <input id={id("note")} name="note" required minLength={8} maxLength={500} className={`${INPUT_CLASS} mt-1 min-h-10 text-sm font-normal`} />
       </label>
-      <CodeField id="pf-code" required={false} hint={`Recording or widening a proof needs a fresh code.${dual} A narrower scope than an active proof needs none.`} />
-      <div className="flex flex-wrap items-center gap-3 sm:col-span-2">
-        <Button type="submit" size="sm" variant="secondary" loading={pending} loadingLabel="Saving…">
-          Record proof
-        </Button>
+      {needsCount && (
+        <label htmlFor={id("confirm")} className="block text-xs font-semibold text-[var(--color-danger)] sm:col-span-2">
+          Listings sent to inquiry: type the number to confirm
+          <input id={id("confirm")} name="confirmDemotions" required inputMode="numeric" pattern="[0-9]{1,6}" className={`${INPUT_CLASS} mt-1 min-h-10 w-32 font-mono text-sm font-normal`} />
+        </label>
+      )}
+      <CodeField id={id("code")} hint={`Recording or widening a proof needs a fresh code.${dual}`} />
+      <div className="grid gap-2 sm:col-span-2">
         <Feedback result={result} saved="Proof recorded." />
+        <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+          {footer}
+          <Button type="submit" size="sm" variant="secondary" loading={pending} loadingLabel="Saving…">
+            {preset ? "Record wider proof" : "Record proof"}
+          </Button>
+        </div>
       </div>
-    </form>
-  );
-}
-
-/** Withdraw one class proof (tightening: a reason only). The seeded exception does not come back. */
-export function RevokeProofForm({ proofId }: { proofId: string }) {
-  const [result, action, pending] = useActionState<CapabilityActionResult | null, FormData>(revokeClassProofAction, null);
-  return (
-    <form action={action} className="flex flex-wrap items-end gap-2">
-      <input type="hidden" name="proofId" value={proofId} />
-      <label htmlFor={`rp-${proofId}`} className="block text-2xs font-semibold text-ink-800">
-        Reason
-        <input id={`rp-${proofId}`} name="note" required minLength={8} maxLength={500} className={`${INPUT_CLASS} mt-1 min-h-9 w-48 text-xs font-normal`} />
-      </label>
-      <Button type="submit" size="sm" variant="secondary" loading={pending} loadingLabel="Saving…">
-        Revoke
-      </Button>
-      <Feedback result={result} saved="Revoked." />
     </form>
   );
 }

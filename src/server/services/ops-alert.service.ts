@@ -13,6 +13,7 @@ import { quoteBudgetIncidents } from "./quote-budget-alert";
 import { AUTH_PAUSE_MS, BREAKER_THRESHOLD, breakerPauseMs } from "../crm/crm.worker";
 import { crmReturnIncidents } from "../crm/crm.return.alerts";
 import { ownerAlertIncidents } from "./owner-alert";
+import { bulkDisarmIncidents } from "./bulk-guard";
 
 /**
  * Ops alert emails for instant-path incidents (doc 22 §32.24: alerts by
@@ -129,12 +130,14 @@ export type OpsIncidentKind =
   | "catalogue_stale"
   | "quote_budget_refused"
   /** Doc 30 N2: the owner alert of a one-person approval failed, needs a human, was suppressed or is late (owner-alert.ts). */
-  | "owner_alert_failed";
+  | "owner_alert_failed"
+  /** Doc 30 N2 (review N2-04): a free-cancellation bulk item left a listing on inquiry after a failure (bulk-guard.ts). */
+  | "bulk_item_disarmed";
 /**
  * `crm_subject` needs migration 20261122140000 (ops_alerts_entity_kind_check). Its entity id is `inquiry:<id>`
  * or `order:<id>`, or `portal:<environment>` for the CRM worker's own pause (C2b, no new entity kind).
  */
-export type OpsEntityKind = "supplier_account" | "payment_saga" | "order_item" | "supplier_booking" | "supplier_document" | "crm_subject" | "privileged_approval";
+export type OpsEntityKind = "supplier_account" | "payment_saga" | "order_item" | "supplier_booking" | "supplier_document" | "crm_subject" | "privileged_approval" | "bulk_operation_item";
 
 export interface OpsIncident {
   kind: OpsIncidentKind;
@@ -168,6 +171,7 @@ export const OPS_INCIDENT_TITLES: Record<OpsIncidentKind, string> = {
   catalogue_stale: "Supplier catalogue not synced for 48 hours",
   quote_budget_refused: "Quote read budget spent: customers sent to inquiry",
   owner_alert_failed: "Owner alert of a one-person approval was not delivered",
+  bulk_item_disarmed: "Bulk free-cancellation run left an armed listing on inquiry",
 };
 
 /** The stored row payload: what the email says plus its idempotency scope. */
@@ -458,6 +462,8 @@ export async function collectOpsIncidents(since: Date, now: Date, limit = COLLEC
   out.push(...(await quoteBudgetIncidents(since, now, limit)));
   // Doc 30 N2: needs migration 20261127140000 (entity kind `privileged_approval`).
   out.push(...(await ownerAlertIncidents(since, now, limit)));
+  // Doc 30 N2 review N2-04: needs migration 20261127160000 (entity kind `bulk_operation_item`).
+  out.push(...(await bulkDisarmIncidents(since, now, limit)));
   return out;
 }
 

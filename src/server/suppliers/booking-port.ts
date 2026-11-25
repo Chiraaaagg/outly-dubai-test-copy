@@ -293,7 +293,7 @@ export type PrivilegedOperation =
  * the same transaction (`alertId`). `item_cap`: the hourly listing cap.
  */
 export type PrivilegedApproval =
-  | { status: "applied"; approvalId: string; mode?: "dual" | "single_step_up"; alertId?: string | null }
+  | { status: "applied"; approvalId: string; mode?: "dual" | "single_step_up" | "test"; alertId?: string | null }
   | { status: "pending"; approvalId: string; needs: "second_approver" }
   | { status: "refused"; reason: "step_up_required" | "same_person" | "expired" | "forbidden" | "item_cap" };
 

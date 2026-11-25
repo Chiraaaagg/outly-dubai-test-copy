@@ -2,6 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { z } from "zod";
+import { hasPermission } from "@/server/lib/actor";
 import { Errors } from "@/server/lib/errors";
 import { parseWith } from "@/server/lib/http";
 import { approvalService, OPERATION_PERMISSION } from "@/server/services/approval.service";
@@ -61,12 +62,37 @@ const proofSchema = z
     evidenceKind: z.enum(PROOF_EVIDENCE_KINDS),
     reference: z.string().trim().min(3, "Give a reference of 3 to 200 characters").max(200),
     widensProofId: z.uuid().optional(),
+    bookedTourId: z.string().trim().regex(/^[1-9][0-9]{0,9}$/, "Enter the TravelDesk tour id the booking was made on"),
+    confirmDemotions: z.coerce.number().int().min(0).max(100_000).optional(),
     note: noteField,
     totpCode: totpField,
   })
   .strict();
 
-const revokeProofSchema = z.object({ proofId: z.uuid(), note: noteField }).strict();
+const confirmField = z.coerce.number().int().min(0).max(100_000).optional();
+const revokeProofSchema = z.object({ proofId: z.uuid(), note: noteField, confirmDemotions: confirmField }).strict();
+const narrowProofSchema = z
+  .object({
+    proofId: z.uuid(),
+    scopeTourIds: z.array(z.string().trim().regex(/^[1-9][0-9]{0,9}$/, "Tour ids are TravelDesk numbers")).min(1).max(200),
+    note: noteField,
+    confirmDemotions: confirmField,
+  })
+  .strict();
+
+/** Review N2-05: a change that sends live listings to inquiry asks for their count first, before any code is used. */
+function requireDemotionConfirmation(count: number, confirmed: number | undefined): void {
+  if (count > 0 && confirmed !== count) {
+    throw Errors.validation(
+      { confirmDemotions: `${count} listing${count === 1 ? "" : "s"} selling instantly today would go to inquiry. Enter ${count} to confirm.` },
+      "This change sends live listings to inquiry",
+    );
+  }
+}
+
+function tourList(raw: string | undefined): string[] | undefined {
+  return raw ? raw.split(/[\s,]+/).filter(Boolean) : undefined;
+}
 
 /** `pending`: waiting for a second approver (production); nothing has changed yet. */
 export type CapabilityActionResult = ActionResult<{ status: "applied" | "pending" | "unchanged"; approvalId: string | null }>;
@@ -142,46 +168,84 @@ export async function revokeOfferEvidenceAction(_prev: CapabilityActionResult | 
   });
 }
 
-/** Record a class proof with its scope (doc 30 §3.12). Loosening unless an active proof already covers the scope. */
+/**
+ * Record or widen a class proof with its scope (doc 30 §3.12). Always a
+ * loosening: a fresh code, `products.activate_instant` and `suppliers.manage`.
+ * Narrowing is `narrowClassProofAction` (review N2-01).
+ */
 export async function recordClassProofAction(_prev: CapabilityActionResult | null, fd: FormData): Promise<CapabilityActionResult> {
   return runAction(async () => {
-    const { actor } = await authService.requireCookies("suppliers.manage");
-    const tours = form.str(fd, "scopeTourIds");
+    const { actor } = await authService.requireCookies("products.activate_instant");
+    if (!hasPermission(actor, "suppliers.manage")) throw Errors.forbidden("suppliers.manage");
     const input = parseWith(proofSchema, {
       environment: form.str(fd, "environment"),
       classKey: form.str(fd, "classKey"),
       basisClassKey: form.str(fd, "basisClassKey") ?? form.str(fd, "classKey"),
       scopeKind: form.str(fd, "scopeKind"),
       scopeProvider: form.str(fd, "scopeProvider"),
-      scopeTourIds: tours ? tours.split(/[\s,]+/).filter(Boolean) : undefined,
+      scopeTourIds: tourList(form.str(fd, "scopeTourIds")),
       evidenceKind: form.str(fd, "evidenceKind"),
       reference: form.str(fd, "reference") ?? "",
       widensProofId: form.str(fd, "widensProofId"),
+      bookedTourId: form.str(fd, "bookedTourId") ?? "",
+      confirmDemotions: form.str(fd, "confirmDemotions"),
       note: form.str(fd, "note") ?? "",
       totpCode: form.str(fd, "totpCode"),
     });
     const req = await supplierCapabilityService.classProofRequest(input);
-    let approvalId: string | undefined;
-    if (req.needs) {
-      if (!input.totpCode) throw Errors.validation({ totpCode: "Recording a proof needs a code from your authenticator app" });
-      const r = await approvalService.requestPrivileged(actor, req.needs, OPERATION_PERMISSION[req.needs], req.payload, { environment: input.environment, totpCode: input.totpCode });
-      if (r.status === "refused") refusedApproval(r.reason);
-      if (r.status === "pending") return { status: "pending" as const, approvalId: r.approvalId };
-      approvalId = r.approvalId;
-    }
-    await supplierCapabilityService.recordClassProof(actor, input, { approvalId });
+    requireDemotionConfirmation(req.demotions.count, input.confirmDemotions);
+    if (!input.totpCode) throw Errors.validation({ totpCode: "Recording a proof needs a code from your authenticator app" });
+    const r = await approvalService.requestPrivileged(actor, req.needs, OPERATION_PERMISSION[req.needs], req.payload, { environment: input.environment, totpCode: input.totpCode });
+    if (r.status === "refused") refusedApproval(r.reason);
+    if (r.status === "pending") return { status: "pending" as const, approvalId: r.approvalId };
+    await supplierCapabilityService.recordClassProof(actor, input, { approvalId: r.approvalId });
     revalidatePath(PATH);
-    return { status: "applied" as const, approvalId: approvalId ?? null };
+    return { status: "applied" as const, approvalId: r.approvalId };
   });
 }
 
-/** Withdraw a class proof (tightening: a reason only). */
+/** Narrow a proof to fewer named tours: one atomic replace, no code (tightening), instant-activation rights (review N2-01). */
+export async function narrowClassProofAction(_prev: CapabilityActionResult | null, fd: FormData): Promise<CapabilityActionResult> {
+  return runAction(async () => {
+    const { actor } = await authService.requireCookies("products.activate_instant");
+    if (!hasPermission(actor, "suppliers.manage")) throw Errors.forbidden("suppliers.manage");
+    const input = parseWith(narrowProofSchema, {
+      proofId: form.str(fd, "proofId"),
+      scopeTourIds: tourList(form.str(fd, "scopeTourIds")) ?? [],
+      note: form.str(fd, "note") ?? "",
+      confirmDemotions: form.str(fd, "confirmDemotions"),
+    });
+    const d = await supplierCapabilityService.proofChangeDemotions(input.proofId, { kind: "narrow", scopeTourIds: input.scopeTourIds });
+    requireDemotionConfirmation(d.count, input.confirmDemotions);
+    await supplierCapabilityService.narrowClassProof(actor, input);
+    revalidatePath(PATH);
+    return { status: "applied" as const, approvalId: null };
+  });
+}
+
+/** Withdraw a class proof (tightening: a reason, and the count of listings it sends to inquiry when there are any). */
 export async function revokeClassProofAction(_prev: CapabilityActionResult | null, fd: FormData): Promise<CapabilityActionResult> {
   return runAction(async () => {
-    const { actor } = await authService.requireCookies("suppliers.manage");
-    const input = parseWith(revokeProofSchema, { proofId: form.str(fd, "proofId"), note: form.str(fd, "note") ?? "" });
-    const done = await supplierCapabilityService.revokeClassProof(actor, input.proofId, input.note);
+    const { actor } = await authService.requireCookies("products.activate_instant");
+    if (!hasPermission(actor, "suppliers.manage")) throw Errors.forbidden("suppliers.manage");
+    const input = parseWith(revokeProofSchema, { proofId: form.str(fd, "proofId"), note: form.str(fd, "note") ?? "", confirmDemotions: form.str(fd, "confirmDemotions") });
+    const d = await supplierCapabilityService.proofChangeDemotions(input.proofId, { kind: "revoke" });
+    requireDemotionConfirmation(d.count, input.confirmDemotions);
+    const done = await supplierCapabilityService.revokeClassProof(actor, input.proofId, input.note, { confirmDemotions: input.confirmDemotions });
     revalidatePath(PATH);
     return { status: done.revoked ? ("applied" as const) : ("unchanged" as const), approvalId: null };
+  });
+}
+
+export type DemotionPreview = ActionResult<{ count: number }>;
+
+/** Read-only: how many listings selling instantly today a revoke or narrowing would send to inquiry (review N2-05). */
+export async function proofDemotionsAction(proofId: string, change: { kind: "revoke" } | { kind: "narrow"; scopeTourIds: string[] }): Promise<DemotionPreview> {
+  return runAction(async () => {
+    await authService.requireCookies("suppliers.manage");
+    const id = parseWith(z.uuid(), proofId);
+    const tours = change.kind === "narrow" ? parseWith(z.array(z.string().trim().regex(/^[1-9][0-9]{0,9}$/)).max(200), change.scopeTourIds) : [];
+    const d = await supplierCapabilityService.proofChangeDemotions(id, change.kind === "narrow" ? { kind: "narrow", scopeTourIds: tours } : { kind: "revoke" });
+    return { count: d.count };
   });
 }

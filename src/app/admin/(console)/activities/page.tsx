@@ -91,8 +91,9 @@ export default async function ActivitiesPage({ searchParams }: { searchParams: P
         }
       />
 
-      <form method="get" action="/admin/activities" className="mb-4 grid gap-2 sm:grid-cols-[minmax(0,1fr)_10rem_8rem_12rem_auto]">
-        <input name="q" defaultValue={q} placeholder="Search title, slug, location" className={INPUT_CLASS} aria-label="Search activities" />
+      {/* Search lives in the table's toolbar (decision 23); these filters keep it. */}
+      <form method="get" action="/admin/activities" className="mb-4 grid gap-2 sm:grid-cols-[10rem_8rem_12rem_auto]" aria-label="Filter activities">
+        {q && <input type="hidden" name="q" value={q} />}
         <select name="status" defaultValue={status ?? ""} className={INPUT_CLASS} aria-label="Status">
           <option value="">All statuses</option>
           <option value="published">Published</option>
