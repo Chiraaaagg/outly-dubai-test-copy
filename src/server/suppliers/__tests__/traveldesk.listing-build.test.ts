@@ -325,4 +325,19 @@ describe("own ages (doc 30 N4, review 109 INT-01)", () => {
     expect(v2.units?.map((u) => u.label)).toEqual(["Adult (12+)", "Child (3–11)", "Infant (under 3)"]);
   });
 });
+
+describe("adult age without a child unit (review 110 R110-03)", () => {
+  it("says what the page and picker read back: the page's adult band", async () => {
+    const { variantPaxAges } = await import("@/lib/pax-ages");
+    const own = stored(1, { childAge: 8 });
+    const l = plan([planOffer({ offerId: 1, childAge: 8, supplierUnits: ["adult", "infant"], netAedMinorByUnit: { adult: 12_347n, child: 0n, infant: 0n, trip: 0n } })]).listings[0];
+    const b = buildListingDraft(l, new Map([[1, own]]), CONTENT, CTX);
+    expect(b.ok).toBe(true);
+    if (!b.ok) return;
+    const v = b.input.variants[0];
+    expect(v.units?.some((u) => u.unitId === "child")).toBe(false);
+    const adult = v.units!.find((u) => u.unitId === "adult")!;
+    expect([adult.ageMin, adult.label]).toEqual([variantPaxAges(v)!.adult.min, "Adult (12+)"]);
+  });
+});
 });

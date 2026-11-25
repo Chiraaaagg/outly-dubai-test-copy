@@ -223,8 +223,11 @@ export function buildListingDraft(
       const units: UnitDefinition[] = [];
       const fallbackQty = stored?.maxPax ?? 20;
       const bands = (stored && offerPaxAges(stored)) || PAGE_PAX_AGES;
-      units.push(unit("adult", adult, maxQty(stored?.paxLimits.adults, fallbackQty), bands));
-      if (sellsChild(o) && price.child) units.push(unit("child", { aed: price.child.aed + delta.aed, inr: price.child.inr + delta.inr }, maxQty(stored?.paxLimits.children, fallbackQty), bands));
+      const writesChild = Boolean(sellsChild(o) && price.child);
+      // Review 110 R110-03: without a child unit the page and picker read the page's adult band (`variantPaxAges`),
+      // so the adult unit says the same.
+      units.push(unit("adult", adult, maxQty(stored?.paxLimits.adults, fallbackQty), writesChild ? bands : { ...bands, adult: { ...PAGE_PAX_AGES.adult } }));
+      if (writesChild && price.child) units.push(unit("child", { aed: price.child.aed + delta.aed, inr: price.child.inr + delta.inr }, maxQty(stored?.paxLimits.children, fallbackQty), bands));
       if (sellsInfant(o)) units.push(unit("infant", { aed: 0, inr: 0 }, maxQty(stored?.paxLimits.infants, fallbackQty), bands));
       return {
         id: `td-${o.offerId}`,

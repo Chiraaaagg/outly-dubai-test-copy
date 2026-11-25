@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState, useEffect, useId, useRef, useState } from "react";
+import { useActionState, useCallback, useEffect, useId, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { Alert } from "@/components/ui/primitives";
@@ -104,6 +104,8 @@ function BatchDialog({ batchId, label, verb, act, force, help }: { batchId: stri
   // A fresh form (and action state) per opening, so an earlier attempt's error is not shown again (review 109 INT-04).
   const [round, setRound] = useState(0);
   const [done, setDone] = useState(false);
+  // Stable, so the body's effect runs once per success (review 110 R110-02).
+  const markDone = useCallback(() => setDone(true), []);
   // After a successful apply or rollback the trigger unmounts on refresh: focus goes to the stable batches heading.
   const stable = useRef<HTMLElement | null>(null);
   useEffect(() => {
@@ -130,7 +132,7 @@ function BatchDialog({ batchId, label, verb, act, force, help }: { batchId: stri
           <AlertDialogTitle>{label}</AlertDialogTitle>
           <AlertDialogDescription>{help}</AlertDialogDescription>
         </AlertDialogHeader>
-        <BatchDialogBody key={round} batchId={batchId} label={label} verb={verb} act={act} force={force} onDone={() => setDone(true)} />
+        <BatchDialogBody key={round} batchId={batchId} label={label} verb={verb} act={act} force={force} onDone={markDone} />
       </AlertDialogContent>
     </AlertDialog>
   );

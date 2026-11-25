@@ -469,8 +469,9 @@ async function upkeepTx(
 
     // Options.
     // Review 109 INT-02: the row lock `writeTicketEvidence` takes, so a revoke or a ticket answer made during this run
+    // (in id order, review 110 R110-01: mapping rows first, then product, then link, as the batch rollback does)
     // either commits before this read (and is read) or waits for this transaction; nothing re-activates or overwrites it.
-    await tx.$queryRaw`SELECT id FROM product_supplier_mappings WHERE product_id = ${product.id}::uuid AND supplier_id = ${data.supplier.id}::uuid AND environment = ${environment}::"supplier_environment" FOR UPDATE`;
+    await tx.$queryRaw`SELECT id FROM product_supplier_mappings WHERE product_id = ${product.id}::uuid AND supplier_id = ${data.supplier.id}::uuid AND environment = ${environment}::"supplier_environment" ORDER BY id FOR UPDATE`;
     const mappings = await tx.productSupplierMapping.findMany({ where: { productId: product.id, supplierId: data.supplier.id, environment } });
     const planOf = new Map<number, PlanOffer>();
     const storedOf = new Map<number, StoredOffer>();

@@ -101,6 +101,7 @@ describe.skipIf(!enabled)("TravelDesk listing upkeep, N3 (local DB)", () => {
   let oldId = "";
   let instantId = "";
   let linkId = "";
+  let batchId = "";
 
   const fillers = () => FILLERS.map((t) => wireTour(t, `zz test ${RUN} filler ${t}`, [wireOffer(t + 1, 600, { bookingType: 0 })]));
   const tourT = (offers: Record<string, unknown>[], description?: string) => wireTour(TOUR, `zz test ${RUN} Evening Dhow Cruise`, offers, description);
@@ -153,6 +154,7 @@ describe.skipIf(!enabled)("TravelDesk listing upkeep, N3 (local DB)", () => {
     const mine = p.rows.filter((r) => r.identity.tourId === TOUR);
     expect(mine.map((r) => [r.identity.kind, r.action])).toEqual([["instant", "create"], ["inquiry", "create"]]);
     const applied = await importer.apply(admin, p.batchId);
+    batchId = p.batchId;
     const created2 = applied.created.find((c) => c.slug === mine[0].slug)!;
     instantId = created2.productId;
     linkId = created2.linkId;
@@ -493,5 +495,28 @@ describe.skipIf(!enabled)("TravelDesk listing upkeep, N3 (local DB)", () => {
     expect((await mappingOf(X)).syncStatus).toBe("changed");
     const late = await run({ deadlineMs: Date.now() - 1 });
     expect(late).toMatchObject({ incomplete: true, processed: 0 });
+  });
+
+  it("a batch rollback and an upkeep transaction lock in the same order, so neither deadlocks (review 110 R110-01)", async () => {
+    // Session A does what the upkeep does for one listing: mapping rows (by id), then the product, then the link.
+    let release!: () => void;
+    let started!: () => void;
+    const hold = new Promise<void>((r) => (release = r));
+    const isHolding = new Promise<void>((r) => (started = r));
+    const upkeepLike = prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM product_supplier_mappings WHERE product_id = ${instantId}::uuid ORDER BY id FOR UPDATE`;
+      await tx.$executeRaw`UPDATE products SET updated_at = now() WHERE id = ${instantId}::uuid`;
+      started();
+      await hold;
+      await tx.$executeRaw`UPDATE supplier_listing_links SET upkeep_at = now() WHERE id = ${linkId}::uuid`;
+    }, { timeout: 30_000 });
+    await isHolding;
+    const rollback = importer.rollback(admin, batchId, "zz synthetic rollback during upkeep", { force: true });
+    await new Promise((r) => setTimeout(r, 300));
+    release();
+    const [a, b] = await Promise.allSettled([upkeepLike, rollback]);
+    expect(a.status).toBe("fulfilled");
+    expect(b.status).toBe("fulfilled");
+    expect((await prisma.supplierListingLink.findUniqueOrThrow({ where: { id: linkId } })).deactivatedAt).not.toBeNull();
   });
 });

@@ -589,6 +589,10 @@ export const traveldeskImportService = {
         where: { importBatchId: batchId, deactivatedAt: null },
         include: { product: { select: { id: true, slug: true, version: true, deletedAt: true, status: true, fulfilmentMode: true, eligibility: { select: { effectiveMode: true } } } } },
       });
+      // Review 110 R110-01: lock in the upkeep's order (mapping rows by id, then product, then link), so a rollback and
+      // a running upkeep never wait on each other in a cycle.
+      const lockIds = [...new Set(links.map((l) => l.productId))];
+      if (lockIds.length) await tx.$queryRaw`SELECT id FROM product_supplier_mappings WHERE product_id = ANY(${lockIds}::uuid[]) ORDER BY id FOR UPDATE`;
       const created = links.filter((l) => !l.adopted && !l.product.deletedAt);
       if (opts.requireUnchanged) {
         const moved = links.filter((l) => !l.adopted && (l.product.deletedAt || l.product.version !== l.importVersion));
