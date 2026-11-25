@@ -121,6 +121,25 @@ describe.skipIf(!enabled)("TravelDesk importer, N1 (local DB)", () => {
   const E = TOUR + 4;
   /** listed start ("any time" slot): an S3 offer of the same tour. */
   const F = TOUR + 5;
+  /** Added between previews (N1-23): a fixed start at 05:00 sorts before A and B; H is a new on-request offer. */
+  const G = TOUR + 6;
+  const H = TOUR + 7;
+  const wires = (extra: Record<string, unknown>[] = []) => [
+    wireTour(TOUR, `zz test ${RUN} Evening Dhow Cruise TD-4411`, [
+      wireOffer(A, 1200),
+      wireOffer(B, 1200, { numberOfHours: 3 }),
+      wireOffer(C, 1200, { bookingType: 0 }),
+      wireOffer(E, 600, {
+        timeSlots: [
+          { id: 1, name: null, startTime: 600, endTime: 720, daysOffered: 0, isAnyTime: false, isOnRequest: false, minimumAdvancedBooking: 12 },
+          { id: 2, name: null, startTime: 900, endTime: 1020, daysOffered: 0, isAnyTime: false, isOnRequest: false, minimumAdvancedBooking: 12 },
+        ],
+      }),
+      wireOffer(F, 480, { timeSlots: [{ id: 1, name: null, startTime: 480, endTime: 600, daysOffered: 0, isAnyTime: true, isOnRequest: false, minimumAdvancedBooking: 12 }] }),
+      ...extra,
+    ]),
+    wireTour(TOUR_LINKED, `zz test ${RUN} Linked Cruise`, [wireOffer(D, 1080)]),
+  ];
   let hadTravelDeskRow = true;
   let supplierId = "";
   let category = "";
@@ -191,25 +210,7 @@ describe.skipIf(!enabled)("TravelDesk importer, N1 (local DB)", () => {
     category = (await prisma.category.findFirstOrThrow({ where: { deletedAt: null }, select: { slug: true } })).slug;
     hadTravelDeskRow = Boolean(await prisma.supplier.findUnique({ where: { code: "traveldesk" } }));
 
-    await catalog.syncTravelDeskCatalogue(
-      source([
-        wireTour(TOUR, `zz test ${RUN} Evening Dhow Cruise TD-4411`, [
-          wireOffer(A, 1200),
-          wireOffer(B, 1200, { numberOfHours: 3 }),
-          wireOffer(C, 1200, { bookingType: 0 }),
-          wireOffer(E, 600, {
-            timeSlots: [
-              { id: 1, name: null, startTime: 600, endTime: 720, daysOffered: 0, isAnyTime: false, isOnRequest: false, minimumAdvancedBooking: 12 },
-              { id: 2, name: null, startTime: 900, endTime: 1020, daysOffered: 0, isAnyTime: false, isOnRequest: false, minimumAdvancedBooking: 12 },
-            ],
-          }),
-          wireOffer(F, 480, { timeSlots: [{ id: 1, name: null, startTime: 480, endTime: 600, daysOffered: 0, isAnyTime: true, isOnRequest: false, minimumAdvancedBooking: 12 }] }),
-        ]),
-        wireTour(TOUR_LINKED, `zz test ${RUN} Linked Cruise`, [wireOffer(D, 1080)]),
-      ]),
-      "test",
-      { supplierCode: CODE, lane: LANE },
-    );
+    await catalog.syncTravelDeskCatalogue(source(wires()), "test", { supplierCode: CODE, lane: LANE });
     supplierId = (await prisma.supplier.findUniqueOrThrow({ where: { code: CODE } })).id;
     oldId = await makeProduct(oldSlug, "Old synthetic dhow cruise");
     // An already-linked listing (adopt in place): its one option maps one to one to offer D.
@@ -379,6 +380,50 @@ describe.skipIf(!enabled)("TravelDesk importer, N1 (local DB)", () => {
     expect(listed.map((r) => [r.action, r.identity.splitNumber, r.options.map((o) => o.offerId)])).toEqual([["create", 3, [F]]]);
   });
 
+  it("a new earlier-sorting offer between previews keeps imported listings on their stored splits (N1-23)", async () => {
+    await catalog.syncTravelDeskCatalogue(source(wires([wireOffer(G, 300), wireOffer(H, 1200, { bookingType: 0 })])), "test", { supplierCode: CODE, lane: LANE });
+    const p = await importer.preview(admin, "test", "S0", { supplierCode: CODE });
+    const tour = p.rows.filter((r) => r.identity.tourId === TOUR);
+    expect(tour.map((r) => [r.identity.classKey, r.identity.offerIds, r.action, r.identity.splitNumber, r.reasons[0] ?? null])).toEqual([
+      [KEY_CHOICE, [E], "skip", 1, "already_imported"],
+      // G now sorts before A and B: the plan numbers it 2, but 2 is stored for A+B, so it takes the next free split.
+      [KEY_SINGLE, [G], "create", 3, null],
+      [KEY_SINGLE, [A, B], "skip", 2, "already_imported"],
+      // The inquiry listing's offers grew: not silently skipped, not a second page.
+      [null, [C, H], "blocked", 1, `identity_shifted:${(await prisma.supplierListingLink.findUniqueOrThrow({ where: { id: inquiryLinkId }, include: { product: true } })).product.slug}`],
+    ]);
+  });
+
+  it("isolates the offer-link lock, races import apply against reviewCandidate, and refuses an offer held by an import (N1-24)", async () => {
+    const { lockOfferLinks } = await import("../supplier-catalog.service");
+    const candidate = await prisma.supplierMappingCandidate.create({ data: { id: uuidv7(), productId: oldId, variantCode: "", supplierId, environment: "test", tourExternalId: String(TOUR), offerExternalId: String(F), state: "suggested", score: 50, source: "manual" } });
+    // 1. While another transaction holds the lock, reviewCandidate waits; it completes once the lock is released.
+    let settled = false;
+    let pending: Promise<unknown> = Promise.resolve();
+    await prisma.$transaction(async (tx) => {
+      await lockOfferLinks(tx, supplierId, "test");
+      pending = catalog.reviewCandidate(admin, candidate.id, "approve", "zz synthetic approval").finally(() => {
+        settled = true;
+      });
+      await new Promise((r) => setTimeout(r, 400));
+      expect(settled).toBe(false);
+    }, { timeout: 10_000 });
+    await pending;
+    expect(settled).toBe(true);
+    await catalog.revokeCandidate(admin, candidate.id, "zz synthetic revoke for the race");
+
+    // 2. Import apply and reviewCandidate race for offer F: exactly one links it.
+    const s3 = await importer.preview(admin, "test", "S3", { supplierCode: CODE });
+    const results = await Promise.allSettled([importer.apply(admin, s3.batchId), catalog.reviewCandidate(admin, candidate.id, "approve", "zz synthetic approval")]);
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    expect(await prisma.productSupplierMapping.count({ where: { supplierId, environment: "test", isActive: true, supplierOfferId: String(F) } })).toBe(1);
+    if (results[1].status === "fulfilled") await catalog.revokeCandidate(admin, candidate.id, "zz synthetic cleanup of the race");
+
+    // 3. An offer an imported listing holds is never approved for another product.
+    const held = await prisma.supplierMappingCandidate.create({ data: { id: uuidv7(), productId: oldId, variantCode: "", supplierId, environment: "test", tourExternalId: String(TOUR), offerExternalId: String(A), state: "suggested", score: 50, source: "manual" } });
+    await expect(catalog.reviewCandidate(admin, held.id, "approve", "zz synthetic approval")).rejects.toSatisfy((e) => isAppError(e) && /imported TravelDesk listing/.test(e.message));
+  });
+
   it("an inquiry listing can never be armed: readiness names it (N1-06)", async () => {
     const { readinessService } = await import("../readiness.service");
     await readinessService.reevaluate(inquiryId, "admin_rerun");
@@ -472,10 +517,10 @@ describe.skipIf(!enabled)("TravelDesk importer, N1 (local DB)", () => {
 
   it("re-imports after a rollback, and the generic revert undoes an unchanged TravelDesk batch", async () => {
     const p = await importer.preview(admin, "test", "S0", { supplierCode: CODE });
-    expect(p.rows.filter((r) => r.identity.tourId === TOUR).map((r) => r.action)).toEqual(["create", "create", "create"]);
+    expect(p.rows.filter((r) => r.identity.tourId === TOUR).map((r) => r.action)).toEqual(["create", "create", "create", "create"]);
     await importer.apply(admin, p.batchId);
     const r = await importService.revert(admin, p.batchId);
-    expect(r.reverted).toBeGreaterThanOrEqual(3);
+    expect(r.reverted).toBeGreaterThanOrEqual(4);
     expect(await prisma.supplierListingLink.count({ where: { importBatchId: p.batchId, deactivatedAt: null } })).toBe(0);
   });
 });

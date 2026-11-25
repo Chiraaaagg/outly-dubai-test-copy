@@ -135,6 +135,11 @@ async function writeVersion(tx: Tx, productId: string, version: number, content:
 
 /** Keep the supplier + mapping graph in step with the document's supplier block. */
 async function ensureSupplierMapping(tx: Tx, productId: string, supplier: Activity["supplier"]) {
+  // A product already mapped to an integration supplier (TravelDesk, Rathin) keeps that row: the supplier is
+  // resolved by the product's own mapping, never by its name, so a renamed supplier row never spawns a
+  // phantom manual supplier (review 106 follow-up nit).
+  const bound = await tx.productSupplierMapping.findFirst({ where: { productId, variantCode: null, supplier: { adapter: { not: "manual" } } }, select: { id: true } });
+  if (bound) return;
   const code = supplier.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || supplier.id;
   // An integration supplier's row (TravelDesk, Rathin) is never renamed or re-scored from a listing's
   // document (review 106 N1-18): only the mapping is ensured.
