@@ -1,0 +1,2443 @@
+// OUTLYY — Inquiry Mode backend schema.
+//
+// Source of truth: docs/backend/05-database-design.md as amended by
+// docs/backend/17-inquiry-mode-pivot.md §6. Every table the pivot marks
+// ACTIVE is here in full; the money path (orders, order_items, payments,
+// attribution) is here in the shape §05 specifies so that
+// `inquiry.convertToOrder()` is a column copy, not a translation. Tables the
+// pivot marks FUTURE (quotes, availability_cache, capacity_ledger, vouchers,
+// refunds, supplier_bookings) are intentionally absent — adding them later is
+// additive and touches nothing here.
+//
+// Conventions (§05.1):
+//   - money is BigInt in minor units (paise / fils), never Float
+//   - all timestamps timestamptz UTC; service dates are DATE + timeslot text
+//   - UUID primary keys generated in code (uuidv7, src/server/lib/ids.ts)
+//   - soft delete via deleted_at where an order can reference the row
+//   - constraints Prisma cannot express live in prisma/migrations/*/migration.sql
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+/**
+ * ---------------------------------------------------------------------------
+ * Enums — closed, stable sets (§05.1 rule 5)
+ * ------------------------------------------------------------------------
+ */
+
+enum FulfilmentMode {
+  inquiry
+  instant
+
+  @@map("fulfilment_mode")
+}
+
+enum ConfirmationType {
+  instant
+  manual
+
+  @@map("confirmation_type")
+}
+
+enum InquiryStatus {
+  new
+  assigned
+  contacted
+  quoted
+  negotiating
+  payment_pending
+  won
+  lost
+  spam
+
+  @@map("inquiry_status")
+}
+
+enum InquirySource {
+  inquiry_form
+  whatsapp
+  concierge
+  contact_form
+  quote_request
+  agent_created
+  abandoned_cart
+
+  @@map("inquiry_source")
+}
+
+enum ActorType {
+  customer
+  agent
+  admin
+  system
+  supplier
+
+  @@map("actor_type")
+}
+
+enum InquiryEventKind {
+  status
+  note
+  assignment
+  contact
+  item
+  system
+
+  @@map("inquiry_event_kind")
+}
+
+enum Currency {
+  INR
+  AED
+
+  @@map("currency")
+}
+
+enum AdminStatus {
+  active
+  suspended
+
+  @@map("admin_status")
+}
+
+enum AgentStatus {
+  available
+  busy
+  away
+  offline
+
+  @@map("agent_status")
+}
+
+enum NotificationChannel {
+  whatsapp
+  email
+  sms
+  push
+
+  @@map("notification_channel")
+}
+
+enum NotificationStatus {
+  queued
+  sent
+  delivered
+  read
+  failed
+  suppressed
+  /// The send was attempted and its result is not known (timeout, network, 5xx). Reconciled under the same idempotency key, never blindly re-sent (TKT-6).
+  unknown
+
+  @@map("notification_status")
+}
+
+enum ConsentChannel {
+  whatsapp
+  email
+  sms
+  push
+
+  @@map("consent_channel")
+}
+
+enum ConsentPurpose {
+  transactional
+  marketing
+  recovery
+
+  @@map("consent_purpose")
+}
+
+enum OrderStatus {
+  pending_payment
+  payment_failed
+  paid
+  supplier_pending
+  confirmed
+  partially_confirmed
+  cancelled
+  refunded
+  completed
+
+  @@map("order_status")
+}
+
+enum OrderItemStatus {
+  pending
+  confirmed
+  rejected
+  cancelled
+  completed
+
+  @@map("order_item_status")
+}
+
+enum Rail {
+  self_serve
+  assisted
+
+  @@map("rail")
+}
+
+enum PaymentCollection {
+  gateway
+  manual_link
+  bank_transfer
+
+  @@map("payment_collection")
+}
+
+enum PaymentStatus {
+  created
+  authorized
+  captured
+  failed
+  refunded
+  partially_refunded
+  /// B3 (migration 20261101130000): provider states the gateway port reports.
+  requires_action
+  voided
+  expired
+  /// A capture call whose outcome is not known yet (F3); never voided or re-charged first.
+  capture_unknown
+
+  @@map("payment_status")
+}
+
+enum SupplierSource {
+  direct
+  api
+  portal
+
+  @@map("supplier_source")
+}
+
+enum SupplierStatus {
+  active
+  paused
+  terminated
+
+  @@map("supplier_status")
+}
+
+/// Which supplier environment an identifier belongs to. TravelDesk test and
+/// production ids are not portable (docs/backend/21 §4.5), so every supplier
+/// id OUTLY stores carries one.
+enum SupplierEnvironment {
+  test
+  production
+
+  @@map("supplier_environment")
+}
+
+/// Supplier booking lifecycle (docs/backend/21 §15.3). Terminal rows are never deleted.
+enum SupplierBookingState {
+  queued
+  reserving
+  reserved
+  confirming
+  awaiting_external
+  confirmed
+  /// A mutation whose result we did not see (timeout, network, 5xx). Never retried automatically: recovery looks it up.
+  outcome_unknown
+  /// Recovery proved the supplier has no such booking; a new attempt (new client reference) may be made by a human.
+  not_created
+  rejected
+  expired
+  cancelling
+  cancelled
+  cancel_refused
+  manual_review
+  /// Reserved, waiting for provider-verified capture before any confirm (PAY-1). Blocks the duplicate guard.
+  awaiting_payment
+  /// Request sent, nothing found by lookup yet; not proof that nothing was created. Blocks the duplicate guard.
+  not_found_unresolved
+  /// Cancel answered or timed out, but the cancelled status is not yet confirmed by a reread. Blocks the duplicate guard.
+  cancel_unverified
+
+  @@map("supplier_booking_state")
+}
+
+/// docs/backend/21 §2.1. `approved` is a human decision; the matcher only writes `suggested`.
+enum MappingCandidateState {
+  suggested
+  approved
+  rejected
+
+  @@map("mapping_candidate_state")
+}
+
+enum AnalyticsSource {
+  client
+  server
+
+  @@map("analytics_source")
+}
+
+enum JobStatus {
+  running
+  succeeded
+  failed
+  dead
+
+  @@map("job_status")
+}
+
+enum WaConversationStatus {
+  open
+  pending
+  resolved
+  snoozed
+
+  @@map("wa_conversation_status")
+}
+
+/**
+ * ---------------------------------------------------------------------------
+ * Admin, roles, audit (§05.3.10, §09.4, §13)
+ * ------------------------------------------------------------------------
+ */
+
+model AdminUser {
+  id                  String      @id @db.Uuid
+  /// Stored lowercased; uniqueness enforced case-insensitively by normalising on write.
+  email               String      @unique
+  fullName            String      @map("full_name")
+  passwordHash        String      @map("password_hash")
+  totpSecretEncrypted String?     @map("totp_secret_encrypted")
+  totpEnabled         Boolean     @default(false) @map("totp_enabled")
+  status              AdminStatus @default(active)
+  /// "Named agent, real photo" (PRD §1) — shown to customers on the confirmation page and in the ack.
+  whatsappDisplayName String?     @map("whatsapp_display_name")
+  photoUrl            String?     @map("photo_url")
+  failedLoginCount    Int         @default(0) @map("failed_login_count")
+  lockedUntil         DateTime?   @map("locked_until") @db.Timestamptz(6)
+  lastLoginAt         DateTime?   @map("last_login_at") @db.Timestamptz(6)
+  createdAt           DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime    @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt           DateTime?   @map("deleted_at") @db.Timestamptz(6)
+
+  roles              AdminUserRole[]
+  sessions           AdminSession[]
+  availability       AgentAvailability?
+  assignedInquiries  Inquiry[]            @relation("InquiryAssignedAgent")
+  ordersCreated      Order[]              @relation("OrderCreatedByAgent")
+  settingsUpdated    Setting[]
+  waConversations    WaConversation[]
+  approvalsRequested PrivilegedApproval[] @relation("ApprovalRequestedBy")
+  approvalsApproved  PrivilegedApproval[] @relation("ApprovalApprovedBy")
+  refundsRequested   Refund[]
+
+  @@index([status], map: "admin_users_status_idx")
+  @@map("admin_users")
+}
+
+model Role {
+  id          String           @id @db.Uuid
+  code        String           @unique
+  name        String
+  permissions RolePermission[]
+  users       AdminUserRole[]
+
+  @@map("roles")
+}
+
+model RolePermission {
+  roleId     String @map("role_id") @db.Uuid
+  permission String
+  role       Role   @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permission])
+  @@map("role_permissions")
+}
+
+model AdminUserRole {
+  adminUserId String    @map("admin_user_id") @db.Uuid
+  roleId      String    @map("role_id") @db.Uuid
+  user        AdminUser @relation(fields: [adminUserId], references: [id], onDelete: Cascade)
+  role        Role      @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([adminUserId, roleId])
+  @@map("admin_user_roles")
+}
+
+/// Refresh-token family for admin/agent sessions (§13.2.2). Hash only, never the token.
+model AdminSession {
+  id          String    @id @db.Uuid
+  adminUserId String    @map("admin_user_id") @db.Uuid
+  refreshHash String    @map("refresh_hash")
+  userAgent   String?   @map("user_agent")
+  ipHash      String?   @map("ip_hash")
+  expiresAt   DateTime  @map("expires_at") @db.Timestamptz(6)
+  revokedAt   DateTime? @map("revoked_at") @db.Timestamptz(6)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  user        AdminUser @relation(fields: [adminUserId], references: [id], onDelete: Cascade)
+
+  @@index([adminUserId, revokedAt], map: "admin_sessions_user_idx")
+  @@index([refreshHash], map: "admin_sessions_refresh_idx")
+  @@index([expiresAt], map: "admin_sessions_expires_idx")
+  @@map("admin_sessions")
+}
+
+/**
+ * ---------------------------------------------------------------------------
+ * Customers — phone-OTP identity (docs/backend/impl/customer-auth-contract.md §2).
+ * An account is created implicitly on the first successful OTP verify; the
+ * inquiry form never requires one (guest-first). Inquiries and orders are
+ * linked by *verified* phone only (§13.2.1), never by a claimed one.
+ * ------------------------------------------------------------------------
+ */
+
+model Customer {
+  id                String    @id @db.Uuid
+  /// E.164 — the identity. Verified by OTP before the row exists.
+  phoneE164         String    @unique @map("phone_e164")
+  /// Stored lowercased. Optional; never used to sign in.
+  email             String?
+  fullName          String?   @map("full_name")
+  /// 'veg' | 'jain' | 'halal' | 'non-veg' (src/lib/types.ts Dietary)
+  dietary           String?
+  hotel             String?
+  locale            String    @default("en-IN")
+  preferredCurrency Currency  @default(INR) @map("preferred_currency")
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  lastLoginAt       DateTime? @map("last_login_at") @db.Timestamptz(6)
+  /// Set by the §05.8 anonymisation (ops action) — the row stays for FK integrity.
+  deletedAt         DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  sessions  CustomerSession[]
+  inquiries Inquiry[]
+  orders    Order[]
+  quotes    Quote[]
+
+  @@map("customers")
+}
+
+/// Opaque bearer session — the token is random, only its SHA-256 is stored. 30-day sliding expiry.
+model CustomerSession {
+  id         String    @id @db.Uuid
+  customerId String    @map("customer_id") @db.Uuid
+  tokenHash  String    @unique @map("token_hash")
+  userAgent  String?   @map("user_agent")
+  ipHash     String?   @map("ip_hash")
+  expiresAt  DateTime  @map("expires_at") @db.Timestamptz(6)
+  revokedAt  DateTime? @map("revoked_at") @db.Timestamptz(6)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  customer   Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([customerId, revokedAt], map: "customer_sessions_customer_idx")
+  @@index([expiresAt], map: "customer_sessions_expires_idx")
+  @@map("customer_sessions")
+}
+
+/// One OTP request. Code stored as SHA-256(challenge id : code), 5-minute TTL, single-use, max attempts (§13.2.1).
+model OtpChallenge {
+  id         String    @id @db.Uuid
+  phoneE164  String    @map("phone_e164")
+  codeHash   String    @map("code_hash")
+  attempts   Int       @default(0)
+  expiresAt  DateTime  @map("expires_at") @db.Timestamptz(6)
+  consumedAt DateTime? @map("consumed_at") @db.Timestamptz(6)
+  ipHash     String?   @map("ip_hash")
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([phoneE164, createdAt(sort: Desc)], map: "otp_challenges_phone_idx")
+  @@index([expiresAt], map: "otp_challenges_expires_idx")
+  @@map("otp_challenges")
+}
+
+/// §09.5 — routing inputs for lead assignment (§17 §7.3).
+model AgentAvailability {
+  agentId       String      @id @map("agent_id") @db.Uuid
+  status        AgentStatus @default(available)
+  maxConcurrent Int         @default(8) @map("max_concurrent")
+  /// 'hindi','luxury','groups','abu-dhabi','uae-shift','senior'
+  skills        String[]    @default([])
+  languages     String[]    @default([])
+  /// 'IST' | 'GST' — which shift the agent covers (§17 §7.3 rule 3)
+  shift         String      @default("IST")
+  /// Customer-facing title, e.g. "Dubai trip specialist"
+  title         String?
+  updatedAt     DateTime    @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  agent         AdminUser   @relation(fields: [agentId], references: [id], onDelete: Cascade)
+
+  @@map("agent_availability")
+}
+
+/// AC-ADM-01. Append-only at the grant level (see migration SQL).
+model AuditLog {
+  id         BigInt    @id @default(autoincrement())
+  actorType  ActorType @map("actor_type")
+  actorId    String?   @map("actor_id") @db.Uuid
+  action     String
+  entityType String    @map("entity_type")
+  entityId   String    @map("entity_id")
+  before     Json?
+  after      Json?
+  reason     String?
+  ipHash     String?   @map("ip_hash")
+  userAgent  String?   @map("user_agent")
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([entityType, entityId, createdAt(sort: Desc)], map: "audit_logs_entity_idx")
+  @@index([actorId, createdAt(sort: Desc)], map: "audit_logs_actor_idx")
+  @@map("audit_logs")
+}
+
+/// Admin-editable configuration without a deploy (AC-SRCH-05, §17 §6.4 sla.*).
+model Setting {
+  key       String     @id
+  value     Json
+  updatedBy String?    @map("updated_by") @db.Uuid
+  updatedAt DateTime   @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  updater   AdminUser? @relation(fields: [updatedBy], references: [id], onDelete: SetNull)
+
+  @@map("settings")
+}
+
+model FeatureFlag {
+  key        String   @id
+  enabled    Boolean  @default(false)
+  rolloutPct Int      @default(0) @map("rollout_pct")
+  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("feature_flags")
+}
+
+/**
+ * ---------------------------------------------------------------------------
+ * Catalogue — minimal. The storefront still reads the hand-checked fixtures in
+ * src/lib/data/*.ts (§10.2.4 keeps them as fixtures). What lives here is what
+ * the backend must own: identity for FK integrity, the per-product
+ * `fulfilment_mode` hinge (§17 §6.4), and supplier mappings for Rathin.
+ * ------------------------------------------------------------------------
+ */
+
+model Supplier {
+  id               String         @id @db.Uuid
+  code             String         @unique
+  name             String
+  source           SupplierSource
+  /// 'rathin' | 'manual' | 'portal' — selects the SupplierPort adapter (§02)
+  adapter          String
+  capabilities     Json           @default("{}")
+  contactName      String?        @map("contact_name")
+  contactWhatsapp  String?        @map("contact_whatsapp")
+  contactEmail     String?        @map("contact_email")
+  emergencyPhone   String?        @map("emergency_phone")
+  reliabilityScore Decimal        @default(80) @map("reliability_score") @db.Decimal(5, 2)
+  status           SupplierStatus @default(active)
+  createdAt        DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  deletedAt        DateTime?      @map("deleted_at") @db.Timestamptz(6)
+
+  mappings          ProductSupplierMapping[]
+  catalogueItems    SupplierCatalogueItem[]
+  priceSnapshots    SupplierPriceSnapshot[]
+  mappingCandidates SupplierMappingCandidate[]
+  bookings          SupplierBooking[]
+  offerCapabilities SupplierOfferCapability[]
+  offerEnablements  SupplierOfferEnablement[]
+
+  @@map("suppliers")
+}
+
+model Product {
+  id              String           @id @db.Uuid
+  slug            String           @unique
+  title           String
+  tier            String           @db.Char(1)
+  status          String           @default("published")
+  categorySlug    String           @map("category_slug")
+  confirmation    ConfirmationType
+  /// THE HINGE (§17 §6.4). Per product, never site-wide. Rollback = set it back.
+  fulfilmentMode  FulfilmentMode   @default(inquiry) @map("fulfilment_mode")
+  quoteOnly       Boolean          @default(false) @map("quote_only")
+  /// Full `Activity` document (src/lib/types.ts), validated by activitySchema on every write.
+  /// Scalar columns below are synced projections for listing/search — never edited on their own.
+  content         Json             @default("{}")
+  subtitle        String?
+  location        String?
+  durationMinutes Int?             @map("duration_minutes")
+  priceFromInr    BigInt?          @map("price_from_inr")
+  priceFromAed    BigInt?          @map("price_from_aed")
+  rating          Decimal?         @db.Decimal(2, 1)
+  reviewCount     Int?             @map("review_count")
+  isPrivate       Boolean          @default(false) @map("is_private")
+  pickupIncluded  Boolean          @default(false) @map("pickup_included")
+  dietary         String[]         @default([])
+  suitability     String[]         @default([])
+  version         Int              @default(1)
+  publishedAt     DateTime?        @map("published_at") @db.Timestamptz(6)
+  seoTitle        String?          @map("seo_title")
+  seoDescription  String?          @map("seo_description")
+  createdAt       DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt       DateTime?        @map("deleted_at") @db.Timestamptz(6)
+
+  mappings          ProductSupplierMapping[]
+  mappingCandidates SupplierMappingCandidate[]
+  inquiryItems      InquiryItem[]
+  orderItems        OrderItem[]
+  versions          ProductVersion[]
+  importItems       ImportBatchItem[]
+  eligibility       ProductEligibility?
+
+  @@index([tier, status], map: "products_tier_status_idx")
+  @@index([categorySlug, status], map: "products_category_status_idx")
+  @@index([status, deletedAt], map: "products_status_deleted_idx")
+  @@map("products")
+}
+
+/// One row per supplier tour or offer as last seen by the catalogue sync
+/// (docs/backend/21 §3.2). `payload` is the normalised supplier record (no
+/// PII). Never written to product content: OUTLY copy stays OUTLY's (§3.4).
+model SupplierCatalogueItem {
+  id               String              @id @db.Uuid
+  supplierId       String              @map("supplier_id") @db.Uuid
+  environment      SupplierEnvironment
+  /// "tour" | "offer"
+  kind             String
+  externalId       String              @map("external_id")
+  parentExternalId String?             @map("parent_external_id")
+  name             String?
+  bookingKind      String?             @map("booking_kind")
+  isExternal       Boolean             @default(false) @map("is_external")
+  payload          Json                @default("{}")
+  payloadHash      String              @map("payload_hash")
+  firstSeenAt      DateTime            @default(now()) @map("first_seen_at") @db.Timestamptz(6)
+  lastSeenAt       DateTime            @default(now()) @map("last_seen_at") @db.Timestamptz(6)
+  /// Set when a sync no longer sees the item; cleared if it comes back.
+  removedAt        DateTime?           @map("removed_at") @db.Timestamptz(6)
+  supplier         Supplier            @relation(fields: [supplierId], references: [id])
+  capability       SupplierOfferCapability?
+
+  @@unique([supplierId, environment, kind, externalId], map: "sci_identity_key")
+  @@index([supplierId, environment, kind, removedAt], map: "sci_live_idx")
+  @@map("supplier_catalogue_items")
+}
+
+/// Derived booking capability of one supplier offer in one environment (doc 29
+/// §3.1, §3.4; migration 20261122120000). Written by the catalogue sync from the
+/// stored offer (`traveldesk.capability.ts`). The gate re-derives from the
+/// stored offer on every check, so this row is provenance and the admin view;
+/// it never enables anything by itself.
+model SupplierOfferCapability {
+  id                String                @id @db.Uuid
+  supplierId        String                @map("supplier_id") @db.Uuid
+  environment       SupplierEnvironment
+  offerExternalId   String                @map("offer_external_id")
+  catalogueItemId   String                @unique @map("catalogue_item_id") @db.Uuid
+  fulfilment        String
+  timeShape         String                @map("time_shape")
+  arrival           String
+  route             String
+  pricingUnit       String                @map("pricing_unit")
+  /// Composed key, e.g. live.fixed_slot_single.self.internal.per_person; `unknown` or `inquiry_only` otherwise.
+  classKey          String                @map("class_key")
+  reviewReasons     String[]              @default([]) @map("review_reasons")
+  /// The raw supplier values the dimensions came from. Never a price.
+  rawValues         Json                  @default("{}") @map("raw_values")
+  derivationVersion Int                   @map("derivation_version")
+  /// Offer terms hash (traveldesk.offer-terms.ts) of the payload derived from; null when unreadable.
+  offerTermsHash    String?               @map("offer_terms_hash")
+  derivedAt         DateTime              @default(now()) @map("derived_at") @db.Timestamptz(6)
+  supplier          Supplier              @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  catalogueItem     SupplierCatalogueItem @relation(fields: [catalogueItemId], references: [id], onDelete: Cascade)
+
+  @@unique([supplierId, environment, offerExternalId], map: "soc_identity_key")
+  @@index([environment, classKey], map: "soc_class_idx")
+  @@map("supplier_offer_capabilities")
+}
+
+/// One switch per adapter, environment and exact composed class key (doc 29
+/// §3.3). Default off; a missing row is off. Turning one on goes through
+/// approval.service (step-up; a second person in production); turning one
+/// off needs no approval. The database refuses an enabled per-unit key.
+/// Two keys are seeded on by migration 20261122120000 (the named exception).
+model SupplierCapabilityFlag {
+  id                    String              @id @db.Uuid
+  /// Supplier adapter whose class vocabulary the key uses ('traveldesk').
+  adapter               String
+  environment           SupplierEnvironment
+  classKey              String              @map("class_key")
+  enabled               Boolean             @default(false)
+  /// False only on the seeded keys: their offers need no per-offer evidence (§3.3 exception).
+  requiresOfferEvidence Boolean             @default(true) @map("requires_offer_evidence")
+  /// Why it was last changed (also in the audit log).
+  reason                String
+  /// The privileged approval that allowed the last loosening; null for tightening and for the seed.
+  approvalId            String?             @map("approval_id") @db.Uuid
+  /// Staff member who last changed it; null for the migration seed.
+  changedBy             String?             @map("changed_by") @db.Uuid
+  changedAt             DateTime            @default(now()) @map("changed_at") @db.Timestamptz(6)
+  createdAt             DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([adapter, environment, classKey], map: "scf_identity_key")
+  @@map("supplier_capability_flags")
+}
+
+/// Per-offer evidence that an offer may be sold instantly under one class key
+/// (doc 29 §3.3). Rows are never deleted: a withdrawn one is revoked. Evidence
+/// lapses when the offer terms hash changes.
+model SupplierOfferEnablement {
+  id              String              @id @db.Uuid
+  supplierId      String              @map("supplier_id") @db.Uuid
+  environment     SupplierEnvironment
+  offerExternalId String              @map("offer_external_id")
+  classKey        String              @map("class_key")
+  /// contract_test | sandbox_drill | production_booking | neighbour_proof
+  evidenceKind    String              @map("evidence_kind")
+  /// Test name, drill reference or booking reference. Never a price or personal data.
+  reference       String
+  offerTermsHash  String              @map("offer_terms_hash")
+  approvalId      String?             @map("approval_id") @db.Uuid
+  recordedBy      String?             @map("recorded_by") @db.Uuid
+  recordedAt      DateTime            @default(now()) @map("recorded_at") @db.Timestamptz(6)
+  revokedAt       DateTime?           @map("revoked_at") @db.Timestamptz(6)
+  revokedBy       String?             @map("revoked_by") @db.Uuid
+  revokeReason    String?             @map("revoke_reason")
+  supplier        Supplier            @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+
+  @@index([supplierId, environment, offerExternalId, classKey], map: "soe_offer_idx")
+  @@map("supplier_offer_enablement")
+}
+
+/// Supplier net price (and seats, when known) for one offer, date and slot, in
+/// AED minor units. Doubles as the availability cache for read models; the
+/// booking path always re-checks live (docs/backend/21 §6.3).
+model SupplierPriceSnapshot {
+  id              String              @id @db.Uuid
+  supplierId      String              @map("supplier_id") @db.Uuid
+  environment     SupplierEnvironment
+  offerExternalId String              @map("offer_external_id")
+  serviceDate     DateTime            @map("service_date") @db.Date
+  timeSlotId      String?             @map("time_slot_id")
+  startMinutes    Int?                @map("start_minutes")
+  seatsLeft       Int?                @map("seats_left")
+  isBookable      Boolean             @map("is_bookable")
+  currency        String              @default("AED") @db.Char(3)
+  netAdultMinor   BigInt              @map("net_adult_minor")
+  netChildMinor   BigInt              @map("net_child_minor")
+  netTripMinor    BigInt              @map("net_trip_minor")
+  recAdultMinor   BigInt?             @map("rec_adult_minor")
+  recChildMinor   BigInt?             @map("rec_child_minor")
+  recTripMinor    BigInt?             @map("rec_trip_minor")
+  fetchedAt       DateTime            @default(now()) @map("fetched_at") @db.Timestamptz(6)
+  supplier        Supplier            @relation(fields: [supplierId], references: [id])
+
+  @@index([supplierId, environment, offerExternalId, serviceDate], map: "sps_offer_date_idx")
+  @@map("supplier_price_snapshots")
+}
+
+/// A suggested match between an OUTLY product variant and a supplier offer,
+/// with the evidence and conflicts a reviewer needs (docs/backend/21 §2–§3).
+/// Only an approval writes `product_supplier_mappings`; approval never changes
+/// fulfilment mode or price.
+model SupplierMappingCandidate {
+  id              String                @id @db.Uuid
+  productId       String                @map("product_id") @db.Uuid
+  /// OUTLY variant id; "" = the product as a whole.
+  variantCode     String                @default("") @map("variant_code")
+  supplierId      String                @map("supplier_id") @db.Uuid
+  environment     SupplierEnvironment
+  tourExternalId  String                @map("tour_external_id")
+  offerExternalId String                @map("offer_external_id")
+  state           MappingCandidateState @default(suggested)
+  /// 0–100 from the matcher (weak signal; never sufficient alone).
+  score           Int                   @default(0)
+  evidence        Json                  @default("[]")
+  conflicts       Json                  @default("[]")
+  sellAdultMinor  BigInt?               @map("sell_adult_minor")
+  netAdultMinor   BigInt?               @map("net_adult_minor")
+  /// Gross margin on the sell price before fees, basis points.
+  marginBps       Int?                  @map("margin_bps")
+  /// "matcher" | "manual"
+  source          String                @default("matcher")
+  reviewedBy      String?               @map("reviewed_by") @db.Uuid
+  reviewedAt      DateTime?             @map("reviewed_at") @db.Timestamptz(6)
+  reviewNote      String?               @map("review_note")
+  /// The mapping row written on approval.
+  mappingId       String?               @map("mapping_id") @db.Uuid
+  createdAt       DateTime              @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime              @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  product         Product               @relation(fields: [productId], references: [id])
+  supplier        Supplier              @relation(fields: [supplierId], references: [id])
+
+  @@unique([productId, variantCode, supplierId, environment, offerExternalId], map: "smc_identity_key")
+  @@index([state, productId], map: "smc_state_product_idx")
+  @@map("supplier_mapping_candidates")
+}
+
+/// One row per supplier booking ATTEMPT (docs/backend/21 §15.3). The row is
+/// written before any supplier call, so a crash can never lose a booking that
+/// may exist at the supplier. `order_item_id` is null for sandbox drills.
+model SupplierBooking {
+  id                     String                 @id @db.Uuid
+  orderId                String?                @map("order_id") @db.Uuid
+  orderItemId            String?                @map("order_item_id") @db.Uuid
+  supplierId             String                 @map("supplier_id") @db.Uuid
+  mappingId              String?                @map("mapping_id") @db.Uuid
+  environment            SupplierEnvironment
+  attempt                Int                    @default(1)
+  /// order:<o>:item:<i>:try:<n>, or drill:<run>:<name>
+  idempotencyKey         String                 @unique @map("idempotency_key")
+  /// Sent to the supplier as referenceNumber; short ASCII, no PII.
+  clientRef              String                 @map("client_ref")
+  /// live_book | ticket_only
+  bookingKind            String                 @map("booking_kind")
+  /// two_step (reserve → confirm) | one_step (create)
+  mode                   String                 @default("two_step")
+  /// What to do with a reservation: confirm | cancel | hold | await_payment (customer intents; drills use cancel/hold).
+  afterReserve           String                 @default("confirm") @map("after_reserve")
+  state                  SupplierBookingState   @default(queued)
+  tourExternalId         String                 @map("tour_external_id")
+  offerExternalId        String                 @map("offer_external_id")
+  serviceDate            DateTime               @map("service_date") @db.Date
+  timeSlotId             String?                @map("time_slot_id")
+  startMinutes           Int?                   @map("start_minutes")
+  endMinutes             Int?                   @map("end_minutes")
+  adults                 Int
+  children               Int                    @default(0)
+  infants                Int                    @default(0)
+  hotelId                String?                @map("hotel_id")
+  /// Lead guest name, final at reserve time (confirm ignores it).
+  guestName              String                 @map("guest_name")
+  expectedNetMinor       BigInt                 @map("expected_net_minor")
+  expectedNetUsdMinor    BigInt                 @map("expected_net_usd_minor")
+  chargedNetMinor        BigInt?                @map("charged_net_minor")
+  chargedNetUsdMinor     BigInt?                @map("charged_net_usd_minor")
+  refundMinor            BigInt?                @map("refund_minor")
+  supplierBookingId      String?                @map("supplier_booking_id")
+  supplierStatusCode     Int?                   @map("supplier_status_code")
+  reservationDeadline    DateTime?              @map("reservation_deadline") @db.Timestamptz(6)
+  externalInProgress     Boolean                @default(false) @map("external_in_progress")
+  externalFailed         Boolean                @default(false) @map("external_failed")
+  externalFailureMessage String?                @map("external_failure_message")
+  hasTickets             Boolean                @default(false) @map("has_tickets")
+  errorCode              String?                @map("error_code")
+  errorMessage           String?                @map("error_message")
+  nextActionAt           DateTime?              @map("next_action_at") @db.Timestamptz(6)
+  pollCount              Int                    @default(0) @map("poll_count")
+  recoverySearches       Int                    @default(0) @map("recovery_searches")
+  /// Request as sent, without contact details.
+  requestPayload         Json                   @default("{}") @map("request_payload")
+  /// Last supplier response, with Guid, ticket codes and document URLs removed.
+  /// The pickup time the supplier returned, minutes after midnight Asia/Dubai (doc 29 §8.7). Kept when a later answer omits it.
+  pickupTimeMinutes      Int?                   @map("pickup_time_minutes")
+  /// The booking's own "tickets valid until" day (doc 29 Batch 5; review 86 B5-07). Kept when a later answer omits it.
+  ticketsValidUntil      DateTime?              @map("tickets_valid_until") @db.Date
+  /// Doc 29 Batch 6: the attempt books an offer on the external-supplier route; null or false is internal.
+  externalRoute          Boolean?               @map("external_route")
+  lastResponse           Json?                  @map("last_response")
+  requestedBy            String?                @map("requested_by") @db.Uuid
+  requestSentAt          DateTime?              @map("request_sent_at") @db.Timestamptz(6)
+  reservedAt             DateTime?              @map("reserved_at") @db.Timestamptz(6)
+  confirmedAt            DateTime?              @map("confirmed_at") @db.Timestamptz(6)
+  cancelledAt            DateTime?              @map("cancelled_at") @db.Timestamptz(6)
+  closedAt               DateTime?              @map("closed_at") @db.Timestamptz(6)
+  /// Set when the booking needs a human; null when it does not.
+  attentionRequiredAt    DateTime?              @map("attention_required_at") @db.Timestamptz(6)
+  /// Hash of the request body as first sent; a changed body under the same key is refused. Null before B1.
+  requestHash            String?                @map("request_hash")
+  /// Supplier account the credentials acted for (TravelDesk agencyId); `default` until pinned (SUP-10).
+  accountId              String                 @default("default") @map("account_id")
+  createdAt              DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt              DateTime               @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  supplier               Supplier               @relation(fields: [supplierId], references: [id])
+  order                  Order?                 @relation(fields: [orderId], references: [id])
+  orderItem              OrderItem?             @relation(fields: [orderItemId], references: [id])
+  events                 SupplierBookingEvent[]
+  remedies               CustomerRemedy[]
+  ledgerEntries          LedgerEntry[]
+  documents              SupplierDocument[]
+  ticketCodes            SupplierTicketCode[]
+  cancellationRequests   CancellationRequest[]
+
+  @@unique([supplierId, environment, clientRef], map: "sb_client_ref_key")
+  @@index([state, nextActionAt], map: "sb_state_next_idx")
+  @@index([supplierId, environment, serviceDate], map: "sb_service_date_idx")
+  @@map("supplier_bookings")
+}
+
+/// Append-only: one row per HTTP call or state change on a supplier booking.
+/// Answers "did we send it twice?" in a dispute.
+model SupplierBookingEvent {
+  id                String          @id @db.Uuid
+  supplierBookingId String          @map("supplier_booking_id") @db.Uuid
+  at                DateTime        @default(now()) @db.Timestamptz(6)
+  /// request_sent | response | outcome_unknown | recovery_search | poll | state_change | cancel | operator_action
+  kind              String
+  operation         String?
+  httpStatus        Int?            @map("http_status")
+  durationMs        Int?            @map("duration_ms")
+  fromState         String?         @map("from_state")
+  toState           String?         @map("to_state")
+  actor             String?
+  detail            Json            @default("{}")
+  booking           SupplierBooking @relation(fields: [supplierBookingId], references: [id])
+
+  @@index([supplierBookingId, at], map: "sbe_booking_at_idx")
+  @@map("supplier_booking_events")
+}
+
+/// Durable job queue for supplier work, claimed with FOR UPDATE SKIP LOCKED.
+model SupplierJob {
+  id                String    @id @db.Uuid
+  /// reserve | confirm | create | recover | poll | cancel | watchdog
+  kind              String
+  supplierBookingId String?   @map("supplier_booking_id") @db.Uuid
+  dedupeKey         String    @unique @map("dedupe_key")
+  payload           Json      @default("{}")
+  /// queued | running | succeeded | failed | dead | cancelled
+  status            String    @default("queued")
+  runAfter          DateTime  @default(now()) @map("run_after") @db.Timestamptz(6)
+  attempts          Int       @default(0)
+  maxAttempts       Int       @default(1) @map("max_attempts")
+  lockedBy          String?   @map("locked_by")
+  lockedUntil       DateTime? @map("locked_until") @db.Timestamptz(6)
+  lastError         String?   @map("last_error")
+  /// Deadline gate (SUP-2): the supplier request must not be sent after this instant.
+  deadlineAt        DateTime? @map("deadline_at") @db.Timestamptz(6)
+  /// Claim order: higher first. cancel 30, confirm 20, recover/poll/watchdog 10, reserve/create 0
+  /// (migration 20261101110000). Claim with ORDER BY priority DESC, deadline_at, run_after.
+  priority          Int       @default(0)
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([status, runAfter], map: "sj_due_idx")
+  @@index([status, priority(sort: Desc), deadlineAt, runAfter], map: "sj_claim_idx")
+  @@map("supplier_jobs")
+}
+
+/// Single-flight lease per supplier, environment and account: TravelDesk
+/// processes one agency's requests at a time, so OUTLY sends one mutation at
+/// a time. A row lease, not pg_advisory_lock: the pooled connection runs in
+/// transaction mode.
+model SupplierAccountLease {
+  supplierId  String              @map("supplier_id") @db.Uuid
+  environment SupplierEnvironment
+  /// Supplier account; `default` for rows written before B1 and until the engine pins the account.
+  accountId   String              @default("default") @map("account_id")
+  holder      String?
+  leaseUntil  DateTime            @default(now()) @map("lease_until") @db.Timestamptz(6)
+  heartbeatAt DateTime?           @map("heartbeat_at") @db.Timestamptz(6)
+  /// Fencing token: bumped on every acquisition.
+  generation  BigInt              @default(0)
+
+  @@id([supplierId, environment, accountId])
+  @@map("supplier_account_leases")
+}
+
+/// One catalogue sync run (doc 29 §6.3, Batch 1b; migration 20261123120000).
+/// Written by `traveldesk-catalogue-sync.service.ts` for the admin button and
+/// the daily scheduled run. A run that stops at its deadline leaves
+/// `resume_after_tour_id`, and the next run continues the same pass after it
+/// (`pass_started_at`); removals are judged only when a pass completes.
+/// Readiness reads the latest `complete` run for staleness. Counts, ids and
+/// short codes only: no prices, payloads or credentials. No foreign key: the
+/// supplier is named by its code, like the sync lease in `settings`.
+model SupplierSyncRun {
+  id                String    @id @db.Uuid
+  supplierCode      String    @map("supplier_code")
+  /// "test" | "production"
+  environment       String
+  /// The read-budget account the run drew on (`bookingAccountId`).
+  accountId         String    @map("account_id")
+  /// "cron" | "admin"
+  triggeredBy       String    @map("triggered_by")
+  /// "running" | "complete" | "incomplete" | "failed"
+  status            String    @default("running")
+  startedAt         DateTime  @default(now()) @map("started_at") @db.Timestamptz(6)
+  finishedAt        DateTime? @map("finished_at") @db.Timestamptz(6)
+  /// Start of the pass this run belongs to: its own start, or the first run's when it resumed one.
+  passStartedAt     DateTime  @map("pass_started_at") @db.Timestamptz(6)
+  /// The incomplete run this one continued; null for a fresh pass.
+  resumedFromRunId  String?   @map("resumed_from_run_id") @db.Uuid
+  /// Incomplete runs only: the last tour id this pass attempted (tours run in id order).
+  resumeAfterTourId Int?      @map("resume_after_tour_id")
+  tours             Int       @default(0)
+  offers            Int       @default(0)
+  added             Int       @default(0)
+  changed           Int       @default(0)
+  removed           Int       @default(0)
+  revived           Int       @default(0)
+  mappingsChanged   Int       @default(0) @map("mappings_changed")
+  /// Tours of this pass whose detail failed to load; they keep their stored items.
+  failedTours       Int[]     @default([]) @map("failed_tours")
+  /// empty_tour_list | too_many_removals | incomplete
+  removalsSkipped   String?   @map("removals_skipped")
+  /// The run stopped at its deadline (catalogue pull or price snapshots).
+  deadlineHit       Boolean   @default(false) @map("deadline_hit")
+  /// Failed runs: a short code (error class or kind), never a message.
+  errorCode         String?   @map("error_code")
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([supplierCode, environment, createdAt(sort: Desc)], map: "ssr_latest_idx")
+  @@index([supplierCode, environment, status, finishedAt(sort: Desc)], map: "ssr_complete_idx")
+  @@map("supplier_sync_runs")
+}
+
+/// Effective eligibility per product, written by the readiness evaluation (B2).
+/// No row means inquiry-only: absence is the safe default, so there is no backfill.
+model ProductEligibility {
+  productId        String         @id @map("product_id") @db.Uuid
+  effectiveMode    FulfilmentMode @default(inquiry) @map("effective_mode")
+  /// Array of reason codes for the decision.
+  reasons          Json           @default("[]")
+  readinessVersion Int            @map("readiness_version")
+  evaluatedAt      DateTime       @default(now()) @map("evaluated_at") @db.Timestamptz(6)
+  product          Product        @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@map("product_eligibility")
+}
+
+/// Step-up and dual approval for privileged operations (SEC-10, PRD-12),
+/// written only by approval.service.ts. Checks in migration 20261101110000:
+/// approver differs from requester, and nothing is applied in production
+/// without an approver.
+model PrivilegedApproval {
+  id          String              @id @db.Uuid
+  /// PrivilegedOperation (booking-port.ts)
+  operation   String
+  permission  String
+  payload     Json                @default("{}")
+  /// sha256 hex of the canonical operation, permission, environment and payload.
+  payloadHash String              @map("payload_hash")
+  environment SupplierEnvironment
+  /// pending | applied | expired | cancelled
+  status      String              @default("pending")
+  requestedBy String              @map("requested_by") @db.Uuid
+  requestedAt DateTime            @default(now()) @map("requested_at") @db.Timestamptz(6)
+  approvedBy  String?             @map("approved_by") @db.Uuid
+  approvedAt  DateTime?           @map("approved_at") @db.Timestamptz(6)
+  appliedAt   DateTime?           @map("applied_at") @db.Timestamptz(6)
+  expiresAt   DateTime            @map("expires_at") @db.Timestamptz(6)
+  requester   AdminUser           @relation("ApprovalRequestedBy", fields: [requestedBy], references: [id], onDelete: Restrict)
+  approver    AdminUser?          @relation("ApprovalApprovedBy", fields: [approvedBy], references: [id], onDelete: Restrict)
+
+  @@index([payloadHash, status], map: "pa_payload_status_idx")
+  @@index([requestedBy, requestedAt(sort: Desc)], map: "pa_requested_by_idx")
+  @@map("privileged_approvals")
+}
+
+/// Append-only history of every product write. `restoreVersion` writes a new
+/// version equal to an old one — history is never rewritten.
+model ProductVersion {
+  id        String   @id @db.Uuid
+  productId String   @map("product_id") @db.Uuid
+  version   Int
+  content   Json
+  status    String
+  actorId   String?  @map("actor_id") @db.Uuid
+  reason    String?
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, version])
+  @@index([productId, version(sort: Desc)], map: "product_versions_product_version_idx")
+  @@map("product_versions")
+}
+
+model Category {
+  id            String    @id @db.Uuid
+  slug          String    @unique
+  name          String
+  shortName     String    @map("short_name")
+  emoji         String    @default("")
+  tagline       String    @default("")
+  intro         String    @default("")
+  heroImage     String    @default("") @map("hero_image")
+  faqs          Json      @default("[]")
+  relatedSlugs  String[]  @default([]) @map("related_slugs")
+  featuredSlugs String[]  @default([]) @map("featured_slugs")
+  sortOrder     Int       @default(100) @map("sort_order")
+  status        String    @default("published")
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt     DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  @@index([status, sortOrder], map: "categories_status_sort_idx")
+  @@map("categories")
+}
+
+/// One import run (CSV / Google Sheet / Google Doc / bulk JSON / manual batch).
+/// `preview` holds the validated rows so apply() re-uses exactly what the
+/// admin approved; `errors` holds per-row problems shown in the wizard.
+model ImportBatch {
+  id         String            @id @db.Uuid
+  source     String
+  status     String            @default("previewed")
+  fileName   String?           @map("file_name")
+  sourceRef  String?           @map("source_ref")
+  mapping    Json              @default("{}")
+  rowsTotal  Int               @default(0) @map("rows_total")
+  rowsOk     Int               @default(0) @map("rows_ok")
+  rowsFailed Int               @default(0) @map("rows_failed")
+  errors     Json              @default("[]")
+  preview    Json              @default("[]")
+  createdBy  String            @map("created_by") @db.Uuid
+  createdAt  DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+  appliedAt  DateTime?         @map("applied_at") @db.Timestamptz(6)
+  revertedAt DateTime?         @map("reverted_at") @db.Timestamptz(6)
+  items      ImportBatchItem[]
+
+  @@index([createdAt(sort: Desc)], map: "import_batches_created_idx")
+  @@map("import_batches")
+}
+
+model ImportBatchItem {
+  id            String      @id @db.Uuid
+  batchId       String      @map("batch_id") @db.Uuid
+  productId     String      @map("product_id") @db.Uuid
+  action        String
+  beforeVersion Int?        @map("before_version")
+  afterVersion  Int         @map("after_version")
+  slug          String
+  batch         ImportBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  product       Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([batchId], map: "import_batch_items_batch_idx")
+  @@map("import_batch_items")
+}
+
+model Combo {
+  id             String           @id @db.Uuid
+  slug           String           @unique
+  name           String
+  tier           String           @default("C") @db.Char(1)
+  status         String           @default("published")
+  confirmation   ConfirmationType
+  fulfilmentMode FulfilmentMode   @default(inquiry) @map("fulfilment_mode")
+  createdAt      DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt      DateTime?        @map("deleted_at") @db.Timestamptz(6)
+
+  inquiryItems InquiryItem[]
+  orderItems   OrderItem[]
+
+  @@map("combos")
+}
+
+/// `external_ref` is opaque JSONB on purpose: Rathin's identifier shape is
+/// unknown until the §16 spike; a new adapter needs no migration.
+model ProductSupplierMapping {
+  id                String               @id @db.Uuid
+  productId         String               @map("product_id") @db.Uuid
+  supplierId        String               @map("supplier_id") @db.Uuid
+  variantCode       String?              @map("variant_code")
+  priority          Int                  @default(1)
+  externalRef       Json                 @default("{}") @map("external_ref")
+  isActive          Boolean              @default(true) @map("is_active")
+  createdAt         DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+  /// Supplier-side identity, promoted from `external_ref` so sync and drift checks can join on it (docs/backend/21 §3.2).
+  supplierProductId String?              @map("supplier_product_id")
+  supplierOfferId   String?              @map("supplier_offer_id")
+  bookingKind       String?              @map("booking_kind")
+  environment       SupplierEnvironment?
+  lastSyncedAt      DateTime?            @map("last_synced_at") @db.Timestamptz(6)
+  /// ok | missing_upstream | changed | error — set by the catalogue sync.
+  syncStatus        String?              @map("sync_status")
+  /// Hash of the supplier offer terms an editor approved (B2). Computed by the catalogue service; null never passes readiness.
+  approvedOfferHash String?              @map("approved_offer_hash")
+  /// The offer's `numberOfHours` when the editor approved (review 85 A1). Compared on its own, outside the hash, where a slot's end is derived from the hours; null when none was recorded.
+  approvedSlotHours Int?                 @map("approved_slot_hours")
+  updatedAt         DateTime             @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  product           Product              @relation(fields: [productId], references: [id])
+  supplier          Supplier             @relation(fields: [supplierId], references: [id])
+
+  @@unique([productId, supplierId, variantCode])
+  @@index([productId, priority], map: "psm_product_priority_idx")
+  @@map("product_supplier_mappings")
+}
+
+/**
+ * ---------------------------------------------------------------------------
+ * Inquiry pipeline — the core system (§17 §6.1–6.3)
+ * ------------------------------------------------------------------------
+ */
+
+model Inquiry {
+  id                String        @id @db.Uuid
+  /// INQ-104821 — sequence + checksum, human-facing (§05.1 rule 7)
+  reference         String        @unique
+  status            InquiryStatus @default(new)
+  source            InquirySource
+  channelPreference String?       @map("channel_preference")
+
+  // identity — guest-first, exactly as orders
+  leadName        String  @map("lead_name")
+  /// E.164, the only channel that matters
+  leadPhone       String  @map("lead_phone")
+  leadEmail       String? @map("lead_email")
+  countryCode     String  @map("country_code")
+  whatsappConsent Boolean @default(true) @map("whatsapp_consent")
+
+  // trip shape
+  travelDateFrom  DateTime? @map("travel_date_from") @db.Date
+  travelDateTo    DateTime? @map("travel_date_to") @db.Date
+  datesFlexible   Boolean   @default(false) @map("dates_flexible")
+  pax             Json?
+  hotel           String?
+  pickupZone      String?   @map("pickup_zone")
+  dietary         String?
+  specialRequests String?   @map("special_requests")
+  budgetBand      String?   @map("budget_band")
+
+  // indicative economics, snapshotted at submission (minor units)
+  currency             Currency @default(INR)
+  indicativeTotalInr   BigInt   @default(0) @map("indicative_total_inr")
+  indicativeTotalAed   BigInt   @default(0) @map("indicative_total_aed")
+  indicativeNetCostAed BigInt   @default(0) @map("indicative_net_cost_aed")
+
+  // SLA and ownership
+  assignedAgentId String?   @map("assigned_agent_id") @db.Uuid
+  assignedAt      DateTime? @map("assigned_at") @db.Timestamptz(6)
+  slaDueAt        DateTime? @map("sla_due_at") @db.Timestamptz(6)
+  slaBreachedAt   DateTime? @map("sla_breached_at") @db.Timestamptz(6)
+  escalatedAt     DateTime? @map("escalated_at") @db.Timestamptz(6)
+  /// The 30-minute measurement (§17 §7.2 step 14)
+  firstResponseAt DateTime? @map("first_response_at") @db.Timestamptz(6)
+  lastContactAt   DateTime? @map("last_contact_at") @db.Timestamptz(6)
+  nextFollowupAt  DateTime? @map("next_followup_at") @db.Timestamptz(6)
+  /// 0 = none sent; 1..3 = ladder step (§17 §7.2 follow-up ladder)
+  followupStage   Int       @default(0) @map("followup_stage")
+  ackSentAt       DateTime? @map("ack_sent_at") @db.Timestamptz(6)
+
+  // outcome — THE HINGE
+  convertedOrderId String?   @unique @map("converted_order_id") @db.Uuid
+  lostReason       String?   @map("lost_reason")
+  lostAt           DateTime? @map("lost_at") @db.Timestamptz(6)
+
+  // attribution captured at submission (§17 §8.4) — copied to order_attribution on win
+  attribution Json?
+  sessionId   String? @map("session_id")
+  anonId      String? @map("anon_id")
+  ipHash      String? @map("ip_hash")
+  userAgent   String? @map("user_agent")
+  /// Spam signals recorded, never used to silently drop (§17 §9): {honeypot, elapsedMs, suppressed}
+  spamSignals Json?   @map("spam_signals")
+
+  waConversationId String?  @map("wa_conversation_id") @db.Uuid
+  /// Linked on OTP verify when lead_phone equals the verified phone (customer-auth-contract §1). Never set from a claimed phone.
+  customerId       String?  @map("customer_id") @db.Uuid
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  assignedAgent  AdminUser?       @relation("InquiryAssignedAgent", fields: [assignedAgentId], references: [id], onDelete: SetNull)
+  convertedOrder Order?           @relation("InquiryConvertedOrder", fields: [convertedOrderId], references: [id])
+  waConversation WaConversation?  @relation(fields: [waConversationId], references: [id])
+  customer       Customer?        @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  items          InquiryItem[]
+  events         InquiryEvent[]
+  notifications  Notification[]
+  analytics      AnalyticsEvent[]
+  /// Orders that cite this inquiry as their source (§17 §6.4). Normally at most one.
+  sourcedOrders  Order[]          @relation("OrderSourceInquiry")
+
+  @@index([status, slaDueAt], map: "inquiries_status_sla_idx")
+  @@index([assignedAgentId, status], map: "inquiries_agent_status_idx")
+  @@index([leadPhone], map: "inquiries_lead_phone_idx")
+  @@index([createdAt(sort: Desc)], map: "inquiries_created_idx")
+  @@index([nextFollowupAt], map: "inquiries_followup_idx")
+  @@index([customerId], map: "inquiries_customer_idx")
+  @@map("inquiries")
+}
+
+/// Deliberately mirrors order_items column-for-column (§17 §6.2). Converting a
+/// won inquiry to an order is a field copy: indicative_* → unit/total, with
+/// confirmed_* winning where present.
+model InquiryItem {
+  id          String    @id @db.Uuid
+  inquiryId   String    @map("inquiry_id") @db.Uuid
+  productId   String?   @map("product_id") @db.Uuid
+  comboId     String?   @map("combo_id") @db.Uuid
+  /// Variant ids in the catalogue are stable string codes ("std", "vip")
+  variantCode String?   @map("variant_code")
+  serviceDate DateTime? @map("service_date") @db.Date
+  timeslot    String?
+  pax         Json
+  addons      Json      @default("[]")
+
+  // snapshots, same fields as order_items
+  titleSnapshot                 String           @map("title_snapshot")
+  tierSnapshot                  String           @map("tier_snapshot") @db.Char(1)
+  slugSnapshot                  String           @map("slug_snapshot")
+  kindSnapshot                  String           @map("kind_snapshot")
+  imageSnapshot                 String?          @map("image_snapshot")
+  variantNameSnapshot           String?          @map("variant_name_snapshot")
+  /// What the customer was shown at submission; copied verbatim into order_items on win.
+  inclusionsSnapshot            String[]         @default([]) @map("inclusions_snapshot")
+  cancellationPolicySnapshot    Json             @default("{}") @map("cancellation_policy_snapshot")
+  confirmationSnapshot          ConfirmationType @map("confirmation_snapshot")
+  fulfilmentModeSnapshot        FulfilmentMode   @map("fulfilment_mode_snapshot")
+  freeCancellationHoursSnapshot Int              @map("free_cancellation_hours_snapshot")
+  durationMinutesSnapshot       Int              @map("duration_minutes_snapshot")
+
+  // INDICATIVE, not binding — the one semantic difference
+  indicativeUnitInr    BigInt @map("indicative_unit_inr")
+  indicativeUnitAed    BigInt @map("indicative_unit_aed")
+  indicativeTotalInr   BigInt @map("indicative_total_inr")
+  indicativeTotalAed   BigInt @map("indicative_total_aed")
+  indicativeNetCostAed BigInt @default(0) @map("indicative_net_cost_aed")
+
+  // agent's confirmed figures, filled during the conversation
+  confirmedTotalInr     BigInt?   @map("confirmed_total_inr")
+  confirmedTotalAed     BigInt?   @map("confirmed_total_aed")
+  confirmedNetCostAed   BigInt?   @map("confirmed_net_cost_aed")
+  availabilityCheckedAt DateTime? @map("availability_checked_at") @db.Timestamptz(6)
+  availabilityNote      String?   @map("availability_note")
+
+  sortOrder Int @default(0) @map("sort_order")
+
+  inquiry Inquiry  @relation(fields: [inquiryId], references: [id], onDelete: Cascade)
+  product Product? @relation(fields: [productId], references: [id])
+  combo   Combo?   @relation(fields: [comboId], references: [id])
+
+  @@index([inquiryId], map: "inquiry_items_inquiry_idx")
+  @@index([productId], map: "inquiry_items_product_idx")
+  @@map("inquiry_items")
+}
+
+/// Pipeline history + agent notes (§17 §6.3). `kind = note` rows are the
+/// console's internal notes; `kind = status` rows carry from/to.
+model InquiryEvent {
+  id         BigInt           @id @default(autoincrement())
+  inquiryId  String           @map("inquiry_id") @db.Uuid
+  kind       InquiryEventKind @default(status)
+  fromStatus InquiryStatus?   @map("from_status")
+  toStatus   InquiryStatus?   @map("to_status")
+  actorType  ActorType        @map("actor_type")
+  actorId    String?          @map("actor_id") @db.Uuid
+  note       String?
+  meta       Json?
+  createdAt  DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  inquiry    Inquiry          @relation(fields: [inquiryId], references: [id], onDelete: Cascade)
+
+  @@index([inquiryId, createdAt], map: "inquiry_events_inquiry_idx")
+  @@map("inquiry_events")
+}
+
+/// Numbers marked spam by an agent (§17 §7.5 "wrong number / fake lead").
+model SuppressedPhone {
+  phoneE164 String   @id @map("phone_e164")
+  reason    String
+  addedBy   String?  @map("added_by") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@map("suppressed_phones")
+}
+
+/// Append-only (§05.3.1). Current state = latest row per (phone, channel, purpose).
+model Consent {
+  id        String         @id @db.Uuid
+  phoneE164 String?        @map("phone_e164")
+  email     String?
+  channel   ConsentChannel
+  purpose   ConsentPurpose
+  granted   Boolean
+  /// 'inquiry_form' | 'stop_keyword' | 'agent' | 'profile'
+  source    String
+  /// exact copy shown, page URL, ip hash
+  evidence  Json?
+  createdAt DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([phoneE164, channel, createdAt(sort: Desc)], map: "consents_phone_idx")
+  @@map("consents")
+}
+
+/**
+ * ---------------------------------------------------------------------------
+ * Orders — DORMANT → ACTIVE on win (§17 §5.1). Shape per §05.3.5 so that
+ * self-serve checkout (future, instant SKUs) and agent conversion share one
+ * `order.createOrder(input, actor)`.
+ * ------------------------------------------------------------------------
+ */
+
+model Guest {
+  id        String   @id @db.Uuid
+  phoneE164 String   @map("phone_e164")
+  email     String?
+  fullName  String   @map("full_name")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  orders    Order[]
+
+  @@index([phoneE164], map: "guests_phone_idx")
+  @@map("guests")
+}
+
+model Order {
+  id                String            @id @db.Uuid
+  /// OUT-482913
+  reference         String            @unique
+  status            OrderStatus       @default(pending_payment)
+  rail              Rail
+  guestId           String?           @map("guest_id") @db.Uuid
+  createdByAgent    String?           @map("created_by_agent") @db.Uuid
+  /// Closes the loop: inquiry → won attribution (§17 §6.4)
+  sourceInquiryId   String?           @map("source_inquiry_id") @db.Uuid
+  /// 'manual_link' records that a Razorpay Payment Link was sent by hand (§17 §6.4)
+  paymentCollection PaymentCollection @default(gateway) @map("payment_collection")
+
+  currency    Currency
+  subtotalInr BigInt   @map("subtotal_inr")
+  subtotalAed BigInt   @map("subtotal_aed")
+  discountInr BigInt   @default(0) @map("discount_inr")
+  discountAed BigInt   @default(0) @map("discount_aed")
+  taxInr      BigInt   @default(0) @map("tax_inr")
+  taxAed      BigInt   @default(0) @map("tax_aed")
+  totalInr    BigInt   @map("total_inr")
+  totalAed    BigInt   @map("total_aed")
+  netCostAed  BigInt   @default(0) @map("net_cost_aed")
+  couponCode  String?  @map("coupon_code")
+
+  // traveller snapshot
+  leadName        String  @map("lead_name")
+  leadEmail       String? @map("lead_email")
+  leadPhone       String  @map("lead_phone")
+  hotel           String?
+  pickupZone      String? @map("pickup_zone")
+  dietary         String?
+  specialRequests String? @map("special_requests")
+
+  paymentMode    String  @default("full") @map("payment_mode")
+  idempotencyKey String? @map("idempotency_key")
+  /// Linked on OTP verify when lead_phone equals the verified phone (customer-auth-contract §1).
+  customerId     String? @map("customer_id") @db.Uuid
+
+  placedAt    DateTime  @default(now()) @map("placed_at") @db.Timestamptz(6)
+  paidAt      DateTime? @map("paid_at") @db.Timestamptz(6)
+  confirmedAt DateTime? @map("confirmed_at") @db.Timestamptz(6)
+  cancelledAt DateTime? @map("cancelled_at") @db.Timestamptz(6)
+  completedAt DateTime? @map("completed_at") @db.Timestamptz(6)
+  updatedAt   DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  guest                Guest?                     @relation(fields: [guestId], references: [id])
+  createdBy            AdminUser?                 @relation("OrderCreatedByAgent", fields: [createdByAgent], references: [id], onDelete: SetNull)
+  sourceInquiry        Inquiry?                   @relation("OrderSourceInquiry", fields: [sourceInquiryId], references: [id], onDelete: SetNull)
+  customer             Customer?                  @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  items                OrderItem[]
+  supplierBookings     SupplierBooking[]
+  attribution          OrderAttribution?
+  payments             Payment[]
+  notifications        Notification[]
+  fromInquiry          Inquiry?                   @relation("InquiryConvertedOrder")
+  analytics            AnalyticsEvent[]
+  quote                Quote?                     @relation("QuoteUsedByOrder")
+  verifications        OrderContactVerification[]
+  paymentSaga          PaymentSaga?
+  remedies             CustomerRemedy[]
+  ledgerEntries        LedgerEntry[]
+  documents            SupplierDocument[]
+  capabilityGrants     GuestCapabilityGrant[]
+  cancellationRequests CancellationRequest[]
+
+  @@index([status, placedAt(sort: Desc)], map: "orders_status_placed_idx")
+  @@index([leadPhone], map: "orders_lead_phone_idx")
+  @@index([rail, placedAt(sort: Desc)], map: "orders_rail_placed_idx")
+  @@index([sourceInquiryId], map: "orders_source_inquiry_idx")
+  @@index([customerId], map: "orders_customer_idx")
+  @@map("orders")
+}
+
+/// IMMUTABLE SNAPSHOT — never joined for display, never recomputed.
+model OrderItem {
+  id          String  @id @db.Uuid
+  orderId     String  @map("order_id") @db.Uuid
+  productId   String? @map("product_id") @db.Uuid
+  comboId     String? @map("combo_id") @db.Uuid
+  variantCode String? @map("variant_code")
+  mappingId   String? @map("mapping_id") @db.Uuid
+
+  titleSnapshot                 String           @map("title_snapshot")
+  tierSnapshot                  String           @map("tier_snapshot") @db.Char(1)
+  slugSnapshot                  String           @map("slug_snapshot")
+  kindSnapshot                  String           @map("kind_snapshot")
+  imageSnapshot                 String?          @map("image_snapshot")
+  variantNameSnapshot           String?          @map("variant_name_snapshot")
+  inclusionsSnapshot            String[]         @default([]) @map("inclusions_snapshot")
+  cancellationPolicySnapshot    Json             @default("{}") @map("cancellation_policy_snapshot")
+  confirmationSnapshot          ConfirmationType @map("confirmation_snapshot")
+  fulfilmentModeSnapshot        FulfilmentMode   @map("fulfilment_mode_snapshot")
+  freeCancellationHoursSnapshot Int              @map("free_cancellation_hours_snapshot")
+  durationMinutesSnapshot       Int              @map("duration_minutes_snapshot")
+
+  serviceDate DateTime @map("service_date") @db.Date
+  timeslot    String?
+  pax         Json
+  addons      Json     @default("[]")
+
+  unitInr          BigInt          @map("unit_inr")
+  unitAed          BigInt          @map("unit_aed")
+  totalInr         BigInt          @map("total_inr")
+  totalAed         BigInt          @map("total_aed")
+  netCostAed       BigInt          @default(0) @map("net_cost_aed")
+  status           OrderItemStatus @default(pending)
+  /// instant_checkout | assisted_conversion (FulfilmentOrigin, booking-port.ts). Only instant_checkout may create a supplier attempt (PRD-3).
+  fulfilmentOrigin String          @default("assisted_conversion") @map("fulfilment_origin")
+
+  /// B2, minor units of chargedCurrency. All null on rows written before B2.
+  /// Currency and amount are set together; allocations need a charged amount (checks in migration 20261101120000).
+  chargedCurrency    Currency? @map("charged_currency")
+  chargedAmountMinor BigInt?   @map("charged_amount_minor")
+  discountAllocMinor BigInt?   @map("discount_alloc_minor")
+  taxAllocMinor      BigInt?   @map("tax_alloc_minor")
+  quoteId            String?   @map("quote_id") @db.Uuid
+  /// MarginSnapshot (src/server/quotes/contracts.ts), bigint values as strings.
+  marginSnapshot     Json?     @map("margin_snapshot")
+  /// Instant items: the index of the quote line the item was sold from, its position in the order (the saga's
+  /// reserve and confirm order). Null for assisted items and rows written before multi-item checkout. Unique per
+  /// order when set (order_items_order_quote_line_key, SQL only; migration 20261103140000).
+  quoteLineIndex     Int?      @map("quote_line_index")
+  /// Batch 3 (doc 29 §3.4): the TravelDesk hotel id the quote accepted for pickup (plain decimal), and the hotel's
+  /// name on the supplier's list at quote time. Null for items without pickup and rows written before Batch 3.
+  pickupHotelId           String? @map("pickup_hotel_id")
+  pickupHotelNameSnapshot String? @map("pickup_hotel_name_snapshot")
+
+  order                Order                 @relation(fields: [orderId], references: [id])
+  product              Product?              @relation(fields: [productId], references: [id])
+  combo                Combo?                @relation(fields: [comboId], references: [id])
+  quote                Quote?                @relation(fields: [quoteId], references: [id], onDelete: Restrict)
+  supplierBookings     SupplierBooking[]
+  paymentSagas         PaymentSaga[]
+  refunds              Refund[]
+  remedies             CustomerRemedy[]
+  documents            SupplierDocument[]
+  cancellationRequests CancellationRequest[]
+
+  @@index([orderId], map: "order_items_order_idx")
+  @@index([serviceDate], map: "order_items_service_date_idx")
+  @@index([quoteId], map: "order_items_quote_idx")
+  @@map("order_items")
+}
+
+/// Guest checkout identity (B2). Opaque bearer token; only its SHA-256 is
+/// stored. Not a customer account and never creates one.
+model GuestSession {
+  id        String    @id @db.Uuid
+  tokenHash String    @unique @map("token_hash")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(6)
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(6)
+  quotes    Quote[]
+
+  @@index([expiresAt], map: "guest_sessions_expires_idx")
+  @@map("guest_sessions")
+}
+
+/// Server quote (QuoteSnapshot, src/server/quotes/contracts.ts). Checks in
+/// migration 20261101120000: exactly one owner matching ownerKind; status
+/// `used` exactly when usedByOrderId is set; fingerprint unique per owner among
+/// active quotes (partial unique indexes, SQL only).
+model Quote {
+  id             String                     @id @db.Uuid
+  /// sha256 hex over the canonical request and owner.
+  fingerprint    String
+  /// customer | guest
+  ownerKind      String                     @map("owner_kind")
+  customerId     String?                    @map("customer_id") @db.Uuid
+  guestSessionId String?                    @map("guest_session_id") @db.Uuid
+  currency       Currency
+  totalMinor     BigInt                     @map("total_minor")
+  /// QuoteLineSnapshot[], bigint values as strings.
+  lines          Json
+  /// The canonical QuoteRequest the fingerprint covers.
+  request        Json
+  /// active | used | expired | superseded
+  status         String                     @default("active")
+  expiresAt      DateTime                   @map("expires_at") @db.Timestamptz(6)
+  createdAt      DateTime                   @default(now()) @map("created_at") @db.Timestamptz(6)
+  usedByOrderId  String?                    @unique @map("used_by_order_id") @db.Uuid
+  customer       Customer?                  @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  guestSession   GuestSession?              @relation(fields: [guestSessionId], references: [id], onDelete: Restrict)
+  usedByOrder    Order?                     @relation("QuoteUsedByOrder", fields: [usedByOrderId], references: [id], onDelete: Restrict)
+  items          OrderItem[]
+  verifications  OrderContactVerification[]
+  payments       Payment[]
+
+  @@index([customerId, status], map: "quotes_customer_status_idx")
+  @@index([guestSessionId, status], map: "quotes_guest_status_idx")
+  @@index([expiresAt], map: "quotes_expires_idx")
+  @@map("quotes")
+}
+
+/// Order-bound recovery contact (TKT-4, ContactVerification). Written against
+/// the quote before payment; orderId is bound when the order is created.
+/// Verifying never creates a customer row. Checks in migration 20261101120000:
+/// channel and method agree; contactHash is sha256 hex.
+model OrderContactVerification {
+  id          String   @id @db.Uuid
+  quoteId     String   @map("quote_id") @db.Uuid
+  orderId     String?  @map("order_id") @db.Uuid
+  /// phone | email
+  channel     String
+  /// sha256 hex of the normalised contact; the contact itself lives on the order.
+  contactHash String   @map("contact_hash")
+  /// otp_sms | otp_whatsapp | email_code
+  method      String
+  verifiedAt  DateTime @map("verified_at") @db.Timestamptz(6)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  quote       Quote    @relation(fields: [quoteId], references: [id], onDelete: Restrict)
+  order       Order?   @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  @@unique([quoteId, channel], map: "ocv_quote_channel_key")
+  @@index([orderId], map: "ocv_order_idx")
+  @@index([contactHash], map: "ocv_contact_hash_idx")
+  @@map("order_contact_verifications")
+}
+
+/// AC-AN-01: first-touch AND last-touch; fbc/fbclid make offline upload possible (AC-META-02).
+model OrderAttribution {
+  orderId          String    @id @map("order_id") @db.Uuid
+  firstSource      String?   @map("first_source")
+  firstMedium      String?   @map("first_medium")
+  firstCampaign    String?   @map("first_campaign")
+  firstTouchAt     DateTime? @map("first_touch_at") @db.Timestamptz(6)
+  lastSource       String?   @map("last_source")
+  lastMedium       String?   @map("last_medium")
+  lastCampaign     String?   @map("last_campaign")
+  lastTouchAt      DateTime? @map("last_touch_at") @db.Timestamptz(6)
+  fbclid           String?
+  fbc              String?
+  fbp              String?
+  gclid            String?
+  waConversationId String?   @map("wa_conversation_id") @db.Uuid
+  uploadedToMetaAt DateTime? @map("uploaded_to_meta_at") @db.Timestamptz(6)
+  order            Order     @relation(fields: [orderId], references: [id])
+
+  @@index([uploadedToMetaAt], map: "order_attribution_meta_upload_idx")
+  @@map("order_attribution")
+}
+
+/// In inquiry mode payments are recorded manually by the agent for
+/// reconciliation (§17 §5.1). Gateway webhooks (future) write the same rows.
+/// B3 columns (migration 20261101130000) are all null, and the two running
+/// totals 0, on manual rows. Checks there: the account binding (rail,
+/// provider, providerAccountId, environment) is all set or all null;
+/// 0 <= refundedMinor <= capturedMinor <= amountMinor; capturedMinor never
+/// drops below the payment's non-failed refunds (trigger).
+model Payment {
+  id                     String        @id @db.Uuid
+  orderId                String        @map("order_id") @db.Uuid
+  /// 'razorpay' — collection via Payment Link is still Razorpay
+  gateway                String
+  gatewayOrderId         String?       @map("gateway_order_id")
+  /// The provider payment id; unique per gateway (payments_gateway_payment_idx, SQL only).
+  gatewayPaymentId       String?       @map("gateway_payment_id")
+  paymentLinkId          String?       @map("payment_link_id")
+  paymentLinkUrl         String?       @map("payment_link_url")
+  method                 String?
+  amountMinor            BigInt        @map("amount_minor")
+  currency               Currency
+  status                 PaymentStatus
+  failureCode            String?       @map("failure_code")
+  failureReason          String?       @map("failure_reason")
+  isDeposit              Boolean       @default(false) @map("is_deposit")
+  feeMinor               BigInt?       @map("fee_minor")
+  taxOnFeeMinor          BigInt?       @map("tax_on_fee_minor")
+  recordedBy             String?       @map("recorded_by") @db.Uuid
+  /// manual | gateway_verified (PAY-9). Only gateway_verified is payment evidence for a supplier confirm.
+  source                 String        @default("manual")
+  /// PaymentRail: inr_pacb | aed_card
+  rail                   String?
+  provider               String?
+  providerAccountId      String?       @map("provider_account_id")
+  /// test | production
+  environment            String?
+  providerOrderId        String?       @map("provider_order_id")
+  idempotencyKey         String?       @unique(map: "payments_idempotency_key_key") @map("idempotency_key")
+  authorizedAt           DateTime?     @map("authorized_at") @db.Timestamptz(6)
+  authorizationExpiresAt DateTime?     @map("authorization_expires_at") @db.Timestamptz(6)
+  voidedAt               DateTime?     @map("voided_at") @db.Timestamptz(6)
+  capturedMinor          BigInt        @default(0) @map("captured_minor")
+  refundedMinor          BigInt        @default(0) @map("refunded_minor")
+  /// passed | failed | not_applicable | unknown
+  threeDs                String?       @map("three_ds")
+  /// normal | elevated | highest | unknown
+  risk                   String?
+  quoteId                String?       @map("quote_id") @db.Uuid
+  createdAt              DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  capturedAt             DateTime?     @map("captured_at") @db.Timestamptz(6)
+  order                  Order         @relation(fields: [orderId], references: [id])
+  quote                  Quote?        @relation(fields: [quoteId], references: [id], onDelete: Restrict)
+  saga                   PaymentSaga?
+  refunds                Refund[]
+  ledgerEntries          LedgerEntry[]
+
+  @@unique([provider, providerOrderId], map: "payments_provider_order_key")
+  @@index([orderId], map: "payments_order_idx")
+  @@index([quoteId], map: "payments_quote_idx")
+  @@map("payments")
+}
+
+/// Payment saga, one per instant order (B3 first release: one instant item
+/// per order). `state` is PaymentSagaState (src/server/payments/contracts.ts);
+/// `version` is compared and incremented on every transition. Checks in
+/// migration 20261101130000; payment_sagas_attention_idx is partial (SQL only).
+model PaymentSaga {
+  id                  String    @id @db.Uuid
+  orderId             String    @unique(map: "payment_sagas_order_id_key") @map("order_id") @db.Uuid
+  orderItemId         String    @map("order_item_id") @db.Uuid
+  paymentId           String?   @unique(map: "payment_sagas_payment_id_key") @map("payment_id") @db.Uuid
+  /// PaymentRail: inr_pacb | aed_card
+  rail                String
+  state               String    @default("session_created")
+  version             Int       @default(0)
+  /// The next point the saga must act by (hold or authorization expiry minus buffer).
+  deadlineAt          DateTime? @map("deadline_at") @db.Timestamptz(6)
+  /// Set when a human must look; null when not.
+  attentionRequiredAt DateTime? @map("attention_required_at") @db.Timestamptz(6)
+  /// When the payments job last picked this saga; null = never (sorts first). CR-B3-14.
+  checkedAt           DateTime? @map("checked_at") @db.Timestamptz(6)
+  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  order               Order     @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  orderItem           OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Restrict)
+  payment             Payment?  @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+
+  @@index([orderItemId], map: "payment_sagas_item_idx")
+  @@index([state, deadlineAt], map: "payment_sagas_state_deadline_idx")
+  @@map("payment_sagas")
+}
+
+/// Payment webhook inbox (PAY-13). One row per (provider, provider event id);
+/// a forged body is never stored. Only the sha256 hex of the raw body is kept,
+/// never the body. `state` is InboxState; processedAt is set exactly when
+/// processed. Checks in migration 20261101130000.
+model PaymentEvent {
+  id                String    @id @db.Uuid
+  provider          String
+  providerEventId   String    @map("provider_event_id")
+  /// received | verified | processing_failed | processed
+  state             String    @default("received")
+  type              String
+  providerPaymentId String?   @map("provider_payment_id")
+  /// sha256 hex of the raw body.
+  payloadDigest     String    @map("payload_digest")
+  attempts          Int       @default(0)
+  /// A short code (at most 64 characters), never a message or body.
+  lastErrorCode     String?   @map("last_error_code")
+  receivedAt        DateTime  @default(now()) @map("received_at") @db.Timestamptz(6)
+  processedAt       DateTime? @map("processed_at") @db.Timestamptz(6)
+  nextAttemptAt     DateTime? @map("next_attempt_at") @db.Timestamptz(6)
+
+  @@unique([provider, providerEventId], map: "payment_events_provider_event_key")
+  @@index([state, nextAttemptAt], map: "payment_events_state_next_idx")
+  @@index([provider, providerPaymentId], map: "payment_events_provider_payment_idx")
+  @@map("payment_events")
+}
+
+/// One refund operation on one payment and item allocation. A trigger in
+/// migration 20261101130000 refuses a non-failed refund total above the
+/// payment's capturedMinor, or a currency other than the payment's; it locks
+/// the payment row and refuses REPEATABLE READ (use the default READ COMMITTED).
+model Refund {
+  id                  String               @id @db.Uuid
+  paymentId           String               @map("payment_id") @db.Uuid
+  orderItemId         String               @map("order_item_id") @db.Uuid
+  provider            String
+  providerRefundId    String?              @map("provider_refund_id")
+  /// Sent to the provider; a retry reuses it.
+  idempotencyKey      String               @unique(map: "refunds_idempotency_key_key") @map("idempotency_key")
+  amountMinor         BigInt               @map("amount_minor")
+  currency            Currency
+  /// requested | accepted | succeeded | failed | unknown
+  status              String               @default("requested")
+  reason              String
+  outlyFunded         Boolean              @default(false) @map("outly_funded")
+  /// Staff member; null for a refund the saga started.
+  requestedBy         String?              @map("requested_by") @db.Uuid
+  createdAt           DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime             @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  payment             Payment              @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  orderItem           OrderItem            @relation(fields: [orderItemId], references: [id], onDelete: Restrict)
+  requester           AdminUser?           @relation(fields: [requestedBy], references: [id], onDelete: Restrict)
+  remedy              CustomerRemedy?
+  cancellationRequest CancellationRequest?
+
+  @@unique([provider, providerRefundId], map: "refunds_provider_refund_key")
+  @@index([paymentId, status], map: "refunds_payment_status_idx")
+  @@index([orderItemId], map: "refunds_item_idx")
+  @@map("refunds")
+}
+
+/// What the customer is given when an item fails (SUP-20, TKT-8). Names the
+/// supplier attempt it compensates and never writes that attempt's state.
+/// Only a `refund` remedy has a refundId. Checks in migration 20261101130000.
+model CustomerRemedy {
+  id                String           @id @db.Uuid
+  orderId           String           @map("order_id") @db.Uuid
+  orderItemId       String           @map("order_item_id") @db.Uuid
+  supplierBookingId String?          @map("supplier_booking_id") @db.Uuid
+  /// RemedyKind: release_authorization | refund | alternative_offered
+  kind              String
+  reason            String
+  amountMinor       BigInt           @map("amount_minor")
+  currency          Currency
+  outlyFunded       Boolean          @default(false) @map("outly_funded")
+  /// pending | in_progress | completed | failed | cancelled
+  status            String           @default("pending")
+  refundId          String?          @unique(map: "customer_remedies_refund_id_key") @map("refund_id") @db.Uuid
+  createdAt         DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  order             Order            @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  orderItem         OrderItem        @relation(fields: [orderItemId], references: [id], onDelete: Restrict)
+  supplierBooking   SupplierBooking? @relation(fields: [supplierBookingId], references: [id], onDelete: Restrict)
+  refund            Refund?          @relation(fields: [refundId], references: [id], onDelete: Restrict)
+
+  @@index([orderId], map: "customer_remedies_order_idx")
+  @@index([orderItemId], map: "customer_remedies_item_idx")
+  @@index([supplierBookingId], map: "customer_remedies_supplier_booking_idx")
+  @@index([status, createdAt], map: "customer_remedies_status_idx")
+  @@map("customer_remedies")
+}
+
+/// B5 (doc 22 §23 B5, F15, F51). A customer's cancellation or exception
+/// request for one order item. A supported request goes engine cancel
+/// (status-4 verified) → refund through the payment saga's refund driver; an
+/// exception request only asks our team and promises nothing. `status` is
+/// CancellationRequestStatus (src/lib/customer-status.ts). Checks, the
+/// one-open-request-per-item partial unique index and RLS are in migration
+/// 20261102120000 (SQL only).
+model CancellationRequest {
+  id                  String           @id @db.Uuid
+  orderId             String           @map("order_id") @db.Uuid
+  orderItemId         String           @map("order_item_id") @db.Uuid
+  supplierBookingId   String?          @map("supplier_booking_id") @db.Uuid
+  /// supported | exception
+  kind                String
+  status              String
+  /// customer | guest | staff
+  requestedVia        String           @map("requested_via")
+  /// The stored verified policy the decision used (deadline, non-refundable flag, issuance), no money or supplier figures.
+  eligibility         Json             @default("{}")
+  /// A short code (`past_deadline`, `cancel_refused`, ...), never supplier text.
+  reasonCode          String?          @map("reason_code")
+  refundId            String?          @unique(map: "cancellation_requests_refund_id_key") @map("refund_id") @db.Uuid
+  attentionRequiredAt DateTime?        @map("attention_required_at") @db.Timestamptz(6)
+  createdAt           DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  closedAt            DateTime?        @map("closed_at") @db.Timestamptz(6)
+  order               Order            @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  orderItem           OrderItem        @relation(fields: [orderItemId], references: [id], onDelete: Restrict)
+  supplierBooking     SupplierBooking? @relation(fields: [supplierBookingId], references: [id], onDelete: Restrict)
+  refund              Refund?          @relation(fields: [refundId], references: [id], onDelete: Restrict)
+
+  @@index([orderId], map: "cancellation_requests_order_idx")
+  @@index([orderItemId], map: "cancellation_requests_item_idx")
+  @@index([status, updatedAt], map: "cancellation_requests_status_idx")
+  @@map("cancellation_requests")
+}
+
+/// Append-only (trigger ledger_entries_immutable): a correction is a new
+/// entry. Three books (LedgerBook), reconciled and never auto-corrected.
+/// Positive amount is money in to Outly, or into the supplier wallet for that
+/// book; never zero.
+model LedgerEntry {
+  id                String           @id @db.Uuid
+  /// customer_money | supplier_wallet | gateway_settlement
+  book              String
+  orderId           String?          @map("order_id") @db.Uuid
+  supplierBookingId String?          @map("supplier_booking_id") @db.Uuid
+  paymentId         String?          @map("payment_id") @db.Uuid
+  currency          Currency
+  amountMinor       BigInt           @map("amount_minor")
+  kind              String
+  /// What proves the entry: provider payment, refund or settlement id, supplier statement line.
+  evidenceRef       String           @map("evidence_ref")
+  occurredAt        DateTime         @map("occurred_at") @db.Timestamptz(6)
+  createdAt         DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  order             Order?           @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  supplierBooking   SupplierBooking? @relation(fields: [supplierBookingId], references: [id], onDelete: Restrict)
+  payment           Payment?         @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+
+  @@index([book, occurredAt], map: "ledger_entries_book_occurred_idx")
+  @@index([orderId], map: "ledger_entries_order_idx")
+  @@index([paymentId], map: "ledger_entries_payment_idx")
+  @@index([supplierBookingId], map: "ledger_entries_supplier_booking_idx")
+  @@map("ledger_entries")
+}
+
+/// Gateway settlement report rows, as reported; net is not derived (the
+/// report may also net refunds, tax and adjustments). rawDigest is the
+/// sha256 hex of the row as received.
+model Settlement {
+  id                   String   @id @db.Uuid
+  provider             String
+  providerSettlementId String   @map("provider_settlement_id")
+  currency             Currency
+  grossMinor           BigInt   @map("gross_minor")
+  feeMinor             BigInt   @map("fee_minor")
+  netMinor             BigInt   @map("net_minor")
+  settledAt            DateTime @map("settled_at") @db.Timestamptz(6)
+  rawDigest            String   @map("raw_digest")
+  createdAt            DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([provider, providerSettlementId], map: "settlements_provider_settlement_key")
+  @@index([settledAt], map: "settlements_settled_idx")
+  @@map("settlements")
+}
+
+/**
+ * ---------------------------------------------------------------------------
+ * Communication — narrow scope (§17 §5.1). BSP transport is a deferred adapter;
+ * the tables it will write exist so nothing is redesigned when it arrives.
+ * ------------------------------------------------------------------------
+ */
+
+model WaConversation {
+  id                       String               @id @db.Uuid
+  phoneE164                String               @map("phone_e164")
+  bspConversationId        String?              @map("bsp_conversation_id")
+  status                   WaConversationStatus @default(open)
+  assignedAgentId          String?              @map("assigned_agent_id") @db.Uuid
+  intent                   String?
+  entryContext             Json?                @map("entry_context")
+  attribution              Json?
+  cswExpiresAt             DateTime?            @map("csw_expires_at") @db.Timestamptz(6)
+  freeEntryWindowExpiresAt DateTime?            @map("free_entry_window_expires_at") @db.Timestamptz(6)
+  firstResponseAt          DateTime?            @map("first_response_at") @db.Timestamptz(6)
+  lastMessageAt            DateTime?            @map("last_message_at") @db.Timestamptz(6)
+  createdAt                DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+  assignedAgent            AdminUser?           @relation(fields: [assignedAgentId], references: [id], onDelete: SetNull)
+  inquiries                Inquiry[]
+
+  @@index([phoneE164], map: "wa_conversations_phone_idx")
+  @@index([status, lastMessageAt(sort: Desc)], map: "wa_conversations_status_idx")
+  @@map("wa_conversations")
+}
+
+/// Every outbound message, every channel, every outcome (§04.6.3).
+model Notification {
+  id                  String              @id @db.Uuid
+  /// INQUIRY_ACK, INQUIRY_OPS_ALERT, INQUIRY_FOLLOWUP, INQUIRY_SLA_BREACH, ...
+  event               String
+  channel             NotificationChannel
+  recipient           String
+  inquiryId           String?             @map("inquiry_id") @db.Uuid
+  orderId             String?             @map("order_id") @db.Uuid
+  template            String?
+  payload             Json?
+  status              NotificationStatus
+  suppressedReason    String?             @map("suppressed_reason")
+  providerId          String?             @map("provider_id")
+  providerError       String?             @map("provider_error")
+  costMinor           BigInt?             @map("cost_minor")
+  attempt             Int                 @default(1)
+  scheduledFor        DateTime?           @map("scheduled_for") @db.Timestamptz(6)
+  sentAt              DateTime?           @map("sent_at") @db.Timestamptz(6)
+  deliveredAt         DateTime?           @map("delivered_at") @db.Timestamptz(6)
+  failedAt            DateTime?           @map("failed_at") @db.Timestamptz(6)
+  createdAt           DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+  /// Outbox dedup key (TKT-6, DedupParts in src/server/documents/contracts.ts). Unique when set; null on rows written before B4.
+  dedupKey            String?             @unique(map: "notifications_dedup_key_key") @map("dedup_key")
+  /// A sender holds the row until then; another sender skips it.
+  lockedUntil         DateTime?           @map("locked_until") @db.Timestamptz(6)
+  /// Set when the row needs a human (an `unknown` outcome past the provider's idempotency window).
+  attentionRequiredAt DateTime?           @map("attention_required_at") @db.Timestamptz(6)
+  inquiry             Inquiry?            @relation(fields: [inquiryId], references: [id], onDelete: SetNull)
+  order               Order?              @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  @@index([inquiryId, event], map: "notifications_inquiry_event_idx")
+  @@index([status, scheduledFor], map: "notifications_status_sched_idx")
+  @@map("notifications")
+}
+
+/// B4 (doc 22 §23, TKT-1/2/3, F12–F14, F36, F47, F48). One row per document
+/// version of a supplier booking. Only `valid` rows are ever served; a reissue
+/// supersedes the old version. Checks and the one-valid-per-kind partial
+/// unique index are in migration 20261102110000 (SQL only).
+model SupplierDocument {
+  id                  String               @id @db.Uuid
+  supplierBookingId   String               @map("supplier_booking_id") @db.Uuid
+  orderId             String?              @map("order_id") @db.Uuid
+  orderItemId         String?              @map("order_item_id") @db.Uuid
+  /// ticket_codes | tickets_pdf | voucher_pdf (DocumentKind)
+  kind                String
+  version             Int
+  /// pending | valid | incomplete | quarantined | superseded | failed (DocumentStatus)
+  status              String
+  /// confirm_response | create_response | document_read | pdf_download
+  source              String
+  /// Random object key (`<env>/<32 hex>`); null for ticket_codes and before the object exists.
+  storageKey          String?              @unique(map: "supplier_documents_storage_key_key") @map("storage_key")
+  contentType         String?              @map("content_type")
+  byteSize            Int?                 @map("byte_size")
+  /// sha256 hex of the stored bytes, checked on every download (F36).
+  sha256              String?
+  /// UnitCounts ordered, and issued (ticket_codes only).
+  unitsExpected       Json?                @map("units_expected")
+  unitsIssued         Json?                @map("units_issued")
+  /// A short code (`active_content`, `bad_magic`, `too_large`, `wrong_booking`, ...), never supplier text.
+  quarantineReason    String?              @map("quarantine_reason")
+  /// Invoices and other internal documents are never shown to customers.
+  customerVisible     Boolean              @default(true) @map("customer_visible")
+  /// Evidence that the supplier already issued tickets (codes seen in a confirm or create answer). Allows the automatic document read (F47).
+  issuedEvidence      String?              @map("issued_evidence")
+  fetchAttempts       Int                  @default(0) @map("fetch_attempts")
+  nextFetchAt         DateTime?            @map("next_fetch_at") @db.Timestamptz(6)
+  lockedUntil         DateTime?            @map("locked_until") @db.Timestamptz(6)
+  attentionRequiredAt DateTime?            @map("attention_required_at") @db.Timestamptz(6)
+  createdAt           DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+  validatedAt         DateTime?            @map("validated_at") @db.Timestamptz(6)
+  invalidatedAt       DateTime?            @map("invalidated_at") @db.Timestamptz(6)
+  updatedAt           DateTime             @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  supplierBooking     SupplierBooking      @relation(fields: [supplierBookingId], references: [id], onDelete: Restrict)
+  order               Order?               @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  orderItem           OrderItem?           @relation(fields: [orderItemId], references: [id], onDelete: Restrict)
+  codes               SupplierTicketCode[]
+
+  @@unique([supplierBookingId, kind, version], map: "supplier_documents_booking_kind_version_key")
+  @@index([orderItemId], map: "supplier_documents_order_item_idx")
+  @@index([orderId], map: "supplier_documents_order_idx")
+  @@map("supplier_documents")
+}
+
+/// One admission code of a ticket_codes document version (TKT-1). The code is
+/// encrypted with the `ticket_codes` key ring (format v2, key id inside the
+/// ciphertext and in `code_key_id`); `code_hash` is a keyed hash for
+/// comparing versions. Rows change only to re-wrap the ciphertext under a new
+/// key (trigger in migration 20261102110000).
+model SupplierTicketCode {
+  id                String           @id @db.Uuid
+  documentId        String           @map("document_id") @db.Uuid
+  supplierBookingId String           @map("supplier_booking_id") @db.Uuid
+  unitIndex         Int              @map("unit_index")
+  /// adult | child | infant | unknown (TicketUnit)
+  ticketFor         String           @map("ticket_for")
+  ticketTypeId      String?          @map("ticket_type_id")
+  ticketTypeName    String?          @map("ticket_type_name")
+  displayType       Int?             @map("display_type")
+  codeCiphertext    String           @map("code_ciphertext")
+  codeKeyId         String           @map("code_key_id")
+  codeHash          String           @map("code_hash")
+  validUntil        DateTime?        @map("valid_until") @db.Timestamptz(6)
+  createdAt         DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  document          SupplierDocument @relation(fields: [documentId], references: [id], onDelete: Restrict)
+  supplierBooking   SupplierBooking  @relation(fields: [supplierBookingId], references: [id], onDelete: Restrict)
+
+  @@unique([documentId, unitIndex], map: "supplier_ticket_codes_document_unit_key")
+  @@index([supplierBookingId], map: "supplier_ticket_codes_booking_idx")
+  @@map("supplier_ticket_codes")
+}
+
+/// Guest capability grant (TKT-5). The token is at least 32 random bytes and
+/// lives only in the message that carries it; the row keeps its SHA-256.
+/// Scoped to one order and purpose, expiring and revocable. It is exchanged
+/// only by a deliberate POST, so a link preview or mail scanner fetching the
+/// link changes nothing. `token_ciphertext` (capability_tokens ring) exists
+/// only while the carrying notification's outcome is open, so a retry can
+/// render the identical message under the same provider idempotency key; it
+/// is cleared once the outcome is known.
+model GuestCapabilityGrant {
+  id              String    @id @db.Uuid
+  tokenHash       String    @unique(map: "guest_capability_grants_token_hash_key") @map("token_hash")
+  tokenCiphertext String?   @map("token_ciphertext")
+  orderId         String    @map("order_id") @db.Uuid
+  /// view_status | download_tickets | cancel_request
+  purpose         String
+  /// ticket_notification | status_notification | staff_resend | recovery (B5) | checkout (checkout redesign batch 3;
+  /// at most one per order: partial unique index guest_capability_grants_one_checkout, migration 20261112120000)
+  issuedFor       String    @map("issued_for")
+  notificationId  String?   @map("notification_id") @db.Uuid
+  expiresAt       DateTime  @map("expires_at") @db.Timestamptz(6)
+  revokedAt       DateTime? @map("revoked_at") @db.Timestamptz(6)
+  /// superseded | staff | erasure | order_cancelled | customer (batch 3: "Remove access on this browser")
+  revokeReason    String?   @map("revoke_reason")
+  exchangedAt     DateTime? @map("exchanged_at") @db.Timestamptz(6)
+  exchangeCount   Int       @default(0) @map("exchange_count")
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  order           Order     @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  @@index([orderId, purpose], map: "guest_capability_grants_order_purpose_idx")
+  @@index([expiresAt], map: "guest_capability_grants_expires_idx")
+  @@index([revokedAt], map: "guest_capability_grants_revoked_idx")
+  @@map("guest_capability_grants")
+}
+
+/// Hashed suppression list (PRV-3). `contact_hash` is `hmacFor("lookup", normalised contact)`;
+/// the contact itself is never stored. Checked alongside the legacy `suppressed_phones`.
+model SuppressedContact {
+  contactHash String   @id @map("contact_hash")
+  /// phone | email
+  channel     String
+  reason      String
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@map("suppressed_contacts")
+}
+
+/// Raw inbound webhook payloads, persisted first, deduplicated by provider event id (§04.4.3).
+model WebhookEvent {
+  id              String    @id @db.Uuid
+  provider        String
+  providerEventId String    @map("provider_event_id")
+  eventType       String?   @map("event_type")
+  payload         Json
+  signatureValid  Boolean   @map("signature_valid")
+  receivedAt      DateTime  @default(now()) @map("received_at") @db.Timestamptz(6)
+  processedAt     DateTime? @map("processed_at") @db.Timestamptz(6)
+  processingError String?   @map("processing_error")
+
+  @@unique([provider, providerEventId])
+  @@map("webhook_events")
+}
+
+/**
+ * ---------------------------------------------------------------------------
+ * Analytics — our collector is the source of truth (§11.1)
+ * ------------------------------------------------------------------------
+ */
+
+model AnalyticsEvent {
+  id               String          @id @db.Uuid
+  eventId          String          @map("event_id")
+  name             String
+  occurredAt       DateTime        @map("occurred_at") @db.Timestamptz(6)
+  receivedAt       DateTime        @default(now()) @map("received_at") @db.Timestamptz(6)
+  sessionId        String?         @map("session_id")
+  anonId           String?         @map("anon_id")
+  inquiryId        String?         @map("inquiry_id") @db.Uuid
+  orderId          String?         @map("order_id") @db.Uuid
+  productSlug      String?         @map("product_slug")
+  rail             String?
+  tier             String?         @db.Char(1)
+  valueMinor       BigInt?         @map("value_minor")
+  currency         String?
+  props            Json            @default("{}")
+  source           AnalyticsSource
+  ipHash           String?         @map("ip_hash")
+  userAgent        String?         @map("user_agent")
+  geoCountry       String?         @map("geo_country")
+  environment      String          @default("development")
+  forwardedMeta    Boolean         @default(false) @map("forwarded_meta")
+  forwardedPosthog Boolean         @default(false) @map("forwarded_posthog")
+  forwardedGa4     Boolean         @default(false) @map("forwarded_ga4")
+  inquiry          Inquiry?        @relation(fields: [inquiryId], references: [id], onDelete: SetNull)
+  order            Order?          @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  @@unique([eventId, source])
+  @@index([name, occurredAt(sort: Desc)], map: "analytics_events_name_idx")
+  @@index([sessionId], map: "analytics_events_session_idx")
+  @@index([inquiryId], map: "analytics_events_inquiry_idx")
+  @@map("analytics_events")
+}
+
+/**
+ * ---------------------------------------------------------------------------
+ * Infrastructure
+ * ------------------------------------------------------------------------
+ */
+
+/// Postgres-backed fixed-window rate limiter (§18 §1.6: Redis is optional at
+/// launch volumes). Swap for @upstash/ratelimit behind the same port later.
+model RateLimitBucket {
+  key         String   @map("bucket_key")
+  windowStart DateTime @map("window_start") @db.Timestamptz(6)
+  count       Int      @default(0)
+  expiresAt   DateTime @map("expires_at") @db.Timestamptz(6)
+
+  @@id([key, windowStart])
+  @@index([expiresAt], map: "rate_limit_expires_idx")
+  @@map("rate_limit_buckets")
+}
+
+model IdempotencyKey {
+  key            String    @id
+  scope          String
+  requestHash    String    @map("request_hash")
+  responseStatus Int?      @map("response_status")
+  responseBody   Json?     @map("response_body")
+  lockedAt       DateTime? @map("locked_at") @db.Timestamptz(6)
+  completedAt    DateTime? @map("completed_at") @db.Timestamptz(6)
+  expiresAt      DateTime  @map("expires_at") @db.Timestamptz(6)
+
+  @@map("idempotency_keys")
+}
+
+model JobExecution {
+  id         String    @id @db.Uuid
+  jobType    String    @map("job_type")
+  dedupeKey  String    @map("dedupe_key")
+  status     JobStatus
+  attempt    Int       @default(1)
+  error      String?
+  payload    Json?
+  startedAt  DateTime  @default(now()) @map("started_at") @db.Timestamptz(6)
+  finishedAt DateTime? @map("finished_at") @db.Timestamptz(6)
+
+  @@unique([jobType, dedupeKey])
+  @@map("job_executions")
+}
+
+/// Resolved Pexels search results per catalogue image ref (image.service.ts).
+/// One row per (kind, slug) holds the ordered photo list, so a whole gallery
+/// costs one API call. `photos = []` with a recent `fetchedAt` is a negative
+/// cache (retried after 24h). Curated ids never touch this table.
+model ImageAsset {
+  key       String   @id
+  query     String
+  photos    Json     @default("[]")
+  fetchedAt DateTime @default(now()) @map("fetched_at") @db.Timestamptz(6)
+
+  @@map("image_assets")
+}
+
+/// Ops alert emails for instant-path incidents (doc 22 §32.24: alerts by email). One row per (entity, reason):
+/// the durable 6-hour dedup, the hourly throttle and the "N more suppressed" digest. Never holds customer
+/// contact data or supplier net prices; `payload` is the email's own context (codes, ids, the order reference).
+model OpsAlert {
+  id               String    @id @db.Uuid
+  /// supplier_account | payment_saga | order_item | supplier_booking | supplier_document | digest
+  entityKind       String    @map("entity_kind")
+  entityId         String    @map("entity_id")
+  /// Short code, e.g. saga_attention, refund_failed, manual_review.
+  reason           String
+  /// When the incident last alerted on (or suppressed) was raised.
+  incidentAt       DateTime  @map("incident_at") @db.Timestamptz(6)
+  /// When this row last sent or suppressed an alert: the 6-hour dedup counts from here.
+  handledAt        DateTime  @map("handled_at") @db.Timestamptz(6)
+  lastSentAt       DateTime? @map("last_sent_at") @db.Timestamptz(6)
+  lastSuppressedAt DateTime? @map("last_suppressed_at") @db.Timestamptz(6)
+  sends            Int       @default(0)
+  suppressed       Int       @default(0)
+  payload          Json      @default("{}")
+  /// Claimed for sending, not yet handed to the notification outbox (after-commit step).
+  dispatchPending  Boolean   @default(false) @map("dispatch_pending")
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([entityKind, entityId, reason], map: "ops_alerts_entity_reason_key")
+  @@index([lastSentAt], map: "ops_alerts_last_sent_idx")
+  @@index([lastSuppressedAt], map: "ops_alerts_last_suppressed_idx")
+  @@index([dispatchPending], map: "ops_alerts_dispatch_pending_idx")
+  @@map("ops_alerts")
+}
+
+/**
+ * ---------------------------------------------------------------------------
+ * Bitrix24 CRM push (doc 29 §6.4, CRM batch C1). Switched off and run only
+ * against a fake portal in C1. None of these tables holds personal data,
+ * payloads, CRM credentials or URLs: ids, versions, codes and timestamps only.
+ * ------------------------------------------------------------------------
+ */
+
+/// CRM outbox: one row per local change of a deal subject (an inquiry, or a
+/// direct-checkout order), written in the domain transaction. No payload: the
+/// worker re-reads current state and pushes a full snapshot, so a row at or
+/// below the link's pushed version is a no-op. Claimed like `supplier_jobs`.
+/// Checks in migration 20261122120000.
+model CrmOutbox {
+  id             String    @id @db.Uuid
+  /// APP_ENV of the writer: development | staging | production
+  environment    String
+  /// The pinned portal host the row is for (CRM_BITRIX_PORTAL_HOST at enqueue).
+  portal         String
+  /// inquiry | order
+  entityType     String    @map("entity_type")
+  entityId       String    @map("entity_id") @db.Uuid
+  /// sync | delete
+  kind           String
+  /// The entity's crm_links.local_version this row was written with.
+  version        BigInt
+  /// Snapshot contract version the writer expected (CRM_PAYLOAD_VERSION).
+  payloadVersion Int       @default(1) @map("payload_version")
+  dedupeKey      String    @unique(map: "crm_outbox_dedupe_key_key") @map("dedupe_key")
+  /// queued | running | done | dead
+  status         String    @default("queued")
+  attempts       Int       @default(0)
+  maxAttempts    Int       @default(8) @map("max_attempts")
+  nextAttemptAt  DateTime  @default(now()) @map("next_attempt_at") @db.Timestamptz(6)
+  lockedBy       String?   @map("locked_by")
+  lockedUntil    DateTime? @map("locked_until") @db.Timestamptz(6)
+  /// A short code (at most 64 characters), never a provider message.
+  lastErrorCode  String?   @map("last_error_code")
+  /// Why a done row is done (pushed, unchanged, stale, not_visible, deleted, ...).
+  outcome        String?
+  /// Delete rows only: erasure | retention.
+  reason         String?
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([environment, portal, status, nextAttemptAt, createdAt], map: "crm_outbox_claim_idx")
+  @@index([entityType, entityId], map: "crm_outbox_entity_idx")
+  @@index([status, updatedAt], map: "crm_outbox_status_updated_idx")
+  @@map("crm_outbox")
+}
+
+/// One local deal subject in one portal and environment, and its CRM deal.
+/// Unique per (environment, portal, entity): the row is also the per-entity
+/// lock a worker must hold to create, update or delete (doc 29 §6.4), and its
+/// `local_version` is the per-entity counter the outbox enqueue bumps under
+/// the row lock, so versions follow commit order.
+model CrmLink {
+  id              String    @id @db.Uuid
+  environment     String
+  portal          String
+  /// inquiry | order
+  entityType      String    @map("entity_type")
+  entityId        String    @map("entity_id") @db.Uuid
+  /// Bitrix24 entityTypeId; 2 = deal.
+  crmEntityTypeId Int       @default(2) @map("crm_entity_type_id")
+  /// The Bitrix24 record id, once created or adopted.
+  crmId           BigInt?   @map("crm_id")
+  /// `outlyy-<environment>`: Bitrix24 originatorId (external source).
+  originatorId    String    @map("originator_id")
+  /// `inq:<id>` or `ord:<id>`: Bitrix24 originId (ORIGIN_ID), the search key before every create.
+  originId        String    @map("origin_id")
+  /// pending | creating | active | deleted
+  state           String    @default("pending")
+  /// Written before a create call: a lost answer is resolved by searching originId first.
+  creatingSince   DateTime? @map("creating_since") @db.Timestamptz(6)
+  localVersion    BigInt    @default(0) @map("local_version")
+  pushedVersion   BigInt    @default(0) @map("pushed_version")
+  /// sha256 hex of the last pushed snapshot (echo and no-change detection).
+  pushedHash      String?   @map("pushed_hash")
+  pushedAt        DateTime? @map("pushed_at") @db.Timestamptz(6)
+  lockedBy        String?   @map("locked_by")
+  lockedUntil     DateTime? @map("locked_until") @db.Timestamptz(6)
+  /// Two or more CRM records carry this originId: the oldest is kept, a human removes the rest.
+  twinFlaggedAt   DateTime? @map("twin_flagged_at") @db.Timestamptz(6)
+  deletedAt       DateTime? @map("deleted_at") @db.Timestamptz(6)
+  /// erasure | retention | crm_deleted
+  deleteReason    String?   @map("delete_reason")
+  /// Return path (C3ab, migration 20261126120000): what the reconciler last saw on the deal.
+  crmSeenUpdatedAt    DateTime? @map("crm_seen_updated_at") @db.Timestamptz(6)
+  crmSeenStageId      String?   @map("crm_seen_stage_id")
+  /// The deal owner's Bitrix24 user id as last seen (a staff identifier).
+  crmSeenOwnerId      BigInt?   @map("crm_seen_owner_id")
+  revertCount         Int?      @map("revert_count")
+  lastRevertAt        DateTime? @map("last_revert_at") @db.Timestamptz(6)
+  prevRevertAt        DateTime? @map("prev_revert_at") @db.Timestamptz(6)
+  lastRevertCommentAt DateTime? @map("last_revert_comment_at") @db.Timestamptz(6)
+  lastFieldRestoreAt  DateTime? @map("last_field_restore_at") @db.Timestamptz(6)
+  /// No forced put-back push before this time (a put-back loop).
+  holdUntil           DateTime? @map("hold_until") @db.Timestamptz(6)
+  /// The nightly sweep did not see the deal in the OUTLYY funnel since this time.
+  missingSince        DateTime? @map("missing_since") @db.Timestamptz(6)
+  sweepSeenAt         DateTime? @map("sweep_seen_at") @db.Timestamptz(6)
+  /// Read this deal again (after a hold, an observe-mode difference, or a failed check).
+  recheckRequestedAt  DateTime? @map("recheck_requested_at") @db.Timestamptz(6)
+  /// Failed rechecks in a row; the marker is dropped (with an alert) after `RECHECK_MAX_ATTEMPTS`.
+  recheckAttempts     Int?      @map("recheck_attempts")
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([environment, portal, entityType, entityId], map: "crm_links_entity_key")
+  @@index([environment, portal, state, pushedAt], map: "crm_links_state_pushed_idx")
+  @@map("crm_links")
+}
+
+/// A key moment of one CRM deal (doc 29 §8.8 C2-11, doc 29d G7; CRM batch C2b) and
+/// whether its timeline comment was posted. Unique per (link, moment key): a moment
+/// posts at most once per deal. `link_id` is crm_links.id without a foreign key.
+/// Codes, an AED amount and times only: never the comment text or contact data.
+model CrmTimelineComment {
+  id             String    @id @db.Uuid
+  linkId         String    @map("link_id") @db.Uuid
+  /// The kind, or `refund:<total refunded in minor units>`.
+  momentKey      String    @map("moment_key")
+  /// paid | confirmed | tickets_sent | refund | handed_to_team | stage_reverted | move_refused | owner_unmapped (C3ab)
+  kind           String
+  amountAedMinor BigInt?   @map("amount_aed_minor")
+  noticedAt      DateTime  @map("noticed_at") @db.Timestamptz(6)
+  /// pending | posting | posted | unknown | failed | dropped
+  status         String    @default("pending")
+  attempts       Int       @default(0)
+  nextAttemptAt  DateTime  @default(now()) @map("next_attempt_at") @db.Timestamptz(6)
+  postingBy      String?   @map("posting_by")
+  postingSince   DateTime? @map("posting_since") @db.Timestamptz(6)
+  postedAt       DateTime? @map("posted_at") @db.Timestamptz(6)
+  crmCommentId   BigInt?   @map("crm_comment_id")
+  /// A short code (at most 64 characters), never a provider message.
+  lastErrorCode  String?   @map("last_error_code")
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([linkId, momentKey], map: "crm_timeline_comments_link_moment_key")
+  @@index([status, nextAttemptAt], map: "crm_timeline_comments_due_idx")
+  @@map("crm_timeline_comments")
+}
+
+/// Per portal and environment: the stored portal identity the worker checks
+/// its configuration against, the circuit breaker and throttle pause, and the
+/// single-flight run lease.
+model CrmPortalState {
+  environment         String
+  portal              String
+  /// The deal funnel the links were written into; a different configured funnel refuses the run.
+  categoryId          Int       @map("category_id")
+  originatorId        String    @map("originator_id")
+  pausedUntil         DateTime? @map("paused_until") @db.Timestamptz(6)
+  /// throttled | breaker | auth
+  pauseReason         String?   @map("pause_reason")
+  consecutiveFailures Int       @default(0) @map("consecutive_failures")
+  leaseHolder         String?   @map("lease_holder")
+  leaseUntil          DateTime? @map("lease_until") @db.Timestamptz(6)
+  /// Return path (C3ab, migration 20261126120000): the poll cursor, always a time the portal returned.
+  reconcileCursor      DateTime? @map("reconcile_cursor") @db.Timestamptz(6)
+  reconcileCheckedAt   DateTime? @map("reconcile_checked_at") @db.Timestamptz(6)
+  /// The keyset position of the last deal read (with `reconcile_cursor`, its time).
+  reconcileCursorId    BigInt?   @map("reconcile_cursor_id")
+  /// True while catching up after a burst (resume by keyset); false or null at the head (read with the overlap).
+  reconcileCatchingUp  Boolean?  @map("reconcile_catching_up")
+  /// sha256 hex of host, webhook user, funnel id and name, and the funnel's stage list (G13).
+  fingerprintHash      String?   @map("fingerprint_hash")
+  /// ok | mismatch | admin | unreadable
+  fingerprintState     String?   @map("fingerprint_state")
+  fingerprintCheckedAt DateTime? @map("fingerprint_checked_at") @db.Timestamptz(6)
+  fingerprintOkAt      DateTime? @map("fingerprint_ok_at") @db.Timestamptz(6)
+  sweepCursorId        BigInt?   @map("sweep_cursor_id")
+  sweepStartedAt       DateTime? @map("sweep_started_at") @db.Timestamptz(6)
+  sweepCompletedAt     DateTime? @map("sweep_completed_at") @db.Timestamptz(6)
+  driftCursorLinkId    String?   @map("drift_cursor_link_id") @db.Uuid
+  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@id([environment, portal])
+  @@map("crm_portal_state")
+}
+
+/// Return path findings (CRM batch C3ab, doc 29e §3.4, §7, §8): one row per (scope, kind, subject) for the
+/// ops alert, and the at-most-once state of the one fixed comment on an extra twin deal. `subject_key` is
+/// `deal:<id>`, `inquiry:<id>`, `order:<id>` or `portal`. Ids and codes only: never a value, a name, a title
+/// or a comment text. `link_id` is crm_links.id without a foreign key. Checks in migration 20261126120000.
+model CrmReturnFinding {
+  id                  String    @id @db.Uuid
+  environment         String
+  portal              String
+  kind                String
+  subjectKey          String    @map("subject_key")
+  crmId               BigInt?   @map("crm_id")
+  linkId              String?   @map("link_id") @db.Uuid
+  /// Codes only (field keys, stage keys, a Bitrix24 user id).
+  detail              String?
+  occurrences         Int       @default(1)
+  firstSeenAt         DateTime  @map("first_seen_at") @db.Timestamptz(6)
+  lastSeenAt          DateTime  @map("last_seen_at") @db.Timestamptz(6)
+  /// When the ops alert is raised; moved on only for a repeat after the re-raise window.
+  raisedAt            DateTime  @map("raised_at") @db.Timestamptz(6)
+  /// Twin comment: pending | posting | posted | unknown | failed | dropped
+  commentState        String?   @map("comment_state")
+  /// The deal OUTLYY keeps ("Duplicate of deal N").
+  commentRefCrmId     BigInt?   @map("comment_ref_crm_id")
+  commentPostingBy    String?   @map("comment_posting_by")
+  commentPostingSince DateTime? @map("comment_posting_since") @db.Timestamptz(6)
+  commentPostedAt     DateTime? @map("comment_posted_at") @db.Timestamptz(6)
+  crmCommentId        BigInt?   @map("crm_comment_id")
+  commentErrorCode    String?   @map("comment_error_code")
+  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([environment, portal, kind, subjectKey], map: "crm_return_findings_subject_key")
+  @@index([raisedAt], map: "crm_return_findings_raised_idx")
+  @@index([environment, portal, commentState], map: "crm_return_findings_comment_idx")
+  @@map("crm_return_findings")
+}
