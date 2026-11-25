@@ -1,7 +1,10 @@
 import "server-only";
 import { randomBytes } from "node:crypto";
 import { lookup as dnsLookup } from "node:dns/promises";
+import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
+import { Readable } from "node:stream";
+import sharp from "sharp";
 import type { TourContentPhoto } from "../suppliers/traveldesk/traveldesk.content";
 import { isPrivateAddress, type LookupFn } from "./fetch";
 
@@ -11,8 +14,10 @@ import { isPrivateAddress, type LookupFn } from "./fetch";
  *
  *  - https only, default port, no user:password, a hostname (never an IP
  *    literal) on the configured TravelDesk media host list, every DNS answer
- *    a public address; redirects are followed by hand, each hop checked
- *    before it is connected to, at most 3, no loops (as `imports/fetch.ts`);
+ *    a public address, and the connection goes to the address that was
+ *    checked (pinned; TLS still verifies the hostname), so a second DNS
+ *    answer cannot redirect it (review 106 N1-12a); redirects are followed by
+ *    hand, each hop checked before it is connected to, at most 3, no loops;
  *  - one deadline per photo; the body is streamed under a byte cap whatever
  *    Content-Length says;
  *  - the type is read from the bytes, not the headers: JPEG, PNG or WebP only
@@ -42,12 +47,17 @@ export function sniffImageType(b: Uint8Array): SniffedType | null {
   return null;
 }
 
-/** "media.example.com" exact, "*.example.com" any subdomain (not the apex). Lower-case hostnames only. */
+/** A host list entry: a hostname of at least two labels, or "*." and at least two labels ("*.com" is refused; review 106 N1-21). */
+export function validHostEntry(entry: string): boolean {
+  return /^(\*\.)?[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(entry.trim().toLowerCase());
+}
+
+/** "media.example.com" exact, "*.example.com" any subdomain (not the apex). Lower-case hostnames only; invalid entries match nothing. */
 export function hostAllowed(hostname: string, allowed: readonly string[]): boolean {
   const h = hostname.toLowerCase();
   return allowed.some((a) => {
     const e = a.trim().toLowerCase();
-    if (!e) return false;
+    if (!validHostEntry(e)) return false;
     if (e.startsWith("*.")) return h.endsWith(e.slice(1)) && h.length > e.length - 1;
     return h === e;
   });
@@ -68,17 +78,71 @@ function checkHop(url: URL, allowed: readonly string[]) {
   if (!hostAllowed(url.hostname, allowed)) throw new PhotoRefused("host_not_allowed");
 }
 
+/** One GET to `url`, connected to `address` (already checked), never following redirects. */
+export type PinnedRequest = (url: URL, address: string, signal: AbortSignal) => Promise<Response>;
+
 export interface PhotoFetchDeps {
   allowedHosts: readonly string[];
-  fetch?: typeof fetch;
-  /** DNS answers; every address must be public. `null` skips the check (tests only). */
-  lookup?: LookupFn | null;
+  /** Defaults to `pinnedHttpsGet`. Tests pass a fake. */
+  request?: PinnedRequest;
+  /** DNS answers; every address must be public. */
+  lookup?: LookupFn;
   timeoutMs?: number;
   maxBytes?: number;
   maxRedirects?: number;
 }
 
 const systemLookup: LookupFn = async (hostname) => (await dnsLookup(hostname, { all: true, verbatim: true })).map((a) => a.address);
+
+/** GET over TLS to the pinned address, with SNI and certificate checks against the URL's hostname. */
+export const pinnedHttpsGet: PinnedRequest = (url, address, signal) =>
+  new Promise<Response>((resolve, reject) => {
+    const family = isIP(address) === 6 ? 6 : 4;
+    const req = httpsRequest(
+      {
+        protocol: "https:",
+        hostname: url.hostname,
+        servername: url.hostname,
+        port: 443,
+        path: `${url.pathname}${url.search}`,
+        method: "GET",
+        headers: { accept: "image/webp,image/jpeg,image/png", "user-agent": "outlyy-photo-copy" },
+        signal,
+        lookup: (_host: string, opts: unknown, cb: (err: Error | null, addr: string | { address: string; family: number }[], fam?: number) => void) => {
+          if (opts && typeof opts === "object" && (opts as { all?: boolean }).all) cb(null, [{ address, family }]);
+          else cb(null, address, family);
+        },
+      },
+      (res) => {
+        const headers = new Headers();
+        for (const [k, v] of Object.entries(res.headers)) if (v !== undefined) headers.set(k, Array.isArray(v) ? v.join(", ") : String(v));
+        const status = res.statusCode ?? 502;
+        const body = status === 204 || status === 304 ? null : (Readable.toWeb(res) as unknown as ReadableStream<Uint8Array>);
+        resolve(new Response(body, { status, headers }));
+      },
+    );
+    req.on("error", reject);
+    req.end();
+  });
+
+/** Reject as soon as `signal` aborts, whatever `promise` is doing (N1-12b). */
+function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(new PhotoRefused("timeout"));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new PhotoRefused("timeout"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (v) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(v);
+      },
+      (e: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(e);
+      },
+    );
+  });
+}
 
 async function readCapped(res: Response, maxBytes: number): Promise<Uint8Array> {
   const declared = res.headers.get("content-length");
@@ -111,8 +175,8 @@ async function readCapped(res: Response, maxBytes: number): Promise<Uint8Array> 
 
 /** GET one photo through the checks above; the bytes and their sniffed type. */
 export async function fetchPhoto(startUrl: string, deps: PhotoFetchDeps): Promise<{ bytes: Uint8Array; type: SniffedType }> {
-  const doFetch = deps.fetch ?? fetch;
-  const lookup = deps.lookup === undefined ? systemLookup : deps.lookup;
+  const doRequest = deps.request ?? pinnedHttpsGet;
+  const lookup = deps.lookup ?? systemLookup;
   const maxBytes = deps.maxBytes ?? PHOTO_MAX_BYTES;
   const maxRedirects = deps.maxRedirects ?? PHOTO_MAX_REDIRECTS;
   const controller = new AbortController();
@@ -129,13 +193,14 @@ export async function fetchPhoto(startUrl: string, deps: PhotoFetchDeps): Promis
       checkHop(url, deps.allowedHosts);
       if (seen.has(url.href)) throw new PhotoRefused("redirect_loop");
       seen.add(url.href);
-      if (lookup) {
-        const addresses = await lookup(url.hostname).catch(() => {
+      const addresses = await abortable(
+        lookup(url.hostname).catch(() => {
           throw new PhotoRefused("dns");
-        });
-        if (addresses.length === 0 || addresses.some(isPrivateAddress)) throw new PhotoRefused("private_address");
-      }
-      const res = await doFetch(url.href, { method: "GET", redirect: "manual", signal: controller.signal, cache: "no-store", credentials: "omit", headers: { accept: "image/webp,image/jpeg,image/png" } });
+        }),
+        controller.signal,
+      );
+      if (addresses.length === 0 || addresses.some(isPrivateAddress)) throw new PhotoRefused("private_address");
+      const res = await abortable(doRequest(url, addresses[0], controller.signal), controller.signal);
       if (REDIRECT.has(res.status)) {
         await res.body?.cancel().catch(() => {});
         const location = res.headers.get("location");
@@ -168,6 +233,8 @@ export async function fetchPhoto(startUrl: string, deps: PhotoFetchDeps): Promis
 export interface PhotoStore {
   put(key: string, bytes: Uint8Array, contentType: string): Promise<void>;
   publicUrl(key: string): string;
+  /** Remove an object no listing took (N1-12d). */
+  delete(key: string): Promise<void>;
 }
 
 /** Re-encode to WebP without metadata. Must refuse anything it cannot decode. */
@@ -194,6 +261,8 @@ export function pickVariant(photo: TourContentPhoto): string | null {
 
 export interface PhotoCopyResult {
   urls: string[];
+  /** Storage keys of `urls`, for cleanup when nothing takes them. */
+  keys: string[];
   failures: { index: number; reason: string }[];
 }
 
@@ -202,6 +271,7 @@ export async function copyTourPhotos(photos: readonly TourContentPhoto[], deps: 
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const max = Math.min(deps.maxPhotos ?? PHOTOS_PER_LISTING, PHOTOS_PER_LISTING);
   const urls: string[] = [];
+  const keys: string[] = [];
   const failures: PhotoCopyResult["failures"] = [];
   let tried = 0;
   for (const [index, photo] of photos.entries()) {
@@ -214,33 +284,35 @@ export async function copyTourPhotos(photos: readonly TourContentPhoto[], deps: 
     if (tried++ > 0) await sleep(deps.throttleMs ?? PHOTO_THROTTLE_MS);
     try {
       const got = await deps.fetchPhoto(src);
-      const out = await deps.reencode(got.bytes, got.type);
+      let out: { bytes: Uint8Array; type: "image/webp" };
+      try {
+        out = await deps.reencode(got.bytes, got.type);
+      } catch {
+        throw new PhotoRefused("reencode_failed");
+      }
       if (sniffImageType(out.bytes) !== "image/webp") throw new PhotoRefused("reencode_failed");
       const key = `${deps.environment}/${randomBytes(16).toString("hex")}`;
-      await deps.store.put(key, out.bytes, "image/webp");
+      try {
+        await deps.store.put(key, out.bytes, "image/webp");
+      } catch {
+        throw new PhotoRefused("store_failed");
+      }
+      keys.push(key);
       urls.push(deps.store.publicUrl(key));
     } catch (e) {
-      failures.push({ index, reason: e instanceof PhotoRefused ? e.code : "store_failed" });
+      failures.push({ index, reason: e instanceof PhotoRefused ? e.code : "fetch_failed" });
     }
   }
-  return { urls, failures };
+  return { urls, keys, failures };
 }
 
 /**
- * The production encoder: `sharp`, loaded at run time (it ships with Next.js
- * but is not a direct dependency of this repository; add it before the N1
- * deploy). Re-encoding drops EXIF and other metadata; decoding is pixel-capped.
+ * The production encoder: `sharp` (a direct dependency, static import so the
+ * standalone build traces it; review 106 N1-12c). Re-encoding drops EXIF and
+ * other metadata; decoding is pixel-capped.
  */
 export const sharpReencoder: ImageReencoder = async (bytes) => {
-  const name = "sharp";
-  type Sharp = (input: Uint8Array, opts: { limitInputPixels: number }) => {
-    rotate(): ReturnType<Sharp>;
-    resize(o: { width: number; withoutEnlargement: boolean }): ReturnType<Sharp>;
-    webp(o: { quality: number }): ReturnType<Sharp>;
-    toBuffer(): Promise<Buffer>;
-  };
-  const mod = (await import(/* webpackIgnore: true */ name)) as { default: Sharp };
-  const out = await mod.default(bytes, { limitInputPixels: 40_000_000 }).rotate().resize({ width: 1600, withoutEnlargement: true }).webp({ quality: 82 }).toBuffer();
+  const out = await sharp(bytes, { limitInputPixels: 40_000_000 }).rotate().resize({ width: 1600, withoutEnlargement: true }).webp({ quality: 82 }).toBuffer();
   return { bytes: new Uint8Array(out), type: "image/webp" };
 };
 
@@ -254,5 +326,8 @@ export class MemoryPhotoStore implements PhotoStore {
   }
   publicUrl(key: string) {
     return `${this.base}/${key}`;
+  }
+  async delete(key: string) {
+    this.objects.delete(key);
   }
 }

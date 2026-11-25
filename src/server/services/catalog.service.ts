@@ -328,9 +328,14 @@ export const catalogService = {
     }
 
     if (target.kind === "product") {
-      const before = await prisma.product.findUnique({ where: { id: target.id }, include: { mappings: { include: { supplier: true } } } });
+      const before = await prisma.product.findUnique({ where: { id: target.id }, include: { mappings: { include: { supplier: true } }, listingLink: { select: { kind: true, deactivatedAt: true } } } });
       if (!before) throw Errors.notFound("Product");
       if (mode === "instant") {
+        // Doc 30 D4 (review 106 N1-06): an imported TravelDesk inquiry listing can never be armed.
+        const link = before.listingLink;
+        if (link && !link.deactivatedAt && link.kind === "inquiry") {
+          throw Errors.conflict("This is a TravelDesk inquiry listing (options that are never instant); it cannot be made instant", { productId: target.id });
+        }
         const apiMapping = before.mappings.find(
           (m) => m.isActive && m.supplier.source === "api" && m.supplier.adapter !== "manual" && m.supplier.status === "active" && !m.supplier.deletedAt,
         );

@@ -8,12 +8,15 @@ import { Errors, isAppError } from "../lib/errors";
 import { uuidv7 } from "../lib/ids";
 import { revalidateCatalog } from "../lib/catalog-cache";
 import { activitySchema } from "../schemas/activity.schema";
-import { lockedFieldsBetween, PENDING_TEXT } from "../suppliers/traveldesk/traveldesk.listing-build";
+import { PENDING_TEXT } from "../suppliers/traveldesk/traveldesk.listing-build";
 import { staticSlugReferences } from "../suppliers/traveldesk/slug-references";
 import { productLifecycle } from "./activity.service";
 import { importService } from "./import.service";
 import { readinessService } from "./readiness.service";
-import { restoreReplacedInTx } from "./traveldesk-import.service";
+import { restoreReplacedInTx, RETIRE_REASON_PREFIX } from "./traveldesk-import.service";
+import { recordEditorialLocks } from "./listing-locks";
+import { env } from "../lib/env";
+import { log } from "../lib/logger";
 
 /**
  * Review queue, publish and replace for imported TravelDesk listings (doc 30
@@ -65,13 +68,28 @@ export type PublishItemResult =
   | { linkId: string; outcome: "published"; slug: string; retired: string | null; notRetired?: string }
   | { linkId: string; outcome: "stopped"; reason: string; references?: string[] };
 
-/** Placeholder fields still showing, by name. */
-function stillPending(doc: { location: string; meetingPoint: string; images: string[] }, pending: string[]): string[] {
+/** Placeholder fields still showing, by name (checked at review and again at publish; review 106 N1-09). */
+function stillPending(doc: { location: string; meetingPoint: string; images: string[] }): string[] {
   const out: string[] = [];
   if (doc.location.trim() === PENDING_TEXT) out.push("location");
   if (doc.meetingPoint.trim() === PENDING_TEXT) out.push("meetingPoint");
-  if (pending.includes("images") && doc.images.every((i) => i.startsWith("img:"))) out.push("images");
+  if (doc.images.every((i) => i.startsWith("img:"))) out.push("images");
   return out;
+}
+
+/** Sibling pages of the same tour with the same title or subtitle: each needs its own copy (§3.3). */
+async function sharedCopy(tx: Prisma.TransactionClient, link: { id: string; supplierId: string; environment: string; tourExternalId: string }, doc: { title: string; subtitle: string }): Promise<string[]> {
+  const siblings = await tx.supplierListingLink.findMany({
+    where: { id: { not: link.id }, supplierId: link.supplierId, environment: link.environment as "test" | "production", tourExternalId: link.tourExternalId, deactivatedAt: null },
+    include: { product: { select: { slug: true, title: true, subtitle: true, deletedAt: true } } },
+  });
+  const norm = (v: string | null) => (v ?? "").trim().toLowerCase();
+  return siblings.filter((x) => !x.product.deletedAt && (norm(x.product.title) === norm(doc.title) || norm(x.product.subtitle) === norm(doc.subtitle))).map((x) => x.product.slug);
+}
+
+/** A listing imported from the test catalogue never reviews or replaces a page of a production deployment (review 106 N1-17). */
+function assertEnvironment(link: { environment: string }) {
+  if (env().isProduction && link.environment !== "production") throw Errors.conflict("This listing was imported from the TravelDesk test catalogue; it cannot be reviewed or published here", { environment: link.environment });
 }
 
 /** Other listings (any product) whose related or combo slugs name `slug`, plus categories that feature it. */
@@ -147,30 +165,31 @@ export const traveldeskListingService = {
       if (!link || link.deactivatedAt) throw Errors.notFound("Imported listing");
       if (link.product.deletedAt) throw Errors.conflict("This listing was deleted");
       if (link.reviewedAt) throw Errors.conflict("This listing is already marked reviewed");
+      assertEnvironment(link);
       const doc = activitySchema.safeParse(link.product.content);
       if (!doc.success) throw Errors.conflict("The listing's document is not valid — fix it in the editor first");
-      const missing = stillPending(doc.data, link.pendingFields);
+      const missing = stillPending(doc.data);
       if (missing.length) throw Errors.validation({ fields: `Fill these first: ${missing.join(", ")}` });
       if ((link.pendingFields.includes("tier") || link.pendingFields.includes("categorySlug")) && !input.confirmTierAndCategory) {
         throw Errors.validation({ confirmTierAndCategory: "Confirm the tier and category (TravelDesk supplies neither)" });
       }
-      // Own copy per sibling page (§3.3).
-      const siblings = await tx.supplierListingLink.findMany({ where: { id: { not: link.id }, supplierId: link.supplierId, environment: link.environment, tourExternalId: link.tourExternalId, deactivatedAt: null }, include: { product: { select: { slug: true, title: true, subtitle: true, deletedAt: true } } } });
-      const same = siblings.filter((s) => !s.product.deletedAt && (s.product.title.trim().toLowerCase() === doc.data.title.trim().toLowerCase() || (s.product.subtitle ?? "").trim().toLowerCase() === doc.data.subtitle.trim().toLowerCase()));
-      if (same.length) throw Errors.validation({ copy: `Give this page its own title and subtitle: ${same.map((s) => s.product.slug).join(", ")} uses the same` });
+      const same = await sharedCopy(tx, link, doc.data);
+      if (same.length) throw Errors.validation({ copy: `Give this page its own title and subtitle: ${same.join(", ")} uses the same` });
       if (input.replacesProductId) {
         if (input.replacesProductId === link.productId) throw Errors.validation({ replacesProductId: "A listing cannot replace itself" });
         const old = await tx.product.findUnique({ where: { id: input.replacesProductId }, select: { id: true, deletedAt: true, listingLink: { select: { deactivatedAt: true } } } });
         if (!old || old.deletedAt) throw Errors.validation({ replacesProductId: "The old listing does not exist or is deleted" });
         if (old.listingLink && !old.listingLink.deactivatedAt) throw Errors.validation({ replacesProductId: "That listing is itself an imported TravelDesk listing" });
       }
-      const imported = await tx.productVersion.findUnique({ where: { productId_version: { productId: link.productId, version: link.importVersion } }, select: { content: true } });
-      const locked = imported ? lockedFieldsBetween(imported.content as Record<string, unknown>, link.product.content as Record<string, unknown>) : [];
       const now = new Date();
-      const updated = await tx.supplierListingLink.update({
-        where: { id: link.id },
-        data: { reviewedAt: now, reviewedBy: actor.id, noindex: false, pendingFields: [], lockedFields: locked, replacesProductId: input.replacesProductId },
+      // Guarded: of two concurrent reviews only one writes (review 106 N1-20).
+      const claimed = await tx.supplierListingLink.updateMany({
+        where: { id: link.id, reviewedAt: null, deactivatedAt: null },
+        data: { reviewedAt: now, reviewedBy: actor.id, noindex: false, pendingFields: [], replacesProductId: input.replacesProductId },
       });
+      if (claimed.count !== 1) throw Errors.conflict("This listing was reviewed by someone else just now");
+      const locked = (await recordEditorialLocks(tx, link.productId)) ?? [];
+      const updated = await tx.supplierListingLink.findUniqueOrThrow({ where: { id: link.id } });
       await audit(actor, "traveldesk_listing.review", { type: "product", id: link.productId }, { after: { linkId: link.id, replacesProductId: input.replacesProductId, lockedFields: locked }, reason: input.note.trim() }, tx);
       return updated;
     }, TX_OPTIONS).catch((e: unknown) => {
@@ -202,8 +221,9 @@ export const traveldeskListingService = {
           await readinessService.reevaluateMany([link!.productId, ...(link!.replacesProductId ? [link!.replacesProductId] : [])], "status_change");
         }
       } catch (e) {
-        if (!isAppError(e)) throw e;
-        results.push({ linkId, outcome: "stopped", reason: e.message });
+        // One item's failure never loses the others' results (review 106 N1-16).
+        if (!isAppError(e)) log.error("traveldesk_listing.publish_item_failed", { linkId, error: e });
+        results.push({ linkId, outcome: "stopped", reason: isAppError(e) ? e.message : "unexpected error; see the log" });
       }
     }
     return results;
@@ -235,10 +255,16 @@ async function publishOne(actor: Actor, linkId: string, reason: string): Promise
     const link = await tx.supplierListingLink.findUnique({ where: { id: linkId }, include: { product: true, replaces: true } });
     if (!link || link.deactivatedAt) return { linkId, outcome: "stopped", reason: "not an active imported listing" };
     if (!link.reviewedAt || link.noindex) return { linkId, outcome: "stopped", reason: "not marked reviewed" };
+    assertEnvironment(link);
     const p = link.product;
     if (p.deletedAt) return { linkId, outcome: "stopped", reason: "listing deleted" };
     const doc = activitySchema.safeParse(p.content);
     if (!doc.success) return { linkId, outcome: "stopped", reason: "invalid document" };
+    // Edits after review are checked again (N1-09).
+    const missing = stillPending(doc.data);
+    if (missing.length) return { linkId, outcome: "stopped", reason: `fill these first: ${missing.join(", ")}` };
+    const same = await sharedCopy(tx, link, doc.data);
+    if (same.length) return { linkId, outcome: "stopped", reason: `same title or subtitle as ${same.join(", ")}` };
 
     // References to the old slug stop the item until repointed (§3.9).
     const old = link.replaces;
@@ -268,7 +294,7 @@ async function publishOne(actor: Actor, linkId: string, reason: string): Promise
     }
 
     if (retire && old) {
-      await productLifecycle.softDeleteInTx(tx, actor, old.id, `Replaced by ${p.slug}: ${reason}`);
+      await productLifecycle.softDeleteInTx(tx, actor, old.id, `${RETIRE_REASON_PREFIX}${p.slug}: ${reason}`);
       await tx.productRedirect.upsert({
         where: { oldSlug: old.slug },
         create: { id: uuidv7(), oldSlug: old.slug, oldProductId: old.id, targetProductId: p.id, linkId, createdBy: actor.id },

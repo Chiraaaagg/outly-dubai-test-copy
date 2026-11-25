@@ -117,6 +117,8 @@ import type { ProductMappingReadiness, VariantMappingState } from "./supplier-ca
  * would only send every instant product to inquiry until the next re-run.
  * Not bumped by doc 29 Batch 7, for the same reason: `dateOnlySellable` lifts `slot_rules_unknown` and the
  * time rule only for the two date-only keys, only when the gate allows them, and no such flag exists before it.
+ * Not bumped by doc 30 N1: `inquiry_listing` applies only to products with an imported inquiry link, and no
+ * such link exists before N1.
  */
 export const READINESS_RULES_VERSION = 11;
 
@@ -177,6 +179,8 @@ export interface ReadinessProduct {
   content: unknown;
   /** `products.version`; absent when the loader does not read it. */
   version?: number | null;
+  /** Kind of the product's active TravelDesk import link (doc 30 §3.3), when it has one. */
+  listingKind?: "instant" | "inquiry" | null;
 }
 
 export type ReadinessTrigger =
@@ -389,6 +393,8 @@ export async function assessReadiness(input: ReadinessInput): Promise<ReadinessA
     return { requested, effective: "inquiry", reasons: [...reasons], activity: null, productVersion, mappings };
   }
 
+  // Doc 30 D4: an imported inquiry listing holds only never-instant offers, whatever its document says.
+  if (product?.listingKind === "inquiry") reasons.add("inquiry_listing");
   if (activity.confirmation !== "instant") reasons.add("editorial_confirmation_not_instant");
   if (activity.addOns.length > 0) reasons.add("safety_fact_unknown");
   if (!policyTextAgrees(activity.cancellationPolicy, activity.freeCancellationHours)) reasons.add("safety_fact_unknown");
@@ -738,7 +744,8 @@ export async function listInstantCandidates(): Promise<string[]> {
 
 export const readinessService = createReadinessService({
   async loadProducts(ids) {
-    return prisma.product.findMany({ where: { id: { in: ids } }, select: { id: true, status: true, deletedAt: true, fulfilmentMode: true, content: true, version: true } });
+    const rows = await prisma.product.findMany({ where: { id: { in: ids } }, select: { id: true, status: true, deletedAt: true, fulfilmentMode: true, content: true, version: true, listingLink: { select: { kind: true, deactivatedAt: true } } } });
+    return rows.map(({ listingLink, ...p }) => ({ ...p, listingKind: listingLink && !listingLink.deactivatedAt ? (listingLink.kind === "inquiry" ? "inquiry" : "instant") : null }));
   },
   mappingSource: supplierMappingSource,
   releaseEnabled: () => env().INSTANT_RELEASE_ENABLED === true,

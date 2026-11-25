@@ -7,7 +7,7 @@ import { readLimits } from "../../suppliers/read-budget";
 import { tourDetailFrom, tourDetailsWire, type TravelDeskTourDetail, type TravelDeskTourSummary } from "../../suppliers/traveldesk/traveldesk.codec";
 import { offerTermsHash } from "../../suppliers/traveldesk/traveldesk.offer-terms";
 import { MemoryPhotoStore, type PhotoCopyDeps } from "../../imports/photo-copy";
-import { PENDING_TEXT } from "../../suppliers/traveldesk/traveldesk.listing-build";
+import { EDITORIAL_FIELDS, PENDING_TEXT } from "../../suppliers/traveldesk/traveldesk.listing-build";
 
 /**
  * Doc 30 N1 against the LOCAL disposable test database: preview and apply of
@@ -117,6 +117,11 @@ describe.skipIf(!enabled)("TravelDesk importer, N1 (local DB)", () => {
   const B = TOUR + 2;
   const C = TOUR + 3;
   const D = TOUR_LINKED + 1;
+  /** fixed_slot_choice (two starts): the second S0 key of the same tour (review 106 N1-02). */
+  const E = TOUR + 4;
+  /** listed start ("any time" slot): an S3 offer of the same tour. */
+  const F = TOUR + 5;
+  let hadTravelDeskRow = true;
   let supplierId = "";
   let category = "";
   let oldId = "";
@@ -184,10 +189,22 @@ describe.skipIf(!enabled)("TravelDesk importer, N1 (local DB)", () => {
     await settings.set("pricing.fx_inr_per_aed", { version: 1, inrPerAed: "24.10", source: "zz synthetic", recordedAt: new Date(now - 86_400_000).toISOString(), expiresAt: new Date(now + 7 * 86_400_000).toISOString() });
     await settings.set("pricing.listing_rule", { version: 1, targetBps: 1700, recordedAt: new Date(now - 86_400_000).toISOString() });
     category = (await prisma.category.findFirstOrThrow({ where: { deletedAt: null }, select: { slug: true } })).slug;
+    hadTravelDeskRow = Boolean(await prisma.supplier.findUnique({ where: { code: "traveldesk" } }));
 
     await catalog.syncTravelDeskCatalogue(
       source([
-        wireTour(TOUR, `zz test ${RUN} Evening Dhow Cruise TD-4411`, [wireOffer(A, 1200), wireOffer(B, 1200, { numberOfHours: 3 }), wireOffer(C, 1200, { bookingType: 0 })]),
+        wireTour(TOUR, `zz test ${RUN} Evening Dhow Cruise TD-4411`, [
+          wireOffer(A, 1200),
+          wireOffer(B, 1200, { numberOfHours: 3 }),
+          wireOffer(C, 1200, { bookingType: 0 }),
+          wireOffer(E, 600, {
+            timeSlots: [
+              { id: 1, name: null, startTime: 600, endTime: 720, daysOffered: 0, isAnyTime: false, isOnRequest: false, minimumAdvancedBooking: 12 },
+              { id: 2, name: null, startTime: 900, endTime: 1020, daysOffered: 0, isAnyTime: false, isOnRequest: false, minimumAdvancedBooking: 12 },
+            ],
+          }),
+          wireOffer(F, 480, { timeSlots: [{ id: 1, name: null, startTime: 480, endTime: 600, daysOffered: 0, isAnyTime: true, isOnRequest: false, minimumAdvancedBooking: 12 }] }),
+        ]),
         wireTour(TOUR_LINKED, `zz test ${RUN} Linked Cruise`, [wireOffer(D, 1080)]),
       ]),
       "test",
@@ -222,6 +239,8 @@ describe.skipIf(!enabled)("TravelDesk importer, N1 (local DB)", () => {
       await prisma.supplierSyncRun.deleteMany({ where: { supplierCode: CODE } }).catch(() => {});
       await prisma.supplier.delete({ where: { id: supplierId } }).catch(() => {});
     }
+    // An editor save of an imported listing ensures a mapping to the supplier its document names; remove a row this run created.
+    if (!hadTravelDeskRow) await prisma.supplier.deleteMany({ where: { code: "traveldesk", adapter: "manual", mappings: { none: {} } } }).catch(() => {});
     for (const [k, v] of saved) {
       if (v === null) await prisma.setting.deleteMany({ where: { key: k } });
       else await settings.set(k, v);
@@ -233,58 +252,91 @@ describe.skipIf(!enabled)("TravelDesk importer, N1 (local DB)", () => {
   let instantLinkId = "";
   let inquiryLinkId = "";
   let instantId = "";
+  let inquiryId = "";
   let instantSlug: string | null = null;
+  const KEY_SINGLE = "live.fixed_slot_single.self.internal.per_person";
+  const KEY_CHOICE = "live.fixed_slot_choice.self.internal.per_person";
+  const mineOf = (rows: { identity: { tourId: number } }[]) => rows.filter((r) => r.identity.tourId === TOUR || r.identity.tourId === TOUR_LINKED);
 
-  it("previews S0: one instant listing of two options, one inquiry listing (D4), one adoption; no net in the batch", async () => {
+  it("previews S0: two keys of one tour as two listings with distinct identities (N1-02), an inquiry listing (D4), an adoption; no net in the batch", async () => {
     const p = await importer.preview(admin, "test", "S0", { supplierCode: CODE });
-    batchId = p.batchId;
-    const mine = p.rows.filter((r) => r.identity.tourId === TOUR || r.identity.tourId === TOUR_LINKED);
-    expect(mine.map((r) => [r.identity.tourId, r.identity.kind, r.action, r.options.map((o) => o.offerId)])).toEqual([
-      [TOUR, "instant", "create", [A, B]],
-      [TOUR, "inquiry", "create", [C]],
-      [TOUR_LINKED, "instant", "adopt", [D]],
+    const mine = mineOf(p.rows) as typeof p.rows;
+    expect(mine.map((r) => [r.identity.tourId, r.identity.kind, r.identity.classKey, r.identity.splitNumber, r.action, r.options.map((o) => o.offerId)])).toEqual([
+      [TOUR, "instant", KEY_CHOICE, 1, "create", [E]],
+      [TOUR, "instant", KEY_SINGLE, 2, "create", [A, B]],
+      [TOUR, "inquiry", null, 1, "create", [C]],
+      [TOUR_LINKED, "instant", KEY_SINGLE, 1, "adopt", [D]],
     ]);
-    const instant = mine[0];
-    expect(instant.input).toMatchObject({ fulfilmentMode: "inquiry", confirmation: "instant", freeCancellationHours: 0, timeSlots: ["20:00"], location: PENDING_TEXT });
-    expect(instant.input!.title).toBe(`zz test ${RUN} Evening Dhow Cruise`);
-    expect(instant.input!.variants.map((v) => v.name)).toEqual(["Shared · 2 hours · meet at the venue", "Shared · 3 hours · meet at the venue"]);
-    expect(instant.input!.relatedSlugs).toContain(mine[1].slug);
-    const stored = await prisma.importBatch.findUniqueOrThrow({ where: { id: batchId } });
+    const single = mine[1];
+    expect(single.input).toMatchObject({ fulfilmentMode: "inquiry", confirmation: "instant", freeCancellationHours: 0, timeSlots: ["20:00"], location: PENDING_TEXT });
+    expect(single.input!.supplier.name).toBe("TravelDesk");
+    expect(single.input!.variants.map((v) => v.name)).toEqual(["Shared · 2 hours · meet at the venue", "Shared · 3 hours · meet at the venue"]);
+    expect(single.input!.relatedSlugs).toEqual(expect.arrayContaining([mine[0].slug, mine[2].slug]));
+    expect(Object.keys(single.offerHashes)).toEqual([String(A), String(B)]);
+    const stored = await prisma.importBatch.findUniqueOrThrow({ where: { id: p.batchId } });
     expect(stored.source).toBe("traveldesk");
     for (const n of NET_NEEDLES) expect(JSON.stringify(stored.preview)).not.toContain(n);
   });
 
-  it("refuses the apply when an offer was linked after the preview, and leaves the batch failed", async () => {
+  it("the generic import apply refuses a TravelDesk batch and writes nothing (N1-01)", async () => {
     const p = await importer.preview(admin, "test", "S0", { supplierCode: CODE });
-    const tmp = await prisma.productSupplierMapping.create({ data: { id: uuidv7(), productId: oldId, supplierId, variantCode: `zz-${RUN}`, externalRef: {}, supplierOfferId: String(A), environment: "test", isActive: true } });
-    await expect(importer.apply(admin, p.batchId, { photos: null })).rejects.toSatisfy((e) => code(e) === "CONFLICT");
-    await prisma.productSupplierMapping.delete({ where: { id: tmp.id } });
-    expect((await prisma.importBatch.findUniqueOrThrow({ where: { id: p.batchId } })).status).toBe("failed");
+    const before = await prisma.product.count({ where: { slug: { startsWith: `zz-test-${RUN}` } } });
+    await expect(importService.apply(admin, p.batchId, { partial: true, publish: true })).rejects.toSatisfy((e) => code(e) === "CONFLICT");
+    expect(await prisma.product.count({ where: { slug: { startsWith: `zz-test-${RUN}` } } })).toBe(before);
+    expect((await prisma.importBatch.findUniqueOrThrow({ where: { id: p.batchId } })).status).toBe("previewed");
   });
 
-  it("applies: drafts in inquiry mode, exact links written as a reviewed approval would, copied photos, no net anywhere", async () => {
-    const store = new MemoryPhotoStore();
-    const r = await importer.apply(admin, batchId, { photos: fakePhotos(store) });
-    expect(r.created.map((c) => c.slug).filter((s) => s.startsWith(`zz-test-${RUN}`))).toHaveLength(2);
-    expect(r.adopted.map((a) => a.productId)).toContain(linkedId);
+  it("refuses a stale preview: an offer linked since, terms changed since, older than 24 hours (N1-05)", async () => {
+    const p = await importer.preview(admin, "test", "S0", { supplierCode: CODE });
+    const tmp = await prisma.productSupplierMapping.create({ data: { id: uuidv7(), productId: oldId, supplierId, variantCode: `zz-${RUN}`, externalRef: {}, supplierOfferId: String(A), environment: "test", isActive: true } });
+    await expect(importer.apply(admin, p.batchId)).rejects.toSatisfy((e) => code(e) === "CONFLICT");
+    await prisma.productSupplierMapping.delete({ where: { id: tmp.id } });
+    expect((await prisma.importBatch.findUniqueOrThrow({ where: { id: p.batchId } })).status).toBe("failed");
+
+    const q = await importer.preview(admin, "test", "S0", { supplierCode: CODE });
+    const offer = await prisma.supplierCatalogueItem.findFirstOrThrow({ where: { supplierId, kind: "offer", externalId: String(B) } });
+    const payload = offer.payload as Record<string, unknown>;
+    await prisma.supplierCatalogueItem.update({ where: { id: offer.id }, data: { payload: { ...payload, maxPax: 19 }, payloadHash: "zz-changed" } });
+    await expect(importer.apply(admin, q.batchId)).rejects.toSatisfy((e) => isAppError(e) && /changed or vanished/.test(e.message));
+    await prisma.supplierCatalogueItem.update({ where: { id: offer.id }, data: { payload: payload as object, payloadHash: offer.payloadHash } });
+
+    const old = await importer.preview(admin, "test", "S0", { supplierCode: CODE });
+    await expect(importer.apply(admin, old.batchId, { now: () => new Date(Date.now() + 25 * 3_600_000) })).rejects.toSatisfy((e) => isAppError(e) && /24 hours/.test(e.message));
+  });
+
+  it("two concurrent applies of the same step: exactly one wins, no offer linked twice (N1-07)", async () => {
+    const [p1, p2] = [await importer.preview(admin, "test", "S0", { supplierCode: CODE }), await importer.preview(admin, "test", "S0", { supplierCode: CODE })];
+    const results = await Promise.allSettled([importer.apply(admin, p1.batchId), importer.apply(admin, p2.batchId)]);
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    const rejected = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
+    expect(code(rejected.reason)).toBe("CONFLICT");
+    batchId = results[0].status === "fulfilled" ? p1.batchId : p2.batchId;
+    const counts = await prisma.productSupplierMapping.groupBy({ by: ["supplierOfferId"], where: { supplierId, isActive: true, supplierOfferId: { in: [A, B, C, E].map(String) } }, _count: true });
+    expect(counts.every((c) => c._count === 1)).toBe(true);
+  });
+
+  it("applies: drafts in inquiry mode, exact links written as a reviewed approval would, adopted page locked, no net anywhere", async () => {
     const links = await prisma.supplierListingLink.findMany({ where: { supplierId, deactivatedAt: null }, include: { product: true } });
-    const instant = links.find((l) => l.kind === "instant" && l.tourExternalId === String(TOUR))!;
+    const instant = links.find((l) => l.kind === "instant" && l.tourExternalId === String(TOUR) && l.classKey === KEY_SINGLE)!;
     const inquiry = links.find((l) => l.kind === "inquiry")!;
     const adopted = links.find((l) => l.adopted)!;
     instantLinkId = instant.id;
     inquiryLinkId = inquiry.id;
     instantId = instant.productId;
+    inquiryId = inquiry.productId;
     instantSlug = instant.product.slug;
-    expect(instant).toMatchObject({ noindex: true, reviewedAt: null, classKey: "live.fixed_slot_single.self.internal.per_person", startMinutes: [1200], splitNumber: 1, pricingRuleVersion: 1, importBatchId: batchId });
-    expect(instant.pendingFields).toEqual(["location", "meetingPoint", "tier", "categorySlug"]);
+    expect(instant).toMatchObject({ noindex: true, reviewedAt: null, classKey: KEY_SINGLE, startMinutes: [1200], splitNumber: 2, pricingRuleVersion: 1, importBatchId: batchId });
+    expect(instant.pendingFields).toEqual(["location", "meetingPoint", "tier", "categorySlug", "images"]);
     expect(instant.product).toMatchObject({ status: "draft", fulfilmentMode: "inquiry", deletedAt: null });
-    expect((instant.product.content as { images: string[] }).images).toEqual([...store.objects.keys()].map((k) => store.publicUrl(k)));
     expect(inquiry.route).toBe("internal");
     expect((inquiry.product.content as { confirmation: string }).confirmation).toBe("manual");
     expect(adopted).toMatchObject({ productId: linkedId, noindex: false });
     expect(adopted.reviewedAt).not.toBeNull();
+    expect(adopted.lockedFields).toEqual([...EDITORIAL_FIELDS]);
 
-    // One approved candidate, one mapping and one approve audit row per option, the mapping as reviewCandidate writes it.
+    // The TravelDesk supplier row is never renamed (N1-18).
+    expect((await prisma.supplier.findUniqueOrThrow({ where: { id: supplierId } })).name).toBe("TravelDesk");
+
     const maps = await prisma.productSupplierMapping.findMany({ where: { productId: instantId, supplierOfferId: { not: null } }, orderBy: { variantCode: "asc" } });
     expect(maps.map((m) => [m.variantCode, m.supplierOfferId, m.isActive, m.syncStatus])).toEqual([
       [`td-${A}`, String(A), true, "ok"],
@@ -298,25 +350,46 @@ describe.skipIf(!enabled)("TravelDesk importer, N1 (local DB)", () => {
     }
     const candidates = await prisma.supplierMappingCandidate.findMany({ where: { productId: instantId } });
     expect(candidates.every((c) => c.source === "import" && c.state === "approved" && c.mappingId)).toBe(true);
-    const approvals = await prisma.auditLog.findMany({ where: { entityId: instantId, action: "supplier_mapping.approve" } });
-    expect(approvals).toHaveLength(2);
+    expect(await prisma.auditLog.count({ where: { entityId: instantId, action: "supplier_mapping.approve" } })).toBe(2);
 
-    // The net never enters content, versions or audit rows.
     const versions = await prisma.productVersion.findMany({ where: { productId: { in: [instantId, inquiry.productId] } } });
     const audits = await prisma.auditLog.findMany({ where: { entityId: { in: [instantId, inquiry.productId, batchId] } } });
     const blob = JSON.stringify([links.map((l) => l.product.content), versions, audits, links], (_k, v) => (typeof v === "bigint" ? v.toString() : v));
     for (const n of NET_NEEDLES) expect(blob).not.toContain(n);
   });
 
-  it("imports nothing the second time", async () => {
+  it("copies photos a few tours per call; the copy is not a person's edit and moves the lock baseline", async () => {
+    const store = new MemoryPhotoStore();
+    const r = await importer.copyPhotos(admin, { batchId, photos: fakePhotos(store), maxTours: 5 });
+    expect(r.listingsUpdated).toBe(3);
+    const link = await prisma.supplierListingLink.findUniqueOrThrow({ where: { id: instantLinkId }, include: { product: true } });
+    expect((link.product.content as { images: string[] }).images).toEqual([...store.objects.keys()].map((k) => store.publicUrl(k)));
+    expect(link.pendingFields).not.toContain("images");
+    expect(link.lockedFields).toEqual([]);
+    expect(link.importVersion).toBe(link.product.version);
+    // Nothing left to copy; a tour whose copy no listing took leaves no object behind.
+    expect((await importer.copyPhotos(admin, { batchId, photos: fakePhotos(new MemoryPhotoStore()) })).toursTried).toBe(0);
+  });
+
+  it("imports nothing the second time; S3 on the same tour is a new listing, not 'already imported' (N1-02)", async () => {
     const again = await importer.preview(admin, "test", "S0", { supplierCode: CODE });
-    const mine = again.rows.filter((r) => r.identity.tourId === TOUR || r.identity.tourId === TOUR_LINKED);
-    expect(mine.map((r) => r.action)).toEqual(["skip", "skip", "skip"]);
+    expect(mineOf(again.rows).map((r) => (r as unknown as { action: string }).action)).toEqual(["skip", "skip", "skip", "skip"]);
+    const s3 = await importer.preview(admin, "test", "S3", { supplierCode: CODE });
+    const listed = s3.rows.filter((r) => r.identity.tourId === TOUR);
+    expect(listed.map((r) => [r.action, r.identity.splitNumber, r.options.map((o) => o.offerId)])).toEqual([["create", 3, [F]]]);
+  });
+
+  it("an inquiry listing can never be armed: readiness names it (N1-06)", async () => {
+    const { readinessService } = await import("../readiness.service");
+    await readinessService.reevaluate(inquiryId, "admin_rerun");
+    const e = await prisma.productEligibility.findUniqueOrThrow({ where: { productId: inquiryId } });
+    expect(e.effectiveMode).toBe("inquiry");
+    expect(e.reasons as string[]).toContain("inquiry_listing");
   });
 
   it("round-trips imported listings through the spreadsheet (D13): export, edit, preview, apply", async () => {
     const { csv, rows } = await listings.exportCsv(admin, { batchId });
-    expect(rows).toBe(3);
+    expect(rows).toBe(4);
     expect(csv).toContain(instantSlug!);
     const preview = await importService.preview(admin, { source: "csv", text: csv, fileName: "zz-roundtrip.csv" });
     expect(preview.rowsFailed).toBe(0);
@@ -331,28 +404,31 @@ describe.skipIf(!enabled)("TravelDesk importer, N1 (local DB)", () => {
       [`td-${A}`, 3],
       [`td-${B}`, 3],
     ]);
-    // The import's own version stays the lock baseline; the round trip changed no editorial field.
-    const link = await prisma.supplierListingLink.findUniqueOrThrow({ where: { id: instantLinkId } });
-    expect(link.importVersion).toBe(1);
+    expect((await prisma.supplier.findUniqueOrThrow({ where: { id: supplierId } })).name).toBe("TravelDesk");
   });
 
-  it("the generic publish refuses an unreviewed import; review refuses placeholders and shared sibling copy", async () => {
+  it("the generic publish refuses an unreviewed import; review refuses placeholders and shared sibling copy; edits lock", async () => {
     await expect(activities.setStatus(admin, instantId, "published")).rejects.toSatisfy((e) => code(e) === "CONFLICT");
     expect((await activities.bulkSetStatus(admin, { ids: [instantId] }, "published")).changed).toBe(0);
+    await expect(activities.duplicate(admin, instantId)).rejects.toSatisfy((e) => code(e) === "CONFLICT");
     await expect(listings.markReviewed(admin, instantLinkId, { replacesProductId: oldId, confirmTierAndCategory: true, note: "copy and facts checked" })).rejects.toSatisfy((e) => code(e) === "VALIDATION_FAILED");
 
     const current = await activities.get(admin, instantId);
     const { id: _i, rating: _r, reviewCount: _c, bookedThisMonth: _b, ...input } = current.content;
     await activities.update(admin, instantId, { ...input, location: "Dubai Creek", meetingPoint: "Al Seef dhow wharf" }, { expectedVersion: current.version });
-    // Same subtitle as the inquiry sibling: own copy first.
+    // Same subtitle as the sibling listings: own copy first.
     await expect(listings.markReviewed(admin, instantLinkId, { replacesProductId: oldId, confirmTierAndCategory: true, note: "copy and facts checked" })).rejects.toSatisfy((e) => code(e) === "VALIDATION_FAILED");
     const v2 = await activities.get(admin, instantId);
     const { id: _i2, rating: _r2, reviewCount: _c2, bookedThisMonth: _b2, ...input2 } = v2.content;
     await activities.update(admin, instantId, { ...input2, subtitle: "A sunset dhow cruise with dinner, at a fixed start." }, { expectedVersion: v2.version });
+    // The editor's change is locked at once, before any review (N1-08).
+    expect((await prisma.supplierListingLink.findUniqueOrThrow({ where: { id: instantLinkId } })).lockedFields).toEqual(["subtitle"]);
     await expect(listings.markReviewed(admin, instantLinkId, { replacesProductId: oldId, confirmTierAndCategory: false, note: "copy and facts checked" })).rejects.toSatisfy((e) => isAppError(e));
     const reviewed = await listings.markReviewed(admin, instantLinkId, { replacesProductId: oldId, confirmTierAndCategory: true, note: "copy and facts checked" });
-    expect(reviewed).toMatchObject({ noindex: false, replacesProductId: oldId, pendingFields: [] });
-    expect(reviewed.lockedFields).toEqual(["subtitle"]);
+    expect(reviewed).toMatchObject({ noindex: false, replacesProductId: oldId, pendingFields: [], lockedFields: ["subtitle"] });
+    await expect(listings.markReviewed(admin, instantLinkId, { replacesProductId: oldId, confirmTierAndCategory: true, note: "copy and facts checked" })).rejects.toSatisfy((e) => code(e) === "CONFLICT");
+    // Reviewed, but its old page is still to be retired: the generic publish still refuses (N1-09).
+    await expect(activities.setStatus(admin, instantId, "published")).rejects.toSatisfy((e) => code(e) === "CONFLICT");
   });
 
   it("publishes the reviewed listing and retires the old page with a permanent redirect; an unreviewed one is stopped", async () => {
@@ -364,16 +440,17 @@ describe.skipIf(!enabled)("TravelDesk importer, N1 (local DB)", () => {
     const target = await prisma.product.findUniqueOrThrow({ where: { id: instantId } });
     expect(target.status).toBe("published");
     expect(await lookupRetiredSlug(oldSlug)).toEqual({ to: `/activities/${target.slug}`, permanent: true });
+    expect(await lookupRetiredSlug("Not A Slug!")).toBeNull();
 
-    // The redirect is permanent only while the target is published and indexable.
     await prisma.product.update({ where: { id: instantId }, data: { status: "draft" } });
     expect(await lookupRetiredSlug(oldSlug)).toEqual({ to: `/categories/${old.categorySlug}`, permanent: false });
     await prisma.product.update({ where: { id: instantId }, data: { status: "published" } });
   });
 
-  it("rolls the batch back by id: listings deleted, links and mappings deactivated, the old page restored and its redirect removed", async () => {
-    const r = await importer.rollback(admin, batchId, "synthetic rollback of the S0 batch");
-    expect(r).toMatchObject({ rolledBack: 2, restored: 1 });
+  it("rollback refuses a published listing without force, then rolls back: old page restored, redirect removed (N1-10)", async () => {
+    await expect(importer.rollback(admin, batchId, "synthetic rollback of the S0 batch")).rejects.toSatisfy((e) => isAppError(e) && /published/.test(e.message));
+    const r = await importer.rollback(admin, batchId, "synthetic rollback of the S0 batch", { force: true });
+    expect(r).toMatchObject({ rolledBack: 3, restored: 1 });
     const old = await prisma.product.findUniqueOrThrow({ where: { id: oldId } });
     expect(old).toMatchObject({ deletedAt: null, status: "published" });
     expect(await prisma.productRedirect.count({ where: { oldProductId: oldId } })).toBe(0);
@@ -382,19 +459,23 @@ describe.skipIf(!enabled)("TravelDesk importer, N1 (local DB)", () => {
     expect(target.deletedAt).not.toBeNull();
     expect(await prisma.productSupplierMapping.count({ where: { productId: instantId, isActive: true, supplierOfferId: { not: null } } })).toBe(0);
     const links = await prisma.supplierListingLink.findMany({ where: { importBatchId: batchId } });
-    expect(links.length).toBe(3);
+    expect(links.length).toBe(4);
     expect(links.every((l) => l.deactivatedAt !== null)).toBe(true);
-    // The adopted listing is untouched.
     expect((await prisma.product.findUniqueOrThrow({ where: { id: linkedId } })).deletedAt).toBeNull();
+  });
+
+  it("a rolled-back import restored from the console still cannot be published (N1-03)", async () => {
+    await activities.restore(admin, inquiryId);
+    await expect(activities.setStatus(admin, inquiryId, "published")).rejects.toSatisfy((e) => code(e) === "CONFLICT");
+    await activities.remove(admin, inquiryId, "zz synthetic cleanup");
   });
 
   it("re-imports after a rollback, and the generic revert undoes an unchanged TravelDesk batch", async () => {
     const p = await importer.preview(admin, "test", "S0", { supplierCode: CODE });
-    const mine = p.rows.filter((r) => r.identity.tourId === TOUR);
-    expect(mine.map((r) => r.action)).toEqual(["create", "create"]);
-    await importer.apply(admin, p.batchId, { photos: null });
+    expect(p.rows.filter((r) => r.identity.tourId === TOUR).map((r) => r.action)).toEqual(["create", "create", "create"]);
+    await importer.apply(admin, p.batchId);
     const r = await importService.revert(admin, p.batchId);
-    expect(r.reverted).toBeGreaterThanOrEqual(2);
+    expect(r.reverted).toBeGreaterThanOrEqual(3);
     expect(await prisma.supplierListingLink.count({ where: { importBatchId: p.batchId, deactivatedAt: null } })).toBe(0);
   });
 });

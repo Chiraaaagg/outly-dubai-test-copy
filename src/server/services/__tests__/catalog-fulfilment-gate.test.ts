@@ -177,6 +177,14 @@ describe("setFulfilmentMode: instant release switch", () => {
     const e = await refusal(catalogService.setFulfilmentMode(admin, { kind: "product", id: "product-1" }, "instant", "go live", code));
     expect(isAppError(e) && e.code).toBe("CONFLICT");
   });
+
+  it("an imported TravelDesk inquiry listing (doc 30 D4) can never be armed, whatever its mappings", async () => {
+    state.instantReleased = true;
+    state.product = { ...productWithApiMapping(), listingLink: { kind: "inquiry", deactivatedAt: null } } as typeof state.product;
+    const e = await refusal(catalogService.setFulfilmentMode(admin, { kind: "product", id: "product-1" }, "instant", "go live", code));
+    expect(isAppError(e) && e.code).toBe("CONFLICT");
+    expect(isAppError(e) && e.message).toMatch(/inquiry listing/);
+  });
 });
 
 describe("setFulfilmentMode: instant activation permission and approval (PRD-12)", () => {

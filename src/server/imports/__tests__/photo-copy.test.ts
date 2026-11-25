@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { copyTourPhotos, fetchPhoto, hostAllowed, MemoryPhotoStore, pickVariant, PhotoRefused, sniffImageType, type SniffedType } from "../photo-copy";
+import { copyTourPhotos, fetchPhoto, hostAllowed, MemoryPhotoStore, pickVariant, PhotoRefused, sniffImageType, validHostEntry, type SniffedType } from "../photo-copy";
 import type { TourContentPhoto } from "../../suppliers/traveldesk/traveldesk.content";
 
 /**
@@ -41,28 +41,42 @@ describe("photo fetch checks", () => {
     ["https://other.example.test/a.jpg", "host_not_allowed"],
   ])("refuses %s before connecting", async (url, code) => {
     const f = vi.fn();
-    await expect(fetchPhoto(url, { allowedHosts: HOSTS, fetch: f, lookup: PUBLIC })).rejects.toMatchObject({ code });
+    await expect(fetchPhoto(url, { allowedHosts: HOSTS, request: f, lookup: PUBLIC })).rejects.toMatchObject({ code });
     expect(f).not.toHaveBeenCalled();
   });
 
   it("refuses a host that resolves to a private address", async () => {
     const f = vi.fn();
-    await expect(fetchPhoto("https://media.example.test/a.jpg", { allowedHosts: HOSTS, fetch: f, lookup: async () => ["10.0.0.5"] })).rejects.toMatchObject({ code: "private_address" });
+    await expect(fetchPhoto("https://media.example.test/a.jpg", { allowedHosts: HOSTS, request: f, lookup: async () => ["10.0.0.5"] })).rejects.toMatchObject({ code: "private_address" });
     expect(f).not.toHaveBeenCalled();
   });
 
-  it("checks every redirect hop and never follows one to a private or unlisted host", async () => {
-    const f = vi.fn(async (u: string) => (u.includes("media.") ? res(302, null, { location: "https://169.254.169.254/latest" }) : res(200, JPEG)));
-    await expect(fetchPhoto("https://media.example.test/a.jpg", { allowedHosts: HOSTS, fetch: f as unknown as typeof fetch, lookup: PUBLIC })).rejects.toMatchObject({ code: "ip_literal" });
+  it("checks every redirect hop, never follows one to a private or unlisted host, and connects to the checked address", async () => {
+    const f = vi.fn(async (u: URL) => (u.hostname.startsWith("media.") ? res(302, null, { location: "https://169.254.169.254/latest" }) : res(200, JPEG)));
+    await expect(fetchPhoto("https://media.example.test/a.jpg", { allowedHosts: HOSTS, request: f, lookup: PUBLIC })).rejects.toMatchObject({ code: "ip_literal" });
     expect(f).toHaveBeenCalledTimes(1);
-    const g = vi.fn(async (u: string) => (u.endsWith("a.jpg") ? res(301, null, { location: "/b.jpg" }) : res(200, PNG)));
-    await expect(fetchPhoto("https://media.example.test/a.jpg", { allowedHosts: HOSTS, fetch: g as unknown as typeof fetch, lookup: PUBLIC })).resolves.toMatchObject({ type: "image/png" });
-    expect(g).toHaveBeenCalledWith("https://media.example.test/b.jpg", expect.objectContaining({ redirect: "manual", credentials: "omit" }));
+    const g = vi.fn(async (u: URL, _address: string) => (u.pathname === "/a.jpg" ? res(301, null, { location: "/b.jpg" }) : res(200, PNG)));
+    await expect(fetchPhoto("https://media.example.test/a.jpg", { allowedHosts: HOSTS, request: g, lookup: PUBLIC })).resolves.toMatchObject({ type: "image/png" });
+    expect(g.mock.calls[1][0].href).toBe("https://media.example.test/b.jpg");
+    // Pinned: the request goes to the address the check approved.
+    expect(g.mock.calls[1][1]).toBe("93.184.216.34");
+  });
+
+  it("bounds a slow DNS answer by the photo deadline", async () => {
+    const never = () => new Promise<string[]>(() => {});
+    await expect(fetchPhoto("https://media.example.test/a.jpg", { allowedHosts: HOSTS, request: vi.fn(), lookup: never, timeoutMs: 20 })).rejects.toMatchObject({ code: "timeout" });
+  });
+
+  it("refuses broad host list entries", () => {
+    expect(validHostEntry("*.com")).toBe(false);
+    expect(validHostEntry("localhost")).toBe(false);
+    expect(validHostEntry("*.cdn.example.test")).toBe(true);
+    expect(hostAllowed("a.com", ["*.com"])).toBe(false);
   });
 
   it("caps the size and refuses SVG served as an image", async () => {
-    await expect(fetchPhoto("https://media.example.test/a", { allowedHosts: HOSTS, fetch: (async () => res(200, new Uint8Array(20).fill(0xff))) as unknown as typeof fetch, lookup: PUBLIC, maxBytes: 10 })).rejects.toMatchObject({ code: "too_large" });
-    await expect(fetchPhoto("https://media.example.test/a", { allowedHosts: HOSTS, fetch: (async () => res(200, SVG, { "content-type": "image/jpeg" })) as unknown as typeof fetch, lookup: PUBLIC })).rejects.toMatchObject({ code: "not_a_raster_image" });
+    await expect(fetchPhoto("https://media.example.test/a", { allowedHosts: HOSTS, request: async () => res(200, new Uint8Array(20).fill(0xff)), lookup: PUBLIC, maxBytes: 10 })).rejects.toMatchObject({ code: "too_large" });
+    await expect(fetchPhoto("https://media.example.test/a", { allowedHosts: HOSTS, request: async () => res(200, SVG, { "content-type": "image/jpeg" }), lookup: PUBLIC })).rejects.toMatchObject({ code: "not_a_raster_image" });
   });
 });
 
@@ -103,6 +117,6 @@ describe("copyTourPhotos", () => {
       environment: "test",
       sleep: async () => {},
     });
-    expect(r).toEqual({ urls: [], failures: [{ index: 0, reason: "reencode_failed" }] });
+    expect(r).toEqual({ urls: [], keys: [], failures: [{ index: 0, reason: "reencode_failed" }] });
   });
 });

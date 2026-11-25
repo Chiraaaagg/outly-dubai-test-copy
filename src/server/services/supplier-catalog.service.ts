@@ -590,6 +590,16 @@ export function travelDeskMappingRow(
   return { externalRef, mappingData, approvedOfferHash, approvedSlotHours };
 }
 
+/**
+ * Serialises offer linking per supplier and environment (review 106 N1-07):
+ * the TravelDesk import apply and `reviewCandidate` take it before their
+ * checks, so one offer cannot become linked to two listings by two
+ * transactions that each saw it free.
+ */
+export async function lockOfferLinks(tx: Prisma.TransactionClient, supplierId: string, environment: SupplierEnvironment) {
+  await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${`td-link:${supplierId}:${environment}`}))::text AS locked`;
+}
+
 export const supplierCatalogService = {
   /**
    * The mapping half of readiness (SUP-15, doc 22 §23 B2), for
@@ -1269,6 +1279,10 @@ export const supplierCatalogService = {
         if (!offer || offer.removedAt) throw Errors.conflict("The supplier no longer lists this offer; re-sync before approving", { offer: c.offerExternalId });
 
         const variantCode = c.variantCode === "" ? null : c.variantCode;
+        await lockOfferLinks(tx, c.supplierId, c.environment);
+        // An offer an imported TravelDesk listing links is never linked to a second product (doc 30 §3.3; review 106 N1-07).
+        const imported = await tx.supplierListingLink.findFirst({ where: { supplierId: c.supplierId, environment: c.environment, deactivatedAt: null, productId: { not: c.productId }, offerExternalIds: { has: c.offerExternalId } }, select: { productId: true } });
+        if (imported) throw Errors.conflict("This offer belongs to an imported TravelDesk listing; it cannot be linked to another product", { offer: c.offerExternalId, productId: imported.productId });
         const existing = await tx.productSupplierMapping.findFirst({ where: { productId: c.productId, supplierId: c.supplierId, variantCode } });
         if (existing?.isActive && existing.environment && existing.environment !== c.environment) {
           // One mapping row per product, supplier and variant: never let a test approval and a production approval overwrite each other.

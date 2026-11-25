@@ -361,6 +361,7 @@ export function buildListingPlan(offers: PlanOffer[], ctx: { rules: PlanRules; f
     const firstStep = stepOrder.find((s) => instant.some((o) => stepOfClassKey(o.classKey) === s))!;
 
     // Instant: tour + exact class key, then split by start-time set.
+    const tourStart = listings.length;
     const byKey = new Map<string, PlanOffer[]>();
     for (const o of instant) byKey.set(o.classKey, [...(byKey.get(o.classKey) ?? []), o]);
     for (const [classKey, keyOffers] of [...byKey].sort(([a], [b]) => a.localeCompare(b))) {
@@ -372,6 +373,20 @@ export function buildListingPlan(offers: PlanOffer[], ctx: { rules: PlanRules; f
         return fa - fb || a.localeCompare(b);
       });
       sets.forEach(([, group], i) => listings.push(instantListing(tourId, classKey, i + 1, group, rules, ctx.content)));
+    }
+    // RR-01 identity is tour + arrival + route + fulfilment + split number: number the splits across every class key
+    // and start set of that group (class key, then first start), so two keys that differ only in time shape or
+    // pricing unit never share an identity (review 106 N1-02).
+    const groups = new Map<string, PlannedListing[]>();
+    for (const l of listings.slice(tourStart)) {
+      const g = `${l.arrival}|${l.route}|${l.fulfilment}`;
+      groups.set(g, [...(groups.get(g) ?? []), l]);
+    }
+    for (const group of groups.values()) {
+      group.forEach((l, i) => {
+        l.splitNumber = i + 1;
+        l.key = `${tourId}:${l.classKey}:${l.splitNumber}`;
+      });
     }
 
     // Inquiry (D4): tour + arrival + fulfilment, with the tour's first instant step.

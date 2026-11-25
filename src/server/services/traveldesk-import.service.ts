@@ -1,7 +1,7 @@
 import "server-only";
 import { Prisma, type SupplierEnvironment } from "@prisma/client";
 import { z } from "zod";
-import { prisma, type Tx } from "../lib/db";
+import { prisma, TX_OPTIONS, type Tx } from "../lib/db";
 import type { Actor } from "../lib/actor";
 import { requirePermission } from "../lib/actor";
 import { audit } from "../lib/audit";
@@ -10,18 +10,19 @@ import { uuidv7 } from "../lib/ids";
 import { log } from "../lib/logger";
 import { revalidateCatalog } from "../lib/catalog-cache";
 import { settingsRepo } from "../repositories/settings.repo";
-import { activityInputSchema, type ActivityInput } from "../schemas/activity.schema";
+import { activityInputSchema, activitySchema, type ActivityInput } from "../schemas/activity.schema";
 import { RULE_TARGET_MARGIN_BPS } from "../domain/rule-price";
 import { copyTourPhotos, type PhotoCopyDeps } from "../imports/photo-copy";
 import { configuredPhotoCopier } from "../imports/photo-store";
 import type { TourContentFaq, TourContentItineraryStep, TourContentPhoto } from "../suppliers/traveldesk/traveldesk.content";
-import { buildListingDraft, type BuildContent, type PendingField } from "../suppliers/traveldesk/traveldesk.listing-build";
+import { buildListingDraft, EDITORIAL_FIELDS, type BuildContent, type PendingField } from "../suppliers/traveldesk/traveldesk.listing-build";
 import { PLAN_STEPS, type PlannedListing, type PlanStepId } from "../suppliers/traveldesk/traveldesk.listing-plan";
-import { parseStoredOffer, type StoredOffer } from "../suppliers/traveldesk/traveldesk.offer-terms";
+import { offerTermsHash, parseStoredOffer, type StoredOffer } from "../suppliers/traveldesk/traveldesk.offer-terms";
 import { categoryFor } from "../suppliers/traveldesk/traveldesk.text-rules";
 import { productLifecycle, activityService } from "./activity.service";
 import { readinessService } from "./readiness.service";
-import { TRAVELDESK_SUPPLIER_CODE, travelDeskMappingRow } from "./supplier-catalog.service";
+import { recordEditorialLocks } from "./listing-locks";
+import { lockOfferLinks, TRAVELDESK_SUPPLIER_CODE, travelDeskMappingRow } from "./supplier-catalog.service";
 import { traveldeskDryRunService } from "./traveldesk-dry-run.service";
 
 /**
@@ -62,6 +63,8 @@ export const listingRuleSchema = z
 const IMPORT_TX = { maxWait: 15_000, timeout: 180_000 } as const;
 /** Per run, so one click never starts an unbounded transaction. */
 export const MAX_LISTINGS_PER_IMPORT = 120;
+/** A preview older than this is refused at apply: prices and facts may have moved (review 106 N1-05). */
+export const PREVIEW_MAX_AGE_MS = 24 * 3_600_000;
 
 export type TdRowAction = "create" | "adopt" | "skip" | "blocked";
 
@@ -97,6 +100,10 @@ export interface TdPreviewRow {
   replacesSuggestion: { productId: string; slug: string; title: string } | null;
   contentHash: string | null;
   photos: number;
+  /** Per option, the offer terms hash at preview; apply refuses when any differs (review 106 N1-05). */
+  offerHashes: Record<string, string | null>;
+  /** Per option, the stored offer payload hash at preview (covers the nets the prices came from). */
+  offerPayloadHashes: Record<string, string>;
 }
 
 export interface TdPreview {
@@ -148,10 +155,9 @@ const identityKey = (i: { tourExternalId: string; kind: string; arrival: string;
 
 const photoList = (v: unknown): TourContentPhoto[] => (Array.isArray(v) ? (v as TourContentPhoto[]) : []);
 
-function supplierBlock(s: { code: string; name: string; reliabilityScore: Prisma.Decimal; createdAt: Date }) {
-  // The editor's supplier graph keys on the slug of the document's supplier name (activity.service `ensureSupplierMapping`).
-  const slug = s.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-  return { name: slug === s.code ? s.name : s.code, reliability: Math.max(0, Math.min(100, Math.round(Number(s.reliabilityScore)))), verifiedSince: s.createdAt.toISOString().slice(0, 7) };
+/** The document's supplier block: the supplier's own name and score, shown on the page; the row itself is never written (N1-18). */
+function supplierBlock(s: { name: string; reliabilityScore: Prisma.Decimal; createdAt: Date }) {
+  return { name: s.name, reliability: Math.max(0, Math.min(100, Math.round(Number(s.reliabilityScore)))), verifiedSince: s.createdAt.toISOString().slice(0, 7) };
 }
 
 /* ------------------------------------------------------------------ service */
@@ -176,7 +182,7 @@ export const traveldeskImportService = {
         where: { supplierId: supplier.id, environment, tourExternalId: { in: tourIds } },
         select: { tourExternalId: true, name: true, salesDescription: true, terms: true, videoUrl: true, faq: true, itinerary: true, photos: true, contentHash: true },
       }),
-      prisma.supplierCatalogueItem.findMany({ where: { supplierId: supplier.id, environment, kind: "offer", externalId: { in: offerIds }, removedAt: null }, select: { externalId: true, payload: true } }),
+      prisma.supplierCatalogueItem.findMany({ where: { supplierId: supplier.id, environment, kind: "offer", externalId: { in: offerIds }, removedAt: null }, select: { externalId: true, parentExternalId: true, payload: true, payloadHash: true } }),
       prisma.supplierCatalogueItem.findMany({ where: { supplierId: supplier.id, environment, kind: "tour", externalId: { in: tourIds }, removedAt: null }, select: { externalId: true, payload: true } }),
       prisma.supplierListingLink.findMany({ where: { supplierId: supplier.id, environment, deactivatedAt: null }, select: { tourExternalId: true, kind: true, arrival: true, route: true, fulfilment: true, splitNumber: true, product: { select: { slug: true } } } }),
       prisma.category.findMany({ where: { deletedAt: null }, select: { slug: true } }),
@@ -184,9 +190,13 @@ export const traveldeskImportService = {
     ]);
     const content = new Map(contents.map((c) => [Number(c.tourExternalId), c]));
     const stored = new Map<number, StoredOffer>();
+    const tourPayload = new Map(tourRows.map((t) => [t.externalId, t.payload]));
+    const hashes = new Map<number, string | null>();
+    const payloadHashes = new Map(offerRows.map((o) => [Number(o.externalId), o.payloadHash]));
     for (const o of offerRows) {
       const p = parseStoredOffer(o.payload);
       if (p) stored.set(Number(o.externalId), p);
+      hashes.set(Number(o.externalId), o.parentExternalId && tourPayload.has(o.parentExternalId) ? offerTermsHash(o.payload, tourPayload.get(o.parentExternalId)) : null);
     }
     const tourCats = new Map(
       tourRows.map((t) => {
@@ -204,6 +214,7 @@ export const traveldeskImportService = {
     for (const l of report.listings) siblings.set(l.tourId, (siblings.get(l.tourId) ?? 0) + 1);
 
     const rows: TdPreviewRow[] = [];
+    const seenIdentity = new Set<string>();
     planned.forEach((l, i) => {
       const optionIds = l.options.map((o) => o.offerId);
       const identity = identityOf(l, optionIds);
@@ -229,14 +240,29 @@ export const traveldeskImportService = {
         replacesSuggestion: suggestion ? { productId: suggestion.productId, slug: suggestion.slug, title: suggestion.title } : null,
         contentHash: c?.contentHash ?? null,
         photos: photoList(c?.photos).length,
+        offerHashes: Object.fromEntries(l.options.map((o) => [String(o.offerId), hashes.get(o.offerId) ?? null])),
+        offerPayloadHashes: Object.fromEntries(l.options.map((o) => [String(o.offerId), payloadHashes.get(o.offerId) ?? ""])),
       };
-      if (existing.has(identityKey({ tourExternalId: String(l.tourId), ...identity }))) {
+      // RR-01: two planned listings never share an identity (review 106 N1-02); a duplicate is a plan bug, so it blocks.
+      const idKey = identityKey({ tourExternalId: String(l.tourId), ...identity });
+      if (seenIdentity.has(idKey)) {
+        rows.push({ ...base, reasons: ["identity_duplicate"] });
+        return;
+      }
+      seenIdentity.add(idKey);
+      if (existing.has(idKey)) {
         rows.push({ ...base, action: "skip", ok: true, reasons: ["already_imported"] });
         return;
       }
       // Adopt in place (§3.9): every option already linked, one to one, to one product.
       if (l.adoptProduct && linked.length === l.options.length) {
         rows.push({ ...base, action: "adopt", ok: true, slug: l.adoptProduct.slug, adoptProductId: l.adoptProduct.productId, options: l.options.map((o) => ({ variantId: `td-${o.offerId}`, offerId: o.offerId })) });
+        return;
+      }
+      // Doc 30 §3.5: an offer whose stored terms cannot be read (no terms hash) is never linked (N1-15).
+      const unreadable = l.options.filter((o) => o.linkedTo.length === 0 && !hashes.get(o.offerId)).map((o) => `td-${o.offerId}:terms_unreadable`);
+      if (unreadable.length) {
+        rows.push({ ...base, reasons: unreadable });
         return;
       }
       const buildContent: BuildContent | null = c
@@ -288,10 +314,14 @@ export const traveldeskImportService = {
 
   /**
    * Apply a previewed TravelDesk batch: drafts, exact links, link rows. Every
-   * row is re-checked under the transaction: an identity imported since the
-   * preview, or an offer linked since, refuses the whole batch (409).
+   * row is re-checked under the transaction, which holds the offer-link lock
+   * of the supplier and environment (review 106 N1-07): an identity imported
+   * since the preview, an offer linked since, an offer whose terms changed
+   * since (N1-05), a changed listing rule, or a preview older than 24 hours
+   * refuses the whole batch (409). Photos are not copied here (N1-12e): run
+   * `copyPhotos` afterwards, a few tours per call.
    */
-  async apply(actor: Actor, batchId: string, opts: { photos?: PhotoCopyDeps | null; reason?: string } = {}) {
+  async apply(actor: Actor, batchId: string, opts: { reason?: string; now?: () => Date } = {}) {
     requireImport(actor);
     const batch = await prisma.importBatch.findUnique({ where: { id: batchId } });
     if (!batch || batch.source !== "traveldesk") throw Errors.notFound("TravelDesk import batch");
@@ -301,29 +331,20 @@ export const traveldeskImportService = {
     const rows = (Array.isArray(batch.preview) ? batch.preview : []) as unknown as TdPreviewRow[];
     const todo = rows.filter((r) => r.ok && (r.action === "create" || r.action === "adopt"));
     if (todo.length === 0) throw Errors.conflict("Nothing to import in this batch");
+    const at = (opts.now ?? (() => new Date()))();
+    if (at.getTime() - batch.createdAt.getTime() > PREVIEW_MAX_AGE_MS) throw Errors.conflict("This preview is more than 24 hours old — preview again");
+    const rule = await listingRule();
+    if (rule.version !== meta.ruleVersion) throw Errors.conflict(`The listing price rule changed since this preview (v${meta.ruleVersion} → v${rule.version}) — preview again`);
     const supplier = await prisma.supplier.findUnique({ where: { code: meta.supplierCode } });
     if (!supplier) throw Errors.conflict("The TravelDesk supplier is missing");
     const reason = opts.reason?.trim() || `TravelDesk import ${meta.step} (${environment})`;
-
-    // Photos first, outside the transaction: one copy per tour, shared by its listings (§3.8).
-    const photos = opts.photos === undefined ? configuredPhotoCopier() : opts.photos;
-    const copied = new Map<number, string[]>();
-    const photoFailures: Record<string, number> = {};
-    if (photos) {
-      const tours = [...new Set(todo.filter((r) => r.action === "create").map((r) => String(r.identity.tourId)))];
-      const contents = await prisma.supplierTourContent.findMany({ where: { supplierId: supplier.id, environment, tourExternalId: { in: tours } }, select: { tourExternalId: true, photos: true } });
-      for (const c of contents) {
-        const r = await copyTourPhotos(photoList(c.photos), photos);
-        copied.set(Number(c.tourExternalId), r.urls);
-        if (r.failures.length) photoFailures[c.tourExternalId] = r.failures.length;
-      }
-    }
 
     const now = new Date();
     const result = await prisma
       .$transaction(async (tx) => {
         const claimed = await tx.importBatch.updateMany({ where: { id: batchId, status: "previewed" }, data: { status: "applied", appliedAt: now } });
         if (claimed.count !== 1) throw Errors.conflict("This batch is being applied or was already applied");
+        await lockOfferLinks(tx, supplier.id, environment);
         const allOffers = [...new Set(todo.filter((r) => r.action === "create").flatMap((r) => r.options.map((o) => String(o.offerId))))];
         const active = await tx.productSupplierMapping.findMany({ where: { supplierId: supplier.id, environment, isActive: true, supplierOfferId: { in: allOffers } }, select: { supplierOfferId: true } });
         if (active.length) throw Errors.conflict(`Linked after this preview: offer ${active.map((a) => a.supplierOfferId).join(", ")} — preview again`);
@@ -332,6 +353,15 @@ export const traveldeskImportService = {
         });
         const offerRow = new Map(catalogue.filter((c) => c.kind === "offer").map((c) => [c.externalId, c]));
         const tourRow = new Map(catalogue.filter((c) => c.kind === "tour").map((c) => [c.externalId, c]));
+        // The terms the preview priced must still be the terms (review 106 N1-05).
+        for (const r of todo.filter((x) => x.action === "create")) {
+          const tour = tourRow.get(String(r.identity.tourId));
+          for (const o of r.options) {
+            const offer = offerRow.get(String(o.offerId));
+            const current = offer && tour ? offerTermsHash(offer.payload, tour.payload) : null;
+            if (!current || current !== r.offerHashes?.[String(o.offerId)] || offer!.payloadHash !== r.offerPayloadHashes?.[String(o.offerId)]) throw Errors.conflict(`Offer ${o.offerId} changed or vanished since this preview — preview again`);
+          }
+        }
 
         const created: { productId: string; slug: string; linkId: string }[] = [];
         const adopted: { productId: string; slug: string; linkId: string }[] = [];
@@ -358,9 +388,9 @@ export const traveldeskImportService = {
             const want = new Set(r.options.map((o) => String(o.offerId)));
             const have = new Set((p?.mappings ?? []).map((m) => m.supplierOfferId).filter((x): x is string => Boolean(x)));
             if (!p || p.deletedAt || have.size !== want.size || [...want].some((o) => !have.has(o))) throw Errors.conflict(`"${r.slug}" no longer matches its offers one to one — preview again`);
-            // An adopted listing is already live and reviewed; it stays indexable (§3.9).
+            // An adopted listing is already live, reviewed and hand-written: it stays indexable and every editorial field is locked (§3.7, §3.9; N1-08).
+            const adoptData = { ...linkBase, productId: p.id, offerExternalIds: [...want], importVersion: p.version, adopted: true, noindex: false, reviewedAt: now, reviewedBy: actor.id, lockedFields: [...EDITORIAL_FIELDS], deactivatedAt: null };
             // A product has one link row ever: a link deactivated by an earlier rollback is taken up again.
-            const adoptData = { ...linkBase, productId: p.id, offerExternalIds: [...want], importVersion: p.version, adopted: true, noindex: false, reviewedAt: now, reviewedBy: actor.id, deactivatedAt: null };
             const prior = await tx.supplierListingLink.findUnique({ where: { productId: p.id }, select: { id: true, deactivatedAt: true } });
             if (prior && !prior.deactivatedAt) throw Errors.conflict(`"${r.slug}" is already linked — preview again`);
             if (prior) {
@@ -372,14 +402,11 @@ export const traveldeskImportService = {
             adopted.push({ productId: p.id, slug: p.slug, linkId: linkBase.id });
             continue;
           }
-          const images = copied.get(r.identity.tourId) ?? [];
-          const pending = r.pendingFields.filter((f) => f !== "images" || images.length === 0);
-          const input = activityInputSchema.parse({ ...r.input, ...(images.length ? { images } : {}) });
-          const row = await activityService.create(actor, input, { status: "draft", reason, tx });
+          const input = activityInputSchema.parse(r.input);
+          const row = await activityService.create(actor, input, { status: "draft", reason, tx, supplierId: supplier.id });
           for (const o of r.options) {
-            const offer = offerRow.get(String(o.offerId));
-            const tour = tourRow.get(tourId);
-            if (!offer || !tour) throw Errors.conflict(`Offer ${o.offerId} or its tour is no longer listed — re-sync and preview again`);
+            const offer = offerRow.get(String(o.offerId))!;
+            const tour = tourRow.get(tourId)!;
             const { mappingData, externalRef, approvedOfferHash, approvedSlotHours } = travelDeskMappingRow(offer, tour, environment);
             const mappingId = uuidv7();
             const top = await tx.productSupplierMapping.aggregate({ where: { productId: row.id }, _max: { priority: true } });
@@ -396,12 +423,12 @@ export const traveldeskImportService = {
               tx,
             );
           }
-          await tx.supplierListingLink.create({ data: { ...linkBase, productId: row.id, offerExternalIds: r.options.map((o) => String(o.offerId)), importVersion: 1, pendingFields: pending } });
+          await tx.supplierListingLink.create({ data: { ...linkBase, productId: row.id, offerExternalIds: r.options.map((o) => String(o.offerId)), importVersion: 1, pendingFields: r.pendingFields } });
           await tx.importBatchItem.create({ data: { id: uuidv7(), batchId, productId: row.id, action: "create", beforeVersion: null, afterVersion: 1, slug: row.slug } });
           created.push({ productId: row.id, slug: row.slug, linkId: linkBase.id });
         }
         await tx.importBatch.update({ where: { id: batchId }, data: { rowsOk: created.length + adopted.length } });
-        await audit(actor, "traveldesk_import.apply", { type: "import_batch", id: batchId }, { after: { environment, step: meta.step, created: created.length, adopted: adopted.length, photoFailures }, reason }, tx);
+        await audit(actor, "traveldesk_import.apply", { type: "import_batch", id: batchId }, { after: { environment, step: meta.step, created: created.length, adopted: adopted.length }, reason }, tx);
         return { created, adopted };
       }, IMPORT_TX)
       .catch(async (error: unknown) => {
@@ -412,7 +439,65 @@ export const traveldeskImportService = {
       });
     revalidateCatalog();
     await readinessService.reevaluateMany([...result.created, ...result.adopted].map((c) => c.productId), "import_apply");
-    return { batchId, ...result, photoFailures };
+    return { batchId, ...result };
+  },
+
+  /**
+   * Copy TravelDesk photos into our own storage for imported drafts still on a
+   * placeholder image (doc 30 §3.8), at most `maxTours` tours per call so a
+   * request never runs long (review 106 N1-12e); call again while `remaining`
+   * is above 0. One copy per tour, shared by its listings. Each listing's
+   * update is its own versioned write; it moves the lock baseline, so the
+   * copied photos never count as a person's edit. Uploaded objects no
+   * listing took are deleted again (N1-12d).
+   */
+  async copyPhotos(actor: Actor, opts: { photos?: PhotoCopyDeps | null; batchId?: string; environment?: SupplierEnvironment; maxTours?: number; reason?: string } = {}) {
+    requirePermission(actor, "imports.run");
+    requirePermission(actor, "products.edit");
+    const photos = opts.photos === undefined ? configuredPhotoCopier() : opts.photos;
+    if (!photos) throw Errors.conflict("Photo copying is not configured (bucket, public base URL and TravelDesk media hosts)");
+    const links = await prisma.supplierListingLink.findMany({
+      where: { deactivatedAt: null, adopted: false, pendingFields: { has: "images" }, product: { deletedAt: null }, ...(opts.batchId ? { importBatchId: opts.batchId } : {}), ...(opts.environment ? { environment: opts.environment } : {}) },
+      select: { id: true, productId: true, supplierId: true, environment: true, tourExternalId: true },
+      orderBy: [{ tourExternalId: "asc" }],
+    });
+    const tours = [...new Map(links.map((l) => [`${l.supplierId}|${l.environment}|${l.tourExternalId}`, l])).values()];
+    const batch = tours.slice(0, Math.max(1, Math.min(10, opts.maxTours ?? 5)));
+    const reason = opts.reason?.trim() || "TravelDesk photos copied";
+    const done: string[] = [];
+    const failures: Record<string, string[]> = {};
+    for (const t of batch) {
+      const content = await prisma.supplierTourContent.findUnique({ where: { supplierId_environment_tourExternalId: { supplierId: t.supplierId, environment: t.environment, tourExternalId: t.tourExternalId } }, select: { photos: true } });
+      const copied = await copyTourPhotos(photoList(content?.photos), photos);
+      if (copied.failures.length) failures[t.tourExternalId] = copied.failures.map((f) => f.reason);
+      if (copied.urls.length === 0) continue;
+      let used = false;
+      for (const l of links.filter((x) => x.supplierId === t.supplierId && x.environment === t.environment && x.tourExternalId === t.tourExternalId)) {
+        try {
+          await prisma.$transaction(async (tx) => {
+            const p = await tx.product.findUniqueOrThrow({ where: { id: l.productId } });
+            const doc = activitySchema.safeParse(p.content);
+            if (p.deletedAt || !doc.success || !doc.data.images.every((i) => i.startsWith("img:"))) return;
+            const next = { ...doc.data, images: copied.urls, fulfilmentMode: p.fulfilmentMode };
+            const version = p.version + 1;
+            const w = await tx.product.updateMany({ where: { id: p.id, version: p.version, deletedAt: null }, data: { content: next as unknown as Prisma.InputJsonValue, version } });
+            if (w.count !== 1) return;
+            await tx.productVersion.create({ data: { id: uuidv7(), productId: p.id, version, content: next as unknown as Prisma.InputJsonValue, status: p.status, actorId: actor.id, reason } });
+            await audit(actor, "activity.update", { type: "product", id: p.id }, { before: { version: p.version }, after: { version, photos: copied.urls.length, source: "traveldesk_photos" }, reason }, tx);
+            const link = await tx.supplierListingLink.findUniqueOrThrow({ where: { id: l.id }, select: { pendingFields: true } });
+            await tx.supplierListingLink.update({ where: { id: l.id }, data: { pendingFields: link.pendingFields.filter((f) => f !== "images") } });
+            await recordEditorialLocks(tx, p.id, { systemFields: ["images"], rebase: true });
+            used = true;
+            done.push(p.id);
+          }, TX_OPTIONS);
+        } catch (e) {
+          log.warn("traveldesk_import.photo_update_failed", { productId: l.productId, error: e });
+        }
+      }
+      if (!used) await Promise.all(copied.keys.map((k) => photos.store.delete?.(k).catch(() => {})));
+    }
+    if (done.length) revalidateCatalog();
+    return { listingsUpdated: done.length, toursTried: batch.length, remainingTours: Math.max(0, tours.length - batch.length), failures };
   },
 
   /** TravelDesk batches, newest first (admin list). Rows carry rule prices only, never nets. */
@@ -435,15 +520,19 @@ export const traveldeskImportService = {
 
   /**
    * Roll a TravelDesk batch back by its id (doc 30 §5 N1 rollback): created
-   * listings are soft-deleted through `productLifecycle` whether or not they
-   * were edited or published, their mappings deactivated and candidates
-   * closed; link rows are kept and deactivated; an old page one of them
-   * replaced is restored (published again) and its redirect removed. Adopted
-   * links are only deactivated. `requireUnchanged` makes it the immediate undo
-   * of the generic import revert: every created listing must still be at the
-   * version the import wrote.
+   * listings are soft-deleted through `productLifecycle`, their mappings
+   * deactivated and candidates closed; link rows are kept and deactivated; an
+   * old page one of them replaced is restored (published again) and its
+   * redirect removed. Adopted links are only deactivated.
+   *
+   * Refused, with the listings named (review 106 N1-10): any created listing
+   * that is instant (requested or effective) or has an open order or inquiry;
+   * a published one unless `force` (the caller has unpublished it, or means
+   * to take it down). `requireUnchanged` makes it the immediate undo of the
+   * generic import revert: every created listing must still be at the version
+   * the import wrote.
    */
-  async rollback(actor: Actor, batchId: string, reason: string, opts: { requireUnchanged?: boolean } = {}) {
+  async rollback(actor: Actor, batchId: string, reason: string, opts: { requireUnchanged?: boolean; force?: boolean } = {}) {
     requirePermission(actor, "imports.run");
     requirePermission(actor, "products.delete");
     requirePermission(actor, "suppliers.manage");
@@ -456,11 +545,33 @@ export const traveldeskImportService = {
     await prisma.$transaction(async (tx) => {
       const claimed = await tx.importBatch.updateMany({ where: { id: batchId, status: "applied" }, data: { status: "reverted", revertedAt: new Date() } });
       if (claimed.count !== 1) throw Errors.conflict("This batch is being rolled back or was already rolled back");
-      const links = await tx.supplierListingLink.findMany({ where: { importBatchId: batchId, deactivatedAt: null }, include: { product: { select: { id: true, slug: true, version: true, deletedAt: true } } } });
+      const links = await tx.supplierListingLink.findMany({
+        where: { importBatchId: batchId, deactivatedAt: null },
+        include: { product: { select: { id: true, slug: true, version: true, deletedAt: true, status: true, fulfilmentMode: true, eligibility: { select: { effectiveMode: true } } } } },
+      });
+      const created = links.filter((l) => !l.adopted && !l.product.deletedAt);
       if (opts.requireUnchanged) {
         const moved = links.filter((l) => !l.adopted && (l.product.deletedAt || l.product.version !== l.importVersion));
         if (moved.length) throw Errors.conflict(`${moved.map((l) => `"${l.product.slug}"`).join(", ")} changed after this import — use the TravelDesk rollback instead`, { slugs: moved.map((l) => l.product.slug) });
       }
+      const ids = created.map((l) => l.productId);
+      const [inquiries, orders] = await Promise.all([
+        tx.inquiryItem.findMany({ where: { productId: { in: ids }, inquiry: { status: { in: [...OPEN_INQUIRY] } } }, select: { productId: true } }),
+        tx.orderItem.findMany({ where: { productId: { in: ids }, order: { status: { in: [...OPEN_ORDER] } } }, select: { productId: true } }),
+      ]);
+      const busy = new Set([...inquiries, ...orders].map((x) => x.productId));
+      const refused = created.flatMap((l) => {
+        const why =
+          l.product.fulfilmentMode === "instant" || l.product.eligibility?.effectiveMode === "instant"
+            ? "instant"
+            : busy.has(l.productId)
+              ? "open order or inquiry"
+              : l.product.status === "published" && !opts.force
+                ? "published (unpublish it first, or roll back with force)"
+                : null;
+        return why ? [`"${l.product.slug}": ${why}`] : [];
+      });
+      if (refused.length) throw Errors.conflict(`Not rolled back: ${refused.join("; ")}`, { refused });
       const now = new Date();
       for (const l of links) {
         await tx.supplierListingLink.update({ where: { id: l.id }, data: { deactivatedAt: now } });
@@ -472,7 +583,18 @@ export const traveldeskImportService = {
         await tx.productSupplierMapping.updateMany({ where: { productId: l.productId, supplierOfferId: { not: null }, isActive: true }, data: { isActive: false } });
         await tx.supplierMappingCandidate.updateMany({ where: { productId: l.productId, source: "import", state: "approved" }, data: { state: "rejected", reviewedBy: actor.id, reviewedAt: now, reviewNote: `Rolled back: ${reason.trim()}`.slice(0, 500) } });
       }
-      await audit(actor, "traveldesk_import.rollback", { type: "import_batch", id: batchId }, { after: { links: links.length, deleted: links.filter((l) => !l.adopted).length, requireUnchanged: Boolean(opts.requireUnchanged) }, reason }, tx);
+      // Defensive: a product this batch created without a link row (none should exist) is removed too.
+      const linked = new Set(links.map((l) => l.productId));
+      for (const item of await tx.importBatchItem.findMany({ where: { batchId, action: "create" }, select: { productId: true } })) {
+        if (linked.has(item.productId)) continue;
+        const p = await tx.product.findUnique({ where: { id: item.productId }, select: { deletedAt: true } });
+        if (p && !p.deletedAt) {
+          await productLifecycle.softDeleteInTx(tx, actor, item.productId, reason);
+          touched.push(item.productId);
+          deleted += 1;
+        }
+      }
+      await audit(actor, "traveldesk_import.rollback", { type: "import_batch", id: batchId }, { after: { links: links.length, deleted, requireUnchanged: Boolean(opts.requireUnchanged), force: Boolean(opts.force) }, reason }, tx);
     }, IMPORT_TX);
     revalidateCatalog();
     await readinessService.reevaluateMany(touched, "import_revert");
@@ -480,11 +602,17 @@ export const traveldeskImportService = {
   },
 };
 
+const OPEN_INQUIRY = ["new", "assigned", "contacted", "quoted", "negotiating", "payment_pending"] as const;
+const OPEN_ORDER = ["pending_payment", "paid", "supplier_pending", "confirmed", "partially_confirmed"] as const;
+
 /**
  * Undo the retire of the page this link replaced (doc 30 §3.9 restore path):
  * the old listing is restored and published again, the redirect to this
- * link's listing removed. Shared by the batch rollback and the publish
- * service's restore. No-op when nothing was retired for this link.
+ * link's listing removed, and the link no longer names it. Shared by the
+ * batch rollback and the publish service's restore. Refused when the old page
+ * changed after the retire (deleted again for another reason, say: its latest
+ * version is not the retire this link wrote; review 106 N1-11). No-op when
+ * nothing was retired for this link.
  */
 export async function restoreReplacedInTx(tx: Tx, actor: Actor, linkId: string, reason: string, touched: string[]) {
   const redirect = await tx.productRedirect.findFirst({ where: { linkId } });
@@ -492,6 +620,8 @@ export async function restoreReplacedInTx(tx: Tx, actor: Actor, linkId: string, 
   const old = await tx.product.findUnique({ where: { id: redirect.oldProductId } });
   if (old?.deletedAt) {
     requirePermission(actor, "products.publish");
+    const latest = await tx.productVersion.findUnique({ where: { productId_version: { productId: old.id, version: old.version } }, select: { reason: true } });
+    if (!latest?.reason?.startsWith(RETIRE_REASON_PREFIX)) throw Errors.conflict(`"${old.slug}" changed after it was retired — restore it from the console instead`, { slug: old.slug });
     const version = old.version + 1;
     const written = await tx.product.updateMany({ where: { id: old.id, version: old.version }, data: { deletedAt: null, status: "published", version, publishedAt: old.publishedAt ?? new Date() } });
     if (written.count !== 1) throw Errors.conflict(`"${old.slug}" changed while it was being restored — try again`);
@@ -500,6 +630,10 @@ export async function restoreReplacedInTx(tx: Tx, actor: Actor, linkId: string, 
     touched.push(old.id);
   }
   await tx.productRedirect.delete({ where: { id: redirect.id } });
+  await tx.supplierListingLink.updateMany({ where: { id: linkId, replacesProductId: redirect.oldProductId }, data: { replacesProductId: null } });
   await audit(actor, "product_redirect.remove", { type: "product", id: redirect.oldProductId }, { before: { oldSlug: redirect.oldSlug, targetProductId: redirect.targetProductId }, reason }, tx);
   return redirect;
 }
+
+/** The version reason of a retire written by the publish service; restore checks it (N1-11). */
+export const RETIRE_REASON_PREFIX = "Replaced by ";

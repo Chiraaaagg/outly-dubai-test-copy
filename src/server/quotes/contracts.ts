@@ -110,7 +110,9 @@ export type ReadinessReason =
   | "policy_exceeds_supplier"
   | "capability_not_ready"
   /** The supplier catalogue the verdict reads is older than the staleness limit, or of unknown age (doc 29 Batch 1b). */
-  | "catalogue_stale";
+  | "catalogue_stale"
+  /** An imported TravelDesk inquiry listing (doc 30 D4): never-instant options, so it never sells instant (review 106 N1-06). */
+  | "inquiry_listing";
 
 export interface ReadinessResult {
   productId: string;

@@ -228,15 +228,15 @@ export function buildListingDraft(
       };
     });
   } else {
-    // Inquiry (D4): an indicative "from" price; options may differ and carry no typed units.
-    const own = options.map((o) => o.rulePrice.adult ?? o.rulePrice.trip);
-    const priced = own.filter((p): p is NonNullable<typeof p> => Boolean(p && p.inr !== null));
-    if (priced.length === 0) {
+    // Inquiry (D4): an indicative per-person "from" price. The page multiplies an option's price by the guests,
+    // so a per-vehicle or mixed offer cannot show one: then the listing shows no price (review 106 N1-15).
+    const own = options.map((o) => (o.rulePrice.trip ? null : o.rulePrice.adult));
+    if (own.some((p) => !p || p.inr === null)) {
       price = { adult: { aed: 0, inr: 0 } };
       quoteOnly = true;
       warnings.push("no_indicative_price");
     } else {
-      price = { adult: { aed: Math.min(...priced.map((p) => num(p.aed))), inr: Math.min(...priced.map((p) => num(p.inr!))) } };
+      price = { adult: { aed: Math.min(...own.map((p) => num(p!.aed))), inr: Math.min(...own.map((p) => num(p!.inr!))) } };
     }
     variants = options.map((o, i) => {
       const p = own[i];

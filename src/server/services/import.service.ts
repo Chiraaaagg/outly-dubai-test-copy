@@ -14,7 +14,8 @@ import { completeNewActivity, currencyIn, matchHeader, mergeIntoExisting, parseC
 import { resolveCategory } from "../imports/categories";
 import { googleExportUrl } from "../imports/google";
 import { fetchGoogleExport } from "../imports/fetch";
-import { productLifecycle } from "./activity.service";
+import { importHolds, productLifecycle } from "./activity.service";
+import { recordEditorialLocks } from "./listing-locks";
 import { readinessService } from "./readiness.service";
 
 /**
@@ -363,6 +364,8 @@ export const importService = {
     if (opts.createMissingCategories) requirePermission(actor, "categories.edit");
     const batch = await prisma.importBatch.findUnique({ where: { id: batchId } });
     if (!batch) throw Errors.notFound("Import batch");
+    // A TravelDesk batch writes links, mappings and a review state: only its own importer applies it (review 106 N1-01).
+    if (batch.source === "traveldesk") throw Errors.conflict("Apply this batch from the TravelDesk import page", { batchId, source: batch.source });
     if (batch.status !== "previewed") throw Errors.conflict(`This batch was already ${batch.status}`);
     type StoredRow = { row: number; slug: string; action: "create" | "update"; ok: boolean; input: unknown; missingCategory?: string | null; review?: boolean; baseVersion?: number | null };
     const preview = (Array.isArray(batch.preview) ? batch.preview : []) as StoredRow[];
@@ -418,14 +421,22 @@ export const importService = {
       const held = new Set(opts.publish ? todo.filter((r) => r.review).map((r) => r.row) : []);
       // An imported TravelDesk listing goes live only through its own review and publish (doc 30 §3.9, D8).
       if (opts.publish) {
-        const unreviewed = new Set((await tx.supplierListingLink.findMany({ where: { product: { slug: { in: inputs.map((i) => i.input.slug) } }, reviewedAt: null, deactivatedAt: null }, select: { product: { select: { slug: true } } } })).map((l) => l.product.slug));
-        for (const i of inputs) if (unreviewed.has(i.input.slug)) held.add(i.row);
+        const linked = await tx.product.findMany({ where: { slug: { in: inputs.map((i) => i.input.slug) }, listingLink: { isNot: null } }, select: { id: true, slug: true } });
+        const holds = await importHolds(tx, linked.map((p) => p.id));
+        const heldSlug = new Set(linked.filter((p) => holds.has(p.id)).map((p) => p.slug));
+        for (const i of inputs) if (heldSlug.has(i.input.slug)) held.add(i.row);
       }
 
       // Suppliers — one upsert per distinct supplier (a handful), one mapping query.
       const supplierIds = new Map<string, string>();
       for (const sup of new Map(inputs.map((i) => [i.input.supplier.name, i.input.supplier])).values()) {
         const code = sup.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || sup.id;
+        // An integration supplier's row is never renamed or re-scored from a sheet (review 106 N1-18).
+        const integration = await tx.supplier.findUnique({ where: { code }, select: { id: true, adapter: true } });
+        if (integration && integration.adapter !== "manual") {
+          supplierIds.set(sup.name, integration.id);
+          continue;
+        }
         const row = await tx.supplier.upsert({
           where: { code },
           create: { id: uuidv7(), code, name: sup.name, source: sup.source === "direct" ? "direct" : sup.source === "portal" ? "portal" : "api", adapter: "manual", capabilities: { availability: false, booking: false, cancellation: false, lookup: false }, reliabilityScore: sup.reliability },
@@ -494,6 +505,11 @@ export const importService = {
         const have = new Set((await tx.productSupplierMapping.findMany({ where: { productId: { in: mappings.map((m) => m.productId) }, variantCode: null }, select: { productId: true, supplierId: true } })).map((m) => `${m.productId}:${m.supplierId}`));
         const fresh = mappings.filter((m) => !have.has(`${m.productId}:${m.supplierId}`));
         if (fresh.length) await tx.productSupplierMapping.createMany({ data: fresh.map((m) => ({ id: uuidv7(), productId: m.productId, supplierId: m.supplierId, priority: 1, externalRef: {} })) });
+      }
+      // Doc 30 §3.7: a sheet edit of an imported TravelDesk listing locks the editorial fields it changed (N1-08).
+      const updatedIds = items.filter((i) => i.action === "update").map((i) => i.id);
+      if (updatedIds.length) {
+        for (const l of await tx.supplierListingLink.findMany({ where: { productId: { in: updatedIds }, deactivatedAt: null }, select: { productId: true } })) await recordEditorialLocks(tx, l.productId);
       }
       await tx.importBatchItem.createMany({ data: items.map((i) => ({ id: uuidv7(), batchId, productId: i.id, action: i.action, beforeVersion: i.before, afterVersion: i.after, slug: i.slug })) });
       await tx.importBatch.update({ where: { id: batchId }, data: { rowsOk: items.length, rowsFailed: preview.length - items.length } });

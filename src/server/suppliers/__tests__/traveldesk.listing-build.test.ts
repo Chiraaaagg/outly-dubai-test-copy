@@ -3,7 +3,7 @@ import { pageUnitPrice } from "@/lib/pricing";
 import type { Activity } from "@/lib/types";
 import { meetsFloor, type RuleCostLine } from "../../domain/rule-price";
 import { activityInputSchema, buildActivityContent } from "../../schemas/activity.schema";
-import { policyTextAgrees, pickupAgrees, unitRestricted } from "../../services/readiness.service";
+import { assessReadiness, policyTextAgrees, pickupAgrees, unitRestricted } from "../../services/readiness.service";
 import { parseClassKey, type CapabilityDimensions } from "../traveldesk/traveldesk.capability";
 import { buildListingDraft, lockedFieldsBetween, NON_REFUNDABLE_POLICY, PENDING_TEXT, type BuildContent, type BuildContext } from "../traveldesk/traveldesk.listing-build";
 import { buildListingPlan, type PlannedListing, type PlanOffer, type PlanRules } from "../traveldesk/traveldesk.listing-plan";
@@ -152,6 +152,35 @@ describe("text rules (doc 30 §3.7, D13)", () => {
   });
 });
 
+describe("listing identity (RR-01; review 106 N1-02)", () => {
+  const CHOICE = "live.fixed_slot_choice.self.internal.per_person";
+  const LISTED = "live.listed_start_single.self.internal.per_person";
+  const identity = (l: PlannedListing) => `${l.tourId}|${l.kind}|${l.arrival}|${l.route}|${l.fulfilment}|${l.splitNumber}`;
+
+  it("numbers splits across every class key of a tour's arrival, route and fulfilment, so identities never collide", () => {
+    const p = buildListingPlan(
+      [
+        planOffer({ offerId: 1, classKey: KEY_S0, startMinutes: [1200] }),
+        planOffer({ offerId: 2, classKey: KEY_S0, startMinutes: [540] }),
+        planOffer({ offerId: 3, classKey: CHOICE, startMinutes: [600, 900] }),
+        planOffer({ offerId: 4, classKey: LISTED, startMinutes: [480] }),
+        planOffer({ offerId: 5, classKey: KEY_PICKUP, startMinutes: [480] }),
+      ],
+      { rules: RULES, flagsOn: new Set([KEY_S0, CHOICE, LISTED, KEY_PICKUP]), content: new Map() },
+    );
+    const inst = p.listings.filter((l) => l.kind === "instant");
+    expect(inst.map((l) => [l.step, l.classKey, l.splitNumber, l.startTimes[0]])).toEqual([
+      ["S0", CHOICE, 1, "10:00"],
+      ["S1", KEY_PICKUP, 1, "08:00"],
+      ["S0", KEY_S0, 2, "09:00"],
+      ["S0", KEY_S0, 3, "20:00"],
+      ["S3", LISTED, 4, "08:00"],
+    ]);
+    expect(new Set(p.listings.map(identity)).size).toBe(p.listings.length);
+    expect(new Set(p.listings.map((l) => l.key)).size).toBe(p.listings.length);
+  });
+});
+
 describe("draft builder (doc 30 §3.4, §3.6)", () => {
   const one = () => plan([planOffer({ offerId: 501 })]).listings[0];
 
@@ -238,6 +267,28 @@ describe("draft builder (doc 30 §3.4, §3.6)", () => {
     expect(r.input.timeSlots).toEqual([]);
     // instant + manual confirmation is refused by the schema itself.
     expect(activityInputSchema.safeParse({ ...r.input, fulfilmentMode: "instant" }).success).toBe(false);
+  });
+
+  it("shows no indicative price on an inquiry listing with a per-vehicle option (review 106 N1-15)", () => {
+    const PER_UNIT = "live.fixed_slot_single.self.internal.per_unit";
+    const p = plan([
+      planOffer({ offerId: 811 }),
+      planOffer({ offerId: 812, classKey: KEY_ON_REQUEST }),
+      planOffer({ offerId: 813, classKey: PER_UNIT, supplierUnits: ["adult", "trip"], netAedMinorByUnit: { adult: 0n, child: 0n, infant: 0n, trip: 40_000n } }),
+    ]);
+    const inq = p.listings.find((l) => l.kind === "inquiry") as PlannedListing;
+    const r = buildListingDraft(inq, offersMap([811, 812, 813]), CONTENT, { ...CTX, siblingCount: 2 });
+    expect(r.ok && r.input.quoteOnly).toBe(true);
+    expect(r.ok && r.input.variants.every((v) => v.delta.aed === 0 && v.delta.inr === 0)).toBe(true);
+  });
+
+  it("readiness keeps an imported inquiry listing out of instant even when armed and edited to look instant (N1-06)", async () => {
+    const r = buildListingDraft(one(), offersMap([501]), CONTENT, CTX);
+    if (!r.ok) throw new Error("build failed");
+    const content = { ...asActivity(r.input), fulfilmentMode: "instant" };
+    const a = await assessReadiness({ product: { id: "p", status: "published", deletedAt: null, fulfilmentMode: "instant", content, listingKind: "inquiry" }, mappings: [], releaseEnabled: true, margin: null });
+    expect(a.effective).toBe("inquiry");
+    expect(a.reasons).toContain("inquiry_listing");
   });
 
   it("names a pickup sibling, picks a free slug and marks missing photos pending", () => {

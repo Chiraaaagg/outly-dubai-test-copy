@@ -4,6 +4,7 @@ import { useActionState } from "react";
 import { Button } from "@/components/ui/button";
 import {
   applyTravelDeskImportAction,
+  copyTravelDeskPhotosAction,
   markListingReviewedAction,
   previewTravelDeskImportAction,
   publishListingsAction,
@@ -75,7 +76,7 @@ export function PreviewForm({ environment }: { environment: string }) {
   );
 }
 
-function ReasonedBatchForm({ batchId, label, verb, act }: { batchId: string; label: string; verb: string; act: typeof applyTravelDeskImportAction }) {
+function ReasonedBatchForm({ batchId, label, verb, act, force }: { batchId: string; label: string; verb: string; act: typeof applyTravelDeskImportAction; force?: boolean }) {
   const [result, action, pending] = useActionState<BatchActionResult | null, FormData>(act, null);
   if (result?.ok) return <p role="status" className="text-2xs font-semibold text-[var(--color-success)]">{result.data.summary}.</p>;
   return (
@@ -85,6 +86,12 @@ function ReasonedBatchForm({ batchId, label, verb, act }: { batchId: string; lab
         Reason to {label}
       </label>
       <input id={`${verb}-${batchId}`} name="reason" required minLength={8} maxLength={500} placeholder={`Reason to ${label}`} className={`${INPUT_CLASS} min-h-9 w-56 text-sm`} />
+      {force && (
+        <label className="flex items-center gap-1.5 text-2xs text-ink-800">
+          <input type="checkbox" name="force" className="size-4" />
+          Include published listings
+        </label>
+      )}
       <Button type="submit" size="sm" variant={verb === "apply" ? "primary" : "outline"} disabled={pending}>
         {pending ? "Working…" : label}
       </Button>
@@ -100,7 +107,23 @@ export function ApplyBatchForm({ batchId }: { batchId: string }) {
 }
 
 export function RollbackBatchForm({ batchId }: { batchId: string }) {
-  return <ReasonedBatchForm batchId={batchId} label="Roll back batch" verb="rollback" act={rollbackTravelDeskImportAction} />;
+  return <ReasonedBatchForm batchId={batchId} label="Roll back batch" verb="rollback" act={rollbackTravelDeskImportAction} force />;
+}
+
+export function CopyPhotosForm({ batchId }: { batchId: string }) {
+  const [result, action, pending] = useActionState<BatchActionResult | null, FormData>(copyTravelDeskPhotosAction, null);
+  return (
+    <form action={action} className="flex flex-wrap items-end gap-2">
+      <input type="hidden" name="batchId" value={batchId} />
+      <Button type="submit" size="sm" variant="outline" disabled={pending}>
+        {pending ? "Copying photos…" : "Copy photos (next 5 tours)"}
+      </Button>
+      <div aria-live="polite" className="basis-full">
+        {result?.ok && <p role="status" className="text-2xs text-[var(--color-success)]">{result.data.summary}.</p>}
+        <Outcome result={result} />
+      </div>
+    </form>
+  );
 }
 
 export function RestoreReplacedForm({ linkId }: { linkId: string }) {

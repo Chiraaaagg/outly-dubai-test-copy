@@ -21,6 +21,8 @@ const nextConfig = {
   agentRules: false,
   // No framework fingerprint in responses (§13.8).
   poweredByHeader: false,
+  // Doc 30 §3.8: the photo re-encoder's native module stays a runtime require, traced into the output.
+  serverExternalPackages: ["sharp"],
   images: {
     remotePatterns: [
       { protocol: "https", hostname: "images.unsplash.com" },

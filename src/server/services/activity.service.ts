@@ -9,6 +9,7 @@ import { Errors } from "../lib/errors";
 import { uuidv7 } from "../lib/ids";
 import { revalidateCatalog } from "../lib/catalog-cache";
 import { readinessService } from "./readiness.service";
+import { recordEditorialLocks } from "./listing-locks";
 import {
   activitySchema,
   buildActivityContent,
@@ -135,6 +136,14 @@ async function writeVersion(tx: Tx, productId: string, version: number, content:
 /** Keep the supplier + mapping graph in step with the document's supplier block. */
 async function ensureSupplierMapping(tx: Tx, productId: string, supplier: Activity["supplier"]) {
   const code = supplier.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || supplier.id;
+  // An integration supplier's row (TravelDesk, Rathin) is never renamed or re-scored from a listing's
+  // document (review 106 N1-18): only the mapping is ensured.
+  const integration = await tx.supplier.findUnique({ where: { code }, select: { id: true, adapter: true } });
+  if (integration && integration.adapter !== "manual") {
+    const has = await tx.productSupplierMapping.findFirst({ where: { productId, supplierId: integration.id, variantCode: null }, select: { id: true } });
+    if (!has) await tx.productSupplierMapping.create({ data: { id: uuidv7(), productId, supplierId: integration.id, priority: 1, externalRef: {} } });
+    return;
+  }
   const row = await tx.supplier.upsert({
     where: { code },
     create: {
@@ -152,10 +161,22 @@ async function ensureSupplierMapping(tx: Tx, productId: string, supplier: Activi
   if (!exists) await tx.productSupplierMapping.create({ data: { id: uuidv7(), productId, supplierId: row.id, priority: 1, externalRef: {} } });
 }
 
-/** Products among `ids` that are imported TravelDesk listings not yet marked reviewed (doc 30 §3.9). */
-async function unreviewedImports(tx: Tx, ids: string[]): Promise<Set<string>> {
+/**
+ * Products among `ids` the generic publish paths must not publish (doc 30
+ * §3.9; review 106 N1-01, N1-03, N1-09): an imported TravelDesk listing never
+ * reviewed (whether or not its link was rolled back since: a product has one
+ * link row ever), and a reviewed one that still has an old page to retire.
+ * Those go live only from the TravelDesk review queue, which runs the retire.
+ */
+export async function importHolds(tx: Tx, ids: string[]): Promise<Set<string>> {
   if (ids.length === 0) return new Set();
-  const rows = await tx.supplierListingLink.findMany({ where: { productId: { in: ids }, reviewedAt: null, deactivatedAt: null }, select: { productId: true } });
+  const rows = await tx.supplierListingLink.findMany({
+    where: {
+      productId: { in: ids },
+      OR: [{ reviewedAt: null }, { deactivatedAt: null, adopted: false, replacesProductId: { not: null }, replaces: { deletedAt: null } }],
+    },
+    select: { productId: true },
+  });
   return new Set(rows.map((r) => r.productId));
 }
 
@@ -297,7 +318,12 @@ export const activityService = {
 
   /* ------------------------------------------------------------ writes */
 
-  async create(actor: Actor, input: ActivityInput, opts: { status?: "draft" | "published"; reason?: string; tx?: Tx } = {}) {
+  /**
+   * `supplierId`: bind the product-level supplier mapping to this supplier row
+   * instead of upserting one from the document's supplier block (the TravelDesk
+   * importer: the API supplier row is never renamed, review 106 N1-18).
+   */
+  async create(actor: Actor, input: ActivityInput, opts: { status?: "draft" | "published"; reason?: string; tx?: Tx; supplierId?: string } = {}) {
     requirePermission(actor, "products.edit");
     const status = opts.status ?? "draft";
     if (status === "published") requirePermission(actor, "products.publish");
@@ -323,7 +349,8 @@ export const activityService = {
         },
         select: SELECT_ROW,
       });
-      await ensureSupplierMapping(tx, id, content.supplier);
+      if (opts.supplierId) await tx.productSupplierMapping.create({ data: { id: uuidv7(), productId: id, supplierId: opts.supplierId, priority: 1, externalRef: {} } });
+      else await ensureSupplierMapping(tx, id, content.supplier);
       await writeVersion(tx, id, 1, content, status, actor, opts.reason);
       await audit(actor, "activity.create", { type: "product", id }, { after: { slug: content.slug, title: content.title, status }, reason: opts.reason }, tx);
       return toRow(row);
@@ -365,6 +392,8 @@ export const activityService = {
       });
       await ensureSupplierMapping(tx, id, content.supplier);
       await writeVersion(tx, id, version, content, before.status, actor, opts.reason);
+      // Doc 30 §3.7: a person's edit of an imported listing locks the editorial fields it changed (N1-08).
+      await recordEditorialLocks(tx, id);
       await audit(actor, "activity.update", { type: "product", id }, { before: { version: before.version, slug: before.slug, title: before.title }, after: { version, slug: content.slug, title: content.title }, reason: opts.reason }, tx);
       return toRow(row);
     };
@@ -383,6 +412,10 @@ export const activityService = {
     const row = await prisma.$transaction(async (tx) => {
       const src = await tx.product.findUnique({ where: { id } });
       if (!src || src.deletedAt) throw Errors.notFound("Activity");
+      // A copy carries no import link, so it would escape the review gate (doc 30 §3.9; review 106 N1-03).
+      if ((await tx.supplierListingLink.count({ where: { productId: id, reviewedAt: null } })) > 0) {
+        throw Errors.conflict("Review this imported TravelDesk listing before duplicating it", { id });
+      }
       const content = readContent(src);
       const taken = new Set((await tx.product.findMany({ where: { slug: { startsWith: src.slug.replace(/-copy(-\d+)?$/, "") } }, select: { slug: true } })).map((p) => p.slug));
       const slug = nextCopySlug(src.slug, taken);
@@ -403,8 +436,8 @@ export const activityService = {
       const before = await tx.product.findUnique({ where: { id } });
       if (!before || before.deletedAt) throw Errors.notFound("Activity");
       if (before.status === status) return toRow(before);
-      if (status === "published" && (await unreviewedImports(tx, [id])).size) {
-        throw Errors.conflict("This imported TravelDesk listing must be marked reviewed and published from the TravelDesk review queue", { id });
+      if (status === "published" && (await importHolds(tx, [id])).size) {
+        throw Errors.conflict("This imported TravelDesk listing is published from the TravelDesk review queue, which reviews it and retires the page it replaces", { id });
       }
       const content = readContent(before);
       const version = before.version + 1;
@@ -457,7 +490,7 @@ export const activityService = {
       const rows = await tx.product.findMany({ where, select: { ...SELECT_ROW, content: true }, orderBy: { updatedAt: "desc" }, take: BULK_LIMIT });
       const remaining = Math.max(0, matched - rows.length);
       // Imported TravelDesk listings go live only through their own review (doc 30 §3.9, D8): skipped here.
-      const held = status === "published" ? await unreviewedImports(tx, rows.map((r) => r.id)) : new Set<string>();
+      const held = status === "published" ? await importHolds(tx, rows.map((r) => r.id)) : new Set<string>();
       const candidates = rows.filter((r) => r.status !== status && !held.has(r.id));
       const skipped = rows.length - candidates.length;
       // A single unparseable document must not block the other 499 rows.

@@ -7,7 +7,12 @@
  *   node --env-file=<file> scripts/retire-listings.mjs            # dry run
  *   node --env-file=<file> scripts/retire-listings.mjs --apply    # do it
  *   ... --apply --only-seeded   # only the 28 fixture-seeded listings (default)
- *   ... --apply --all           # every live listing, imported ones too
+ *   ... --apply --all           # refused with --apply (doc 30 §3.9): dry run only
+ *
+ * Doc 30 §3.9 (review 106 N1-04): `--all --apply` is refused, and imported
+ * TravelDesk listings, pages a TravelDesk listing replaces and pages behind a
+ * redirect are never selected. Pages are retired through the TravelDesk
+ * review queue, which writes the redirect.
  */
 import { PrismaClient } from "@prisma/client";
 import { assertDisposableDbLive, confirmProductionTarget, parseTargetArgs } from "../src/server/__tests__/helpers/target-guard.ts";
@@ -21,6 +26,11 @@ if (target.target === "production") await confirmProductionTarget({ projectRef: 
 else await assertDisposableDbLive(prisma);
 const apply = process.argv.includes("--apply");
 const all = process.argv.includes("--all");
+if (apply && all) {
+  console.error("retire-listings: --all is a dry run only (doc 30 §3.9). Retire pages from the TravelDesk review queue.");
+  await prisma.$disconnect();
+  process.exit(2);
+}
 
 function uuidv7() {
   const ts = BigInt(Date.now());
@@ -33,7 +43,7 @@ function uuidv7() {
 }
 
 const live = await prisma.product.findMany({
-  where: { deletedAt: null, status: { not: "archived" } },
+  where: { deletedAt: null, status: { not: "archived" }, listingLink: { is: null }, replacedByLinks: { none: { deactivatedAt: null } }, redirectsFrom: { none: {} } },
   select: { id: true, slug: true, title: true, status: true, version: true, content: true, versions: { where: { version: 1 }, select: { reason: true } } },
   orderBy: { slug: "asc" },
 });

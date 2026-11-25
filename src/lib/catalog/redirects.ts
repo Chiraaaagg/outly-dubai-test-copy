@@ -21,7 +21,11 @@ import { CATALOG_TAG } from "@/server/lib/catalog-cache";
 
 export type RetiredSlugTarget = { to: string; permanent: boolean } | null;
 
+/** Only a well-formed slug is looked up (review 106 N1-14): random paths cost no query and no cache entry. */
+const SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
 export async function lookupRetiredSlug(slug: string): Promise<RetiredSlugTarget> {
+  if (slug.length < 3 || slug.length > 80 || !SLUG.test(slug)) return null;
   try {
     const r = await prisma.productRedirect.findUnique({
       where: { oldSlug: slug },
@@ -42,4 +46,10 @@ export async function lookupRetiredSlug(slug: string): Promise<RetiredSlugTarget
   }
 }
 
-export const resolveRetiredSlug = unstable_cache(lookupRetiredSlug, ["retired-slug-v1"], { tags: [CATALOG_TAG], revalidate: 60 });
+const cachedLookup = unstable_cache(lookupRetiredSlug, ["retired-slug-v1"], { tags: [CATALOG_TAG], revalidate: 60 });
+
+/** The cached lookup, reached only by well-formed slugs. */
+export async function resolveRetiredSlug(slug: string): Promise<RetiredSlugTarget> {
+  if (slug.length < 3 || slug.length > 80 || !SLUG.test(slug)) return null;
+  return cachedLookup(slug);
+}

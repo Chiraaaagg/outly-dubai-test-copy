@@ -13,7 +13,8 @@
  * Categories get the status change and an audit row (they are not versioned).
  *
  * A listing whose `content` does not parse is skipped and reported rather
- * than published half-formed.
+ * than published half-formed. Imported TravelDesk listings (any row in
+ * `supplier_listing_links`) are never published here (doc 30 §3.9).
  *
  * Usage: node --env-file=<file> scripts/publish-catalogue.mjs [--apply]
  */
@@ -44,17 +45,21 @@ const ACTOR = { type: "system", id: null };
 
 const [drafts, draftCategories] = await Promise.all([
   prisma.product.findMany({
-    where: { deletedAt: null, status: "draft" },
+    // Doc 30 §3.9 (review 106 N1-04): an imported TravelDesk listing goes live only from its own review queue,
+    // which reviews it and retires the page it replaces. Every linked product is left out here.
+    where: { deletedAt: null, status: "draft", listingLink: { is: null } },
     select: { id: true, slug: true, title: true, version: true, content: true, publishedAt: true, categorySlug: true },
     orderBy: { slug: "asc" },
   }),
   prisma.category.findMany({ where: { deletedAt: null, status: { not: "published" } }, select: { id: true, slug: true, status: true } }),
 ]);
 
+const heldImports = await prisma.supplierListingLink.count({ where: { product: { deletedAt: null, status: "draft" } } });
 const usable = drafts.filter((d) => d.content && typeof d.content === "object");
 const unusable = drafts.filter((d) => !usable.includes(d));
 
 console.log(`draft activities   : ${drafts.length}`);
+console.log(`  held (TravelDesk imports, published from their review queue): ${heldImports}`);
 console.log(`  publishable      : ${usable.length}`);
 console.log(`  skipped (content): ${unusable.length}${unusable.length ? ` -> ${unusable.map((u) => u.slug).join(", ")}` : ""}`);
 console.log(`draft categories   : ${draftCategories.length}${draftCategories.length ? ` -> ${draftCategories.map((c) => c.slug).join(", ")}` : ""}`);

@@ -5,9 +5,12 @@
 --      batches) and `smc_source_check` widened with 'import' (the candidate
 --      row the importer writes when it creates a mapping, so an imported link
 --      has the same candidate, mapping and audit rows as a reviewed one).
---      Widening refuses no existing row. Each swap adds the new check
---      NOT VALID, then VALIDATEs it, so the long scan does not hold the
---      ACCESS EXCLUSIVE lock (repository lock-timeout pattern).
+--      Widening refuses no existing row. Each swap drops the old check and
+--      adds the new one NOT VALID, then VALIDATEs it. Prisma runs the file in
+--      one transaction, so the ACCESS EXCLUSIVE lock the DROP takes is held
+--      through the VALIDATE scan; both tables are small, and the lock timeout
+--      makes the migration fail fast rather than queue traffic. Split the
+--      migration if either table grows large.
 --   2. New table `product_redirects`: a retired listing's old slug, unique,
 --      to the listing that replaced it (D12). Written only when the
 --      replacement is published and reviewed; the storefront follows it

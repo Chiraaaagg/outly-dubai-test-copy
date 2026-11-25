@@ -110,6 +110,12 @@ export default async function ImportBatchPage({ params }: { params: Promise<{ id
           </>
         }
         actions={
+          batch.source === "traveldesk" ? (
+            // Doc 30 N1 (review 106 N1-01): a TravelDesk batch is applied and rolled back only from its own page.
+            <Link href={`/admin/suppliers/traveldesk/import?batch=${batch.id}`} className="text-sm underline underline-offset-2">
+              Open in TravelDesk import
+            </Link>
+          ) : (
           <BatchActions
             id={batch.id}
             status={batch.status}
@@ -118,6 +124,7 @@ export default async function ImportBatchPage({ params }: { params: Promise<{ id
             missingCategories={missingCategories}
             canCreateCategories={hasPermission(actor, "categories.edit")}
           />
+          )
         }
       />
       <div className="grid gap-4 lg:grid-cols-[18rem_minmax(0,1fr)]">

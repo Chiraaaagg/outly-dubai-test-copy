@@ -5,7 +5,7 @@ import { traveldeskImportService, type TdPreviewRow } from "@/server/services/tr
 import { traveldeskListingService, type ReviewQueueRow } from "@/server/services/traveldesk-listing.service";
 import { requirePage } from "../../../../_lib/guard";
 import { DataTable, PageHeader, Panel, StatusPill, fmtDateTime, type DataColumn } from "../../../../_components/ui";
-import { ApplyBatchForm, PreviewForm, PublishForm, RestoreReplacedForm, ReviewForm, RollbackBatchForm } from "./import-forms";
+import { ApplyBatchForm, CopyPhotosForm, PreviewForm, PublishForm, RestoreReplacedForm, ReviewForm, RollbackBatchForm } from "./import-forms";
 
 /**
  * /admin/suppliers/traveldesk/import — the TravelDesk importer (doc 30 §2
@@ -157,7 +157,17 @@ export default async function TravelDeskImportPage({ searchParams }: { searchPar
                 {
                   key: "act",
                   header: "Action",
-                  cell: (b) => (b.status === "previewed" ? <ApplyBatchForm batchId={b.id} /> : b.status === "applied" ? <RollbackBatchForm batchId={b.id} /> : "—"),
+                  cell: (b) =>
+                    b.status === "previewed" ? (
+                      <ApplyBatchForm batchId={b.id} />
+                    ) : b.status === "applied" ? (
+                      <div className="space-y-2">
+                        <CopyPhotosForm batchId={b.id} />
+                        <RollbackBatchForm batchId={b.id} />
+                      </div>
+                    ) : (
+                      "—"
+                    ),
                 },
               ]}
             />

@@ -42,11 +42,23 @@ export async function applyTravelDeskImportAction(_prev: BatchActionResult | nul
   });
 }
 
+/** Photos are copied a few tours per click (review 106 N1-12e): the result says how many tours remain. */
+export async function copyTravelDeskPhotosAction(_prev: BatchActionResult | null, fd: FormData): Promise<BatchActionResult> {
+  return runAction(async () => {
+    const { actor } = await authService.requireCookies("imports.run");
+    const input = parseWith(z.object({ batchId: z.uuid() }).strict(), { batchId: form.str(fd, "batchId") });
+    const r = await traveldeskImportService.copyPhotos(actor, { batchId: input.batchId, maxTours: 5 });
+    revalidatePath(PATH);
+    const failed = Object.keys(r.failures).length;
+    return { batchId: input.batchId, summary: `${r.listingsUpdated} listings got photos from ${r.toursTried} tours; ${r.remainingTours} tours left${failed ? `; ${failed} tours had photo failures` : ""}` };
+  });
+}
+
 export async function rollbackTravelDeskImportAction(_prev: BatchActionResult | null, fd: FormData): Promise<BatchActionResult> {
   return runAction(async () => {
     const { actor } = await authService.requireCookies("imports.run");
-    const input = parseWith(z.object({ batchId: z.uuid(), reason }).strict(), { batchId: form.str(fd, "batchId"), reason: form.str(fd, "reason") ?? "" });
-    const r = await traveldeskImportService.rollback(actor, input.batchId, input.reason);
+    const input = parseWith(z.object({ batchId: z.uuid(), reason, force: z.boolean() }).strict(), { batchId: form.str(fd, "batchId"), reason: form.str(fd, "reason") ?? "", force: form.bool(fd, "force") });
+    const r = await traveldeskImportService.rollback(actor, input.batchId, input.reason, { force: input.force });
     revalidatePath(PATH);
     return { batchId: input.batchId, summary: `${r.rolledBack} listings removed, ${r.restored} old pages restored` };
   });

@@ -20,7 +20,7 @@
  *    the editor at review (it is a pending field).
  *
  * Adding a rule: add it here with a test in
- * `src/server/suppliers/__tests__/traveldesk.text-rules.test.ts`.
+ * `src/server/suppliers/__tests__/traveldesk.listing-build.test.ts` ("text rules").
  *
  * Pure: no env, db, clock or logger.
  */
@@ -95,7 +95,8 @@ function titleCaseLanguage(word: string): string | null {
 /** A supplier tour or offer name → a clean title and the languages its tags named. */
 export function cleanTitle(raw: string | null | undefined, maxChars = 120): { title: string; languages: string[] } {
   const languages: string[] = [];
-  let s = collapse(dropCodes(raw ?? ""));
+  // Collapse first, so no pattern runs over a long whitespace run (review 106 N1-22).
+  let s = collapse(dropCodes(collapse(raw ?? "")));
   s = s.replace(new RegExp(LANGUAGE_TAG.source, LANGUAGE_TAG.flags), (m, a?: string, b?: string) => {
     const lang = titleCaseLanguage(a ?? b ?? "");
     if (!lang) return m;
@@ -111,7 +112,7 @@ export function cleanTitle(raw: string | null | undefined, maxChars = 120): { ti
 export function cleanText(raw: string | null | undefined): string {
   return (raw ?? "")
     .split("\n")
-    .map((line) => fixTypos(dropCodes(line)).replace(/[ \t]+/g, " ").trim())
+    .map((line) => fixTypos(dropCodes(line.replace(/[ \t]+/g, " "))).replace(/[ \t]+/g, " ").trim())
     .join("\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
