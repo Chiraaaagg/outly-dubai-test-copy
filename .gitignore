@@ -1,0 +1,23 @@
+node_modules
+.next
+out
+.env*.local
+*.tsbuildinfo
+next-env.d.ts.bak
+
+# Local Netlify folder
+.netlify
+
+.vercel
+.neon
+
+# TravelDesk read-only probe output (supplier data; never commit)
+.traveldesk-probe/
+
+# Supplier commercial data (net rates) must never be committed: this repository is public.
+docs/backend/impl/traveldesk-mapping*.md
+
+# Playwright output (B5 e2e)
+test-results/
+playwright-report/
+.stripe-drill/
