@@ -14,6 +14,8 @@ import { CATALOG_TAG } from "@/server/lib/catalog-cache";
  *    for review): a temporary redirect to the old listing's category page.
  *  - The old listing is live again (restored and published): nothing; the
  *    page itself serves it.
+ *  - Not a retired slug, but an imported listing the N3 upkeep hid (D19):
+ *    a temporary redirect to its category page.
  *
  * Cached with the catalogue (tag "catalog", 60 s), so a publish, retire or
  * restore is reflected as soon as the catalogue is revalidated.
@@ -34,7 +36,13 @@ export async function lookupRetiredSlug(slug: string): Promise<RetiredSlugTarget
         targetProduct: { select: { slug: true, status: true, deletedAt: true, listingLink: { select: { noindex: true, reviewedAt: true, deactivatedAt: true } } } },
       },
     });
-    if (!r) return null;
+    if (!r) {
+      // Doc 30 N3 (review 108 N3-15): an imported listing the upkeep hid (its tour gone 14 days) sends its own visitors
+      // to its category page, temporarily, instead of "not found".
+      const hidden = await prisma.product.findUnique({ where: { slug }, select: { status: true, deletedAt: true, categorySlug: true, listingLink: { select: { hiddenAt: true, deactivatedAt: true } } } });
+      if (hidden && !hidden.deletedAt && hidden.status !== "published" && hidden.listingLink?.hiddenAt && !hidden.listingLink.deactivatedAt) return { to: `/categories/${hidden.categorySlug}`, permanent: false };
+      return null;
+    }
     if (!r.oldProduct.deletedAt && r.oldProduct.status === "published") return null;
     const t = r.targetProduct;
     const indexable = !t.listingLink || (!t.listingLink.deactivatedAt && !t.listingLink.noindex && t.listingLink.reviewedAt !== null);
@@ -46,7 +54,7 @@ export async function lookupRetiredSlug(slug: string): Promise<RetiredSlugTarget
   }
 }
 
-const cachedLookup = unstable_cache(lookupRetiredSlug, ["retired-slug-v1"], { tags: [CATALOG_TAG], revalidate: 60 });
+const cachedLookup = unstable_cache(lookupRetiredSlug, ["retired-slug-v2"], { tags: [CATALOG_TAG], revalidate: 60 });
 
 /** The cached lookup, reached only by well-formed slugs. */
 export async function resolveRetiredSlug(slug: string): Promise<RetiredSlugTarget> {

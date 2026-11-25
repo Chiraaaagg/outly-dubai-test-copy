@@ -21,7 +21,7 @@ import { configuredPhotoCopier } from "../imports/photo-store";
 import type { UpkeepDigestContext } from "../notifications/templates";
 import { loadCapabilityGate } from "../suppliers/capability-gate";
 import type { TourContentFaq, TourContentItineraryStep, TourContentPhoto } from "../suppliers/traveldesk/traveldesk.content";
-import { buildListingDraft, EDITORIAL_FIELDS, type BuildContent } from "../suppliers/traveldesk/traveldesk.listing-build";
+import { buildListingDraft, EDITORIAL_FIELDS, personLocksBetween, type BuildContent } from "../suppliers/traveldesk/traveldesk.listing-build";
 import { inquiryListing, instantListing, type PlanOffer, type PlanTourContent } from "../suppliers/traveldesk/traveldesk.listing-plan";
 import { approvedSlotHoursHold, offerTermsHash, offerTermsOf, parseStoredOffer, type OfferTerms, type StoredOffer } from "../suppliers/traveldesk/traveldesk.offer-terms";
 import {
@@ -32,6 +32,8 @@ import {
   inputOf,
   logValue,
   mergeDocument,
+  applyPriceLocks,
+  photosHashOf,
   PRICE_AUTO_LIMIT_BPS,
   priceMoveBps,
   priceTable,
@@ -98,8 +100,10 @@ export const UPKEEP_ACTION = "traveldesk_listing.upkeep";
 const DIGEST_EVENT = "TRAVELDESK_UPKEEP_DIGEST";
 /** Photo copies per run (network); the rest wait for the next run. */
 const MAX_PHOTO_TOURS_PER_RUN = 3;
-/** A photo copy starts only with at least this much time left. */
-const PHOTO_MIN_REMAINING_MS = 30_000;
+/** A photo copy starts only with at least this much time left before the deadline (review 108 N3-06)... */
+const PHOTO_MIN_REMAINING_MS = 60_000;
+/** ...and stops before the next photo once less than this is left (one fetch has a 15 s limit). */
+const PHOTO_STOP_REMAINING_MS = 20_000;
 /** Change rows per digest; the rest go in the next one. */
 const DIGEST_MAX_ROWS = 2_000;
 const REASON = "TravelDesk daily upkeep (doc 30 N3)";
@@ -144,7 +148,9 @@ export function ownerDigestRecipient(raw: string | undefined = env().OWNER_ALERT
 
 const sha = (v: unknown) => createHash("sha256").update(JSON.stringify(v ?? null)).digest("hex");
 const photoList = (v: unknown): TourContentPhoto[] => (Array.isArray(v) ? (v as TourContentPhoto[]) : []);
-const photosHashOf = (v: unknown) => sha(photoList(v).map((p) => (p as { src?: unknown }).src ?? p));
+/** JSON with object keys sorted at every level (key order of stored JSONB is not the code's). */
+const canonical = (v: unknown): string =>
+  JSON.stringify(v ?? null, (_k, x) => (x && typeof x === "object" && !Array.isArray(x) ? Object.fromEntries(Object.entries(x as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) : x));
 const asJson = (v: unknown) => (v === undefined ? Prisma.JsonNull : (JSON.parse(JSON.stringify(v)) as Prisma.InputJsonValue));
 
 /* ------------------------------------------------------------------ shared run data */
@@ -191,7 +197,7 @@ interface RunData {
   /** Offers linked by any active link of the environment. */
   linkedOffers: Set<string>;
   /** Active links per tour. */
-  linksPerTour: Map<string, { id: string; createdAt: Date }[]>;
+  linksPerTour: Map<string, { id: string; createdAt: Date; adopted: boolean }[]>;
 }
 
 async function listingRule(): Promise<{ version: number } | null> {
@@ -204,7 +210,7 @@ async function loadRunData(code: string, environment: SupplierEnvironment, now: 
   if (!supplier) return null;
   const links = await prisma.supplierListingLink.findMany({
     where: { supplierId: supplier.id, environment, deactivatedAt: null },
-    select: { id: true, tourExternalId: true, offerExternalIds: true, createdAt: true, upkeepAt: true },
+    select: { id: true, tourExternalId: true, offerExternalIds: true, createdAt: true, upkeepAt: true, adopted: true },
     orderBy: [{ upkeepAt: { sort: "asc", nulls: "first" } }, { id: "asc" }],
   });
   const tours = [...new Set(links.map((l) => l.tourExternalId))];
@@ -223,8 +229,8 @@ async function loadRunData(code: string, environment: SupplierEnvironment, now: 
     lastCompleteSync(code, environment),
   ]);
   const gate = await loadCapabilityGate(prisma, { adapter: supplier.adapter, supplierId: supplier.id, environment, offerExternalIds: items.filter((i) => i.kind === "offer").map((i) => i.externalId) });
-  const linksPerTour = new Map<string, { id: string; createdAt: Date }[]>();
-  for (const l of links) linksPerTour.set(l.tourExternalId, [...(linksPerTour.get(l.tourExternalId) ?? []), { id: l.id, createdAt: l.createdAt }]);
+  const linksPerTour = new Map<string, { id: string; createdAt: Date; adopted: boolean }[]>();
+  for (const l of links) linksPerTour.set(l.tourExternalId, [...(linksPerTour.get(l.tourExternalId) ?? []), { id: l.id, createdAt: l.createdAt, adopted: l.adopted }]);
   return {
     links,
     data: {
@@ -291,8 +297,8 @@ async function writeChanges(tx: Tx, base: ChangeBase, rows: ChangeRow[], now: Da
 interface OneOptions {
   actor: Actor;
   allowPriceJump?: boolean;
-  /** Resolve this review row (a person approved the price move) in the same transaction. */
-  resolve?: { changeId: string; note: string };
+  /** Resolve this review row (a person approved the price move) in the same transaction; `prices` are the ones the person saw. */
+  resolve?: { changeId: string; note: string; prices: unknown };
   runId: string | null;
   photos: PhotoCopyDeps | null;
   photoBudget: { left: number; deadlineMs: number | undefined };
@@ -302,6 +308,8 @@ interface OneOptions {
 
 interface OneResult {
   outcome: "changed" | "unchanged" | "skipped";
+  /** Whether the copied photos were written to the page (else their files are removed). */
+  imagesUsed?: boolean;
   reason?: string;
   reapproved: number;
   reviews: number;
@@ -322,20 +330,26 @@ async function maybeCopyPhotos(
   doc: ActivityInput,
   opts: OneOptions,
   now: number,
-): Promise<{ images: string[] | null; hash: string | null }> {
-  if (!content) return { images: null, hash: link.photosHash };
+): Promise<{ images: string[] | null; hash: string | null; keys: string[] }> {
+  const none = (hash: string | null) => ({ images: null, hash, keys: [] as string[] });
+  if (!content) return none(link.photosHash);
   const hash = photosHashOf(content.photos);
   // An N1 listing's copies were made from the photos stored at import: record that list as the starting point.
-  if (link.photosHash === null || link.photosHash === hash) return { images: null, hash };
-  if (!opts.photos || opts.photoBudget.left <= 0) return { images: null, hash: link.photosHash };
-  if (opts.photoBudget.deadlineMs !== undefined && opts.photoBudget.deadlineMs - now < PHOTO_MIN_REMAINING_MS) return { images: null, hash: link.photosHash };
+  // No hash yet: still placeholders (the importer's photo copy records the list it copied, review 108 N3-07), or a
+  // link from before N3 whose copies were made from the photos stored at import.
+  if (link.photosHash === null) return none(doc.images.every((i) => i.startsWith("img:")) ? null : hash);
+  if (link.photosHash === hash) return none(hash);
+  if (!opts.photos || opts.photoBudget.left <= 0) return none(link.photosHash);
+  const deadline = opts.photoBudget.deadlineMs;
+  if (deadline !== undefined && deadline - now < PHOTO_MIN_REMAINING_MS) return none(link.photosHash);
   const baseline = await prisma.productVersion.findUnique({ where: { productId_version: { productId: link.productId, version: link.importVersion } }, select: { content: true } });
   const baseImages = (baseline?.content as { images?: unknown } | null)?.images;
-  if (link.lockedFields.includes("images") || JSON.stringify(baseImages ?? null) !== JSON.stringify(doc.images)) return { images: null, hash };
+  if (link.lockedFields.includes("images") || JSON.stringify(baseImages ?? null) !== JSON.stringify(doc.images)) return none(hash);
   opts.photoBudget.left -= 1;
-  const r = await copyTourPhotos(photoList(content.photos), opts.photos);
-  if (!r.urls.length) return { images: null, hash: link.photosHash };
-  return { images: r.urls.slice(0, 12), hash };
+  const stopAt = deadline === undefined ? undefined : () => deadline - opts.clock() < PHOTO_STOP_REMAINING_MS;
+  const r = await copyTourPhotos(photoList(content.photos), { ...opts.photos, stopAt });
+  if (!r.urls.length) return none(link.photosHash);
+  return { images: r.urls.slice(0, 12), hash, keys: r.keys };
 }
 
 async function upkeepOne(data: RunData, linkId: string, opts: OneOptions): Promise<OneResult> {
@@ -349,7 +363,31 @@ async function upkeepOne(data: RunData, linkId: string, opts: OneOptions): Promi
   if (!parsed.success) return { ...base, outcome: "skipped", reason: "invalid_document" };
   const content = data.content.get(pre.tourExternalId);
   const photo = await maybeCopyPhotos(pre, content, inputOf(parsed.data), opts, opts.clock());
+  // Review 108 N3-16: copied files nobody references are removed (skipped listing, failed transaction).
+  const dropPhotos = async () => {
+    if (photo.keys.length && opts.photos?.store.delete) await Promise.all(photo.keys.map((k) => opts.photos!.store.delete!(k).catch(() => {})));
+  };
+  let result: OneResult;
+  try {
+    result = await upkeepTx(data, linkId, pre, content, photo, opts, base);
+  } catch (error) {
+    await dropPhotos();
+    throw error;
+  }
+  if (!result.imagesUsed) await dropPhotos();
+  return result;
+}
 
+async function upkeepTx(
+  data: RunData,
+  linkId: string,
+  pre: { productId: string; product: { version: number } },
+  content: ContentRow | undefined,
+  photo: { images: string[] | null; hash: string | null },
+  opts: OneOptions,
+  base: OneResult,
+): Promise<OneResult> {
+  const { now, environment } = data;
   return prisma.$transaction(async (tx) => {
     const link = await tx.supplierListingLink.findUnique({ where: { id: linkId } });
     const product = await tx.product.findUnique({ where: { id: pre.productId } });
@@ -366,10 +404,29 @@ async function upkeepOne(data: RunData, linkId: string, opts: OneOptions): Promi
       const o = offerRow(id);
       return !o || Boolean(o.removedAt) || o.parentExternalId !== link.tourExternalId;
     };
-    const gone = !tourLive || link.offerExternalIds.every(offerGone);
+    // Review 108 N3-09: an option the upkeep sold out (still sold out on the page) sells nothing either.
+    const systemSoldOut = (id: string) => link.soldOutOfferIds.includes(id) && current.variants.find((v) => v.id === `td-${id}`)?.soldOut === true;
+    const gone = !tourLive || link.offerExternalIds.every((id) => offerGone(id) || systemSoldOut(id));
+    // Review 108 N3-04 (b): an approval must reach the price step, or nothing was applied.
+    const refuseResolve = () => {
+      if (opts.resolve) throw Errors.conflict("Nothing was applied: the listing is hidden or its tour is gone. The review stays open");
+    };
+
+    // Review 108 N3-05: a hidden listing a person published again is upkept again (its state is cleared, audited).
+    let resumed = false;
+    if (link.hiddenAt && product.status === "published") {
+      await tx.supplierListingLink.update({ where: { id: link.id }, data: { hiddenAt: null, unavailableSince: null } });
+      await tx.supplierListingChange.updateMany({ where: { linkId, kind: "returned_after_hidden", status: "review" }, data: { status: "resolved", resolution: "superseded", resolvedAt: now, updatedAt: now } });
+      await audit(opts.actor, UPKEEP_ACTION, { type: "product", id: product.id }, { before: { hiddenAt: link.hiddenAt.toISOString() }, after: { linkId, step: "resumed", runId: opts.runId } }, tx);
+      changes.push({ kind: "resumed", status: "applied", before: { hiddenAt: link.hiddenAt.toISOString() }, after: { status: "published" } });
+      link.hiddenAt = null;
+      link.unavailableSince = null;
+      resumed = true;
+    }
 
     // D19: a hidden listing stays hidden; its tour coming back is for a person.
     if (link.hiddenAt) {
+      refuseResolve();
       if (!gone) {
         const reviews = await writeChanges(tx, cb, [{ kind: "returned_after_hidden", status: "review", after: { tour: link.tourExternalId } }], now);
         if (reviews) await tx.supplierListingLink.update({ where: { id: link.id }, data: { upkeepAt: now } });
@@ -379,7 +436,9 @@ async function upkeepOne(data: RunData, linkId: string, opts: OneOptions): Promi
       return base;
     }
     const step = unavailabilityStep(link, gone, now);
+    if (step === "mark" || step === "hide" || gone) refuseResolve();
     if (step === "mark") {
+      if (changes.length) await writeChanges(tx, cb, changes, now);
       await tx.supplierListingLink.update({ where: { id: link.id }, data: { unavailableSince: now, upkeepAt: now } });
       await writeChanges(tx, cb, [{ kind: "unavailable", status: "applied", after: { since: now.toISOString(), tourRemoved: !tourLive } }], now);
       await audit(opts.actor, UPKEEP_ACTION, { type: "product", id: product.id }, { after: { linkId, step: "unavailable", runId: opts.runId } }, tx);
@@ -404,11 +463,13 @@ async function upkeepOne(data: RunData, linkId: string, opts: OneOptions): Promi
       await tx.supplierListingLink.update({ where: { id: link.id }, data: { upkeepAt: now } });
       return base;
     }
-    let stateChanged = false;
+    let stateChanged = resumed;
     if (step === "clear") {
       changes.push({ kind: "available_again", status: "applied", before: { since: link.unavailableSince?.toISOString() } });
       stateChanged = true;
     }
+
+    const baseline = ((await tx.productVersion.findUnique({ where: { productId_version: { productId: product.id, version: link.importVersion } }, select: { content: true } }))?.content as Record<string, unknown> | null) ?? null;
 
     // Options.
     const mappings = await tx.productSupplierMapping.findMany({ where: { productId: product.id, supplierId: data.supplier.id, environment } });
@@ -483,7 +544,17 @@ async function upkeepOne(data: RunData, linkId: string, opts: OneOptions): Promi
 
     // D18: price.
     let priceMode: PriceMode = "keep";
+    const lockedNow = new Set([...link.lockedFields, ...(baseline ? personLocksBetween(baseline, current as unknown as Record<string, unknown>) : [])]);
     if (draft) {
+      // §3.7 (review 108 N3-14): a price a person raised is never lowered; when no consistent page price fits, hold.
+      const lockedDraft = applyPriceLocks(current, draft, lockedNow, kept);
+      if (!lockedDraft) {
+        priceMode = canHoldPrices(current, draft, kept) ? "hold" : "keep";
+        changes.push({ kind: "reprice_blocked", field: "price_lock", status: "review", after: { reason: "price_raised_by_a_person_does_not_fit_the_rule_band" } });
+      }
+      draft = lockedDraft ?? draft;
+    }
+    if (draft && !changes.some((c) => c.field === "price_lock")) {
       const move = priceMoveBps(current, draft, kept);
       const auto = data.rule !== null && (move <= PRICE_AUTO_LIMIT_BPS || opts.allowPriceJump === true);
       priceMode = auto ? "apply" : canHoldPrices(current, draft, kept) ? "hold" : "keep";
@@ -494,12 +565,22 @@ async function upkeepOne(data: RunData, linkId: string, opts: OneOptions): Promi
         changes.push({ kind: "price_jump", status: "review", before: Object.fromEntries([...kept].map((k) => [k, before[k]])), after: { prices: Object.fromEntries([...kept].map((k) => [k, after[k]])), moveBps: Number.isFinite(move) ? move : null } });
       }
     }
-    if (opts.resolve && priceMode !== "apply") throw Errors.conflict("This price change cannot be applied now (no draft or no recorded listing rule); the listing keeps its prices");
+    if (opts.resolve) {
+      if (priceMode !== "apply" || !draft) throw Errors.conflict("This price change cannot be applied now (no draft, no recorded listing rule, or a price a person raised); the listing keeps its prices");
+      // Review 108 N3-04 (a): only the prices the person reviewed.
+      const table = priceTable(draft);
+      const fresh = Object.fromEntries([...kept].map((k) => [k, table[k]]));
+      const seen = (opts.resolve.prices as Record<string, unknown> | null) ?? {};
+      if (canonical(fresh) !== canonical(seen)) {
+        throw Errors.conflict("The prices moved since this review was raised; reload the log and review the new figures");
+      }
+    }
 
     const textChanged = Boolean(content && content.contentHash !== link.contentHash);
     const merged = mergeDocument({
       current,
-      baseline: ((await tx.productVersion.findUnique({ where: { productId_version: { productId: product.id, version: link.importVersion } }, select: { content: true } }))?.content as Record<string, unknown> | null) ?? null,
+      baseline,
+      prevTextHashes: (link.supplierTextHashes as Record<string, string> | null) ?? {},
       draft,
       lockedFields: link.lockedFields,
       textChanged,
@@ -554,7 +635,8 @@ async function upkeepOne(data: RunData, linkId: string, opts: OneOptions): Promi
     }
 
     // New offers on the tour are never added by themselves (K9): listed once, on the tour's first listing.
-    const first = data.linksPerTour.get(link.tourExternalId)?.slice().sort((a, b) => (a.id < b.id ? -1 : 1))[0];
+    // The tour's first listing the upkeep processes (adopted ones are skipped; review 108 N3-08).
+    const first = data.linksPerTour.get(link.tourExternalId)?.filter((l) => !l.adopted).sort((a, b) => (a.id < b.id ? -1 : 1))[0];
     if (first?.id === link.id) {
       for (const o of data.items.values()) {
         if (o.kind !== "offer" || o.parentExternalId !== link.tourExternalId || o.removedAt || data.linkedOffers.has(o.externalId)) continue;
@@ -569,7 +651,7 @@ async function upkeepOne(data: RunData, linkId: string, opts: OneOptions): Promi
     if (docChanged) {
       // N1's rule: a system write passes the editorial fields it wrote and moves the lock baseline to its own version.
       // The upkeep never writes a locked field, so a person's edits stay locked and nothing it wrote is locked.
-      const systemFields = changedFields(current, merged.next).map((c) => c.field).filter((f) => (EDITORIAL_FIELDS as readonly string[]).includes(f));
+      const systemFields = personLocksBetween(current as unknown as Record<string, unknown>, merged.next as unknown as Record<string, unknown>);
       const row = await activityService.update(opts.actor, product.id, merged.next, { tx, expectedVersion: product.version, reason: opts.resolve ? `${REASON}: price change approved` : REASON, locks: { systemFields, rebase: true } });
       version = row.version;
       for (const c of changedFields(current, merged.next)) changes.push({ kind: c.kind, field: c.field, status: "applied", before: logValue(c.field, current), after: logValue(c.field, merged.next) });
@@ -583,6 +665,7 @@ async function upkeepOne(data: RunData, linkId: string, opts: OneOptions): Promi
       soldOutOfferIds: [...soldOutIds].slice(0, 12),
       approvedTerms: asJson(approvedTerms) as Prisma.InputJsonValue,
       photosHash: photo.hash,
+      ...(merged.textHashes ? { supplierTextHashes: merged.textHashes } : {}),
       ...(step === "clear" ? { unavailableSince: null } : {}),
       ...(draft && content ? { contentHash: content.contentHash } : {}),
       ...(factsApplied && link.kind === "instant" && cls.kept.length ? { classKey: cls.signature.classKey, startMinutes: cls.signature.startMinutes } : {}),
@@ -590,13 +673,19 @@ async function upkeepOne(data: RunData, linkId: string, opts: OneOptions): Promi
     };
     await tx.supplierListingLink.update({ where: { id: link.id }, data: linkData });
     const reviews = await writeChanges(tx, cb, changes, now);
+    // Review 108 N3-15: price reviews whose condition went away this run are closed as superseded.
+    if (draft) {
+      const raised = new Set(changes.filter((c) => c.status === "review").map((c) => `${c.kind}|${c.field ?? ""}`));
+      const stale = (await tx.supplierListingChange.findMany({ where: { linkId, status: "review", kind: { in: ["price_jump", "reprice_blocked"] } }, select: { id: true, kind: true, field: true } })).filter((r) => !raised.has(`${r.kind}|${r.field}`) && r.id !== opts.resolve?.changeId);
+      if (stale.length) await tx.supplierListingChange.updateMany({ where: { id: { in: stale.map((r) => r.id) } }, data: { status: "resolved", resolution: "superseded", resolvedAt: now, updatedAt: now } });
+    }
     if (opts.resolve) {
       const done = await tx.supplierListingChange.updateMany({ where: { id: opts.resolve.changeId, status: "review" }, data: { status: "resolved", resolution: "applied", resolvedAt: now, resolvedBy: opts.actor.id ?? null, updatedAt: now } });
       if (done.count !== 1) throw Errors.conflict("This review was already resolved");
     }
     const any = docChanged || reapproved > 0 || deactivate.length > 0 || stateChanged || changes.some((c) => c.status === "applied");
     if (any) await audit(opts.actor, UPKEEP_ACTION, { type: "product", id: product.id }, { after: { linkId, runId: opts.runId, version, reapproved, soldOut: [...soldOut], priceMode, kinds: [...new Set(changes.map((c) => c.kind))] } }, tx);
-    return { ...base, outcome: any ? "changed" : "unchanged", reapproved, reviews } as OneResult;
+    return { ...base, outcome: any ? "changed" : "unchanged", reapproved, reviews, imagesUsed: Boolean(photo.images && docChanged && JSON.stringify(merged.next.images) === JSON.stringify(photo.images)) } as OneResult;
   }, { maxWait: 10_000, timeout: 60_000 });
 }
 
@@ -659,9 +748,14 @@ async function queueDigest(supplier: { id: string; code: string }, environment: 
 
 async function purgeRemovedTourContent(supplierId: string, environment: SupplierEnvironment, now: Date): Promise<number> {
   const cutoff = new Date(now.getTime() - TOUR_CONTENT_KEEP_AFTER_REMOVAL_MS);
-  const gone = await prisma.supplierCatalogueItem.findMany({ where: { supplierId, environment, kind: "tour", removedAt: { lt: cutoff }, lastSeenAt: { lt: cutoff } }, select: { externalId: true }, take: 500 });
-  if (!gone.length) return 0;
-  return (await prisma.supplierTourContent.deleteMany({ where: { supplierId, environment, tourExternalId: { in: gone.map((g) => g.externalId) } } })).count;
+  // Only tours that still have a content row, oldest removal first (review 108 N3-12): a backlog drains run by run.
+  return prisma.$executeRaw`
+    DELETE FROM "supplier_tour_content" WHERE "id" IN (
+      SELECT c."id" FROM "supplier_tour_content" c
+      JOIN "supplier_catalogue_items" i ON i."supplier_id" = c."supplier_id" AND i."environment" = c."environment" AND i."kind" = 'tour' AND i."external_id" = c."tour_external_id"
+      WHERE c."supplier_id" = ${supplierId}::uuid AND c."environment" = ${environment}::"supplier_environment"
+        AND i."removed_at" < ${cutoff} AND i."last_seen_at" < ${cutoff}
+      ORDER BY i."removed_at" ASC LIMIT 500)`;
 }
 
 /* ------------------------------------------------------------------ service */
@@ -700,6 +794,8 @@ export const traveldeskUpkeepService = {
         break;
       }
       try {
+        // Claimed before the work (review 108 N3-06): a listing the platform kills mid-way is not first in line forever.
+        await prisma.supplierListingLink.updateMany({ where: { id: l.id }, data: { upkeepAt: now } });
         const r = await upkeepOne(data, l.id, one);
         result.processed += 1;
         if (r.outcome === "skipped") {
@@ -752,18 +848,20 @@ export const traveldeskUpkeepService = {
   /**
    * A person approves a price move above 20% (D18): the listing is brought up
    * to date now with the move allowed, and the review is resolved in the same
-   * transaction. Never below the floor: the draft builder refuses such a price.
+   * transaction, only if the prices are still the ones the review showed.
+   * Never below the floor: the draft builder refuses such a price.
    */
   async approvePriceChange(actor: Actor, changeId: string, note: string) {
     requirePermission(actor, "products.edit");
-    requirePermission(actor, "products.publish");
+    // Review 108 N3-20: price decisions are `pricing.edit` (the catalogue's pricing permission).
+    requirePermission(actor, "pricing.edit");
     if (!actor.id) throw Errors.unauthorized();
     if (note.trim().length < 8) throw Errors.validation({ note: "Give a reason of at least 8 characters — it goes in the audit log" });
     const change = await prisma.supplierListingChange.findUnique({ where: { id: changeId }, include: { link: { select: { supplier: { select: { code: true } } } } } });
     if (!change || change.kind !== "price_jump" || change.status !== "review") throw Errors.notFound("Open price review");
     const loaded = await loadRunData(change.link.supplier.code, change.environment, new Date());
     if (!loaded) throw Errors.conflict("The TravelDesk supplier is missing");
-    const r = await upkeepOne(loaded.data, change.linkId, { actor, allowPriceJump: true, resolve: { changeId, note: note.trim() }, runId: null, photos: null, photoBudget: { left: 0, deadlineMs: undefined }, clock: Date.now });
+    const r = await upkeepOne(loaded.data, change.linkId, { actor, allowPriceJump: true, resolve: { changeId, note: note.trim(), prices: (change.after as { prices?: unknown } | null)?.prices ?? null }, runId: null, photos: null, photoBudget: { left: 0, deadlineMs: undefined }, clock: Date.now });
     if (r.outcome === "skipped") throw Errors.conflict(`The listing could not be updated now (${r.reason}); try again`);
     revalidateCatalog();
     await readinessService.reevaluateMany([r.productId], "sync");

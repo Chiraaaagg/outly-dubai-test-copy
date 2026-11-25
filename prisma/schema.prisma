@@ -725,8 +725,10 @@ model SupplierListingLink {
   soldOutOfferIds    String[]            @default([]) @map("sold_out_offer_ids")
   /// Doc 30 N3: sha256 of the supplier photo list the listing's copies were made from.
   photosHash         String?             @map("photos_hash")
-  /// Doc 30 N3: the last upkeep run that processed this listing (oldest first next run).
+  /// Doc 30 N3: the last upkeep run that started on this listing (oldest first next run).
   upkeepAt           DateTime?           @map("upkeep_at") @db.Timestamptz(6)
+  /// Doc 30 N3 (review 108 N3-10): per editorial field, sha256 of the last supplier-derived value.
+  supplierTextHashes Json                @default("{}") @map("supplier_text_hashes")
   createdAt          DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt          DateTime            @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
   product            Product             @relation("ListingLinkProduct", fields: [productId], references: [id], onDelete: Restrict)

@@ -19,9 +19,14 @@
 --        photos_hash        hash of the supplier photo list the listing's
 --                           copies were made from, so photos are copied again
 --                           only when the supplier's list changed;
---        upkeep_at          the last upkeep run that processed the listing
+--        upkeep_at          the last upkeep run that started on the listing
 --                           (oldest first, so a run cut by its deadline is
---                           continued by the next one).
+--                           continued by the next one; set before the work,
+--                           so a listing that was killed is not first forever);
+--        supplier_text_hashes per editorial field, the hash of the last
+--                           supplier-derived value, so "supplier text changed"
+--                           beside a locked field is reported only when the
+--                           supplier's own text for that field moved.
 --   2. New table `supplier_listing_changes`: one row per change the upkeep
 --      applied, per item it left for a person (review) and per locked field
 --      whose supplier text changed (info). The admin "supplier changes" log
@@ -39,14 +44,16 @@ ALTER TABLE "supplier_listing_links"
   ADD COLUMN "approved_terms"     JSONB   NOT NULL DEFAULT '{}'::jsonb,
   ADD COLUMN "sold_out_offer_ids" TEXT[]  NOT NULL DEFAULT ARRAY[]::TEXT[],
   ADD COLUMN "photos_hash"        TEXT,
-  ADD COLUMN "upkeep_at"          TIMESTAMPTZ(6);
+  ADD COLUMN "upkeep_at"          TIMESTAMPTZ(6),
+  ADD COLUMN "supplier_text_hashes" JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 -- Constant checks on new, nullable or defaulted columns: no row can fail them, so they are added valid.
 ALTER TABLE "supplier_listing_links"
   ADD CONSTRAINT "sll_hidden_check" CHECK ("hidden_at" IS NULL OR ("unavailable_since" IS NOT NULL AND "hidden_at" >= "unavailable_since")),
   ADD CONSTRAINT "sll_approved_terms_check" CHECK (jsonb_typeof("approved_terms") = 'object' AND pg_column_size("approved_terms") <= 65536),
   ADD CONSTRAINT "sll_sold_out_check" CHECK (cardinality("sold_out_offer_ids") <= 12),
-  ADD CONSTRAINT "sll_photos_hash_check" CHECK ("photos_hash" IS NULL OR "photos_hash" ~ '^[0-9a-f]{64}$');
+  ADD CONSTRAINT "sll_photos_hash_check" CHECK ("photos_hash" IS NULL OR "photos_hash" ~ '^[0-9a-f]{64}$'),
+  ADD CONSTRAINT "sll_supplier_text_hashes_check" CHECK (jsonb_typeof("supplier_text_hashes") = 'object' AND pg_column_size("supplier_text_hashes") <= 8192);
 
 CREATE INDEX "sll_upkeep_idx" ON "supplier_listing_links" ("supplier_id", "environment", "upkeep_at")
   WHERE "deactivated_at" IS NULL;
@@ -74,7 +81,7 @@ CREATE TABLE "supplier_listing_changes" (
   CONSTRAINT "slc_kind_check" CHECK ("kind" IN (
     'text', 'fact', 'price', 'photos', 'terms', 'offer_removed', 'unavailable', 'available_again', 'hidden',
     'price_jump', 'reprice_blocked', 'diverged', 'never_instant', 'new_offer', 'offer_revived', 'returned_after_hidden',
-    'locked_text_changed'
+    'locked_text_changed', 'resumed'
   )),
   CONSTRAINT "slc_status_check" CHECK ("status" IN ('applied', 'review', 'resolved', 'info')),
   CONSTRAINT "slc_field_check" CHECK (char_length("field") <= 80),
@@ -84,7 +91,7 @@ CREATE TABLE "supplier_listing_changes" (
   ),
   CONSTRAINT "slc_resolved_check" CHECK (
     ("status" = 'resolved') = ("resolved_at" IS NOT NULL)
-    AND ("resolved_at" IS NULL OR "resolution" IN ('applied', 'dismissed'))
+    AND ("resolved_at" IS NULL OR "resolution" IN ('applied', 'dismissed', 'superseded'))
     AND ("resolved_at" IS NOT NULL OR ("resolution" IS NULL AND "resolved_by" IS NULL))
   ),
   CONSTRAINT "slc_digest_pair_check" CHECK (("digested_at" IS NULL) = ("digest_notification_id" IS NULL)),

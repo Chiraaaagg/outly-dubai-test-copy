@@ -17,7 +17,8 @@ import { configuredPhotoCopier } from "../imports/photo-store";
 import type { TourContentFaq, TourContentItineraryStep, TourContentPhoto } from "../suppliers/traveldesk/traveldesk.content";
 import { buildListingDraft, EDITORIAL_FIELDS, type BuildContent, type PendingField } from "../suppliers/traveldesk/traveldesk.listing-build";
 import { PLAN_STEPS, type PlannedListing, type PlanStepId } from "../suppliers/traveldesk/traveldesk.listing-plan";
-import { offerTermsHash, parseStoredOffer, type StoredOffer } from "../suppliers/traveldesk/traveldesk.offer-terms";
+import { offerTermsHash, offerTermsOf, parseStoredOffer, type StoredOffer } from "../suppliers/traveldesk/traveldesk.offer-terms";
+import { photosHashOf } from "../suppliers/traveldesk/traveldesk.upkeep";
 import { categoryFor } from "../suppliers/traveldesk/traveldesk.text-rules";
 import { productLifecycle, activityService } from "./activity.service";
 import { readinessService } from "./readiness.service";
@@ -170,6 +171,11 @@ export const traveldeskImportService = {
     const code = opts.supplierCode ?? TRAVELDESK_SUPPLIER_CODE;
     const supplier = await prisma.supplier.findUnique({ where: { code } });
     if (!supplier) throw Errors.conflict("Run a catalogue sync first: the TravelDesk supplier has no catalogue yet");
+    // The priced plan and the hashes stored beside it must describe one catalogue state (review 106 nit): the
+    // payload hashes are read before the report and compared after it; a sync in between refuses the preview.
+    const hashesBefore = new Map(
+      (await prisma.supplierCatalogueItem.findMany({ where: { supplierId: supplier.id, environment, removedAt: null }, select: { kind: true, externalId: true, payloadHash: true } })).map((r) => [`${r.kind}:${r.externalId}`, r.payloadHash]),
+    );
     const report = await traveldeskDryRunService.report(actor, environment, { supplierCode: code, now: opts.now });
     const planned = report.listings.filter((l) => l.step === step);
     if (planned.length > MAX_LISTINGS_PER_IMPORT) throw Errors.conflict(`Step ${step} plans ${planned.length} listings; at most ${MAX_LISTINGS_PER_IMPORT} per run`);
@@ -183,11 +189,13 @@ export const traveldeskImportService = {
         select: { tourExternalId: true, name: true, salesDescription: true, terms: true, videoUrl: true, faq: true, itinerary: true, photos: true, contentHash: true },
       }),
       prisma.supplierCatalogueItem.findMany({ where: { supplierId: supplier.id, environment, kind: "offer", externalId: { in: offerIds }, removedAt: null }, select: { externalId: true, parentExternalId: true, payload: true, payloadHash: true } }),
-      prisma.supplierCatalogueItem.findMany({ where: { supplierId: supplier.id, environment, kind: "tour", externalId: { in: tourIds }, removedAt: null }, select: { externalId: true, payload: true } }),
-      prisma.supplierListingLink.findMany({ where: { supplierId: supplier.id, environment, deactivatedAt: null }, select: { tourExternalId: true, kind: true, arrival: true, route: true, fulfilment: true, splitNumber: true, product: { select: { slug: true } } } }),
+      prisma.supplierCatalogueItem.findMany({ where: { supplierId: supplier.id, environment, kind: "tour", externalId: { in: tourIds }, removedAt: null }, select: { externalId: true, payload: true, payloadHash: true } }),
+      prisma.supplierListingLink.findMany({ where: { supplierId: supplier.id, environment, deactivatedAt: null }, select: { tourExternalId: true, kind: true, arrival: true, route: true, fulfilment: true, splitNumber: true, offerExternalIds: true, product: { select: { slug: true } } } }),
       prisma.category.findMany({ where: { deletedAt: null }, select: { slug: true } }),
       prisma.product.findMany({ select: { slug: true } }),
     ]);
+    const moved = [...offerRows.map((o) => ["offer", o.externalId, o.payloadHash] as const), ...tourRows.map((t) => ["tour", t.externalId, t.payloadHash] as const)].filter(([k, id, h]) => hashesBefore.get(`${k}:${id}`) !== h);
+    if (moved.length || offerRows.length !== offerIds.length) throw Errors.conflict("The TravelDesk catalogue changed while this preview was built — preview again");
     const content = new Map(contents.map((c) => [Number(c.tourExternalId), c]));
     const stored = new Map<number, StoredOffer>();
     const tourPayload = new Map(tourRows.map((t) => [t.externalId, t.payload]));
@@ -204,7 +212,13 @@ export const traveldeskImportService = {
         return [Number(t.externalId), cats.map((c) => c.name ?? "").filter(Boolean)];
       }),
     );
-    const existing = new Set(links.map(identityKey));
+    // RR-01: a link's split number is fixed at import. Planned listings are matched to the group's links by their
+    // offers, never by position (review 106 N1-23): split numbers are recomputed from the catalogue on every preview.
+    const groupOf = (i: { tourExternalId: string; kind: string; arrival: string; route: string; fulfilment: string }) => `${i.tourExternalId}|${i.kind}|${i.arrival}|${i.route}|${i.fulfilment}`;
+    const groupLinks = new Map<string, typeof links>();
+    for (const l of links) groupLinks.set(groupOf(l), [...(groupLinks.get(groupOf(l)) ?? []), l]);
+    const usedSplits = new Map<string, number>();
+    for (const l of links) usedSplits.set(groupOf(l), Math.max(usedSplits.get(groupOf(l)) ?? 0, l.splitNumber));
     const linkedSlugsByTour = new Map<number, string[]>();
     for (const l of links) linkedSlugsByTour.set(Number(l.tourExternalId), [...(linkedSlugsByTour.get(Number(l.tourExternalId)) ?? []), l.product.slug]);
     const known = new Set(categories.map((c) => c.slug));
@@ -243,6 +257,31 @@ export const traveldeskImportService = {
         offerHashes: Object.fromEntries(l.options.map((o) => [String(o.offerId), hashes.get(o.offerId) ?? null])),
         offerPayloadHashes: Object.fromEntries(l.options.map((o) => [String(o.offerId), payloadHashes.get(o.offerId) ?? ""])),
       };
+      const group = groupOf({ tourExternalId: String(l.tourId), ...identity });
+      const mine = new Set(optionIds.map(String));
+      const inGroup = groupLinks.get(group) ?? [];
+      const same = inGroup.find((x) => x.offerExternalIds.length === mine.size && x.offerExternalIds.every((o) => mine.has(o)));
+      if (same) {
+        identity.splitNumber = same.splitNumber;
+        rows.push({ ...base, action: "skip", ok: true, slug: same.product.slug, reasons: ["already_imported"] });
+        return;
+      }
+      const overlap = inGroup.find((x) => x.offerExternalIds.some((o) => mine.has(o)));
+      if (overlap) {
+        rows.push({ ...base, reasons: [`identity_shifted:${overlap.product.slug}`] });
+        return;
+      }
+      if (inGroup.length) {
+        if (l.kind === "inquiry") {
+          // One inquiry listing per group (D4); new never-instant offers join it by review (N3), not by a second page.
+          rows.push({ ...base, reasons: [`inquiry_listing_exists:${inGroup[0].product.slug}`] });
+          return;
+        }
+        // A new listing beside imported ones is numbered after the group's highest stored split.
+        const next = (usedSplits.get(group) ?? 0) + 1;
+        usedSplits.set(group, next);
+        identity.splitNumber = next;
+      }
       // RR-01: two planned listings never share an identity (review 106 N1-02); a duplicate is a plan bug, so it blocks.
       const idKey = identityKey({ tourExternalId: String(l.tourId), ...identity });
       if (seenIdentity.has(idKey)) {
@@ -250,10 +289,6 @@ export const traveldeskImportService = {
         return;
       }
       seenIdentity.add(idKey);
-      if (existing.has(idKey)) {
-        rows.push({ ...base, action: "skip", ok: true, reasons: ["already_imported"] });
-        return;
-      }
       // Adopt in place (§3.9): every option already linked, one to one, to one product.
       if (l.adoptProduct && linked.length === l.options.length) {
         rows.push({ ...base, action: "adopt", ok: true, slug: l.adoptProduct.slug, adoptProductId: l.adoptProduct.productId, options: l.options.map((o) => ({ variantId: `td-${o.offerId}`, offerId: o.offerId })) });
@@ -404,10 +439,14 @@ export const traveldeskImportService = {
           }
           const input = activityInputSchema.parse(r.input);
           const row = await activityService.create(actor, input, { status: "draft", reason, tx, supplierId: supplier.id });
+          // Doc 30 N3 (review 108 N3-07): the terms approved here, so the first automatic re-approval names each changed term.
+          const approvedTerms: Record<string, unknown> = {};
           for (const o of r.options) {
             const offer = offerRow.get(String(o.offerId))!;
             const tour = tourRow.get(tourId)!;
             const { mappingData, externalRef, approvedOfferHash, approvedSlotHours } = travelDeskMappingRow(offer, tour, environment);
+            const terms = offerTermsOf(offer.payload, tour.payload);
+            if (terms) approvedTerms[String(o.offerId)] = terms;
             const mappingId = uuidv7();
             const top = await tx.productSupplierMapping.aggregate({ where: { productId: row.id }, _max: { priority: true } });
             await tx.productSupplierMapping.create({ data: { id: mappingId, productId: row.id, supplierId: supplier.id, variantCode: o.variantId, priority: (top._max.priority ?? 0) + 1, ...mappingData } });
@@ -423,7 +462,7 @@ export const traveldeskImportService = {
               tx,
             );
           }
-          await tx.supplierListingLink.create({ data: { ...linkBase, productId: row.id, offerExternalIds: r.options.map((o) => String(o.offerId)), importVersion: 1, pendingFields: r.pendingFields } });
+          await tx.supplierListingLink.create({ data: { ...linkBase, productId: row.id, offerExternalIds: r.options.map((o) => String(o.offerId)), importVersion: 1, pendingFields: r.pendingFields, approvedTerms: approvedTerms as Prisma.InputJsonValue } });
           await tx.importBatchItem.create({ data: { id: uuidv7(), batchId, productId: row.id, action: "create", beforeVersion: null, afterVersion: 1, slug: row.slug } });
           created.push({ productId: row.id, slug: row.slug, linkId: linkBase.id });
         }
@@ -485,7 +524,8 @@ export const traveldeskImportService = {
             await tx.productVersion.create({ data: { id: uuidv7(), productId: p.id, version, content: next as unknown as Prisma.InputJsonValue, status: p.status, actorId: actor.id, reason } });
             await audit(actor, "activity.update", { type: "product", id: p.id }, { before: { version: p.version }, after: { version, photos: copied.urls.length, source: "traveldesk_photos" }, reason }, tx);
             const link = await tx.supplierListingLink.findUniqueOrThrow({ where: { id: l.id }, select: { pendingFields: true } });
-            await tx.supplierListingLink.update({ where: { id: l.id }, data: { pendingFields: link.pendingFields.filter((f) => f !== "images") } });
+            // Doc 30 N3 (review 108 N3-07): the photo list these copies came from; the upkeep copies again when it moves.
+            await tx.supplierListingLink.update({ where: { id: l.id }, data: { pendingFields: link.pendingFields.filter((f) => f !== "images"), photosHash: photosHashOf(content?.photos) } });
             await recordEditorialLocks(tx, p.id, { systemFields: ["images"], rebase: true });
             used = true;
             done.push(p.id);

@@ -1,6 +1,7 @@
+import { createHash } from "node:crypto";
 import type { Activity } from "@/lib/types";
 import { activityInputSchema, type ActivityInput } from "../../schemas/activity.schema";
-import { EDITORIAL_FIELDS, lockedFieldsBetween, NON_REFUNDABLE_POLICY } from "./traveldesk.listing-build";
+import { EDITORIAL_FIELDS, NON_REFUNDABLE_POLICY, personLocksBetween, QUOTE_ONLY_LOCK, variantNameLock, variantPriceLock } from "./traveldesk.listing-build";
 import { stepOfClassKey } from "./traveldesk.listing-plan";
 import type { OfferTerms } from "./traveldesk.offer-terms";
 
@@ -159,13 +160,25 @@ export interface MergeInput {
   priceMode: PriceMode;
   /** Newly copied photos, when the supplier's photo list changed. */
   images: string[] | null;
+  /** Per editorial field, the hash of the last supplier-derived value (`supplier_text_hashes`); empty before the first run. */
+  prevTextHashes?: Readonly<Record<string, string>>;
 }
 
 export interface MergeResult {
   next: ActivityInput;
   locked: string[];
-  /** Locked fields whose supplier text changed since the system last wrote them (shown as "supplier text changed"). */
+  /** Locked fields whose supplier text changed since the last run (shown as "supplier text changed"). */
   lockedTextChanged: string[];
+  /** Per editorial field, the hash of this draft's supplier-derived value (stored for the next run); null without a draft. */
+  textHashes: Record<string, string> | null;
+}
+
+const sha = (v: unknown) => createHash("sha256").update(JSON.stringify(v ?? null)).digest("hex");
+
+/** sha256 of a tour's supplier photo list (addresses only): the importer records it, the upkeep copies again when it moves. */
+export function photosHashOf(photos: unknown): string {
+  const list = Array.isArray(photos) ? photos : [];
+  return sha(list.map((p) => (p && typeof p === "object" && "variants" in p ? (p as { variants: { url?: unknown }[] }).variants.map((v) => v.url) : p)));
 }
 
 /** Whether the draft's prices can be held at the page's current ones: every kept unit must have a price today. */
@@ -183,7 +196,7 @@ export function canHoldPrices(current: ActivityInput, draft: ActivityInput, kept
 
 /**
  * The largest price move, in basis points, over every kept option's units
- * (AED), the page band and the deltas. A unit priced 0 today that would cost
+ * in AED and INR (the page band and the deltas for options without units). A unit priced 0 today that would cost
  * something counts as unbounded. Units without a price today are not moves
  * (`canHoldPrices` handles them).
  */
@@ -202,11 +215,16 @@ export function priceMoveBps(current: ActivityInput, draft: ActivityInput, kept:
     if ((d.units ?? []).length) {
       for (const u of d.units ?? []) {
         const old = cUnits.find((x) => x.unitId === u.unitId);
-        if (old) move(old.price.aed, u.price.aed);
+        if (old) {
+          move(old.price.aed, u.price.aed);
+          // Review 108 N3-13: an FX setting change moves INR alone; it counts too.
+          move(old.price.inr, u.price.inr);
+        }
       }
     } else {
       // Inquiry listings carry no units: the option's shown "from" price is band + delta.
       move(current.price.adult.aed + c.delta.aed, draft.price.adult.aed + d.delta.aed);
+      move(current.price.adult.inr + c.delta.inr, draft.price.adult.inr + d.delta.inr);
     }
   }
   return worst;
@@ -216,33 +234,76 @@ export function priceMoveBps(current: ActivityInput, draft: ActivityInput, kept:
 export function policyFor(text: string, hours: number, supplierHours: number | null): { text: string; hours: number } | null {
   if (hours <= 0 || supplierHours === null || supplierHours === hours) return null;
   if (supplierHours <= 0) return { text: NON_REFUNDABLE_POLICY, hours: 0 };
-  const re = new RegExp(`\\b${hours}(\\s*)hours\\b`);
-  if (!re.test(text)) return { text: NON_REFUNDABLE_POLICY, hours: 0 };
-  return { text: text.replace(re, `${supplierHours}$1hours`), hours: supplierHours };
+  // Review 108 N3-11: every stated "N hours" must be the old window and is rewritten; anything else is not ours to guess.
+  const stated = [...text.matchAll(/\b(\d+)\s*hours?\b/gi)].map((m) => Number(m[1]));
+  if (stated.length === 0 || stated.some((h) => h !== hours)) return { text: NON_REFUNDABLE_POLICY, hours: 0 };
+  return { text: text.replace(new RegExp(`\\b${hours}(\\s*)hours\\b`, "g"), `${supplierHours}$1hours`), hours: supplierHours };
 }
 
-/** Variant id → name in a stored document, for the per-variant name lock. */
-function baselineNames(baseline: Record<string, unknown> | null): Map<string, string> {
-  const raw = baseline && Array.isArray(baseline.variants) ? (baseline.variants as { id?: unknown; name?: unknown }[]) : [];
-  return new Map(raw.flatMap((v) => (typeof v.id === "string" && typeof v.name === "string" ? [[v.id, v.name] as const] : [])));
+/**
+ * §3.7 "a price may be locked upward only" (review 108 N3-14): for every kept
+ * option a person raised (`variant:<id>:price`), each unit costs the higher
+ * of its current and its rule price. The band stays the draft's; the option's
+ * delta is refitted so every unit still equals what the page shows. Null when
+ * no delta fits (the child gap differs): the caller then holds the page's
+ * prices, which lowers nothing.
+ */
+export function applyPriceLocks(current: ActivityInput, draft: ActivityInput, locked: ReadonlySet<string>, kept: ReadonlySet<string>): ActivityInput | null {
+  const out = structuredClone(draft);
+  for (const d of out.variants) {
+    if (!kept.has(d.id) || !locked.has(variantPriceLock(d.id))) continue;
+    const c = current.variants.find((v) => v.id === d.id);
+    if (!c) continue;
+    if (!(d.units ?? []).length) {
+      for (const k of ["aed", "inr"] as const) {
+        const target = Math.max(current.price.adult[k] + c.delta[k], draft.price.adult[k] + d.delta[k]);
+        d.delta[k] = target - out.price.adult[k];
+      }
+      continue;
+    }
+    const target = (unitId: string, k: "aed" | "inr") => {
+      const now = (c.units ?? []).find((u) => u.unitId === unitId)?.price[k];
+      const rule = (d.units ?? []).find((u) => u.unitId === unitId)!.price[k];
+      return now === undefined ? rule : Math.max(now, rule);
+    };
+    for (const k of ["aed", "inr"] as const) {
+      const delta = target("adult", k) - out.price.adult[k];
+      for (const u of d.units ?? []) {
+        const want = target(u.unitId, k);
+        const shown = u.unitId === "infant" ? (out.price.infant?.[k] ?? 0) : u.unitId === "child" ? (out.price.child ?? out.price.adult)[k] + delta : out.price.adult[k] + delta;
+        if (want !== shown) return null;
+        u.price[k] = want;
+      }
+      d.delta[k] = delta;
+    }
+  }
+  return out;
 }
 
 /** The next document: supplier text where unlocked, supplier facts always (see the module comment). */
 export function mergeDocument(m: MergeInput): MergeResult {
   const locked = new Set(m.lockedFields);
-  if (m.baseline) for (const f of lockedFieldsBetween(m.baseline, m.current as unknown as Record<string, unknown>)) locked.add(f);
+  if (m.baseline) for (const f of personLocksBetween(m.baseline, m.current as unknown as Record<string, unknown>)) locked.add(f);
   const next = structuredClone(m.current) as ActivityInput;
   const nextRec = next as unknown as Record<string, unknown>;
   const cur = m.current as unknown as Record<string, unknown>;
   const lockedTextChanged: string[] = [];
+  let textHashes: Record<string, string> | null = null;
 
-  if (m.draft && m.textChanged) {
+  if (m.draft) {
     const d = m.draft as unknown as Record<string, unknown>;
+    textHashes = {};
     for (const f of EDITORIAL_FIELDS) {
       if (f === "images") continue;
+      textHashes[f] = sha(d[f]);
+      // `importantInfo` carries the days line, built from the offers' days: a fact, so it follows them every run
+      // (review 108 N3-17). Every other editorial field follows only a change of the supplier's content.
+      if (!m.textChanged && f !== "importantInfo") continue;
       if (locked.has(f)) {
-        const was = m.baseline ? m.baseline[f] : cur[f];
-        if (json(d[f]) !== json(was)) lockedTextChanged.push(f);
+        // Review 108 N3-10: reported only when the supplier's own value for this field moved.
+        const prev = m.prevTextHashes?.[f];
+        const moved = prev !== undefined ? prev !== textHashes[f] : json(d[f]) !== json(m.baseline ? m.baseline[f] : cur[f]);
+        if (m.textChanged && moved) lockedTextChanged.push(f);
         continue;
       }
       if (d[f] === undefined) delete nextRec[f];
@@ -259,17 +320,21 @@ export function mergeDocument(m: MergeInput): MergeResult {
     next.timeSlots = [...d.timeSlots];
     next.durationMinutes = d.durationMinutes;
     next.isPrivate = d.isPrivate;
-    if (d.quoteOnly) next.quoteOnly = true;
-    else delete next.quoteOnly;
     if (m.priceMode === "apply") next.price = structuredClone(d.price);
   }
+  // "Quote only" goes with the prices (review 108 N3-02): it follows the draft only when the draft's prices apply,
+  // and never when a person switched it on (N3-03).
+  if (m.draft && m.priceMode === "apply" && !locked.has(QUOTE_ONLY_LOCK)) {
+    if (m.draft.quoteOnly) next.quoteOnly = true;
+    else delete next.quoteOnly;
+  }
 
-  const names = baselineNames(m.baseline);
   next.variants = m.current.variants.map((v) => {
     if (m.soldOut.has(v.id)) return { ...structuredClone(v), soldOut: true };
     const d = m.draft?.variants.find((x) => x.id === v.id);
     if (!d || !m.kept.has(v.id) || m.priceMode === "keep") return structuredClone(v);
-    const nameLocked = names.has(v.id) ? names.get(v.id) !== v.name : false;
+    // Review 108 N3-01: the name lock is stored (`variant:<id>:name`), so it survives every rebase.
+    const nameLocked = locked.has(variantNameLock(v.id));
     const highlights = [...d.highlights.filter((h) => STARTS_AT.test(h)), ...v.highlights.filter((h) => !STARTS_AT.test(h))].slice(0, 8);
     const out = { ...structuredClone(v), name: nameLocked ? v.name : d.name, highlights, isPrivate: d.isPrivate };
     if (m.priceMode === "apply") {
@@ -288,7 +353,7 @@ export function mergeDocument(m: MergeInput): MergeResult {
     next.cancellationPolicy = policy.text;
     next.freeCancellationHours = policy.hours;
   }
-  return { next: activityInputSchema.parse(next), locked: [...locked].sort(), lockedTextChanged: [...new Set(lockedTextChanged)].sort() };
+  return { next: activityInputSchema.parse(next), locked: [...locked].sort(), lockedTextChanged: [...new Set(lockedTextChanged)].sort(), textHashes };
 }
 
 /* ---------------------------------------------------------------------------

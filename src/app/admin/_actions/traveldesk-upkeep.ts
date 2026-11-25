@@ -21,7 +21,7 @@ export type UpkeepReviewResult = ActionResult<{ changeId: string; summary: strin
 
 export async function approvePriceChangeAction(_prev: UpkeepReviewResult | null, fd: FormData): Promise<UpkeepReviewResult> {
   return runAction(async () => {
-    const { actor } = await authService.requireCookies("products.publish");
+    const { actor } = await authService.requireCookies("pricing.edit");
     const input = parseWith(z.object({ changeId: z.uuid(), note }).strict(), { changeId: form.str(fd, "changeId"), note: form.str(fd, "note") ?? "" });
     const r = await traveldeskUpkeepService.approvePriceChange(actor, input.changeId, input.note);
     revalidatePath(PATH);

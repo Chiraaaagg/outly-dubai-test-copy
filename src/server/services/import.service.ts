@@ -428,8 +428,12 @@ export const importService = {
       }
 
       // Suppliers — one upsert per distinct supplier (a handful), one mapping query.
+      // Rows updating a product already bound to an integration supplier keep that binding: no upsert by name.
+      const bound = new Set(
+        (await tx.productSupplierMapping.findMany({ where: { product: { slug: { in: inputs.map((i) => i.input.slug) } }, variantCode: null, supplier: { adapter: { not: "manual" } } }, select: { product: { select: { slug: true } } } })).map((m) => m.product.slug),
+      );
       const supplierIds = new Map<string, string>();
-      for (const sup of new Map(inputs.map((i) => [i.input.supplier.name, i.input.supplier])).values()) {
+      for (const sup of new Map(inputs.filter((i) => !bound.has(i.input.slug)).map((i) => [i.input.supplier.name, i.input.supplier])).values()) {
         const code = sup.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || sup.id;
         // An integration supplier's row is never renamed or re-scored from a sheet (review 106 N1-18).
         const integration = await tx.supplier.findUnique({ where: { code }, select: { id: true, adapter: true } });
@@ -458,7 +462,7 @@ export const importService = {
         // "Held" = this import did not publish it. A listing that is already live stays live with the new values;
         // the preview marks those rows so nobody reads "held" as "not on the site".
         if (opts.publish && held.has(row) && prev?.status !== "published") heldSlugs.push(input.slug);
-        const supplierId = supplierIds.get(input.supplier.name);
+        const supplierId = bound.has(input.slug) ? undefined : supplierIds.get(input.supplier.name);
         if (prev) {
           const prevDoc = activitySchema.safeParse(prev.content);
           const derived = prevDoc.success

@@ -196,7 +196,9 @@ describe.skipIf(!enabled)("TravelDesk listing upkeep, N3 (local DB)", () => {
     expect(await changesOf(instantId)).toEqual([]);
     const link = await prisma.supplierListingLink.findUniqueOrThrow({ where: { id: linkId } });
     expect(link.upkeepAt).not.toBeNull();
-    expect(link.photosHash).toMatch(/^[0-9a-f]{64}$/);
+    // Still placeholder images: the importer's photo copy records the hash of the list it copies (review 108 N3-07).
+    expect(link.photosHash).toBeNull();
+    // Written by the importer with the approval itself (review 108 N3-07).
     expect(Object.keys(link.approvedTerms as object).sort()).toEqual([String(A), String(B)].sort());
   });
 
@@ -289,6 +291,18 @@ describe.skipIf(!enabled)("TravelDesk listing upkeep, N3 (local DB)", () => {
     expect(await prisma.supplierListingChange.count({ where: { productId: instantId, kind: "price_jump" } })).toBe(1);
 
     await expect(upkeep.approvePriceChange(admin, review.id, "short")).rejects.toSatisfy((e) => code(e) === "VALIDATION_FAILED");
+    // Review 108 N3-04: the supplier moved again after the review; the approval applies nothing and says so.
+    const wires = (adult: number) => [
+      tourT([wireOffer(A, 1200, { maxNumOfPeople: 12, timeSlots: slot, pricingPeriods: [period(adult, 98.71)] }), wireOffer(B, 1260, { numberOfHours: 3 }), wireOffer(C, 1200, { bookingType: 0 }), wireOffer(E, 1200)], "A brand new first sentence about the dhow cruise. More."),
+      tourOld({ maxNumOfPeople: 9 }),
+      ...fillers(),
+    ];
+    await sync(wires(260.03));
+    const v = await versionOf(instantId);
+    await expect(upkeep.approvePriceChange(admin, review.id, "checked the new season price")).rejects.toSatisfy((e) => code(e) === "CONFLICT");
+    expect(await versionOf(instantId)).toBe(v);
+    expect((await prisma.supplierListingChange.findUniqueOrThrow({ where: { id: review.id } })).status).toBe("review");
+    await sync(wires(185.21));
     await upkeep.approvePriceChange(admin, review.id, "checked the new season price");
     const after = (await prisma.product.findUniqueOrThrow({ where: { id: instantId } })).content as { price: { adult: { aed: number } } };
     expect(after.price.adult.aed).toBeGreaterThan(before.price.adult.aed * 1.2);
@@ -296,21 +310,47 @@ describe.skipIf(!enabled)("TravelDesk listing upkeep, N3 (local DB)", () => {
     await expect(upkeep.approvePriceChange(admin, review.id, "checked the new season price")).rejects.toSatisfy((e) => code(e) === "NOT_FOUND");
   });
 
-  it("keeps a field a person edited and reports the supplier's new text beside it", async () => {
-    const row = await prisma.product.findUniqueOrThrow({ where: { id: instantId } });
-    const { id: _i, rating: _r, reviewCount: _c, bookedThisMonth: _b, ...input } = row.content as Record<string, unknown>;
-    await activities.update(admin, instantId, { ...(input as Parameters<typeof activities.update>[2]), subtitle: "Our own words about this cruise." }, { reason: "editor copy" });
+  it("closes a price review by itself when the move went away (review 108 N3-15)", async () => {
     const slot = [{ id: 1, name: null, startTime: 1200, endTime: 1320, daysOffered: 0, isAnyTime: false, isOnRequest: false, minimumAdvancedBooking: 24 }];
-    await sync([
-      tourT([wireOffer(A, 1200, { maxNumOfPeople: 12, timeSlots: slot, pricingPeriods: [period(185.21, 98.71)] }), wireOffer(B, 1260, { numberOfHours: 3 }), wireOffer(C, 1200, { bookingType: 0 }), wireOffer(E, 1200)], "Yet another opening line from the supplier today. More."),
+    const wires = (adult: number) => [
+      tourT([wireOffer(A, 1200, { maxNumOfPeople: 12, timeSlots: slot, pricingPeriods: [period(adult, 98.71)] }), wireOffer(B, 1260, { numberOfHours: 3 }), wireOffer(C, 1200, { bookingType: 0 }), wireOffer(E, 1200)], "A brand new first sentence about the dhow cruise. More."),
       tourOld({ maxNumOfPeople: 9 }),
       ...fillers(),
-    ]);
+    ];
+    await sync(wires(300.07));
     await run();
-    const doc = (await prisma.product.findUniqueOrThrow({ where: { id: instantId } })).content as { subtitle: string };
-    expect(doc.subtitle).toBe("Our own words about this cruise.");
-    expect((await prisma.supplierListingLink.findUniqueOrThrow({ where: { id: linkId } })).lockedFields).toContain("subtitle");
-    expect(await prisma.supplierListingChange.count({ where: { productId: instantId, kind: "locked_text_changed", field: "subtitle" } })).toBe(1);
+    const open = await prisma.supplierListingChange.findFirstOrThrow({ where: { productId: instantId, kind: "price_jump", status: "review" } });
+    await sync(wires(185.21));
+    await run();
+    expect(await prisma.supplierListingChange.findUniqueOrThrow({ where: { id: open.id } })).toMatchObject({ status: "resolved", resolution: "superseded" });
+  });
+
+  it("keeps a field and an option name a person edited over several runs, and reports the supplier's new text beside the field", async () => {
+    const row = await prisma.product.findUniqueOrThrow({ where: { id: instantId } });
+    const { id: _i, rating: _r, reviewCount: _c, bookedThisMonth: _b, ...input } = row.content as Record<string, unknown>;
+    const doc = input as Parameters<typeof activities.update>[2];
+    await activities.update(admin, instantId, { ...doc, subtitle: "Our own words about this cruise.", variants: doc.variants.map((v) => (v.id === `td-${A}` ? { ...v, name: "Sunset sailing on the creek" } : v)) }, { reason: "editor copy" });
+    const slot = [{ id: 1, name: null, startTime: 1200, endTime: 1320, daysOffered: 0, isAnyTime: false, isOnRequest: false, minimumAdvancedBooking: 24 }];
+    const wires = (text: string, days = 0) => [
+      tourT([wireOffer(A, 1200, { maxNumOfPeople: 12, timeSlots: slot, pricingPeriods: [period(185.21, 98.71)], daysOffered: days }), wireOffer(B, 1260, { numberOfHours: 3 }), wireOffer(C, 1200, { bookingType: 0 }), wireOffer(E, 1200)], text),
+      tourOld({ maxNumOfPeople: 9 }),
+      ...fillers(),
+    ];
+    // Three runs, each with a document write (so each rebases): the person's choices hold every time.
+    const texts = ["Yet another opening line from the supplier today. Paragraph one.", "Yet another opening line from the supplier today. Paragraph two.", "A third opening line from the supplier arrives. Paragraph three."];
+    for (const [i, t] of texts.entries()) {
+      await sync(wires(t, i === 1 ? 62 : 0));
+      const v = await versionOf(instantId);
+      await run();
+      expect(await versionOf(instantId)).toBe(v + 1);
+      const now = (await prisma.product.findUniqueOrThrow({ where: { id: instantId } })).content as { subtitle: string; variants: { id: string; name: string }[] };
+      expect(now.subtitle).toBe("Our own words about this cruise.");
+      expect(now.variants.find((x) => x.id === `td-${A}`)?.name).toBe("Sunset sailing on the creek");
+    }
+    const link = await prisma.supplierListingLink.findUniqueOrThrow({ where: { id: linkId } });
+    expect(link.lockedFields).toEqual(expect.arrayContaining(["subtitle", `variant:td-${A}:name`]));
+    // Reported when the supplier's own subtitle moved (runs 1 and 3), not when only another paragraph did (run 2).
+    expect(await prisma.supplierListingChange.count({ where: { productId: instantId, kind: "locked_text_changed", field: "subtitle" } })).toBe(2);
   });
 
   it("queues one digest a day to the owner, with no price and no net", async () => {
@@ -346,5 +386,29 @@ describe.skipIf(!enabled)("TravelDesk listing upkeep, N3 (local DB)", () => {
     const purged = await run();
     expect(purged.contentPurged).toBe(1);
     expect(await prisma.supplierTourContent.count({ where: { supplierId, tourExternalId: String(TOUR) } })).toBe(0);
+  });
+
+  it("a hidden listing a person published again is upkept again (resumed); with its tour still gone it is marked again", async () => {
+    await prisma.product.update({ where: { id: instantId }, data: { status: "published" } });
+    const r = await run();
+    expect(r.skipped).toEqual([]);
+    const link = await prisma.supplierListingLink.findUniqueOrThrow({ where: { id: linkId } });
+    expect(link.hiddenAt).toBeNull();
+    expect(link.unavailableSince).not.toBeNull();
+    expect(await prisma.supplierListingChange.count({ where: { productId: instantId, kind: "resumed" } })).toBe(1);
+  });
+
+  it("adopted listings are left alone (K3), and a run past its deadline starts no listing", async () => {
+    const tour = await prisma.supplierCatalogueItem.findFirstOrThrow({ where: { supplierId, kind: "tour", externalId: String(TOUR_OLD) } });
+    await prisma.supplierListingLink.create({ data: { id: uuidv7(), productId: oldId, supplierId, environment: "test", tourExternalId: tour.externalId, kind: "inquiry", arrival: "self", route: "internal", fulfilment: "on_request", offerExternalIds: [String(X)], pricingRuleVersion: 1, adopted: true, noindex: false, reviewedAt: new Date(), reviewedBy: admin.id, importVersion: await versionOf(oldId) } });
+    await sync([tourOld({ maxNumOfPeople: 7 }), ...fillers()]);
+    const v = await versionOf(oldId);
+    const r = await run();
+    expect(r.skipped.find((s) => s.reason === "adopted")).toBeUndefined();
+    expect(await versionOf(oldId)).toBe(v);
+    expect(await changesOf(oldId)).toEqual([]);
+    expect((await mappingOf(X)).syncStatus).toBe("changed");
+    const late = await run({ deadlineMs: Date.now() - 1 });
+    expect(late).toMatchObject({ incomplete: true, processed: 0 });
   });
 });

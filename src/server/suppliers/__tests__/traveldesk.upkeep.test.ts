@@ -5,10 +5,11 @@ import type { RuleCostLine } from "../../domain/rule-price";
 import { renderTemplate, type TemplateContext } from "../../notifications/templates";
 import type { ActivityInput } from "../../schemas/activity.schema";
 import { parseClassKey, type CapabilityDimensions } from "../traveldesk/traveldesk.capability";
-import { buildListingDraft, NON_REFUNDABLE_POLICY, type BuildContent, type BuildContext } from "../traveldesk/traveldesk.listing-build";
+import { buildListingDraft, NON_REFUNDABLE_POLICY, personLocksBetween, QUOTE_ONLY_LOCK, variantNameLock, variantPriceLock, type BuildContent, type BuildContext } from "../traveldesk/traveldesk.listing-build";
 import { instantListing, type PlanOffer, type PlanRules } from "../traveldesk/traveldesk.listing-plan";
 import { offerTermsOf, type StoredOffer } from "../traveldesk/traveldesk.offer-terms";
 import {
+  applyPriceLocks,
   canHoldPrices,
   changedFields,
   classifyOptions,
@@ -263,5 +264,89 @@ describe("the upkeep never writes orders, quotes or bookings (existing bookings 
     expect(src).not.toMatch(/\b(tx|prisma)\.(order|orderItem|quote|supplierBooking|payment)\b/);
     // Never the content table's `raw` column (review 103 N0-06).
     expect(src).not.toMatch(/raw:\s*true/);
+  });
+});
+
+describe("review 108 fixes: stored person locks, quote only, price lock upward, INR, policy", () => {
+  const asRec = (d: ActivityInput) => d as unknown as Record<string, unknown>;
+
+  it("N3-01: an option name a person changed stays over any number of rebases", () => {
+    const sys = base();
+    const renamed = { ...sys, variants: sys.variants.map((v, i) => (i === 0 ? { ...v, name: "Sunset sailing" } : v)) };
+    const locks = personLocksBetween(asRec(sys), asRec(renamed));
+    expect(locks).toContain(variantNameLock("td-1"));
+    // Run 1 keeps it and rebases (the new baseline holds the person's name).
+    const r1 = merge({ current: renamed, baseline: asRec(sys), draft: base(), lockedFields: locks });
+    expect(r1.next.variants[0].name).toBe("Sunset sailing");
+    // Run 2: baseline equals current, so only the stored lock can keep the name.
+    const r2 = merge({ current: r1.next, baseline: asRec(r1.next), draft: base(), lockedFields: r1.locked });
+    expect(r2.next.variants[0].name).toBe("Sunset sailing");
+    // Without the stored lock the fact-built name would come back: the lock is what holds it.
+    expect(merge({ current: r1.next, baseline: asRec(r1.next), draft: base(), lockedFields: [] }).next.variants[0].name).not.toBe("Sunset sailing");
+  });
+
+  it("N3-02: holding prices keeps quote only, so an inquiry page never shows a price of 0", () => {
+    const current = { ...base(), quoteOnly: true, price: { adult: { aed: 0, inr: 0 } } } as ActivityInput;
+    const r = merge({ current, draft: base(), priceMode: "hold" });
+    expect(r.next.quoteOnly).toBe(true);
+    expect(r.next.price.adult).toEqual({ aed: 0, inr: 0 });
+  });
+
+  it("N3-03: a quote-only switch a person set is never removed", () => {
+    const sys = base();
+    const person = { ...sys, quoteOnly: true } as ActivityInput;
+    expect(personLocksBetween(asRec(sys), asRec(person))).toContain(QUOTE_ONLY_LOCK);
+    const r = merge({ current: person, baseline: asRec(person), draft: base(), lockedFields: [QUOTE_ONLY_LOCK] });
+    expect(r.next.quoteOnly).toBe(true);
+    // A system quote-only (no lock) follows the draft's applied prices.
+    expect(merge({ current: person, baseline: asRec(person), draft: base(), lockedFields: [] }).next.quoteOnly).toBeUndefined();
+  });
+
+  it("N3-14: a price a person raised is never lowered; the rule may raise it", () => {
+    const sys = base();
+    const bump = 30;
+    const raised = structuredClone(sys);
+    raised.variants[0].delta = { aed: sys.variants[0].delta.aed + bump, inr: sys.variants[0].delta.inr + bump * 25 };
+    raised.variants[0].units = raised.variants[0].units!.map((u) => (u.unitId === "infant" ? u : { ...u, price: { aed: u.price.aed + bump, inr: u.price.inr + bump * 25 } }));
+    const lock = personLocksBetween(asRec(sys), asRec(raised));
+    expect(lock).toContain(variantPriceLock("td-1"));
+    const fitted = applyPriceLocks(raised, base(), new Set(lock), ALL)!;
+    expect(fitted).not.toBeNull();
+    const adult = (d: ActivityInput) => d.variants[0].units!.find((u) => u.unitId === "adult")!.price;
+    expect(adult(fitted)).toEqual(adult(raised));
+    // Unlocked option: the rule price.
+    expect(fitted.variants[1].units).toEqual(base().variants[1].units);
+    // A rule above the person's price wins.
+    const dearer = draftOf([planOffer(1, { netAedMinorByUnit: { adult: 40_000n, child: 30_000n, infant: 0n, trip: 0n } }), planOffer(2, { durationHours: 3 })]);
+    const up = applyPriceLocks(raised, dearer, new Set(lock), ALL);
+    if (up) expect(adult(up).aed).toBeGreaterThanOrEqual(adult(dearer).aed);
+    // Lowering a price locks nothing (locked upward only).
+    const lowered = structuredClone(sys);
+    lowered.variants[0].units = lowered.variants[0].units!.map((u) => ({ ...u, price: { aed: Math.max(0, u.price.aed - 5), inr: Math.max(0, u.price.inr - 100) } }));
+    expect(personLocksBetween(asRec(sys), asRec(lowered))).not.toContain(variantPriceLock("td-1"));
+  });
+
+  it("N3-13: an INR-only move counts", () => {
+    const current = base();
+    const inr = structuredClone(current);
+    inr.variants[0].units = inr.variants[0].units!.map((u) => ({ ...u, price: { ...u.price, inr: Math.round(u.price.inr * 1.5) } }));
+    expect(priceMoveBps(current, inr, ALL)).toBeGreaterThan(PRICE_AUTO_LIMIT_BPS);
+  });
+
+  it("N3-11: every stated hour is rewritten, or the text becomes non-refundable", () => {
+    expect(policyFor("Free cancellation up to 24 hours before; after 24 hours no refund", 24, 48)).toEqual({ text: "Free cancellation up to 48 hours before; after 48 hours no refund", hours: 48 });
+    expect(policyFor("Free cancellation up to 24 hours before; 12 hours notice for changes", 24, 48)).toEqual({ text: NON_REFUNDABLE_POLICY, hours: 0 });
+  });
+
+  it("N3-10: a locked field is reported only when the supplier's own text moved", () => {
+    const sys = base();
+    const edited = { ...sys, subtitle: "Our own words about the cruise." };
+    const first = merge({ current: edited, baseline: asRec(sys), draft: base(), textChanged: true, lockedFields: ["subtitle"] });
+    // Supplier content moved but the subtitle's supplier value did not: no report.
+    const again = merge({ current: first.next, baseline: asRec(first.next), draft: base(), textChanged: true, lockedFields: ["subtitle"], prevTextHashes: first.textHashes! });
+    expect(again.lockedTextChanged).not.toContain("subtitle");
+    const moved = draftOf([planOffer(1), planOffer(2, { durationHours: 3 })], { ...CONTENT, salesDescription: "A completely different opening line from TravelDesk now. More." });
+    const third = merge({ current: first.next, baseline: asRec(first.next), draft: moved, textChanged: true, lockedFields: ["subtitle"], prevTextHashes: first.textHashes! });
+    expect(third.lockedTextChanged).toContain("subtitle");
   });
 });

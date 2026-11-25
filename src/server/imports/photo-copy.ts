@@ -94,24 +94,31 @@ export interface PhotoFetchDeps {
 
 const systemLookup: LookupFn = async (hostname) => (await dnsLookup(hostname, { all: true, verbatim: true })).map((a) => a.address);
 
-/** GET over TLS to the pinned address, with SNI and certificate checks against the URL's hostname. */
-export const pinnedHttpsGet: PinnedRequest = (url, address, signal) =>
+/**
+ * GET over TLS to the pinned address, with SNI and certificate checks against
+ * the URL's hostname. `port` and `ca` exist for the loopback test only;
+ * production uses `pinnedHttpsGet` (443, the system trust store).
+ */
+export function makePinnedHttpsGet(opts: { port?: number; ca?: string } = {}): PinnedRequest {
+  return (url, address, signal) => pinnedGet(url, address, signal, opts.port ?? 443, opts.ca);
+}
+
+const pinnedGet = (url: URL, address: string, signal: AbortSignal, port: number, ca: string | undefined) =>
   new Promise<Response>((resolve, reject) => {
-    const family = isIP(address) === 6 ? 6 : 4;
+    // The socket goes to the checked address itself (no second resolution); SNI, the certificate check and the
+    // Host header use the URL's hostname.
     const req = httpsRequest(
       {
         protocol: "https:",
-        hostname: url.hostname,
+        host: address,
+        family: isIP(address) === 6 ? 6 : 4,
         servername: url.hostname,
-        port: 443,
+        port,
+        ...(ca ? { ca } : {}),
         path: `${url.pathname}${url.search}`,
         method: "GET",
-        headers: { accept: "image/webp,image/jpeg,image/png", "user-agent": "outlyy-photo-copy" },
+        headers: { host: port === 443 ? url.hostname : `${url.hostname}:${port}`, accept: "image/webp,image/jpeg,image/png", "user-agent": "outlyy-photo-copy" },
         signal,
-        lookup: (_host: string, opts: unknown, cb: (err: Error | null, addr: string | { address: string; family: number }[], fam?: number) => void) => {
-          if (opts && typeof opts === "object" && (opts as { all?: boolean }).all) cb(null, [{ address, family }]);
-          else cb(null, address, family);
-        },
       },
       (res) => {
         const headers = new Headers();
@@ -124,6 +131,8 @@ export const pinnedHttpsGet: PinnedRequest = (url, address, signal) =>
     req.on("error", reject);
     req.end();
   });
+
+export const pinnedHttpsGet: PinnedRequest = makePinnedHttpsGet();
 
 /** Reject as soon as `signal` aborts, whatever `promise` is doing (N1-12b). */
 function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -248,6 +257,8 @@ export interface PhotoCopyDeps {
   sleep?: (ms: number) => Promise<void>;
   throttleMs?: number;
   maxPhotos?: number;
+  /** True when no further photo may start (the caller's time budget, doc 30 N3 review 108 N3-06). */
+  stopAt?: () => boolean;
 }
 
 /** The variant to copy: the widest at or under 2000 px, else the narrowest; declared SVG/GIF never. */
@@ -276,6 +287,10 @@ export async function copyTourPhotos(photos: readonly TourContentPhoto[], deps: 
   let tried = 0;
   for (const [index, photo] of photos.entries()) {
     if (urls.length >= max) break;
+    if (deps.stopAt?.()) {
+      failures.push({ index, reason: "time_budget" });
+      break;
+    }
     const src = pickVariant(photo);
     if (!src) {
       failures.push({ index, reason: "no_usable_variant" });

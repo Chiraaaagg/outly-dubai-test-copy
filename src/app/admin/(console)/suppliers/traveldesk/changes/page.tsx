@@ -64,7 +64,7 @@ export default async function SupplierChangesPage({ searchParams }: { searchPara
   const env = ENVS.includes(params.env as (typeof ENVS)[number]) ? (params.env as (typeof ENVS)[number]) : "production";
   const status = STATUSES.includes(params.status as (typeof STATUSES)[number]) ? (params.status as (typeof STATUSES)[number]) : undefined;
   const productId = params.product && /^[0-9a-f-]{36}$/i.test(params.product) ? params.product : undefined;
-  const canApprovePrice = hasPermission(actor, "products.publish");
+  const canApprovePrice = hasPermission(actor, "pricing.edit");
   const rows = await traveldeskUpkeepService.changes(actor, { environment: env, status, productId });
   const filter = (over: Partial<Params>) => {
     const q = new URLSearchParams({ env, ...(status ? { status } : {}), ...(productId ? { product: productId } : {}), ...over } as Record<string, string>);

@@ -71,10 +71,11 @@ const SNAPSHOT_MIN_REMAINING_MS = 60_000;
 /** Longest wait for one read token before the run gives up (the deadline usually ends it first). */
 const MAX_TOKEN_WAIT_MS = 60_000;
 /**
- * Doc 30 N3: the listing upkeep starts no listing after this, measured from the run's start; inside the
- * route's `maxDuration` (300 s) and the lease. Listings it does not reach are first in line next run.
+ * Doc 30 N3: the listing upkeep starts no listing (and no photo) after this, measured from the run's start.
+ * It leaves 50 s of the route's `maxDuration` (300 s) for the last listing's transaction, readiness, the
+ * digest, the run audit and the lease release (review 108 N3-06). Listings it does not reach go first next run.
  */
-export const UPKEEP_DEADLINE_MS = 280_000;
+export const UPKEEP_DEADLINE_MS = 250_000;
 /** Offers whose prices are snapshotted per run: approved mappings first, then suggestions. */
 const SNAPSHOT_OFFER_LIMIT = 40;
 

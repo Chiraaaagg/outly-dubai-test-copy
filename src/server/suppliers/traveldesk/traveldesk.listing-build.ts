@@ -306,3 +306,60 @@ export const EDITORIAL_FIELDS = ["title", "subtitle", "images", "imageAlt", "inc
 export function lockedFieldsBetween(imported: Record<string, unknown>, current: Record<string, unknown>): string[] {
   return EDITORIAL_FIELDS.filter((f) => JSON.stringify(imported[f] ?? null) !== JSON.stringify(current[f] ?? null));
 }
+
+/**
+ * Person choices beyond the editorial fields that the N3 upkeep must also
+ * respect (review 108 N3-01, N3-03, N3-14), stored in `locked_fields` next to
+ * the field names so they survive every rebase:
+ *  - `variant:<id>:name`: a person renamed that option;
+ *  - `variant:<id>:price`: a person raised a price of that option (§3.7: a
+ *    price may be locked upward only; lowering one locks nothing);
+ *  - `quoteOnly`: a person switched "Quote only" on.
+ */
+export const QUOTE_ONLY_LOCK = "quoteOnly";
+export const variantNameLock = (variantId: string) => `variant:${variantId}:name`;
+export const variantPriceLock = (variantId: string) => `variant:${variantId}:price`;
+const VARIANT_LOCK = /^variant:[a-z0-9-]{1,60}:(name|price)$/;
+
+/** Whether `key` is a lock the importer or the upkeep knows. */
+export function isLockKey(key: string): boolean {
+  return (EDITORIAL_FIELDS as readonly string[]).includes(key) || key === QUOTE_ONLY_LOCK || VARIANT_LOCK.test(key);
+}
+
+type LockVariant = { id?: unknown; name?: unknown; delta?: { aed?: unknown; inr?: unknown }; units?: { unitId?: unknown; price?: { aed?: unknown; inr?: unknown } }[] };
+const variantsOf = (doc: Record<string, unknown>): LockVariant[] => (Array.isArray(doc.variants) ? (doc.variants as LockVariant[]) : []);
+const finite = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+
+/** Every lock key whose value differs between a system-written document and the current one (person edits when `current` is a person's save). */
+export function personLocksBetween(base: Record<string, unknown>, current: Record<string, unknown>): string[] {
+  const out: string[] = [...lockedFieldsBetween(base, current)];
+  if (current.quoteOnly === true && base.quoteOnly !== true) out.push(QUOTE_ONLY_LOCK);
+  const before = new Map(variantsOf(base).flatMap((v) => (typeof v.id === "string" ? [[v.id, v] as const] : [])));
+  const bandOf = (doc: Record<string, unknown>) => (doc.price as { adult?: { aed?: unknown; inr?: unknown } } | undefined)?.adult;
+  for (const v of variantsOf(current)) {
+    if (typeof v.id !== "string") continue;
+    const b = before.get(v.id);
+    if (!b) continue;
+    if (typeof v.name === "string" && v.name !== b.name) out.push(variantNameLock(v.id));
+    let raised = false;
+    const units = v.units ?? [];
+    if (units.length) {
+      for (const u of units) {
+        const old = (b.units ?? []).find((x) => x.unitId === u.unitId);
+        for (const c of ["aed", "inr"] as const) {
+          const n = finite(u.price?.[c]);
+          const o = finite(old?.price?.[c]);
+          if (n !== null && o !== null && n > o) raised = true;
+        }
+      }
+    } else {
+      for (const c of ["aed", "inr"] as const) {
+        const n = (finite(bandOf(current)?.[c]) ?? 0) + (finite(v.delta?.[c]) ?? 0);
+        const o = (finite(bandOf(base)?.[c]) ?? 0) + (finite(b.delta?.[c]) ?? 0);
+        if (n > o) raised = true;
+      }
+    }
+    if (raised) out.push(variantPriceLock(v.id));
+  }
+  return out;
+}

@@ -119,4 +119,21 @@ describe("copyTourPhotos", () => {
     });
     expect(r).toEqual({ urls: [], keys: [], failures: [{ index: 0, reason: "reencode_failed" }] });
   });
+
+  it("stops before the next photo when the caller's time budget is spent (doc 30 N3, review 108 N3-06)", async () => {
+    let calls = 0;
+    const r = await copyTourPhotos(Array.from({ length: 5 }, (_, i) => photo(`https://media.example.test/${i}.jpg`)), {
+      fetchPhoto: async () => {
+        calls += 1;
+        return { bytes: JPEG, type: "image/jpeg" as SniffedType };
+      },
+      reencode: async () => ({ bytes: WEBP, type: "image/webp" }),
+      store: new MemoryPhotoStore(),
+      environment: "test",
+      sleep: async () => {},
+      stopAt: () => calls >= 2,
+    });
+    expect(r.urls).toHaveLength(2);
+    expect(r.failures).toEqual([{ index: 2, reason: "time_budget" }]);
+  });
 });
