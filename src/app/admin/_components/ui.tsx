@@ -125,6 +125,7 @@ export function DataTable<T>({
   empty = "Nothing to show yet.",
   caption,
   className,
+  keyboardScroll = false,
 }: {
   columns: DataColumn<T>[];
   rows: T[];
@@ -132,9 +133,20 @@ export function DataTable<T>({
   empty?: ReactNode;
   caption?: string;
   className?: string;
+  /** A table with no controls of its own: its scroll box takes keyboard focus, so it can be scrolled without a mouse (WCAG 2.1.1). */
+  keyboardScroll?: boolean;
 }) {
   return (
-    <div className={cn("overflow-x-auto rounded-[var(--radius-card)] border border-ink-200 bg-paper shadow-[var(--shadow-soft)]", className)}>
+    // `relative`: visually hidden labels (`sr-only`, absolutely positioned) stay inside the scroll box instead of
+    // widening the page on narrow screens and at 200% zoom.
+    <div
+      className={cn(
+        "relative overflow-x-auto rounded-[var(--radius-card)] border border-ink-200 bg-paper shadow-[var(--shadow-soft)]",
+        keyboardScroll && "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ink-900",
+        className,
+      )}
+      {...(keyboardScroll ? { tabIndex: 0, role: "region", "aria-label": caption } : {})}
+    >
       <table className="w-full min-w-[40rem] border-collapse text-sm">
         {caption && <caption className="sr-only">{caption}</caption>}
         <thead className="bg-shell/70 text-left text-xs font-semibold uppercase tracking-wider text-ink-600">

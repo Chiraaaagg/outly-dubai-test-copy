@@ -155,6 +155,9 @@ describe.skipIf(!enabled)("TravelDesk listing upkeep, N3 (local DB)", () => {
     expect(mine.map((r) => [r.identity.kind, r.action])).toEqual([["instant", "create"], ["inquiry", "create"]]);
     const applied = await importer.apply(admin, p.batchId);
     batchId = p.batchId;
+    // The links' created time from the same clock as the sync's first-seen times (host, not database): the new-offer
+    // check compares the two, and a host/container clock skew could otherwise hide offer E (D17 test).
+    await prisma.supplierListingLink.updateMany({ where: { importBatchId: p.batchId }, data: { createdAt: new Date(Date.now() - 60_000) } });
     const created2 = applied.created.find((c) => c.slug === mine[0].slug)!;
     instantId = created2.productId;
     linkId = created2.linkId;
@@ -497,26 +500,51 @@ describe.skipIf(!enabled)("TravelDesk listing upkeep, N3 (local DB)", () => {
     expect(late).toMatchObject({ incomplete: true, processed: 0 });
   });
 
-  it("a batch rollback and an upkeep transaction lock in the same order, so neither deadlocks (review 110 R110-01)", async () => {
-    // Session A does what the upkeep does for one listing: mapping rows (by id), then the product, then the link.
-    let release!: () => void;
-    let started!: () => void;
-    const hold = new Promise<void>((r) => (release = r));
-    const isHolding = new Promise<void>((r) => (started = r));
+  it("a batch rollback, an upkeep and an editor save take one lock order (product, mappings by id, link), so none deadlocks (review 110 R110-01)", async () => {
+    const inquiry = await prisma.supplierListingLink.findFirstOrThrow({ where: { importBatchId: batchId, kind: "inquiry", deactivatedAt: null } });
+    const holder = () => {
+      let release!: () => void;
+      let ready!: () => void;
+      return { hold: new Promise<void>((r) => (release = r)), isReady: new Promise<void>((r) => (ready = r)), release: () => release(), ready: () => ready() };
+    };
+    // Session U does what the upkeep does for one listing: the product row, then its mapping rows by id, then the link.
+    const u = holder();
     const upkeepLike = prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM products WHERE id = ${instantId}::uuid FOR UPDATE`;
       await tx.$queryRaw`SELECT id FROM product_supplier_mappings WHERE product_id = ${instantId}::uuid ORDER BY id FOR UPDATE`;
       await tx.$executeRaw`UPDATE products SET updated_at = now() WHERE id = ${instantId}::uuid`;
-      started();
-      await hold;
+      u.ready();
+      await u.hold;
       await tx.$executeRaw`UPDATE supplier_listing_links SET upkeep_at = now() WHERE id = ${linkId}::uuid`;
     }, { timeout: 30_000 });
-    await isHolding;
-    const rollback = importer.rollback(admin, batchId, "zz synthetic rollback during upkeep", { force: true });
+    // Session E does what an editor save (`activityService.update`) does on another listing of the batch: the product
+    // row, then its link (the editorial lock record).
+    const e = holder();
+    const editorLike = prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`UPDATE products SET updated_at = now() WHERE id = ${inquiry.productId}::uuid`;
+      e.ready();
+      await e.hold;
+      await tx.$executeRaw`UPDATE supplier_listing_links SET updated_at = now() WHERE id = ${inquiry.id}::uuid`;
+    }, { timeout: 30_000 });
+    await Promise.all([u.isReady, e.isReady]);
+    const rollback = importer.rollback(admin, batchId, "zz synthetic rollback during upkeep and edit", { force: true });
+    // And a real editor save on the inquiry listing, queued behind session E.
+    const row = await prisma.product.findUniqueOrThrow({ where: { id: inquiry.productId } });
+    const { id: _i, rating: _r, reviewCount: _c, bookedThisMonth: _b, ...input } = row.content as Record<string, unknown>;
+    const realSave = activities.update(admin, inquiry.productId, { ...(input as Parameters<typeof activities.update>[2]), subtitle: "An editor's subtitle during the rollback." }, { reason: "editor save during rollback" });
     await new Promise((r) => setTimeout(r, 300));
-    release();
-    const [a, b] = await Promise.allSettled([upkeepLike, rollback]);
+    u.release();
+    e.release();
+    const [a, b, c, d] = await Promise.allSettled([upkeepLike, editorLike, rollback, realSave]);
+    const deadlock = (x: PromiseSettledResult<unknown>) => x.status === "rejected" && /40P01|deadlock/i.test(String((x.reason as Error)?.message ?? x.reason));
+    expect([a, b, c, d].some(deadlock)).toBe(false);
     expect(a.status).toBe("fulfilled");
     expect(b.status).toBe("fulfilled");
+    expect(c.status).toBe("fulfilled");
+    // The real save either ran before the rollback reached that listing or lost to it (404 or 409); never a deadlock,
+    // never a raw database error (the save takes the product row lock before it reads).
+    if (d.status === "rejected") expect(isAppError(d.reason) && ["NOT_FOUND", "CONFLICT"].includes((d.reason as { code: string }).code)).toBe(true);
     expect((await prisma.supplierListingLink.findUniqueOrThrow({ where: { id: linkId } })).deactivatedAt).not.toBeNull();
+    expect((await prisma.supplierListingLink.findUniqueOrThrow({ where: { id: inquiry.id } })).deactivatedAt).not.toBeNull();
   });
 });

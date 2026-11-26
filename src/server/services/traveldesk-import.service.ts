@@ -589,9 +589,12 @@ export const traveldeskImportService = {
         where: { importBatchId: batchId, deactivatedAt: null },
         include: { product: { select: { id: true, slug: true, version: true, deletedAt: true, status: true, fulfilmentMode: true, eligibility: { select: { effectiveMode: true } } } } },
       });
-      // Review 110 R110-01: lock in the upkeep's order (mapping rows by id, then product, then link), so a rollback and
-      // a running upkeep never wait on each other in a cycle.
+      // One lock order for every writer of an imported listing (review 110 R110-01): the product rows first (the
+      // listings and the pages they replaced, by id), then their mapping rows by id, then the links. The upkeep and
+      // the editor save take the product first too, so a rollback never waits on either of them in a cycle.
       const lockIds = [...new Set(links.map((l) => l.productId))];
+      const productLockIds = [...new Set([...lockIds, ...links.flatMap((l) => (l.replacesProductId ? [l.replacesProductId] : []))])];
+      if (productLockIds.length) await tx.$queryRaw`SELECT id FROM products WHERE id = ANY(${productLockIds}::uuid[]) ORDER BY id FOR UPDATE`;
       if (lockIds.length) await tx.$queryRaw`SELECT id FROM product_supplier_mappings WHERE product_id = ANY(${lockIds}::uuid[]) ORDER BY id FOR UPDATE`;
       const created = links.filter((l) => !l.adopted && !l.product.deletedAt);
       if (opts.requireUnchanged) {
@@ -620,8 +623,11 @@ export const traveldeskImportService = {
       for (const l of links) {
         await tx.supplierListingLink.update({ where: { id: l.id }, data: { deactivatedAt: now } });
         if (l.adopted) continue;
-        touched.push(l.productId);
-        deleted += 1;
+        // A listing already deleted before the rollback is not counted as rolled back (its old page may still be restored).
+        if (!l.product.deletedAt) {
+          touched.push(l.productId);
+          deleted += 1;
+        }
         await restoreReplacedInTx(tx, actor, l.id, reason, touched);
         if (!l.product.deletedAt) await productLifecycle.softDeleteInTx(tx, actor, l.productId, reason);
         await tx.productSupplierMapping.updateMany({ where: { productId: l.productId, supplierOfferId: { not: null }, isActive: true }, data: { isActive: false } });

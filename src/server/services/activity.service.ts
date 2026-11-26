@@ -377,6 +377,10 @@ export const activityService = {
     requirePermission(actor, "products.edit");
 
     const run = async (tx: Tx) => {
+      // The product row first (the lock order every writer of an imported listing takes): a concurrent write such as
+      // a TravelDesk batch rollback either commits before this read, and is seen (not found / version conflict), or
+      // waits for this save. Without it the save read a stale version and failed on the version row's unique key.
+      await tx.$queryRaw`SELECT id FROM products WHERE id = ${id}::uuid FOR UPDATE`;
       const before = await tx.product.findUnique({ where: { id } });
       if (!before || before.deletedAt) throw Errors.notFound("Activity");
       if (opts.expectedVersion !== undefined && before.version !== opts.expectedVersion) {

@@ -385,6 +385,10 @@ async function upkeepTx(
 ): Promise<OneResult> {
   const { now, environment } = data;
   return prisma.$transaction(async (tx) => {
+    // One lock order for every writer of an imported listing: the product row first, then its mapping rows (below),
+    // then the link. The editor save and the batch rollback take the product first too, so none of them can wait on
+    // another in a cycle, whichever path (resumed, hidden, repriced) this run takes.
+    await tx.$queryRaw`SELECT id FROM products WHERE id = ${pre.productId}::uuid FOR UPDATE`;
     const link = await tx.supplierListingLink.findUnique({ where: { id: linkId } });
     const product = await tx.product.findUnique({ where: { id: pre.productId } });
     if (!link || link.deactivatedAt || !product || product.deletedAt) return { ...base, outcome: "skipped", reason: "inactive" } as OneResult;
@@ -469,7 +473,7 @@ async function upkeepTx(
 
     // Options.
     // Review 109 INT-02: the row lock `writeTicketEvidence` takes, so a revoke or a ticket answer made during this run
-    // (in id order, review 110 R110-01: mapping rows first, then product, then link, as the batch rollback does)
+    // (in id order, after the product row taken at the top; review 110 R110-01)
     // either commits before this read (and is read) or waits for this transaction; nothing re-activates or overwrites it.
     await tx.$queryRaw`SELECT id FROM product_supplier_mappings WHERE product_id = ${product.id}::uuid AND supplier_id = ${data.supplier.id}::uuid AND environment = ${environment}::"supplier_environment" ORDER BY id FOR UPDATE`;
     const mappings = await tx.productSupplierMapping.findMany({ where: { productId: product.id, supplierId: data.supplier.id, environment } });
@@ -637,7 +641,8 @@ async function upkeepTx(
       reapproved += 1;
     }
     for (const mid of deactivate) {
-      await tx.productSupplierMapping.updateMany({ where: { id: mid, isActive: true }, data: { isActive: false } });
+      const off = await tx.productSupplierMapping.updateMany({ where: { id: mid, isActive: true }, data: { isActive: false } });
+      if (off.count !== 1) continue;
       await audit(opts.actor, "supplier_mapping.deactivate", { type: "product", id: product.id }, { after: { mappingId: mid, reason: "offer_removed_upstream", runId: opts.runId } }, tx);
     }
 

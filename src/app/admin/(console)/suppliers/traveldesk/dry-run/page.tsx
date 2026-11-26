@@ -217,14 +217,14 @@ export default async function DryRunPage({ searchParams }: { searchParams: Promi
       )}
 
       <Panel className="mb-5" title="Steps" sub="Offer types in the order they are planned (doc 30 §2.1).">
-        <DataTable columns={stepColumns} rows={r.steps} rowKey={(s) => s.id} caption={`Dry run steps, ${env}`} />
+        <DataTable columns={stepColumns} rows={r.steps} rowKey={(s) => s.id} caption={`Dry run steps, ${env}`} keyboardScroll />
       </Panel>
 
       {r.steps.map((s) => {
         const rows = r.listings.filter((l) => l.step === s.id);
         return (
-          <Panel key={s.id} className="mb-5" title={`${s.id} · ${s.label}`} sub={s.classKeys.join(", ")}>
-            <DataTable columns={columns} rows={rows} rowKey={(l) => l.key} caption={`Planned listings, step ${s.id}, ${env}`} empty="No listing in this step." />
+          <Panel key={s.id} className="mb-5" title={`${s.id} · ${s.label}`} sub={<span className="break-all">{s.classKeys.join(", ")}</span>}>
+            <DataTable columns={columns} rows={rows} rowKey={(l) => l.key} caption={`Planned listings, step ${s.id}, ${env}`} empty="No listing in this step." keyboardScroll />
           </Panel>
         );
       })}
