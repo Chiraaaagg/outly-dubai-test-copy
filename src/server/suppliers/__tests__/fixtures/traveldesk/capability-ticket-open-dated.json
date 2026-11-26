@@ -1,0 +1,81 @@
+{
+  "_comment": "Sanitised contract fixture for capability class ticket.open_dated.self.internal.per_person (doc 29 Batch 5). Shape of a TravelDesk GET /tours/{id} answer with one TicketOnly offer (bookingType 2): no time slots, direct reporting, internal route, per-person price, no cancellation policy (non-refundable). Ids, names and every price are synthetic; no supplier rate, ticket code or supplier text.",
+  "id": 9005,
+  "name": "Synthetic attraction with an open-dated ticket",
+  "languageId": 1,
+  "language": "English",
+  "isExternal": false,
+  "cancellationPolicy": [],
+  "categories": [
+    {
+      "id": 3,
+      "name": null,
+      "url": null,
+      "heroImageId": null,
+      "heroImage": null
+    }
+  ],
+  "notesToAgent": null,
+  "videoUrl": null,
+  "termsAndConditions": "Synthetic terms.",
+  "salesDescription": "Synthetic description.",
+  "faqList": [],
+  "itineraries": [],
+  "photos": [],
+  "offers": [
+    {
+      "id": 90051,
+      "name": "Synthetic open-dated ticket, direct reporting",
+      "code": "SYNTH-TICKET-90051",
+      "daysOffered": 0,
+      "numberOfHours": 2,
+      "minNumOfPeople": 1,
+      "maxNumOfPeople": 40,
+      "minNumberOfAdult": null,
+      "maxNumberOfAdult": null,
+      "minNumberOfChild": null,
+      "maxNumberOfChild": null,
+      "minNumberOfInfant": null,
+      "maxNumberOfInfant": null,
+      "minimumAdvancedPayment": 0,
+      "privateType": 0,
+      "childrenAllowed": true,
+      "childAge": 12,
+      "infantsAllowed": true,
+      "infantAge": 3,
+      "pricingPeriods": [
+        {
+          "id": 900511,
+          "widgetPricing": null,
+          "dateStart": "2026-01-01T00:00:00",
+          "dateEnd": "2027-12-31T00:00:00",
+          "offerId": 90051,
+          "currency": "AED",
+          "recPricePerAdult": 150,
+          "recPricePerChild": 100,
+          "recPricePerTrip": 0,
+          "pricePerAdult": 100,
+          "pricePerChild": 60,
+          "pricePerTrip": 0,
+          "pricePerAdultUsd": 27.25,
+          "pricePerChildUsd": 16.35,
+          "pricePerTripUsd": 0,
+          "discountPercent": null,
+          "hasDiscount": false,
+          "isBookable": true,
+          "supplierCurrencyCode": null,
+          "conversionRate": 3.67,
+          "vat": 5
+        }
+      ],
+      "isDirectReporting": true,
+      "isAppendTransactionFeeB2b": false,
+      "isDirectCollection": false,
+      "description": null,
+      "timeSlots": [],
+      "bookingType": 2,
+      "isExternal": false,
+      "tripUnit": ""
+    }
+  ]
+}
