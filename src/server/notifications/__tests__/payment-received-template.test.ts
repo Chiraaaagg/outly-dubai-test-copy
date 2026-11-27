@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MAX_SUBJECT_LENGTH, renderPaymentReceived, type PaymentReceivedContext } from "../templates";
+import { MAX_SUBJECT_LENGTH, renderInvoiceIssued, renderPaymentReceived, type PaymentReceivedContext } from "../templates";
 
 /** Group C C2: the payment confirmation email (doc 93 §3.1, §5.7; owner answers O7, O8, 16). Synthetic values. */
 const ctx: PaymentReceivedContext = {
@@ -55,5 +55,17 @@ describe("PAYMENT_RECEIVED email", () => {
 
   it("greets without a name when none is known", () => {
     expect(renderPaymentReceived({ ...ctx, firstName: undefined }).text).toMatch(/^Hi, we have received/);
+  });
+});
+
+describe("INVOICE_ISSUED email (review 102 finding 14)", () => {
+  it("names the attached invoice, is not the entry ticket, asks for nothing and has no link", () => {
+    const r = renderInvoiceIssued({ firstName: "Asha", orderReference: "OUT-000000", displayNumber: "TEST-INV-000123", supportEmail: "support@example.com" });
+    expect(r.subject).toContain("TEST-INV-000123");
+    expect(r.subject!.length).toBeLessThanOrEqual(MAX_SUBJECT_LENGTH);
+    expect(r.text).toContain("Your tax invoice / receipt TEST-INV-000123 for booking OUT-000000 is attached.");
+    expect(r.text).toContain("This email is not your entry ticket.");
+    expect(r.text).toContain("There is nothing to pay.");
+    expect(r.html).not.toMatch(/<a\s/i);
   });
 });

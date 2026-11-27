@@ -6,6 +6,7 @@ import { uuidv7 } from "../lib/ids";
 import { emitEvent } from "../lib/structured-events";
 import { creditForRefund, isVatCategory, splitInclusive, totalsOf, VAT_RULE, VAT_RULE_CONFIRMED, vatRateBasisPoints, vatRateLabel, type VatCategory, type VatSplit } from "../domain/vat";
 import { plainFiscalLayout } from "../documents/generated/fiscal/render";
+import { sellerFrom } from "../documents/generated/fiscal/seller";
 import { dubaiIsoDate, refundReasonLabel, type FiscalDocType, type FiscalEnvironment, type FiscalLine, type FiscalSeller, type FiscalSnapshot } from "../documents/generated/fiscal/snapshot";
 import { itemPayableMinor } from "./order.service";
 import { paxLabel } from "./order-status.service";
@@ -40,15 +41,28 @@ import { paxLabel } from "./order-status.service";
  * a currency other than AED (A9), a product with no VAT category (A6),
  * captured lines that do not add up to the capture, a second capture on one
  * payment, a payment whose environment is unknown, a production document
- * while the production series row or the seller details are missing, a
- * goodwill refund (A10), a refund with no `refunds` row (dashboard refund,
- * `reconcileRefunds`), a refund before its invoice exists (retried).
+ * while the production series row or the seller details are missing, while
+ * the VAT rule is unconfirmed or while the layout is the pending specimen
+ * layout (review finding 5), a goodwill refund (A10), a refund with no
+ * `refunds` row (dashboard refund, `reconcileRefunds`), a refund before its
+ * invoice exists (retried).
+ *
+ * Cut-off (review finding 6): a series' `issue_from` excludes every capture or
+ * refund before it (required on a production series). A blocked entry is
+ * re-checked at most hourly (`FISCAL_BLOCKED_RECHECK_MS`).
+ *
+ * Concurrency (review finding 7): the draft, including what earlier credit
+ * notes already credited on a line, is built INSIDE the issuing transaction,
+ * after the series row lock, so two refunds of one line can never both see
+ * the same remainder. One invoice per payment is also a unique index.
  *
  * Never on a fiscal document: net cost, margin, supplier amounts, provider
  * payment or refund ids (O4), INR values (O5).
  */
 
 export const FISCAL_LIMITS = Object.freeze({ scanPerRun: 200, issuePerRun: 25 });
+/** Time one issue (or one fiscal file draw) may take; the job steps stop before their deadline by this much. */
+export const FISCAL_UNIT_MS = 3_000;
 
 export type FiscalBlockReason =
   | "currency_not_supported"
@@ -65,7 +79,16 @@ export type FiscalBlockReason =
   | "line_not_invoiced"
   | "credit_exceeds_invoice"
   | "no_lines"
-  | "not_documentable";
+  | "not_documentable"
+  | "vat_rule_unconfirmed"
+  | "layout_pending"
+  | "before_issue_from";
+
+/** Refusals that open no `fiscal_attention` row: the entry is outside the series' cut-off by design (finding 6). */
+const SILENT_BLOCKS: ReadonlySet<FiscalBlockReason> = new Set(["before_issue_from", "not_documentable"]);
+
+/** A blocked entry is looked at again only after this long, so permanently blocked entries never hog the scan (finding 6). */
+export const FISCAL_BLOCKED_RECHECK_MS = 60 * 60_000;
 
 export type IssueOutcome =
   | { kind: "issued"; id: string; displayNumber: string; docType: FiscalDocType }
@@ -80,21 +103,9 @@ class Blocked extends Error {
 
 /* ------------------------------------------------------------ seller */
 
-/** The seller block from server configuration (inputs I1–I4). Unset values print as bracketed placeholders. */
+/** The seller block from server configuration (inputs I1–I4). Unset or stand-in values print as bracketed placeholders (finding 18). */
 export function sellerFromEnv(e: Pick<Env, "FISCAL_SELLER_LEGAL_NAME" | "FISCAL_SELLER_TRN" | "FISCAL_SELLER_ADDRESS" | "FISCAL_SELLER_LICENCE" | "NEXT_PUBLIC_SUPPORT_EMAIL" | "EMAIL_REPLY_TO">): FiscalSeller {
-  const name = e.FISCAL_SELLER_LEGAL_NAME;
-  const trn = e.FISCAL_SELLER_TRN && /^\d{15}$/.test(e.FISCAL_SELLER_TRN) ? e.FISCAL_SELLER_TRN : undefined;
-  const address = e.FISCAL_SELLER_ADDRESS;
-  return {
-    legalName: name ?? "[Legal name]",
-    tradingName: "OUTLYY",
-    trn: trn ?? "[TRN]",
-    address: address ?? "[Registered address]",
-    licence: e.FISCAL_SELLER_LICENCE ?? null,
-    supportEmail: e.NEXT_PUBLIC_SUPPORT_EMAIL ?? e.EMAIL_REPLY_TO ?? null,
-    phone: null,
-    placeholder: !name || !trn || !address,
-  };
+  return sellerFrom(e);
 }
 
 /** `capture:<environment>:…` / `refund:<environment>:…` → the environment the evidence names. */
@@ -282,6 +293,10 @@ export interface IssueDeps {
   seller: FiscalSeller;
   /** False outside a production deployment: a production-environment payment is then refused. */
   productionAllowed: boolean;
+  /** The accountant confirmed the VAT rule (default `VAT_RULE_CONFIRMED`). A production document needs it (finding 5). */
+  vatRuleConfirmed?: boolean;
+  /** The layout is the owner's production design (default `plainFiscalLayout.productionReady`). A production document needs it (finding 5). */
+  layoutProductionReady?: boolean;
   /** Test seam: runs after the counter was taken and before the document is inserted. */
   faultAfterCounter?: () => Promise<void> | void;
 }
@@ -298,6 +313,7 @@ export async function issueForLedgerEntry(ledgerEntryId: string, deps: IssueDeps
   const { paymentId, orderId } = entry;
   const environment = environmentOfEvidence(entry.evidenceRef);
   const block = async (reason: FiscalBlockReason): Promise<IssueOutcome> => {
+    if (SILENT_BLOCKS.has(reason)) return { kind: "blocked", reason };
     await raiseAttention(prisma, { entityKind: "ledger_entry", entityId: entry.id, orderId, reason, detail: { kind: entry.kind } }, deps.now);
     emitEvent("fiscal.blocked", { ledgerEntryId: entry.id, reason }, "warn");
     return { kind: "blocked", reason };
@@ -307,26 +323,24 @@ export async function issueForLedgerEntry(ledgerEntryId: string, deps: IssueDeps
   if (payment?.environment !== environment) return block("environment_mismatch");
   if (environment === "production" && !deps.productionAllowed) return block("environment_mismatch");
   if (environment === "production" && deps.seller.placeholder) return block("seller_unconfigured");
-
-  let draft: Draft;
-  try {
-    const e = { id: entry.id, paymentId, orderId, amountMinor: entry.amountMinor, currency: entry.currency, occurredAt: entry.occurredAt, evidenceRef: entry.evidenceRef };
-    draft = entry.kind === "capture" ? await draftInvoice(prisma, e, environment) : await draftCreditNote(prisma, e, environment);
-  } catch (err) {
-    if (err instanceof Blocked) return block(err.reason);
-    throw err;
-  }
+  if (environment === "production" && !(deps.vatRuleConfirmed ?? VAT_RULE_CONFIRMED)) return block("vat_rule_unconfirmed");
+  if (environment === "production" && !(deps.layoutProductionReady ?? plainFiscalLayout.productionReady)) return block("layout_pending");
+  const docType: FiscalDocType = entry.kind === "capture" ? "tax_invoice" : "tax_credit_note";
+  const draftInput = { id: entry.id, paymentId, orderId, amountMinor: entry.amountMinor, currency: entry.currency, occurredAt: entry.occurredAt, evidenceRef: entry.evidenceRef };
 
   try {
     const out = await prisma.$transaction(async (tx) => {
-      const [series] = await tx.$queryRaw<{ id: string; prefix: string; next_number: bigint; pad_to: number }[]>`
-        SELECT id, prefix, next_number, pad_to FROM fiscal_series
-        WHERE legal_entity = ${deps.legalEntity} AND environment = ${draft.environment} AND doc_type = ${draft.docType}
+      const [series] = await tx.$queryRaw<{ id: string; prefix: string; next_number: bigint; pad_to: number; issue_from: Date | null }[]>`
+        SELECT id, prefix, next_number, pad_to, issue_from FROM fiscal_series
+        WHERE legal_entity = ${deps.legalEntity} AND environment = ${environment} AND doc_type = ${docType}
         FOR UPDATE`;
       if (!series) throw new Blocked("series_missing");
+      if (series.issue_from && entry.occurredAt < series.issue_from) throw new Blocked("before_issue_from");
       // Under the series lock: a concurrent issuer of the same entry has committed by now if it won.
       const won = await tx.fiscalDocument.findUnique({ where: { ledgerEntryId }, select: { id: true, displayNumber: true } });
       if (won) return { kind: "exists" as const, ...won };
+      // The draft is built under the lock (finding 7): earlier credit notes of this invoice are all committed and seen.
+      const draft = entry.kind === "capture" ? await draftInvoice(tx, draftInput, environment) : await draftCreditNote(tx, draftInput, environment);
       const number = series.next_number;
       await tx.$executeRaw`UPDATE fiscal_series SET next_number = next_number + 1, updated_at = ${deps.now} WHERE id = ${series.id}::uuid`;
       if (deps.faultAfterCounter) await deps.faultAfterCounter();
@@ -349,7 +363,7 @@ export async function issueForLedgerEntry(ledgerEntryId: string, deps: IssueDeps
         refersTo: draft.refersTo ? { displayNumber: draft.refersTo.displayNumber, issuedAt: draft.refersTo.issuedAt.toISOString() } : null,
         refundReasonLabel: draft.refundReasonLabel,
         vatRule: VAT_RULE,
-        vatRuleConfirmed: VAT_RULE_CONFIRMED,
+        vatRuleConfirmed: deps.vatRuleConfirmed ?? VAT_RULE_CONFIRMED,
         templateVersion: plainFiscalLayout.templateVersion,
       };
       const id = uuidv7();
@@ -395,10 +409,12 @@ export async function issueForLedgerEntry(ledgerEntryId: string, deps: IssueDeps
     return out;
   } catch (err) {
     if (err instanceof Blocked) return block(err.reason);
-    // A unique conflict on the ledger entry: another issuer committed first; the counter rolled back with us.
+    // A unique conflict: another issuer of the same entry committed first (the counter rolled back with us), or the
+    // payment already has its one invoice (fiscal_documents_one_invoice_per_payment, finding 7).
     if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
       const won = await prisma.fiscalDocument.findUnique({ where: { ledgerEntryId }, select: { id: true, displayNumber: true } });
       if (won) return { kind: "exists", ...won };
+      if (docType === "tax_invoice") return block("second_capture");
     }
     throw err;
   }
@@ -413,19 +429,30 @@ export interface IssueDueSummary {
 }
 
 /** The documents-job step: issue due documents, oldest entry first. Never throws. */
-export async function issueDue(opts: { now: Date; e?: Env; max?: number; scan?: number; deps?: Partial<IssueDeps>; ledgerEntryIds?: readonly string[] }): Promise<IssueDueSummary> {
+export async function issueDue(opts: { now: Date; e?: Env; max?: number; scan?: number; deps?: Partial<IssueDeps>; ledgerEntryIds?: readonly string[]; deadline?: number }): Promise<IssueDueSummary> {
   const e = opts.e ?? env();
   const summary: IssueDueSummary = { scanned: 0, issued: 0, blocked: 0, errors: 0 };
   if (!e.FISCAL_DOCUMENTS_ENABLED) return { ...summary, skipped: "switch_off" };
   const deps: IssueDeps = { now: opts.now, legalEntity: e.FISCAL_LEGAL_ENTITY, seller: sellerFromEnv(e), productionAllowed: e.isProduction, ...opts.deps };
   // `ledgerEntryIds` limits the scan (tests on a shared database).
   const scope = opts.ledgerEntryIds ? Prisma.sql`AND l.id IN (${Prisma.join(opts.ledgerEntryIds.length ? opts.ledgerEntryIds.map((id) => Prisma.sql`${id}::uuid`) : [Prisma.sql`NULL::uuid`])})` : Prisma.empty;
+  const recheckBefore = new Date(opts.now.getTime() - FISCAL_BLOCKED_RECHECK_MS);
   let rows: { id: string }[] = [];
   try {
     rows = await prisma.$queryRaw<{ id: string }[]>`
       SELECT l.id FROM ledger_entries l
       WHERE l.book = 'customer_money' AND l.kind IN ('capture', 'refund') AND l.payment_id IS NOT NULL
         AND NOT EXISTS (SELECT 1 FROM fiscal_documents f WHERE f.ledger_entry_id = l.id)
+        -- Finding 6: nothing before the series' cut-off is ever numbered (historic payments, A12).
+        AND NOT EXISTS (
+          SELECT 1 FROM fiscal_series fs
+          WHERE fs.legal_entity = ${deps.legalEntity} AND fs.environment = split_part(l.evidence_ref, ':', 2)
+            AND fs.doc_type = (CASE WHEN l.kind = 'capture' THEN 'tax_invoice' ELSE 'tax_credit_note' END)
+            AND fs.issue_from IS NOT NULL AND l.occurred_at < fs.issue_from)
+        -- Finding 6: a blocked entry waits FISCAL_BLOCKED_RECHECK_MS before it is looked at again.
+        AND NOT EXISTS (
+          SELECT 1 FROM fiscal_attention a
+          WHERE a.entity_kind = 'ledger_entry' AND a.entity_id = l.id AND a.resolved_at IS NULL AND a.last_seen_at > ${recheckBefore})
         ${scope}
       ORDER BY l.occurred_at ASC, l.id ASC
       LIMIT ${opts.scan ?? FISCAL_LIMITS.scanPerRun}`;
@@ -435,6 +462,8 @@ export async function issueDue(opts: { now: Date; e?: Env; max?: number; scan?: 
   }
   for (const r of rows) {
     if (summary.issued >= (opts.max ?? FISCAL_LIMITS.issuePerRun)) break;
+    // The job's shared deadline (finding 10): one issue is a short transaction; stop with room to spare.
+    if (opts.deadline !== undefined && Date.now() + FISCAL_UNIT_MS > opts.deadline) break;
     summary.scanned++;
     try {
       const o = await issueForLedgerEntry(r.id, deps);
@@ -466,6 +495,13 @@ export interface ReconcileSummary {
  * email. Detection only: no document is issued from here (A12). Runs whatever
  * the fiscal switch says, so the case is known before the switch goes on.
  * Never throws.
+ *
+ * In-flight refunds (review finding 8): the provider total moves as soon as
+ * the provider shows a refund, while our row may still be `requested`,
+ * `accepted` or `unknown`. Those rows count too, so an ordinary refund never
+ * opens a row; and a row is alerted only once the gap has lasted
+ * `REFUND_GAP_ALERT_AFTER_MS` (`fiscalAttentionOpen`), so a short flap never
+ * reaches the ops email.
  */
 export async function reconcileRefunds(now: Date, opts: { paymentIds?: readonly string[] } = {}): Promise<ReconcileSummary> {
   const summary: ReconcileSummary = { checked: 0, raised: 0, resolved: 0 };
@@ -474,7 +510,7 @@ export async function reconcileRefunds(now: Date, opts: { paymentIds?: readonly 
   try {
     const rows = await prisma.$queryRaw<{ id: string; order_id: string; refunded_minor: bigint; settled: bigint }[]>`
       SELECT p.id, p.order_id, p.refunded_minor,
-        COALESCE((SELECT SUM(r.amount_minor) FROM refunds r WHERE r.payment_id = p.id AND r.status = 'succeeded'), 0)::bigint AS settled
+        COALESCE((SELECT SUM(r.amount_minor) FROM refunds r WHERE r.payment_id = p.id AND r.status IN ('succeeded', 'requested', 'accepted', 'unknown')), 0)::bigint AS settled
       FROM payments p
       WHERE p.captured_minor > 0 AND (p.refunded_minor > 0 OR EXISTS (SELECT 1 FROM fiscal_attention a WHERE a.entity_kind = 'payment' AND a.entity_id = p.id AND a.resolved_at IS NULL))
         ${scope}`;
@@ -494,12 +530,16 @@ export async function reconcileRefunds(now: Date, opts: { paymentIds?: readonly 
   return summary;
 }
 
-/** Open attention rows raised in the window, for the ops alert sweep (codes and ids only). */
+/** A refund gap is alerted only after it has lasted this long (finding 8). */
+export const REFUND_GAP_ALERT_AFTER_MS = 15 * 60_000;
+
+/** Open attention rows raised in the window, for the ops alert sweep (codes and ids only). A refund gap only once it has lasted. */
 export async function fiscalAttentionOpen(since: Date, now: Date, limit: number): Promise<{ id: string; entityKind: string; entityId: string; orderId: string | null; reason: string; raisedAt: Date; reference: string | null }[]> {
   const rows = await prisma.$queryRaw<{ id: string; entity_kind: string; entity_id: string; order_id: string | null; reason: string; raised_at: Date; reference: string | null }[]>`
     SELECT a.id, a.entity_kind, a.entity_id, a.order_id, a.reason, a.raised_at, o.reference
     FROM fiscal_attention a LEFT JOIN orders o ON o.id = a.order_id
     WHERE a.resolved_at IS NULL AND a.raised_at >= ${since} AND a.raised_at <= ${now}
+      AND (a.reason <> 'refund_without_refund_row' OR a.raised_at <= ${new Date(now.getTime() - REFUND_GAP_ALERT_AFTER_MS)})
     ORDER BY a.raised_at DESC LIMIT ${limit}`;
   return rows.map((r) => ({ id: r.id, entityKind: r.entity_kind, entityId: r.entity_id, orderId: r.order_id, reason: r.reason, raisedAt: r.raised_at, reference: r.reference }));
 }

@@ -7,6 +7,7 @@ import { emitEvent } from "../lib/structured-events";
 import { sha256Of } from "../documents/pdf";
 import { getDocumentStore } from "../documents/store";
 import { DOCUMENT_LIMITS } from "./document.service";
+import { GUARD_RELEASING_STATES } from "../suppliers/booking-port";
 
 /**
  * Reading the files OUTLYY draws itself (Group C, doc 93 §4.4): the owner
@@ -48,8 +49,14 @@ export async function readServableGenerated(id: string, now: Date = new Date(), 
   if (!generatedKindEnabled(row.kind, e)) return { kind: "unavailable", reason: "switch_off" };
   if (row.status !== "valid" || !row.storageKey || !row.sha256) return { kind: "unavailable", reason: "not_valid" };
   if (isEntryKind(row.kind)) {
-    const src = row.sourceDocumentId ? await prisma.supplierDocument.findUnique({ where: { id: row.sourceDocumentId }, select: { status: true, customerVisible: true } }) : null;
+    // The source must still be the valid, visible file of a booking that has not ended in a voiding state (review
+    // finding 3), and of a kind still on BRANDED_ENTRY_PDF_KINDS (finding 23: taking a kind off the list stops its files).
+    const src = row.sourceDocumentId
+      ? await prisma.supplierDocument.findUnique({ where: { id: row.sourceDocumentId }, select: { status: true, customerVisible: true, kind: true, supplierBooking: { select: { state: true } } } })
+      : null;
     if (!src || src.status !== "valid" || !src.customerVisible) return { kind: "unavailable", reason: "not_valid" };
+    if ((GUARD_RELEASING_STATES as readonly string[]).includes(src.supplierBooking.state)) return { kind: "unavailable", reason: "not_valid" };
+    if (!(e.BRANDED_ENTRY_PDF_KINDS as readonly string[]).includes(src.kind)) return { kind: "unavailable", reason: "switch_off" };
   }
   const store = getDocumentStore();
   if (!store) return { kind: "unavailable", reason: "no_store" };
@@ -57,7 +64,7 @@ export async function readServableGenerated(id: string, now: Date = new Date(), 
   try {
     bytes = await store.get(row.storageKey, { maxBytes: DOCUMENT_LIMITS.maxPdfBytes });
   } catch {
-    emitEvent("generated_document.store_error", { generatedDocumentId: row.id, operation: "get" }, "error");
+    emitEvent("document.generated_store_error", { generatedDocumentId: row.id, operation: "get" }, "error");
     return { kind: "unavailable", reason: "no_store" };
   }
   if (!bytes || bytes.byteLength !== row.byteSize || sha256Of(bytes) !== row.sha256) {
@@ -73,19 +80,25 @@ export async function readServableGenerated(id: string, now: Date = new Date(), 
     } else {
       await prisma.generatedDocument.updateMany({ where: { id: row.id, status: "valid" }, data: { status: "superseded", reasonCode: reason } });
     }
-    emitEvent("generated_document.integrity", { generatedDocumentId: row.id, reason }, "warn");
+    emitEvent("document.generated_integrity", { generatedDocumentId: row.id, reason }, "warn");
     return { kind: "unavailable", reason: "redrawing" };
   }
   return { kind: "ok", bytes, document: { id: row.id, orderId: row.orderId, kind: row.kind as GeneratedKind, displayNumber: row.fiscalDocument?.displayNumber ?? null } };
 }
 
-/** The order a generated file belongs to, without reading the file (route ownership check). */
-export async function generatedOwner(id: string): Promise<{ order: { id: string; reference: string; customerId: string | null }; kind: string } | null> {
-  const row = await prisma.generatedDocument.findUnique({ where: { id }, select: { orderId: true, kind: true } });
+/**
+ * The order a generated file belongs to, without reading the file (route ownership check).
+ * `sourceDocumentId` is the supplier document an entry file was made from: the route resolves its visibility
+ * through `ticketAccess.documentOwner`, exactly like the operator's own file (review finding 3).
+ */
+export async function generatedOwner(id: string): Promise<{ order: { id: string; reference: string; customerId: string | null }; kind: string; sourceDocumentId: string | null } | null> {
+  const row = await prisma.generatedDocument.findUnique({ where: { id }, select: { orderId: true, kind: true, sourceDocumentId: true } });
   if (!row) return null;
   const order = await prisma.order.findUnique({ where: { id: row.orderId }, select: { id: true, reference: true, customerId: true } });
-  return order ? { order, kind: row.kind } : null;
+  return order ? { order, kind: row.kind, sourceDocumentId: row.sourceDocumentId } : null;
 }
+
+export { isEntryKind as isGeneratedEntryKind };
 
 /** The valid combined invoice file of an order's capture, for the payment email attachment hook (O8). */
 export async function invoiceFileForPayment(paymentId: string, e: Env = env()): Promise<{ generatedDocumentId: string; displayNumber: string } | null> {

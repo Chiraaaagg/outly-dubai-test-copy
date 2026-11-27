@@ -222,6 +222,14 @@ const schema = z.object({
    * details below. Only "true" enables it; default off everywhere.
    */
   FISCAL_DOCUMENTS_ENABLED: strictBool("FISCAL_DOCUMENTS_ENABLED"),
+  /**
+   * Group C kill switch for the payment confirmation email (C2, doc 93 §3.1;
+   * review 102): while false no PAYMENT_RECEIVED row is written and none
+   * already written is sent (checked again before every send, retries
+   * included). Turning it on is its own live approval. Only "true" enables
+   * it; default off everywhere.
+   */
+  PAYMENT_RECEIVED_EMAIL_ENABLED: strictBool("PAYMENT_RECEIVED_EMAIL_ENABLED"),
   /** Stable key of the issuing legal entity for the fiscal series (doc 93 §1.4). */
   FISCAL_LEGAL_ENTITY: z
     .string()

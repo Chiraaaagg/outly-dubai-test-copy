@@ -10,7 +10,8 @@ import { sha256Of, validatePdf } from "../documents/pdf";
 import { storageEnvironment } from "../documents/store";
 import { renderFiscalPdf } from "../documents/generated/fiscal/render";
 import { isFiscalSnapshot, type FiscalSnapshot } from "../documents/generated/fiscal/snapshot";
-import { createZxingDecoder, type CodeDecoder } from "../documents/generated/entry/code-decoder";
+import { assertDecoderReady, createZxingDecoder, DecoderUnavailableError, type CodeDecoder } from "../documents/generated/entry/code-decoder";
+import { GUARD_RELEASING_STATES } from "../suppliers/booking-port";
 import { generateEntryDocument, plainEntryLayout, type EntryView } from "../documents/generated/entry/entry-pdf";
 import { DOCUMENT_LIMITS } from "./document.service";
 import { paxLabel } from "./order-status.service";
@@ -43,9 +44,9 @@ function newKey(): string {
   return `${storageEnvironment()}/${randomBytes(16).toString("hex")}`;
 }
 
-async function claim(row: Pick<GeneratedDocument, "id" | "attempts">, now: Date): Promise<boolean> {
+async function claim(row: Pick<GeneratedDocument, "id" | "attempts">, now: Date, kinds: readonly string[] = FISCAL_KINDS): Promise<boolean> {
   const n = await prisma.generatedDocument.updateMany({
-    where: { id: row.id, status: "pending", attempts: row.attempts, OR: [{ lockedUntil: null }, { lockedUntil: { lt: now } }] },
+    where: { id: row.id, kind: { in: [...kinds] }, status: "pending", attempts: row.attempts, OR: [{ lockedUntil: null }, { lockedUntil: { lt: now } }] },
     data: { lockedUntil: new Date(now.getTime() + CLAIM_MS), attempts: { increment: 1 } },
   });
   return n.count === 1;
@@ -60,15 +61,57 @@ async function storeValid(row: Pick<GeneratedDocument, "id">, bytes: Uint8Array,
   });
 }
 
-async function retryOrFail(row: Pick<GeneratedDocument, "id" | "attempts">, reason: string, now: Date): Promise<"retry" | "failed"> {
+/**
+ * `row.attempts` is the count BEFORE the claim that started this attempt (the claim added one).
+ * At `maxAttempts` the row is failed for good: a fiscal file then raises a `fiscal_attention` row for staff
+ * (`fiscal_file_failed`, review finding 16), an entry file keeps its `fault_…` reason for the ops alert sweep.
+ */
+async function retryOrFail(row: Pick<GeneratedDocument, "id" | "attempts">, reason: string, now: Date, maxAttempts = MAX_ATTEMPTS): Promise<"retry" | "failed"> {
   const attempts = row.attempts + 1;
-  if (attempts >= MAX_ATTEMPTS) {
-    await prisma.generatedDocument.updateMany({ where: { id: row.id, status: "pending" }, data: { status: "failed", reasonCode: reason, lockedUntil: null } });
-    emitEvent("generated_document.failed", { generatedDocumentId: row.id, reason }, "error");
+  if (attempts >= maxAttempts) {
+    const n = await prisma.generatedDocument.updateMany({ where: { id: row.id, status: "pending" }, data: { status: "failed", reasonCode: reason, lockedUntil: null, updatedAt: now } });
+    emitEvent("document.generated_failed", { generatedDocumentId: row.id, reason }, "error");
+    if (n.count === 1) await raiseFiscalFileAttention(row.id, reason, now);
     return "failed";
   }
-  await prisma.generatedDocument.updateMany({ where: { id: row.id, status: "pending" }, data: { reasonCode: reason, lockedUntil: null, nextAttemptAt: new Date(now.getTime() + backoffMs(attempts)) } });
+  await prisma.generatedDocument.updateMany({ where: { id: row.id, status: "pending" }, data: { reasonCode: reason, lockedUntil: null, nextAttemptAt: new Date(now.getTime() + backoffMs(attempts)), updatedAt: now } });
   return "retry";
+}
+
+/** A fiscal file failed for good: one open `fiscal_attention` row on its ledger entry, alerted by the ops sweep. */
+async function raiseFiscalFileAttention(generatedDocumentId: string, reason: string, now: Date): Promise<void> {
+  const g = await prisma.generatedDocument.findUnique({ where: { id: generatedDocumentId }, select: { fiscalDocumentId: true, orderId: true } });
+  if (!g?.fiscalDocumentId) return;
+  const doc = await prisma.fiscalDocument.findUnique({ where: { id: g.fiscalDocumentId }, select: { ledgerEntryId: true } });
+  if (!doc) return;
+  const { raiseAttention } = await import("./fiscal-document.service");
+  await raiseAttention(prisma, { entityKind: "ledger_entry", entityId: doc.ledgerEntryId, orderId: g.orderId, reason: "fiscal_file_failed", detail: { stage: "draw", code: reason.slice(0, 64) } }, now);
+}
+
+/**
+ * Staff re-queue of a fiscal file that failed for good (review finding 16):
+ * a new pending copy of the latest failed row, same snapshot, next version,
+ * when the document has no live file. Drawing never renumbers. Answers
+ * whether a copy was queued. The caller checks staff permission and audits.
+ */
+export async function requeueFailedFiscalFile(fiscalDocumentId: string, now: Date = new Date()): Promise<boolean> {
+  const queued = await prisma.$transaction(async (tx) => {
+    const live = await tx.generatedDocument.count({ where: { fiscalDocumentId, status: { in: ["pending", "valid"] } } });
+    if (live) return false;
+    const last = await tx.generatedDocument.findFirst({ where: { fiscalDocumentId, status: "failed" }, orderBy: { version: "desc" } });
+    if (!last) return false;
+    const top = await tx.generatedDocument.aggregate({ where: { fiscalDocumentId }, _max: { version: true } });
+    await tx.generatedDocument.create({ data: { id: uuidv7(), kind: last.kind, orderId: last.orderId, fiscalDocumentId, templateVersion: last.templateVersion, snapshot: last.snapshot as Prisma.InputJsonValue, version: (top._max.version ?? last.version) + 1, status: "pending" } });
+    return true;
+  });
+  if (queued) {
+    const doc = await prisma.fiscalDocument.findUnique({ where: { id: fiscalDocumentId }, select: { ledgerEntryId: true } });
+    if (doc) {
+      const { resolveAttention } = await import("./fiscal-document.service");
+      await resolveAttention(prisma, "ledger_entry", doc.ledgerEntryId, now, ["fiscal_file_failed"]);
+    }
+  }
+  return queued;
 }
 
 /* ------------------------------------------------------------ fiscal files */
@@ -86,7 +129,7 @@ export async function drawFiscal(row: Pick<GeneratedDocument, "fiscalDocumentId"
   const out = await renderFiscalPdf(snap, doc.party ? { buyerName: doc.party.erasedAt ? null : doc.party.buyerName } : null);
   const verdict = validatePdf(out.bytes, { maxBytes: DOCUMENT_LIMITS.maxPdfBytes });
   if (!verdict.ok) return { ok: false, reason: `validator_${verdict.reason}` };
-  if (out.replacedChars > 0) emitEvent("generated_document.replaced_chars", { fiscalDocumentId: doc.id, count: out.replacedChars }, "warn");
+  if (out.replacedChars > 0) emitEvent("document.generated_replaced_chars", { fiscalDocumentId: doc.id, count: out.replacedChars }, "warn");
   return { ok: true, bytes: out.bytes };
 }
 
@@ -98,7 +141,7 @@ export interface GeneratedRunSummary {
 }
 
 /** Draws pending fiscal files. Gated by FISCAL_DOCUMENTS_ENABLED. Never throws. */
-export async function drawPendingFiscal(opts: { store: DocumentStore | null; now: Date; max: number; e?: Env; fiscalDocumentIds?: readonly string[] }): Promise<GeneratedRunSummary> {
+export async function drawPendingFiscal(opts: { store: DocumentStore | null; now: Date; max: number; e?: Env; fiscalDocumentIds?: readonly string[]; deadline?: number }): Promise<GeneratedRunSummary> {
   const e = opts.e ?? env();
   const summary: GeneratedRunSummary = { drawn: 0, failed: 0, retried: 0 };
   if (!e.FISCAL_DOCUMENTS_ENABLED) return { ...summary, skipped: "switch_off" };
@@ -116,6 +159,7 @@ export async function drawPendingFiscal(opts: { store: DocumentStore | null; now
       take: opts.max,
     });
     for (const row of rows) {
+      if (opts.deadline !== undefined && Date.now() + 3_000 > opts.deadline) break;
       if (!(await claim(row, opts.now))) continue;
       try {
         const drawn = await drawFiscal(row);
@@ -130,7 +174,7 @@ export async function drawPendingFiscal(opts: { store: DocumentStore | null; now
       }
     }
   } catch {
-    emitEvent("generated_document.sweep_failed", { stage: "fiscal", reason: "query_failed" }, "error");
+    emitEvent("document.generated_sweep_failed", { stage: "fiscal", reason: "query_failed" }, "error");
   }
   return summary;
 }
@@ -196,22 +240,51 @@ export async function entryViewFor(sourceDocumentId: string): Promise<{ view: En
   return { view, expectedUnits: tickets ? expectedUnits : null, orderId: d.order.id, orderItemId: item.id, sha256: d.sha256, storageKey: d.storageKey, validatedAt: d.validatedAt ?? d.createdAt };
 }
 
+/** Supplier booking states that void every document of the booking (R-B5-8), as `ticketAccess.documentOwner` reads them. */
+const RELEASED_STATES = Prisma.join(GUARD_RELEASING_STATES.map((st) => Prisma.sql`${st}`));
+
 /**
  * Supersedes entry files whose supplier document is no longer the current
- * valid version (a reissue or a quarantine). A file is never served unless its
- * source is valid (also checked at serve time).
+ * valid, customer-visible version (a reissue or a quarantine), or whose
+ * booking has ended in a state that voids its documents (a verified
+ * cancellation, R-B5-8; review finding 3). A file is never served unless its
+ * source passes the same test (also checked at serve time).
  */
 export async function supersedeStaleEntries(now: Date): Promise<number> {
   return prisma.$executeRaw`
-    UPDATE generated_documents g SET status = 'superseded', reason_code = 'source_not_valid', updated_at = ${now}
+    UPDATE generated_documents g SET status = 'superseded', reason_code = 'source_not_valid', locked_until = NULL, updated_at = ${now}
     WHERE g.kind IN ('entry_pdf', 'cover_page') AND g.status IN ('pending', 'valid')
-      AND NOT EXISTS (SELECT 1 FROM supplier_documents s WHERE s.id = g.source_document_id AND s.status = 'valid' AND s.customer_visible)`;
+      AND NOT EXISTS (
+        SELECT 1 FROM supplier_documents s JOIN supplier_bookings b ON b.id = s.supplier_booking_id
+        WHERE s.id = g.source_document_id AND s.status = 'valid' AND s.customer_visible AND b.state::text NOT IN (${RELEASED_STATES}))`;
 }
 
+/** Entry rows whose last attempt was a fault carry a reason starting with this; the ops alert sweep reports them. */
+export const ENTRY_FAULT_PREFIX = "fault_";
+/** Attempts of one entry file before it is failed for good (a hanging or throwing source never loops, review finding 11). */
+export const ENTRY_MAX_ATTEMPTS = 3;
+/** Time one entry file may take: two document walks (10 s each at most) plus decode, build and store. */
+export const ENTRY_UNIT_MS = 35_000;
+
+type EntrySummary = GeneratedRunSummary & { cover: number; none: number };
+
 /**
- * Generates entry files for valid supplier PDFs that have none. Gated by
+ * Generates entry files for valid supplier PDFs. Gated by
  * BRANDED_ENTRY_PDF_ENABLED and BRANDED_ENTRY_PDF_KINDS. One decoder (one
  * comparison key) per file. Never throws.
+ *
+ * Every file is claimed FIRST (review finding 11): a `pending` row with an
+ * attempt count and a lock is written before the supplier PDF is read, so a
+ * file that makes the walk, the decoder or pdf-lib hang or throw is retried
+ * with a back-off at most `ENTRY_MAX_ATTEMPTS` times, then failed with a
+ * `fault_…` reason that the ops alert sweep reports. A decided fallback (no
+ * branded file, reason code) is final for that source version and never
+ * retried. A source whose earlier file was superseded (a lost object) is
+ * picked again with the next version (finding 15).
+ *
+ * The code reader is checked before any file (finding 13): if it cannot load,
+ * nothing is claimed, a structured error is logged, and the sources simply
+ * wait; the ops alert sweep reports sources left waiting.
  */
 export async function generatePendingEntries(opts: {
   store: DocumentStore | null;
@@ -219,83 +292,167 @@ export async function generatePendingEntries(opts: {
   max: number;
   e?: Env;
   decoder?: () => CodeDecoder;
+  /** Test seam: the reader readiness check (default: load the zxing reader). */
+  decoderReady?: () => Promise<void>;
   /** Limits the run (tests on a shared database). */
   sourceDocumentIds?: readonly string[];
-}): Promise<GeneratedRunSummary & { cover: number; none: number }> {
+  /** The job's shared deadline (epoch ms, finding 10): no file is started without `ENTRY_UNIT_MS` left. */
+  deadline?: number;
+}): Promise<EntrySummary> {
   const e = opts.e ?? env();
-  const summary = { drawn: 0, failed: 0, retried: 0, cover: 0, none: 0 } as GeneratedRunSummary & { cover: number; none: number };
+  const summary = { drawn: 0, failed: 0, retried: 0, cover: 0, none: 0 } as EntrySummary;
   if (!e.BRANDED_ENTRY_PDF_ENABLED) return { ...summary, skipped: "switch_off" };
   if (!opts.store) return { ...summary, skipped: "no_store" };
+  const kinds = e.BRANDED_ENTRY_PDF_KINDS;
+  if (!kinds.length) return { ...summary, skipped: "no_kinds" };
+  if (opts.deadline !== undefined && Date.now() + ENTRY_UNIT_MS > opts.deadline) return { ...summary, skipped: "no_time" };
   try {
     if (!opts.sourceDocumentIds) await supersedeStaleEntries(opts.now);
     const scope = opts.sourceDocumentIds
       ? Prisma.sql`AND s.id IN (${Prisma.join(opts.sourceDocumentIds.length ? opts.sourceDocumentIds.map((id) => Prisma.sql`${id}::uuid`) : [Prisma.sql`NULL::uuid`])})`
       : Prisma.empty;
-    const kinds = e.BRANDED_ENTRY_PDF_KINDS;
-    if (!kinds.length) return { ...summary, skipped: "no_kinds" };
-    const sources = await prisma.$queryRaw<{ id: string }[]>`
-      SELECT s.id FROM supplier_documents s
+    const gscope = opts.sourceDocumentIds
+      ? Prisma.sql`AND g.source_document_id IN (${Prisma.join(opts.sourceDocumentIds.length ? opts.sourceDocumentIds.map((id) => Prisma.sql`${id}::uuid`) : [Prisma.sql`NULL::uuid`])})`
+      : Prisma.empty;
+    // Retries first (oldest first), then new sources; together at most `max`.
+    const due = await prisma.$queryRaw<{ id: string; attempts: number }[]>`
+      SELECT g.id, g.attempts FROM generated_documents g
+      WHERE g.kind IN ('entry_pdf', 'cover_page') AND g.status = 'pending'
+        AND (g.locked_until IS NULL OR g.locked_until < ${opts.now})
+        AND (g.next_attempt_at IS NULL OR g.next_attempt_at <= ${opts.now})
+        ${gscope}
+      ORDER BY g.created_at ASC
+      LIMIT ${opts.max}`;
+    const fresh = due.length >= opts.max
+      ? []
+      : await prisma.$queryRaw<{ id: string; order_id: string; order_item_id: string; sha256: string; next_version: number }[]>`
+      SELECT s.id, s.order_id, s.order_item_id, s.sha256,
+        COALESCE((SELECT MAX(x.version) FROM generated_documents x WHERE x.source_document_id = s.id), 0)::int + 1 AS next_version
+      FROM supplier_documents s JOIN supplier_bookings b ON b.id = s.supplier_booking_id
       WHERE s.kind IN (${Prisma.join(kinds)}) AND s.status = 'valid' AND s.customer_visible AND s.storage_key IS NOT NULL
-        AND s.order_item_id IS NOT NULL
-        AND NOT EXISTS (SELECT 1 FROM generated_documents g WHERE g.source_document_id = s.id)
+        AND s.order_item_id IS NOT NULL AND s.order_id IS NOT NULL AND s.sha256 IS NOT NULL
+        AND b.state::text NOT IN (${RELEASED_STATES})
+        AND NOT EXISTS (SELECT 1 FROM generated_documents g WHERE g.source_document_id = s.id AND g.status IN ('pending', 'valid', 'failed'))
         ${scope}
       ORDER BY s.validated_at ASC NULLS LAST, s.id ASC
-      LIMIT ${opts.max}`;
-    for (const s of sources) {
+      LIMIT ${opts.max - due.length}`;
+    if (!due.length && !fresh.length) return summary;
+
+    // Finding 13: a reader that cannot load is a job fault, never a property of a file.
+    try {
+      await (opts.decoderReady ?? assertDecoderReady)();
+    } catch (err) {
+      emitEvent("document.generated_decoder_unavailable", { reason: err instanceof DecoderUnavailableError ? err.reason : "load_failed" }, "error");
+      return { ...summary, skipped: "decoder_unavailable" };
+    }
+
+    // `attempts` as before this attempt's claim (the retry/fail arithmetic of `retryOrFail`).
+    const claimed: Pick<GeneratedDocument, "id" | "attempts">[] = [];
+    for (const r of due) {
+      if (await claim(r, opts.now, ["entry_pdf", "cover_page"])) claimed.push({ id: r.id, attempts: r.attempts });
+    }
+    for (const s of fresh) {
+      const id = uuidv7();
       try {
-        await generateEntryFor(s.id, opts.store, opts.now, opts.decoder ?? createZxingDecoder, summary);
-      } catch {
-        summary.failed++;
-        emitEvent("generated_document.failed", { sourceDocumentId: s.id, reason: "error" }, "error");
+        await prisma.generatedDocument.create({
+          data: {
+            id,
+            kind: "entry_pdf",
+            orderId: s.order_id,
+            orderItemId: s.order_item_id,
+            sourceDocumentId: s.id,
+            sourceSha256: s.sha256,
+            version: s.next_version,
+            templateVersion: plainEntryLayout.templateVersion,
+            status: "pending",
+            attempts: 1,
+            lockedUntil: new Date(opts.now.getTime() + CLAIM_MS),
+          },
+        });
+        claimed.push({ id, attempts: 0 });
+      } catch (err) {
+        // A concurrent run claimed this source (or the item has another live entry file): leave it.
+        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") continue;
+        throw err;
+      }
+    }
+    for (const [i, row] of claimed.entries()) {
+      if (opts.deadline !== undefined && Date.now() + ENTRY_UNIT_MS > opts.deadline) {
+        // Out of time: release the claims not started, giving their attempts back.
+        for (const left of claimed.slice(i)) {
+          await prisma.generatedDocument.updateMany({ where: { id: left.id, status: "pending" }, data: { attempts: left.attempts, lockedUntil: null } });
+        }
+        break;
+      }
+      try {
+        await generateEntryFor(row, opts.store, opts.now, opts.decoder ?? createZxingDecoder, summary);
+      } catch (err) {
+        if (err instanceof DecoderUnavailableError) {
+          // Not this file's fault: give the attempt back and stop the run.
+          await prisma.generatedDocument.updateMany({ where: { id: row.id, status: "pending" }, data: { attempts: { decrement: 1 }, lockedUntil: null, nextAttemptAt: new Date(opts.now.getTime() + 5 * 60_000), reasonCode: "decoder_unavailable" } });
+          emitEvent("document.generated_decoder_unavailable", { reason: err.reason }, "error");
+          summary.retried++;
+          break;
+        }
+        (await retryOrFail(row, `${ENTRY_FAULT_PREFIX}generate_error`, opts.now, ENTRY_MAX_ATTEMPTS)) === "failed" ? summary.failed++ : summary.retried++;
       }
     }
   } catch {
-    emitEvent("generated_document.sweep_failed", { stage: "entry", reason: "query_failed" }, "error");
+    emitEvent("document.generated_sweep_failed", { stage: "entry", reason: "query_failed" }, "error");
   }
   return summary;
 }
 
-async function generateEntryFor(sourceDocumentId: string, store: DocumentStore, now: Date, makeDecoder: () => CodeDecoder, summary: GeneratedRunSummary & { cover: number; none: number }): Promise<void> {
+async function generateEntryFor(row: Pick<GeneratedDocument, "id" | "attempts">, store: DocumentStore, now: Date, makeDecoder: () => CodeDecoder, summary: EntrySummary): Promise<void> {
+  const current = await prisma.generatedDocument.findUnique({ where: { id: row.id }, select: { sourceDocumentId: true, sourceSha256: true, status: true } });
+  if (!current || current.status !== "pending" || !current.sourceDocumentId) return;
+  const sourceDocumentId = current.sourceDocumentId;
   const facts = await entryViewFor(sourceDocumentId);
-  if (!facts) return;
+  if (!facts || facts.sha256 !== current.sourceSha256) {
+    // The source is no longer the valid file this row was claimed for: nothing to make from it.
+    await prisma.generatedDocument.updateMany({ where: { id: row.id, status: "pending" }, data: { status: "superseded", reasonCode: "source_not_valid", lockedUntil: null } });
+    return;
+  }
   const bytes = await store.get(facts.storageKey, { maxBytes: DOCUMENT_LIMITS.maxPdfBytes });
-  // The supplier file must be exactly the one validated; a mismatch is the supplier pipeline's to repair (F36).
-  if (!bytes || sha256Of(bytes) !== facts.sha256) return;
+  // The supplier file must be exactly the one validated; a mismatch is the supplier pipeline's to repair (F36). Retried, then alerted.
+  if (!bytes || sha256Of(bytes) !== facts.sha256) {
+    (await retryOrFail(row, `${ENTRY_FAULT_PREFIX}source_unreadable`, now, ENTRY_MAX_ATTEMPTS)) === "failed" ? summary.failed++ : summary.retried++;
+    return;
+  }
   // Tickets: the code count must match the units issued (doc 93 §2.2); with no stored count there is nothing to check against.
   const outcome =
     facts.view.kind === "tickets" && facts.expectedUnits === null
       ? ({ kind: "none", reason: "units_unknown" } as const)
       : await generateEntryDocument(bytes, facts.view, makeDecoder(), { date: facts.validatedAt, expectedUnits: facts.expectedUnits, maxBytes: DOCUMENT_LIMITS.maxPdfBytes });
-  const base = {
-    id: uuidv7(),
-    orderId: facts.orderId,
-    orderItemId: facts.orderItemId,
-    sourceDocumentId,
-    sourceSha256: facts.sha256,
-    templateVersion: plainEntryLayout.templateVersion,
-    snapshot: facts.view as unknown as Prisma.InputJsonValue,
-    attempts: 1,
-  };
+  const snapshot = facts.view as unknown as Prisma.InputJsonValue;
   if (outcome.kind === "none") {
-    // Recorded once, so it is not retried in a loop; staff see the reason code. The supplier PDF stays the entry document.
-    await prisma.generatedDocument.create({ data: { ...base, kind: "entry_pdf", status: "failed", reasonCode: outcome.reason } });
+    // Decided once for this source version, so it is not retried in a loop; staff see the reason code. The supplier PDF stays the entry document.
+    await prisma.generatedDocument.updateMany({ where: { id: row.id, status: "pending" }, data: { status: "failed", reasonCode: outcome.reason, snapshot, lockedUntil: null, updatedAt: now } });
     summary.none++;
-    emitEvent("generated_document.entry_fallback", { sourceDocumentId, reason: outcome.reason }, "warn");
+    emitEvent("document.entry_fallback", { sourceDocumentId, reason: outcome.reason }, "warn");
     return;
   }
   const key = newKey();
   await store.put(key, outcome.bytes, "application/pdf");
   try {
-    await prisma.generatedDocument.create({
-      data: { ...base, kind: outcome.kind, status: "valid", storageKey: key, contentType: "application/pdf", byteSize: outcome.bytes.byteLength, sha256: sha256Of(outcome.bytes), validatedAt: now, reasonCode: outcome.kind === "cover_page" ? outcome.reason : null },
+    const n = await prisma.generatedDocument.updateMany({
+      where: { id: row.id, status: "pending" },
+      data: { kind: outcome.kind, status: "valid", snapshot, storageKey: key, contentType: "application/pdf", byteSize: outcome.bytes.byteLength, sha256: sha256Of(outcome.bytes), validatedAt: now, lockedUntil: null, nextAttemptAt: null, reasonCode: outcome.kind === "cover_page" ? outcome.reason : null },
     });
+    if (n.count !== 1) {
+      // Superseded or taken over meanwhile: drop our object.
+      await store.delete(key).catch(() => {});
+      return;
+    }
   } catch (err) {
-    // A concurrent run won the one-live-row index: drop our object.
     await store.delete(key).catch(() => {});
-    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") return;
+    // The item already has a live file of this kind (one-live-row index): this one is not needed.
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+      await prisma.generatedDocument.updateMany({ where: { id: row.id, status: "pending" }, data: { status: "superseded", reasonCode: "duplicate_live", lockedUntil: null } });
+      return;
+    }
     throw err;
   }
   if (outcome.kind === "cover_page") summary.cover++;
   else summary.drawn++;
 }
-

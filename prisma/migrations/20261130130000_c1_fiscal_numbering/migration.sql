@@ -18,6 +18,17 @@
 --   3. `fiscal_document_parties`: the buyer block, the only mutable part, so a
 --      privacy erasure can blank it while number, date and amounts stay (A13).
 --
+-- Group C fix round 1 (review 102; this migration was not applied anywhere
+-- yet, so it is amended in place):
+--   - `fiscal_series.issue_from` (finding 6): no document is issued for a
+--     capture or refund that happened before it. Required for a production
+--     series, so the switch can never number historic payments (A12); NULL on
+--     a TEST series means no cut-off.
+--   - `fiscal_series` guard (finding 17): `next_number` never decreases; the
+--     identity, prefix, padding and cut-off are fixed once the series has a
+--     document; rows are never deleted or truncated.
+--   - one combined invoice per payment, enforced by the database (finding 7).
+--
 -- VAT values are derived by `src/server/domain/vat.ts` under a rule marked
 -- UNCONFIRMED until the accountant answers doc 93 §8B; the rule name used is
 -- stored on every row (`vat_rule`).
@@ -35,6 +46,7 @@ CREATE TABLE "fiscal_series" (
   "prefix"       TEXT           NOT NULL,
   "next_number"  BIGINT         NOT NULL DEFAULT 1,
   "pad_to"       INTEGER        NOT NULL DEFAULT 6,
+  "issue_from"   TIMESTAMPTZ(6),
   "created_at"   TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
   "updated_at"   TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT "fiscal_series_pkey" PRIMARY KEY ("id"),
@@ -45,7 +57,9 @@ CREATE TABLE "fiscal_series" (
   -- A test series always carries the TEST marker, a production series never does.
   CONSTRAINT "fiscal_series_test_prefix_check" CHECK (("environment" = 'test') = ("prefix" LIKE 'TEST-%')),
   CONSTRAINT "fiscal_series_next_check" CHECK ("next_number" >= 1),
-  CONSTRAINT "fiscal_series_pad_check" CHECK ("pad_to" BETWEEN 1 AND 12)
+  CONSTRAINT "fiscal_series_pad_check" CHECK ("pad_to" BETWEEN 1 AND 12),
+  -- A production series always names its cut-off (finding 6): nothing before it is ever numbered.
+  CONSTRAINT "fiscal_series_issue_from_check" CHECK ("environment" = 'test' OR "issue_from" IS NOT NULL)
 );
 
 CREATE UNIQUE INDEX "fiscal_series_entity_env_type_key" ON "fiscal_series" ("legal_entity", "environment", "doc_type");
@@ -100,6 +114,8 @@ CREATE UNIQUE INDEX "fiscal_documents_display_number_key" ON "fiscal_documents" 
 CREATE UNIQUE INDEX "fiscal_documents_ledger_entry_key" ON "fiscal_documents" ("ledger_entry_id");
 -- One credit note per refund.
 CREATE UNIQUE INDEX "fiscal_documents_refund_key" ON "fiscal_documents" ("refund_id") WHERE "refund_id" IS NOT NULL;
+-- One combined invoice per payment (finding 7): a second capture on one payment can never get a second invoice.
+CREATE UNIQUE INDEX "fiscal_documents_one_invoice_per_payment" ON "fiscal_documents" ("payment_id") WHERE "doc_type" = 'tax_invoice';
 CREATE INDEX "fiscal_documents_order_idx" ON "fiscal_documents" ("order_id");
 CREATE INDEX "fiscal_documents_payment_idx" ON "fiscal_documents" ("payment_id");
 CREATE INDEX "fiscal_documents_refers_to_idx" ON "fiscal_documents" ("refers_to_id");
@@ -121,6 +137,31 @@ ALTER TABLE "fiscal_documents" ADD CONSTRAINT "fiscal_documents_refers_to_id_fke
 CREATE TRIGGER fiscal_documents_immutable BEFORE UPDATE OR DELETE ON "fiscal_documents"
   FOR EACH ROW EXECUTE FUNCTION outly_raise_immutable();
 CREATE TRIGGER fiscal_documents_no_truncate BEFORE TRUNCATE ON "fiscal_documents"
+  FOR EACH STATEMENT EXECUTE FUNCTION outly_raise_immutable();
+
+-- The series counter is only ever moved forward by the issuer (finding 17).
+CREATE FUNCTION outly_fiscal_series_guard() RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'fiscal_series: a series row is never deleted' USING ERRCODE = 'check_violation';
+  END IF;
+  IF NEW."next_number" < OLD."next_number" THEN
+    RAISE EXCEPTION 'fiscal_series: next_number never decreases' USING ERRCODE = 'check_violation';
+  END IF;
+  IF (NEW."id", NEW."legal_entity", NEW."environment", NEW."doc_type", NEW."prefix", NEW."pad_to", NEW."issue_from")
+       IS DISTINCT FROM (OLD."id", OLD."legal_entity", OLD."environment", OLD."doc_type", OLD."prefix", OLD."pad_to", OLD."issue_from")
+     AND EXISTS (SELECT 1 FROM "fiscal_documents" d WHERE d."series_id" = OLD."id") THEN
+    RAISE EXCEPTION 'fiscal_series: identity, prefix, padding and cut-off are fixed once the series has a document' USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER fiscal_series_guard BEFORE UPDATE OR DELETE ON "fiscal_series"
+  FOR EACH ROW EXECUTE FUNCTION outly_fiscal_series_guard();
+CREATE TRIGGER fiscal_series_no_truncate BEFORE TRUNCATE ON "fiscal_series"
   FOR EACH STATEMENT EXECUTE FUNCTION outly_raise_immutable();
 
 CREATE TABLE "fiscal_document_parties" (

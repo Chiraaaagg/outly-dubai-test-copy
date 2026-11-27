@@ -166,7 +166,8 @@ export function fiscalView(s: FiscalSnapshot, party: { buyerName: string | null 
     { label: "Gross", width: 0.11, align: "right" },
   ];
   const rows = s.lines.map((l) => [
-    [l.description, l.variant, l.note].filter(Boolean).join(" · "),
+    // The note (credit notes: "Full refund" / "Partial refund") on its own line, so it is never split by wrapping.
+    [[l.description, l.variant].filter(Boolean).join(" · "), l.note].filter(Boolean).join("\n"),
     dubaiDateLabel(l.serviceDate),
     l.guests,
     l.rateLabel,

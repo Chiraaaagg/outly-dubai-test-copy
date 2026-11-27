@@ -35,6 +35,8 @@ const PRIVATE_SAMPLES = [
   "/api/tickets/remove-access",
   "/api/tickets/orders/OUT-10000017",
   "/api/tickets/documents/0190a0a0-0000-7000-8000-000000000000",
+  // Group C (review 102 finding 24): files OUTLYY draws itself.
+  "/api/tickets/generated/0190a0a0-0000-7000-8000-000000000000",
 ];
 /** Look-alikes that are public and must keep the storefront policy. */
 const PUBLIC_SAMPLES = ["/", "/terms", "/tours", "/activities/desert-safari", "/bookings", "/vouchers-explained", "/checkout", "/api/quotes", "/categories/booking"];

@@ -4,6 +4,8 @@ import { validatePdf } from "../../pdf";
 import { renderFiscalPdf } from "../fiscal/render";
 import { fiscalView, isFiscalSnapshot, refundReasonLabel, dubaiIsoDate, type FiscalLine, type FiscalSnapshot } from "../fiscal/snapshot";
 import { LAYOUT_PENDING_BAND, toWinAnsi } from "../layout/plain";
+import { plainFiscalLayout } from "../fiscal/render";
+import { isRealSellerText, isRealTrn, sellerFrom } from "../fiscal/seller";
 import { pdfText } from "./pdf-text";
 
 /**
@@ -113,6 +115,41 @@ describe("fiscal PDF (plain layout, switch-off backbone)", () => {
     expect(isFiscalSnapshot({ ...snapshot(), lines: [] })).toBe(false);
     expect(isFiscalSnapshot({ ...snapshot(), lines: [{ ...line("a", 1n), vatCategory: "vat5" }] })).toBe(false);
     expect(isFiscalSnapshot(null)).toBe(false);
+  });
+
+  it("a credit note's reason line is printed whole on its own line, never split by wrapping", async () => {
+    const cn = snapshot({
+      docType: "tax_credit_note",
+      displayNumber: "TEST-CN-000008",
+      lines: [line("a", 30000n, { description: "Specimen Desert Safari with a long enough title to wrap in the column", note: "Partial refund" })],
+      refersTo: { displayNumber: "TEST-INV-000123", issuedAt: "2027-02-14T10:05:00.000Z" },
+      refundReasonLabel: refundReasonLabel("customer_cancel_request"),
+    });
+    const [text] = await pdfText((await renderFiscalPdf(cn, null)).bytes);
+    expect(text.split("\n")).toContain("Partial refund");
+    expect(fiscalView(cn, null).rows[0][0]).toMatch(/\nPartial refund$/);
+  });
+
+  it("the plain layout is not a production layout (finding 5)", () => {
+    expect(plainFiscalLayout.productionReady).toBe(false);
+  });
+
+  it("seller details: stand-ins and malformed values count as placeholders (finding 18)", () => {
+    // TRN-shaped values are built at run time (the public CI copy is scanned for long digit runs).
+    const trn = ["1", "0".repeat(13), "3"].join("");
+    const real = { FISCAL_SELLER_LEGAL_NAME: "Specimen Legal Name LLC", FISCAL_SELLER_TRN: trn, FISCAL_SELLER_ADDRESS: "Specimen Street, Dubai" };
+    expect(sellerFrom(real).placeholder).toBe(false);
+    expect(sellerFrom({}).placeholder).toBe(true);
+    for (const name of ["TBC", "tbd", "[Legal name]", "N/A", "xxx", "Placeholder", "ab", "1234"]) {
+      expect(isRealSellerText(name, 3), name).toBe(false);
+      expect(sellerFrom({ ...real, FISCAL_SELLER_LEGAL_NAME: name }).placeholder, name).toBe(true);
+    }
+    expect(sellerFrom({ ...real, FISCAL_SELLER_ADDRESS: "Dubai" }).placeholder).toBe(true);
+    expect(isRealTrn("0".repeat(15))).toBe(false);
+    expect(isRealTrn(trn.slice(1))).toBe(false);
+    expect(isRealTrn(trn)).toBe(true);
+    expect(sellerFrom({ ...real, FISCAL_SELLER_TRN: "1".repeat(15) }).placeholder).toBe(true);
+    expect(sellerFrom({ ...real, FISCAL_SELLER_LICENCE: "1234567" }).licence).toBe("1234567");
   });
 
   it("dates are Dubai calendar dates", () => {

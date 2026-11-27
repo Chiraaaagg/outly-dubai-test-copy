@@ -2736,6 +2736,9 @@ model FiscalSeries {
   prefix      String
   nextNumber  BigInt           @default(1) @map("next_number")
   padTo       Int              @default(6) @map("pad_to")
+  /// No document for a capture or refund before this instant (review 102 finding 6). Required for a production series
+  /// (check fiscal_series_issue_from_check); NULL on a TEST series means no cut-off. Fixed once the series has a document.
+  issueFrom   DateTime?        @map("issue_from") @db.Timestamptz(6)
   createdAt   DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt   DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
   documents   FiscalDocument[]

@@ -1,9 +1,9 @@
 import { PDFDocument, rgb } from "@cantoo/pdf-lib";
 import { validatePdf } from "../../pdf";
 import { A4, MARGIN, PlainWriter } from "../layout/plain";
-import type { CodeDecoder } from "./code-decoder";
+import { DecoderUnavailableError, type CodeDecoder } from "./code-decoder";
 import { locateCodes, type LocatedCode } from "./code-locator";
-import { intersect, type Box } from "./pdf-walk";
+import { intersect, WalkLimitError, type Box } from "./pdf-walk";
 
 /**
  * The OUTLYY-branded entry PDF (doc 93 §2; answer 15; owner answers O11,
@@ -200,6 +200,15 @@ export type EntryOutcome =
  * The whole step for one supplier PDF: locate, check the count, build,
  * verify; or the cover page when no code was found; or nothing (the
  * operator's PDF only) on any other doubt.
+ *
+ * "Any doubt" (review finding 4) includes: any code-sized image the decoder
+ * could not read, or any code only partly visible, beside the codes that were
+ * found (one guest's code might be the unreadable one while a booking-level
+ * barcode makes the count look right); and codes of more than one symbology.
+ *
+ * A reader fault (`DecoderUnavailableError`) is thrown, not answered: it says
+ * nothing about this file, so the caller must not record a fallback for it
+ * (review finding 13).
  */
 export async function generateEntryDocument(
   sourceBytes: Uint8Array,
@@ -216,14 +225,18 @@ export async function generateEntryDocument(
   let located;
   try {
     located = await locateCodes(source, decoder);
-  } catch {
-    return { kind: "none", reason: "locate_error" };
+  } catch (e) {
+    if (e instanceof DecoderUnavailableError) throw e;
+    return { kind: "none", reason: e instanceof WalkLimitError ? e.reason : "locate_error" };
   }
   if (!located.codes.length) {
     const bytes = await buildCoverPage(view, { date: opts.date });
     const v = validatePdf(bytes, { maxBytes: opts.maxBytes });
     return v.ok ? { kind: "cover_page", bytes, reason: "no_code_found" } : { kind: "none", reason: `validator_${v.reason}` };
   }
+  if (located.undecodable.length) return { kind: "none", reason: "undecodable_image_beside_codes" };
+  if (located.partlyVisible.length) return { kind: "none", reason: "code_partly_visible" };
+  if (new Set(located.codes.map((c) => c.symbology)).size !== 1) return { kind: "none", reason: "mixed_symbologies" };
   if (opts.expectedUnits !== null && located.codes.length !== opts.expectedUnits) return { kind: "none", reason: "code_count_mismatch" };
   if (new Set(located.codes.map((c) => c.digest)).size !== located.codes.length) return { kind: "none", reason: "duplicate_code" };
   let built: BuildResult;
@@ -233,7 +246,10 @@ export async function generateEntryDocument(
     return { kind: "none", reason: "build_error" };
   }
   if (!built.ok) return { kind: "none", reason: built.reason };
-  const verified = await verifyEntryPdf(located.codes, built.bytes, decoder, { maxBytes: opts.maxBytes }).catch(() => ({ ok: false as const, reason: "verify_error" }));
+  const verified = await verifyEntryPdf(located.codes, built.bytes, decoder, { maxBytes: opts.maxBytes }).catch((e: unknown) => {
+    if (e instanceof DecoderUnavailableError) throw e;
+    return { ok: false as const, reason: "verify_error" };
+  });
   if (!verified.ok) return { kind: "none", reason: verified.reason };
   return { kind: "entry_pdf", bytes: built.bytes, codes: located.codes.length };
 }

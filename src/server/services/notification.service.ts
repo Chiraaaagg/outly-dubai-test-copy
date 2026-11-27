@@ -18,11 +18,13 @@ import { ticketTypeLine } from "@/lib/ticket-validity";
 import type { AgentPublic, InquiryDetail } from "./inquiry.types";
 import { dedupKeyOf, type CapabilityIssuedFor, type TicketMessageRef } from "../documents/contracts";
 import {
+  renderInvoiceIssued,
   renderPaymentReceived,
   renderTemplate,
   renderTicketsReady,
   supportsChannel,
   ticketLink,
+  type InvoiceNotificationEvent,
   type NotificationEvent,
   type PaymentNotificationEvent,
   type Rendered,
@@ -130,7 +132,7 @@ export interface DispatchResult {
   error?: string;
 }
 
-type SuppressedReason = "non_production_allowlist" | "opted_out" | "no_consent" | "unsupported_channel";
+type SuppressedReason = "non_production_allowlist" | "opted_out" | "no_consent" | "unsupported_channel" | "switch_off";
 
 /** Outcome of one attempt, before it is recorded. `code` is a short machine code, never provider text. */
 type Outcome =
@@ -144,6 +146,23 @@ const TICKETS_READY: TicketNotificationEvent = "TICKETS_READY";
 const PAYMENT_RECEIVED: PaymentNotificationEvent = "PAYMENT_RECEIVED";
 /** Captures older than this are never announced by the sweep (first deploy, a long job outage). */
 export const PAYMENT_RECEIVED_WINDOW_MS = 30 * 60_000;
+
+/** Group C (review 102 finding 14, O8): the follow-up email that carries the combined invoice once it exists. */
+const INVOICE_ISSUED: InvoiceNotificationEvent = "INVOICE_ISSUED";
+/** Invoices issued longer ago than this are never mailed by the sweep (first switch-on, a long job outage). */
+export const INVOICE_ISSUED_WINDOW_MS = 24 * 3600_000;
+/** Order states in which the money is still held for the booking: the payment email is sent only in these (finding 9). */
+const PAYMENT_EMAIL_ORDER_STATES = ["paid", "supplier_pending", "confirmed", "partially_confirmed", "completed"] as const;
+/** Time one payment or invoice email send may take (the email provider's timeout plus the writes). */
+export const EMAIL_SEND_UNIT_MS = 12_000;
+
+/** The row payload of a follow-up invoice email: ids only. */
+interface InvoiceMessageRef {
+  kind: "invoice_message";
+  orderId: string;
+  fiscalDocumentId: string;
+  generatedDocumentId: string;
+}
 
 /** The row payload of a payment confirmation: ids only, plus the attachment decided at insert (O8). */
 interface PaymentMessageRef {
@@ -224,6 +243,32 @@ function parsePaymentRef(payload: unknown): PaymentMessageRef | null {
   if (p.kind !== "payment_message" || typeof p.orderId !== "string" || typeof p.paymentId !== "string" || !uuid.test(p.orderId) || !uuid.test(p.paymentId)) return null;
   const attach = typeof p.attachGeneratedDocumentId === "string" && uuid.test(p.attachGeneratedDocumentId) ? p.attachGeneratedDocumentId : null;
   return { kind: "payment_message", orderId: p.orderId, paymentId: p.paymentId, attachGeneratedDocumentId: attach };
+}
+
+function parseInvoiceRef(payload: unknown): InvoiceMessageRef | null {
+  if (!payload || typeof payload !== "object") return null;
+  const p = payload as Record<string, unknown>;
+  const uuid = /^[0-9a-f-]{36}$/;
+  if (p.kind !== "invoice_message" || typeof p.orderId !== "string" || typeof p.fiscalDocumentId !== "string" || typeof p.generatedDocumentId !== "string") return null;
+  if (!uuid.test(p.orderId) || !uuid.test(p.fiscalDocumentId) || !uuid.test(p.generatedDocumentId)) return null;
+  return { kind: "invoice_message", orderId: p.orderId, fiscalDocumentId: p.fiscalDocumentId, generatedDocumentId: p.generatedDocumentId };
+}
+
+/**
+ * Is the payment email still right for this order (review finding 9)? The money is still held for the booking: the
+ * order is in a paid state, nothing was refunded on the payment, no refund row is open or done, and no refund remedy
+ * is pending, running or done. An order the saga is refunding (supplier failed after capture) gets no "we have
+ * received your payment" email.
+ */
+async function paymentEmailStillRight(orderId: string, paymentId: string): Promise<boolean> {
+  const [row] = await prisma.$queryRaw<{ ok: boolean }[]>`
+    SELECT (
+      EXISTS (SELECT 1 FROM orders o WHERE o.id = ${orderId}::uuid AND o.status::text IN (${Prisma.join([...PAYMENT_EMAIL_ORDER_STATES])}))
+      AND EXISTS (SELECT 1 FROM payments p WHERE p.id = ${paymentId}::uuid AND p.order_id = ${orderId}::uuid AND p.captured_minor > 0 AND p.refunded_minor = 0)
+      AND NOT EXISTS (SELECT 1 FROM refunds r WHERE r.payment_id = ${paymentId}::uuid AND r.status <> 'failed')
+      AND NOT EXISTS (SELECT 1 FROM customer_remedies cr WHERE cr.order_id = ${orderId}::uuid AND cr.kind = 'refund' AND cr.status IN ('pending', 'in_progress', 'completed'))
+    ) AS ok`;
+  return row?.ok === true;
 }
 
 function errorCodeOf(o: Outcome): string | undefined {
@@ -367,23 +412,34 @@ async function preparePaymentMessage(ref: PaymentMessageRef): Promise<Prepared> 
     select: {
       reference: true,
       leadName: true,
-      items: { where: { chargedAmountMinor: { not: null } }, select: { titleSnapshot: true, serviceDate: true, pax: true, quoteLineIndex: true, id: true }, orderBy: [{ quoteLineIndex: "asc" }, { id: "asc" }] },
+      // Only the items the capture paid for (finding 9): an item rejected or cancelled before a partial capture is not listed.
+      items: {
+        where: { chargedAmountMinor: { not: null }, status: { notIn: ["rejected", "cancelled"] } },
+        select: { titleSnapshot: true, serviceDate: true, pax: true, quoteLineIndex: true, id: true },
+        orderBy: [{ quoteLineIndex: "asc" }, { id: "asc" }],
+      },
     },
   });
   const payment = await prisma.payment.findUnique({ where: { id: ref.paymentId }, select: { orderId: true, currency: true, capturedMinor: true, capturedAt: true, rail: true, method: true } });
   if (!order || !payment || payment.orderId !== ref.orderId || payment.capturedMinor <= 0n) return { ok: false, outcome: { status: "failed", retryable: false, code: "order_missing" } };
+  // Re-checked at send time (finding 9): a refund that started after the row was written stops the email for good.
+  if (!(await paymentEmailStillRight(ref.orderId, ref.paymentId))) return { ok: false, outcome: { status: "failed", retryable: false, code: "order_refunding" } };
   const { paxLabel } = await import("./order-status.service");
   let attachments: EmailSend["attachments"];
   let invoice: { displayNumber: string } | null = null;
   if (ref.attachGeneratedDocumentId) {
     const { readServableGenerated } = await import("./generated-document.read");
     const file = await readServableGenerated(ref.attachGeneratedDocumentId);
-    if (file.kind !== "ok" || file.document.orderId !== ref.orderId || file.document.kind !== "tax_invoice" || !file.document.displayNumber) {
+    if (file.kind === "unavailable" && file.reason === "switch_off") {
+      // Finding 19: the fiscal switch was turned off after the row was written: the email goes without the invoice line.
+      // The follow-up invoice email (INVOICE_ISSUED) sends the file once the switch is on again.
+    } else if (file.kind !== "ok" || file.document.orderId !== ref.orderId || file.document.kind !== "tax_invoice" || !file.document.displayNumber) {
       return { ok: false, outcome: { status: "failed", retryable: true, code: "attachment_unavailable" } };
+    } else {
+      const { generatedDownloadName } = await import("../documents/download-name");
+      invoice = { displayNumber: file.document.displayNumber };
+      attachments = [{ filename: generatedDownloadName("tax_invoice", order.reference, file.document.displayNumber), content: file.bytes, contentType: "application/pdf" }];
     }
-    const { generatedDownloadName } = await import("../documents/download-name");
-    invoice = { displayNumber: file.document.displayNumber };
-    attachments = [{ filename: generatedDownloadName("tax_invoice", order.reference, file.document.displayNumber), content: file.bytes, contentType: "application/pdf" }];
   }
   const e = env();
   const rendered = renderPaymentReceived({
@@ -400,6 +456,30 @@ async function preparePaymentMessage(ref: PaymentMessageRef): Promise<Prepared> 
 }
 
 /**
+ * The follow-up invoice email (finding 14), rendered at send time from ids. Needs the fiscal switch on and the named
+ * file valid and checked; otherwise it fails retryably (a later attempt may find the switch back on or the file re-drawn).
+ */
+async function prepareInvoiceMessage(ref: InvoiceMessageRef): Promise<Prepared> {
+  const e = env();
+  if (!e.FISCAL_DOCUMENTS_ENABLED) return { ok: false, outcome: { status: "suppressed", reason: "switch_off" } };
+  const order = await prisma.order.findUnique({ where: { id: ref.orderId }, select: { reference: true, leadName: true } });
+  if (!order) return { ok: false, outcome: { status: "failed", retryable: false, code: "order_missing" } };
+  const { readServableGenerated } = await import("./generated-document.read");
+  const file = await readServableGenerated(ref.generatedDocumentId);
+  if (file.kind !== "ok" || file.document.orderId !== ref.orderId || file.document.kind !== "tax_invoice" || !file.document.displayNumber) {
+    return { ok: false, outcome: { status: "failed", retryable: true, code: "attachment_unavailable" } };
+  }
+  const { generatedDownloadName } = await import("../documents/download-name");
+  const rendered = renderInvoiceIssued({
+    firstName: order.leadName.trim().split(/\s+/)[0] || undefined,
+    orderReference: order.reference,
+    displayNumber: file.document.displayNumber,
+    supportEmail: e.NEXT_PUBLIC_SUPPORT_EMAIL ?? e.EMAIL_REPLY_TO,
+  });
+  return { ok: true, rendered, attachments: [{ filename: generatedDownloadName("tax_invoice", order.reference, file.document.displayNumber), content: file.bytes, contentType: "application/pdf" }] };
+}
+
+/**
  * Guards → render → send for one claimed row. Writes nothing to the
  * notifications table; the caller records the outcome.
  */
@@ -413,7 +493,12 @@ async function attempt(row: Notification, now: Date): Promise<{ outcome: Outcome
   const isPayment = row.event === PAYMENT_RECEIVED;
   const paymentRef = isPayment ? parsePaymentRef(row.payload) : null;
   if (isPayment && (!paymentRef || channel !== "email")) return { outcome: { status: "failed", retryable: false, code: "bad_payload" } };
-  if (!isTicket && !isPayment && !supportsChannel(row.event as NotificationEvent, channel)) return { outcome: { status: "suppressed", reason: "unsupported_channel" } };
+  // Kill switch, checked before any send, retries included (PAYMENT_RECEIVED_EMAIL_ENABLED, default off).
+  if (isPayment && !e.PAYMENT_RECEIVED_EMAIL_ENABLED) return { outcome: { status: "suppressed", reason: "switch_off" } };
+  const isInvoice = row.event === INVOICE_ISSUED;
+  const invoiceRef = isInvoice ? parseInvoiceRef(row.payload) : null;
+  if (isInvoice && (!invoiceRef || channel !== "email")) return { outcome: { status: "failed", retryable: false, code: "bad_payload" } };
+  if (!isTicket && !isPayment && !isInvoice && !supportsChannel(row.event as NotificationEvent, channel)) return { outcome: { status: "suppressed", reason: "unsupported_channel" } };
 
   // 1. Environment guard — staging can never message a real customer. Checked before any
   //    capability is minted, so a suppressed message creates no grant.
@@ -431,6 +516,7 @@ async function attempt(row: Notification, now: Date): Promise<{ outcome: Outcome
   try {
     if (ref) prepared = await prepareTicketMessage(row, ref, now);
     else if (paymentRef) prepared = await preparePaymentMessage(paymentRef);
+    else if (invoiceRef) prepared = await prepareInvoiceMessage(invoiceRef);
     else prepared = { ok: true, rendered: renderTemplate(row.event as NotificationEvent, channel, (row.payload as unknown as TemplateContext) ?? ({} as TemplateContext)) };
   } catch {
     return { outcome: { status: "failed", retryable: true, code: "render" } };
@@ -602,6 +688,18 @@ async function sendPaymentMessage(input: { orderId: string; paymentId: string; r
   const payload: PaymentMessageRef = { kind: "payment_message", orderId: input.orderId, paymentId: input.paymentId, attachGeneratedDocumentId: input.attachGeneratedDocumentId };
   const inserted = await insertQueued(
     { id: uuidv7(), event: PAYMENT_RECEIVED, channel: "email", recipient: input.recipient, orderId: input.orderId, payload: payload as unknown as Prisma.InputJsonValue, dedupKey },
+    now,
+    olderKeys,
+  );
+  if ("duplicate" in inserted) return resultOf(inserted.duplicate.id, rowOutcome(inserted.duplicate), { duplicate: true, providerId: inserted.duplicate.providerId });
+  return attemptAndRecord(inserted.row, now, inserted.claimUntil);
+}
+
+/** One follow-up invoice email per invoice and recipient (finding 14): the dedup key names the fiscal document. */
+async function sendInvoiceMessage(input: { ref: InvoiceMessageRef; recipient: string }, now: Date): Promise<DispatchResult> {
+  const [dedupKey, ...olderKeys] = dedupKeysFor({ event: `${INVOICE_ISSUED}:email:${input.ref.fiscalDocumentId}`, orderId: input.ref.orderId }, recipientHashes(input.recipient));
+  const inserted = await insertQueued(
+    { id: uuidv7(), event: INVOICE_ISSUED, channel: "email", recipient: input.recipient, orderId: input.ref.orderId, payload: input.ref as unknown as Prisma.InputJsonValue, dedupKey },
     now,
     olderKeys,
   );
@@ -879,15 +977,20 @@ export const notificationService = {
   /**
    * The order's payment was captured. One email to the order's lead email
    * per order (dedup), none when the order has no email. Not sent for a hold
-   * that is released (no capture). The combined invoice is attached only
-   * when FISCAL_DOCUMENTS_ENABLED is on and its file already exists (O8);
-   * otherwise the email goes without it. Never throws.
+   * that is released (no capture), nor for an order whose money is being
+   * refunded (finding 9). The combined invoice is attached only when
+   * FISCAL_DOCUMENTS_ENABLED is on and its file already exists (O8);
+   * otherwise the email goes without it and the follow-up invoice email
+   * carries the file later. Kill switch: nothing is written or sent while
+   * PAYMENT_RECEIVED_EMAIL_ENABLED is not "true". Never throws.
    */
   async onPaymentCaptured(input: { orderId: string; paymentId: string }, now: Date = new Date()): Promise<DispatchResult | null> {
+    if (!env().PAYMENT_RECEIVED_EMAIL_ENABLED) return null;
     try {
       const order = await prisma.order.findUnique({ where: { id: input.orderId }, select: { leadEmail: true } });
       const recipient = order?.leadEmail?.trim();
       if (!recipient) return null;
+      if (!(await paymentEmailStillRight(input.orderId, input.paymentId))) return null;
       const { invoiceFileForPayment } = await import("./generated-document.read");
       const invoice = await invoiceFileForPayment(input.paymentId).catch(() => null);
       return await sendPaymentMessage({ ...input, recipient, attachGeneratedDocumentId: invoice?.generatedDocumentId ?? null }, now);
@@ -899,12 +1002,21 @@ export const notificationService = {
 
   /**
    * The documents-job step: every capture booked in the last
-   * `PAYMENT_RECEIVED_WINDOW_MS` whose order has no payment confirmation yet
-   * gets one. The window keeps a first deploy from writing to old orders.
-   * Never throws.
+   * `PAYMENT_RECEIVED_WINDOW_MS` whose order has no payment confirmation yet,
+   * and whose money is still held for the booking (finding 9), gets one. The
+   * window keeps a first deploy from writing to old orders. At most `max`
+   * orders and no send started after `budget.startBy` (finding 10: an email-provider
+   * outage cannot eat the job's time). Kill switch:
+   * PAYMENT_RECEIVED_EMAIL_ENABLED. Never throws.
    */
-  async sweepPaymentReceived(now: Date = new Date(), max = 25, scope: { orderIds?: readonly string[] } = {}): Promise<{ scanned: number; sent: number; failed: number }> {
+  async sweepPaymentReceived(
+    now: Date = new Date(),
+    max = 5,
+    scope: { orderIds?: readonly string[] } = {},
+    budget: { startBy?: number } = {},
+  ): Promise<{ skipped?: "switch_off"; scanned: number; sent: number; failed: number }> {
     const summary = { scanned: 0, sent: 0, failed: 0 };
+    if (!env().PAYMENT_RECEIVED_EMAIL_ENABLED) return { ...summary, skipped: "switch_off" };
     // `scope.orderIds` limits the sweep (tests on a shared database).
     const only = scope.orderIds
       ? Prisma.sql`AND l.order_id IN (${Prisma.join(scope.orderIds.length ? scope.orderIds.map((id) => Prisma.sql`${id}::uuid`) : [Prisma.sql`NULL::uuid`])})`
@@ -920,6 +1032,8 @@ export const notificationService = {
         ORDER BY l.order_id, l.occurred_at ASC
         LIMIT ${max}`;
       for (const r of rows) {
+        // No send starts after `startBy` (the caller leaves one send's worst case after it, finding 10).
+        if (budget.startBy !== undefined && Date.now() >= budget.startBy) break;
         summary.scanned++;
         const out = await notificationService.onPaymentCaptured({ orderId: r.order_id, paymentId: r.payment_id }, now);
         if (out?.outcome === "sent") summary.sent++;
@@ -927,6 +1041,61 @@ export const notificationService = {
       }
     } catch {
       emitEvent("notification.failed", { event: PAYMENT_RECEIVED, channel: "email", reason: "sweep_error" }, "error");
+    }
+    return summary;
+  },
+
+  /**
+   * The documents-job step for the follow-up invoice email (finding 14; O8):
+   * every valid combined invoice file issued in the last
+   * `INVOICE_ISSUED_WINDOW_MS` that no payment email carried and that has no
+   * invoice email yet gets one, to the order's lead email. Only while
+   * FISCAL_DOCUMENTS_ENABLED is on. At most `max`, no send started after
+   * `budget.startBy`. Never throws.
+   */
+  async sweepInvoiceIssued(
+    now: Date = new Date(),
+    max = 5,
+    scope: { orderIds?: readonly string[] } = {},
+    budget: { startBy?: number } = {},
+  ): Promise<{ skipped?: "switch_off"; scanned: number; sent: number; failed: number }> {
+    const summary = { scanned: 0, sent: 0, failed: 0 };
+    if (!env().FISCAL_DOCUMENTS_ENABLED) return { ...summary, skipped: "switch_off" };
+    const only = scope.orderIds
+      ? Prisma.sql`AND f.order_id IN (${Prisma.join(scope.orderIds.length ? scope.orderIds.map((id) => Prisma.sql`${id}::uuid`) : [Prisma.sql`NULL::uuid`])})`
+      : Prisma.empty;
+    try {
+      const since = new Date(now.getTime() - INVOICE_ISSUED_WINDOW_MS);
+      const rows = await prisma.$queryRaw<{ order_id: string; fiscal_document_id: string; generated_document_id: string; lead_email: string | null }[]>`
+        SELECT f.order_id, f.id AS fiscal_document_id, g.id AS generated_document_id, o.lead_email
+        FROM fiscal_documents f
+        JOIN generated_documents g ON g.fiscal_document_id = f.id AND g.status = 'valid'
+        JOIN orders o ON o.id = f.order_id
+        WHERE f.doc_type = 'tax_invoice' AND f.issued_at >= ${since} AND f.issued_at <= ${now}
+          AND NOT EXISTS (SELECT 1 FROM notifications n WHERE n.order_id = f.order_id AND n.event = ${INVOICE_ISSUED} AND n.payload->>'fiscalDocumentId' = f.id::text)
+          AND NOT EXISTS (
+            SELECT 1 FROM notifications n JOIN generated_documents g2 ON g2.id::text = n.payload->>'attachGeneratedDocumentId'
+            WHERE n.order_id = f.order_id AND n.event = ${PAYMENT_RECEIVED} AND n.status::text NOT IN ('failed', 'suppressed') AND g2.fiscal_document_id = f.id)
+          ${only}
+        ORDER BY f.issued_at ASC
+        LIMIT ${max}`;
+      for (const r of rows) {
+        // No send starts after `startBy` (the caller leaves one send's worst case after it, finding 10).
+        if (budget.startBy !== undefined && Date.now() >= budget.startBy) break;
+        const recipient = r.lead_email?.trim();
+        if (!recipient) continue;
+        summary.scanned++;
+        try {
+          const out = await sendInvoiceMessage({ ref: { kind: "invoice_message", orderId: r.order_id, fiscalDocumentId: r.fiscal_document_id, generatedDocumentId: r.generated_document_id }, recipient }, now);
+          if (out.outcome === "sent") summary.sent++;
+          else if (out.outcome !== "suppressed") summary.failed++;
+        } catch {
+          summary.failed++;
+          emitEvent("notification.failed", { event: INVOICE_ISSUED, channel: "email", reason: "dispatch_error" }, "error");
+        }
+      }
+    } catch {
+      emitEvent("notification.failed", { event: INVOICE_ISSUED, channel: "email", reason: "sweep_error" }, "error");
     }
     return summary;
   },
@@ -1090,7 +1259,7 @@ export const notificationService = {
     }
     requirePermission(actor, "notifications.resend");
     // A payment confirmation is rendered from ids and sent once per order; it is not replayed from the console.
-    if (n.event === PAYMENT_RECEIVED) throw Errors.conflict("A payment confirmation cannot be resent");
+    if (n.event === PAYMENT_RECEIVED || n.event === INVOICE_ISSUED) throw Errors.conflict("A payment confirmation cannot be resent");
     // Ownership mirrors the inquiry *update* rule (§13.3): resending messages a
     // customer, so reading every inquiry (`view_all`, which every agent holds)
     // is not enough. Leads/ops (`inquiries.assign`) may resend anything; an

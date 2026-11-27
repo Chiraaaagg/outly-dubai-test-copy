@@ -12,6 +12,12 @@
 --      a customer detail; amounts stay out of alert emails.
 --   2. `ops_alerts.entity_kind` also allows `payment` and `ledger_entry`, so
 --      these reach the existing ops alert email (codes and ids only).
+--      The list is the UNION of every kind any branch adds (review 102
+--      finding 1): Group B's migration 20261130120000 (impl/postpay-b) adds
+--      'order_account_link', 'customer' and 'email_volume' and runs before this
+--      one, so this list keeps them; otherwise merging both branches would
+--      narrow the constraint and Group B's alerts would fail on insert. Kinds
+--      no code on this branch writes yet are harmless in a CHECK list.
 --
 -- RLS on, no grants to the API roles, lock timeout (repository pattern).
 
@@ -52,5 +58,6 @@ END $$;
 
 ALTER TABLE "ops_alerts" DROP CONSTRAINT "ops_alerts_entity_kind_check";
 ALTER TABLE "ops_alerts" ADD CONSTRAINT "ops_alerts_entity_kind_check" CHECK ("entity_kind" IN
-  ('supplier_account', 'payment_saga', 'order_item', 'supplier_booking', 'supplier_document', 'crm_subject', 'privileged_approval', 'bulk_operation_item', 'payment', 'ledger_entry', 'digest')) NOT VALID;
+  ('supplier_account', 'payment_saga', 'order_item', 'supplier_booking', 'supplier_document', 'crm_subject', 'privileged_approval', 'bulk_operation_item',
+   'order_account_link', 'customer', 'email_volume', 'payment', 'ledger_entry', 'digest')) NOT VALID;
 ALTER TABLE "ops_alerts" VALIDATE CONSTRAINT "ops_alerts_entity_kind_check";

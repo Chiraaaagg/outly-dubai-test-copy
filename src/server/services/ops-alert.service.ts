@@ -14,6 +14,7 @@ import { AUTH_PAUSE_MS, BREAKER_THRESHOLD, breakerPauseMs } from "../crm/crm.wor
 import { crmReturnIncidents } from "../crm/crm.return.alerts";
 import { ownerAlertIncidents } from "./owner-alert";
 import { bulkDisarmIncidents } from "./bulk-guard";
+import type { OpsEntityKind } from "./ops-alert.kinds";
 
 /**
  * Ops alert emails for instant-path incidents (doc 22 §32.24: alerts by
@@ -136,23 +137,16 @@ export type OpsIncidentKind =
   /** Doc 30 N2 (review N2-04): a free-cancellation bulk item left a listing on inquiry after a failure (bulk-guard.ts). */
   | "bulk_item_disarmed"
   /** Group C (doc 93 §1.5, §9): a fiscal document could not be issued automatically, or a refund has no refunds row (fiscal-document.service.ts). */
-  | "fiscal_attention";
+  | "fiscal_attention"
+  /** Group C (review 102 findings 11, 13): a branded entry file failed for good after repeated faults (generated-document.service.ts). */
+  | "entry_file_failed"
+  /** Group C (findings 11, 13): a supplier file has waited too long for its branded entry file (for example the code reader cannot load). */
+  | "entry_file_waiting";
 /**
  * `crm_subject` needs migration 20261122140000 (ops_alerts_entity_kind_check). Its entity id is `inquiry:<id>`
  * or `order:<id>`, or `portal:<environment>` for the CRM worker's own pause (C2b, no new entity kind).
  */
-export type OpsEntityKind =
-  | "supplier_account"
-  | "payment_saga"
-  | "order_item"
-  | "supplier_booking"
-  | "supplier_document"
-  | "crm_subject"
-  | "privileged_approval"
-  | "bulk_operation_item"
-  /** Group C: needs migration 20261130160000 (ops_alerts_entity_kind_check). */
-  | "payment"
-  | "ledger_entry";
+export type { OpsEntityKind } from "./ops-alert.kinds";
 
 export interface OpsIncident {
   kind: OpsIncidentKind;
@@ -189,6 +183,8 @@ export const OPS_INCIDENT_TITLES: Record<OpsIncidentKind, string> = {
   owner_alert_failed: "Owner alert of a one-person approval was not delivered",
   bulk_item_disarmed: "Bulk free-cancellation run left an armed listing on inquiry",
   fiscal_attention: "Fiscal document needs staff: invoice or credit note not issued automatically",
+  entry_file_failed: "Branded entry PDF failed: the operator's PDF stays the entry document",
+  entry_file_waiting: "Branded entry PDF not made in time: check the documents job and the code reader",
 };
 
 /** The stored row payload: what the email says plus its idempotency scope. */
@@ -486,7 +482,68 @@ export async function collectOpsIncidents(since: Date, now: Date, limit = COLLEC
   out.push(...(await bulkDisarmIncidents(since, now, limit)));
   // Group C: needs migration 20261130160000 (table fiscal_attention, entity kinds `payment`, `ledger_entry`).
   out.push(...(await fiscalIncidents(since, now, limit)));
+  // Group C (findings 11, 13): branded entry files that failed for good or wait too long; nothing while the switch is off.
+  out.push(...(await entryFileIncidents(since, now, limit)));
   return out;
+}
+
+/** A supplier file with no branded entry file this long after it was validated is reported (findings 11, 13). */
+export const ENTRY_FILE_WAIT_ALERT_MS = 30 * 60_000;
+
+/**
+ * Group C (review 102 findings 11, 13): while BRANDED_ENTRY_PDF_ENABLED is on,
+ * (a) entry files failed for good after repeated faults (`fault_…` reason
+ * codes; a decided fallback such as "no code found" is not an incident), and
+ * (b) supplier files of an enabled kind still without a valid or decided
+ * entry file `ENTRY_FILE_WAIT_ALERT_MS` after they were validated, which is
+ * how a code reader that cannot load (no row is written then) reaches staff.
+ * Ids and codes only.
+ */
+export async function entryFileIncidents(since: Date, now: Date, limit = COLLECT_LIMIT): Promise<OpsIncident[]> {
+  const e = env();
+  if (!e.BRANDED_ENTRY_PDF_ENABLED || !e.BRANDED_ENTRY_PDF_KINDS.length) return [];
+  const failed = await prisma.$queryRaw<{ source_document_id: string; reason_code: string; updated_at: Date; order_id: string; reference: string | null }[]>`
+    SELECT g.source_document_id, g.reason_code, g.updated_at, g.order_id, o.reference
+    FROM generated_documents g LEFT JOIN orders o ON o.id = g.order_id
+    WHERE g.kind IN ('entry_pdf', 'cover_page') AND g.status = 'failed' AND left(g.reason_code, 6) = 'fault_'
+      AND g.updated_at >= ${since} AND g.updated_at <= ${now}
+    ORDER BY g.updated_at DESC LIMIT ${limit}`;
+  const waitedSince = new Date(since.getTime() - ENTRY_FILE_WAIT_ALERT_MS);
+  const waitedUntil = new Date(now.getTime() - ENTRY_FILE_WAIT_ALERT_MS);
+  const waiting = await prisma.$queryRaw<{ id: string; validated_at: Date; order_id: string | null; reference: string | null }[]>`
+    SELECT s.id, s.validated_at, s.order_id, o.reference
+    FROM supplier_documents s LEFT JOIN orders o ON o.id = s.order_id
+    WHERE s.kind::text IN (${Prisma.join([...e.BRANDED_ENTRY_PDF_KINDS])}) AND s.status = 'valid' AND s.customer_visible
+      AND s.storage_key IS NOT NULL AND s.order_item_id IS NOT NULL
+      AND s.validated_at >= ${waitedSince} AND s.validated_at <= ${waitedUntil}
+      AND NOT EXISTS (SELECT 1 FROM generated_documents g WHERE g.source_document_id = s.id AND g.status IN ('valid', 'failed'))
+    ORDER BY s.validated_at DESC LIMIT ${limit}`;
+  return [
+    ...failed.map((r) => ({
+      kind: "entry_file_failed" as const,
+      entityKind: "supplier_document" as const,
+      entityId: r.source_document_id,
+      reason: r.reason_code,
+      raisedAt: r.updated_at,
+      orderId: r.order_id,
+      orderReference: r.reference,
+      bookingId: null,
+      supplierBookingRef: null,
+      adminPath: bookingPath(r.reference),
+    })),
+    ...waiting.map((r) => ({
+      kind: "entry_file_waiting" as const,
+      entityKind: "supplier_document" as const,
+      entityId: r.id,
+      reason: "entry_file_waiting",
+      raisedAt: new Date(r.validated_at.getTime() + ENTRY_FILE_WAIT_ALERT_MS),
+      orderId: r.order_id,
+      orderReference: r.reference,
+      bookingId: null,
+      supplierBookingRef: null,
+      adminPath: bookingPath(r.reference),
+    })),
+  ];
 }
 
 /**

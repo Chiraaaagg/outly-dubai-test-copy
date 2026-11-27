@@ -180,7 +180,7 @@ export class PlainWriter {
     this.y -= h;
   }
 
-  /** A simple table: header row in bold, right-aligned numeric columns. Widths are fractions of the column. */
+  /** A simple table: header row in bold, right-aligned numeric columns. Widths are fractions of the column; "\n" breaks a cell's line. */
   table(cols: readonly { label: string; width: number; align?: "left" | "right" }[], rows: readonly (readonly string[])[], size = 9): void {
     const total = A4.width - 2 * MARGIN;
     const xs: number[] = [];
@@ -190,7 +190,8 @@ export class PlainWriter {
       acc += c.width * total;
     }
     const drawRow = (cells: readonly string[], bold: boolean) => {
-      const wrapped = cells.map((cell, i) => this.wrap(this.clean(cell), bold ? this.bold : this.regular, size, cols[i].width * total - 6));
+      // A "\n" in a cell starts a new line in it (a credit note's "Partial refund" under the description).
+      const wrapped = cells.map((cell, i) => cell.split("\n").flatMap((part) => this.wrap(this.clean(part), bold ? this.bold : this.regular, size, cols[i].width * total - 6)));
       const h = Math.max(...wrapped.map((w) => w.length)) * (size + 3) + 3;
       this.ensure(h);
       wrapped.forEach((lines, i) => {

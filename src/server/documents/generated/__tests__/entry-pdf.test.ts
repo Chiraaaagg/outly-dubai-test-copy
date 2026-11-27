@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { PDFDocument, rgb } from "@cantoo/pdf-lib";
+import { PDFDocument, concatTransformationMatrix, drawObject, popGraphicsState, pushGraphicsState, rgb, type PDFPage } from "@cantoo/pdf-lib";
 import { validatePdf } from "../../pdf";
-import { createZxingDecoder } from "../entry/code-decoder";
+import { ACCEPTED_CODE_FORMATS, createZxingDecoder, DecoderUnavailableError, type CodeDecoder } from "../entry/code-decoder";
 import { locateCodes } from "../entry/code-locator";
 import { buildEntryPdf, generateEntryDocument, verifyEntryPdf, type EntryView } from "../entry/entry-pdf";
-import { imageDraws, multiply, boundsOf } from "../entry/pdf-walk";
+import { imageDraws, multiply, boundsOf, WalkBudget, WalkLimitError, WALK_LIMITS } from "../entry/pdf-walk";
 import { LAYOUT_PENDING_BAND } from "../layout/plain";
 import { qrPng, syntheticSupplierPdf } from "../specimen/synthetic-supplier";
 import { pdfText } from "./pdf-text";
@@ -35,6 +35,14 @@ const view: EntryView = {
   support: "support@example.com",
   sourceLine: "version 1 · fingerprint aaaaaaaa…bbbbbbbb",
 };
+
+/** Paints a code-sized image the decoder cannot read (DeviceCMYK is not decoded): a stand-in for a JPEG or Indexed code. */
+function paintUndecodable(doc: PDFDocument, page: PDFPage, at: { x: number; y: number; side: number }) {
+  const w = 40;
+  const stream = doc.context.flateStream(new Uint8Array(w * w * 4), { Type: "XObject", Subtype: "Image", Width: w, Height: w, ColorSpace: "DeviceCMYK", BitsPerComponent: 8 });
+  const name = page.node.newXObject("ZzUndecodable", doc.context.register(stream));
+  page.pushOperators(pushGraphicsState(), concatTransformationMatrix(at.side, 0, 0, at.side, at.x, at.y), drawObject(name), popGraphicsState());
+}
 
 async function sourceCodes(bytes: Uint8Array, decoder = createZxingDecoder()) {
   return { decoder, located: await locateCodes(await PDFDocument.load(bytes), decoder) };
@@ -151,6 +159,53 @@ describe("branded entry PDF (switch-off backbone, synthetic sources only)", () =
     }
     expect(await generateEntryDocument(new TextEncoder().encode("<html>not a pdf</html>"), view, createZxingDecoder(), { date: DATE, expectedUnits: 1, maxBytes: MAX })).toEqual({ kind: "none", reason: "source_unreadable" });
   }, 120_000);
+
+  it("any doubt means no branded file: an unreadable code-sized image beside readable codes (finding 4)", async () => {
+    // Two guests; guest 2 also has an image the decoder cannot read. The count still "matches", but the file is refused.
+    const doc = await PDFDocument.load(await syntheticSupplierPdf({ layout: [1, 1] }));
+    paintUndecodable(doc, doc.getPages()[1], { x: 320, y: 560, side: 120 });
+    const src = await doc.save({ useObjectStreams: false });
+    const { located } = await sourceCodes(src);
+    expect(located.codes).toHaveLength(2);
+    expect(located.undecodable.map((u) => u.reason)).toEqual(["colour_space"]);
+    expect(await generateEntryDocument(src, view, createZxingDecoder(), { date: DATE, expectedUnits: 2, maxBytes: MAX })).toEqual({ kind: "none", reason: "undecodable_image_beside_codes" });
+  }, 120_000);
+
+  it("codes of two symbologies in one file are refused; only the accepted symbologies are read (finding 4)", async () => {
+    expect(ACCEPTED_CODE_FORMATS).toContain("QRCode");
+    const doc = await PDFDocument.load(await syntheticSupplierPdf({ layout: [1] }));
+    const page = doc.addPage([595.28, 841.89]);
+    page.drawImage(await doc.embedPng(await qrPng("SPECIMEN-NOT-VALID-DM-2", { format: "DataMatrix" })), { x: 60, y: 560, width: 120, height: 120 });
+    const src = await doc.save({ useObjectStreams: false });
+    const { located } = await sourceCodes(src);
+    expect(new Set(located.codes.map((c) => c.symbology))).toEqual(new Set(["QRCode", "DataMatrix"]));
+    expect(await generateEntryDocument(src, view, createZxingDecoder(), { date: DATE, expectedUnits: 2, maxBytes: MAX })).toEqual({ kind: "none", reason: "mixed_symbologies" });
+  }, 120_000);
+
+  it("a code reader fault is thrown, never recorded as 'no code found' (finding 13)", async () => {
+    const src = await syntheticSupplierPdf({ layout: [1] });
+    const broken: CodeDecoder = {
+      async decode() {
+        throw new DecoderUnavailableError("wasm_missing");
+      },
+    };
+    await expect(generateEntryDocument(src, view, broken, { date: DATE, expectedUnits: 1, maxBytes: MAX })).rejects.toBeInstanceOf(DecoderUnavailableError);
+  }, 60_000);
+
+  it("one budget per document: form visits and inflated bytes are capped across the whole file (finding 12)", async () => {
+    const doc = await PDFDocument.create();
+    const inner = await PDFDocument.create();
+    inner.addPage([100, 100]).drawRectangle({ x: 10, y: 10, width: 20, height: 20, color: rgb(0, 0, 0) });
+    const [form] = await doc.embedPdf(await inner.save());
+    const page = doc.addPage([400, 400]);
+    for (let i = 0; i < 5; i++) page.drawPage(form, { x: i * 60, y: 10 });
+    const loaded = await PDFDocument.load(await doc.save({ useObjectStreams: false }));
+    expect(() => imageDraws(loaded, new WalkBudget({ ...WALK_LIMITS, maxFormVisits: 3 }))).toThrow(WalkLimitError);
+    expect(() => imageDraws(loaded, new WalkBudget({ ...WALK_LIMITS, maxInflatedBytes: 16 }))).toThrow(/content_too_large/);
+    expect(() => imageDraws(loaded, new WalkBudget({ ...WALK_LIMITS, maxMs: -1 }))).toThrow(/walk_timeout/);
+    // The default budget walks it.
+    expect(imageDraws(loaded)).toEqual([]);
+  });
 
   it("never scales a code area down: one too wide for the page is refused", async () => {
     const doc = await PDFDocument.create();

@@ -17,11 +17,17 @@ import { fiscalView, type FiscalSnapshot, type FiscalView } from "./snapshot";
 
 export interface FiscalLayout {
   templateVersion: number;
+  /**
+   * False while the layout is the plain "SPECIMEN — layout pending owner design" one: a
+   * production document is refused (`layout_pending`, review finding 5) until the owner's design replaces it.
+   */
+  productionReady: boolean;
   render(view: FiscalView, opts: { date: Date }): Promise<{ bytes: Uint8Array; replacedChars: number }>;
 }
 
 export const plainFiscalLayout: FiscalLayout = {
   templateVersion: 1,
+  productionReady: false,
   async render(view, opts) {
     const w = await PlainWriter.create({ title: view.metaTitle, bands: view.bands, date: opts.date, subject: view.title, keywords: ["OUTLYY", view.number] });
     w.heading(view.title, 18);

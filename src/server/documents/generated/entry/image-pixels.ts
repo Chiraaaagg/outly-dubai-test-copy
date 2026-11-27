@@ -23,7 +23,11 @@ export interface Rgba {
 
 export type PixelResult = { ok: true; image: Rgba } | { ok: false; reason: string };
 
-const MAX_PIXELS = 25_000_000;
+/**
+ * Largest image decoded for verification: 4 million pixels (16 MB of RGBA).
+ * A code image is far smaller; the cap bounds memory on hostile input (review finding 12).
+ */
+export const MAX_PIXELS = 4_000_000;
 
 function lookup(ctx: PDFContext, o: PDFObject | undefined): PDFObject | undefined {
   return o instanceof PDFRef ? ctx.lookup(o) : o;

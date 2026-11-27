@@ -28,10 +28,10 @@ async function loadWriter(): Promise<ZxingWriter> {
   return writer;
 }
 
-/** PNG bytes of a QR code for `text`. */
-export async function qrPng(text: string, opts: { scale?: number } = {}): Promise<Uint8Array> {
+/** PNG bytes of a QR code (or, for tests, another symbology) for `text`. */
+export async function qrPng(text: string, opts: { scale?: number; format?: "QRCode" | "DataMatrix" } = {}): Promise<Uint8Array> {
   const z = await loadWriter();
-  const r = await z.writeBarcode(text, { format: "QRCode", scale: opts.scale ?? 4, addQuietZones: false });
+  const r = await z.writeBarcode(text, { format: opts.format ?? "QRCode", scale: opts.scale ?? 4, addQuietZones: false });
   if (r.error || !r.image) throw new Error(`qrPng: ${r.error || "no image"}`);
   return new Uint8Array(await r.image.arrayBuffer());
 }
