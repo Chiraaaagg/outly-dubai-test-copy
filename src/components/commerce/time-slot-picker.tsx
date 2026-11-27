@@ -22,10 +22,14 @@
 //   - the radio group can take `aria-labelledby` (the visible heading) and `aria-describedby` (a notice);
 //     the live line is mounted empty and filled after, and says "Checking times with the operator"
 //     while loading.
+//   - more than 12 times (a listing may list up to 96) scroll inside the grid, 15rem high (about four and
+//     a half rows of chips), so the sticky booking card no longer grows with the number of times; scroll
+//     padding keeps a focused chip's ring clear of the box edge, and the checked time is scrolled into
+//     view inside the box (never the page) when the grid mounts or the date or value changes.
 // Licence text: THIRD-PARTY-NOTICES.md at the repository root (MIT, copyright Klyv contributors).
 "use client";
 
-import { useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
 import { cn } from "@/lib/utils";
 
 export interface TimeSlotPickerSlot {
@@ -93,6 +97,76 @@ export function availableTimesLine(slots: readonly TimeSlotPickerSlot[]): string
   return `${n} start ${n === 1 ? "time" : "times"} available`;
 }
 
+/** Above this many times the list scrolls inside itself (a listing may offer up to 96, every 15 minutes). */
+export const SCROLL_AFTER_SLOTS = 12;
+
+/**
+ * Gives a long list of times a fixed height of 15rem: about four and a half
+ * rows of this picker's 44 px chips (about five of the smaller `TimeSlots`
+ * chips), so the booking card, sticky on desktop, no longer grows with the
+ * number of times and the cut row shows there is more. It does not promise the
+ * card fits every screen. Sized in rem so it grows with text zoom. The padding
+ * keeps the first and last rows' focus rings inside the box; the scroll
+ * padding keeps a chip focused mid-list clear of the edge, for native focus
+ * scrolling and `revealTime` alike. Short lists are unchanged.
+ */
+export function longTimesClass(count: number): string | undefined {
+  return count > SCROLL_AFTER_SLOTS ? "-m-1.5 max-h-[15rem] overflow-y-auto scroll-py-2 p-1.5" : undefined;
+}
+
+/** Marks the element that scrolls a long list of times (set with `longTimesClass`). */
+export const TIMES_SCROLL_ATTR = "data-times-scroll";
+
+/**
+ * The box `scrollTop` that shows a chip whole with `padding` clear above and
+ * below it (its focus ring); the current one when it already shows. Rects are
+ * viewport pixels. Pure, so it is unit-tested without a DOM.
+ */
+export function scrollTopToReveal(box: { top: number; bottom: number; scrollTop: number }, chip: { top: number; bottom: number }, padding: number): number {
+  if (chip.top < box.top + padding) return Math.max(0, box.scrollTop - (box.top + padding - chip.top));
+  if (chip.bottom > box.bottom - padding) return box.scrollTop + (chip.bottom - (box.bottom - padding));
+  return box.scrollTop;
+}
+
+/**
+ * Scrolls only the long-list box around `chip` so the chip shows whole. Never
+ * scrolls the page: a caller that also moves the page does so itself, once.
+ */
+export function revealTime(chip: HTMLElement | null | undefined): void {
+  const box = chip?.closest<HTMLElement>(`[${TIMES_SCROLL_ATTR}]`);
+  if (!chip || !box || box === chip) return;
+  const b = box.getBoundingClientRect();
+  const pad = Number.parseFloat(getComputedStyle(box).scrollPaddingTop) || 0;
+  box.scrollTop = scrollTopToReveal({ top: b.top, bottom: b.bottom, scrollTop: box.scrollTop }, chip.getBoundingClientRect(), pad);
+}
+
+/**
+ * Up and Down in a wrapped row of chips of different widths: the usable chip
+ * in the nearest row below (1) or above (-1) whose centre is closest to this
+ * one's; null at the first or last row. `boxes` are layout offsets.
+ */
+export function rowNeighbour(index: number, dir: 1 | -1, boxes: readonly ({ top: number; center: number } | null)[], usableAt: readonly boolean[]): number | null {
+  const here = boxes[index];
+  if (!here) return null;
+  let rowTop: number | null = null;
+  boxes.forEach((b, i) => {
+    if (!b || !usableAt[i] || (dir === 1 ? b.top <= here.top : b.top >= here.top)) return;
+    if (rowTop === null || (dir === 1 ? b.top < rowTop : b.top > rowTop)) rowTop = b.top;
+  });
+  if (rowTop === null) return null;
+  let best: number | null = null;
+  let distance = Infinity;
+  boxes.forEach((b, i) => {
+    if (!b || !usableAt[i] || b.top !== rowTop) return;
+    const d = Math.abs(b.center - here.center);
+    if (d < distance) {
+      distance = d;
+      best = i;
+    }
+  });
+  return best;
+}
+
 const WORD: Record<string, string | undefined> = { limited: "Few left", sold_out: "Sold out", unavailable: "Unavailable" };
 
 /**
@@ -128,6 +202,12 @@ export function TimeSlotPicker({
 
   const checkedSlot = slots.findIndex((slot) => slot.time === value && usable(slot));
   const slotStop = checkedSlot >= 0 ? checkedSlot : slots.findIndex(usable);
+  const long = slots.length > SCROLL_AFTER_SLOTS;
+
+  // A long list starts scrolled to its top: show the checked time (e.g. 19:30) inside the box, never moving the page.
+  useLayoutEffect(() => {
+    if (long && !loading && checkedSlot >= 0) revealTime(slotRefs.current[checkedSlot]);
+  }, [date, value, slots.length, loading, long, checkedSlot]);
 
   const onKey = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
     // Up and down move by a laid-out row: two or three columns, by the picker's width.
@@ -160,7 +240,8 @@ export function TimeSlotPicker({
           aria-labelledby={labelledBy}
           aria-describedby={[describedBy, `${uid}-zone`].filter(Boolean).join(" ")}
           tabIndex={-1}
-          className="grid grid-cols-2 gap-2 outline-none @[18rem]:grid-cols-3"
+          className={cn("grid grid-cols-2 gap-2 outline-none @[18rem]:grid-cols-3", longTimesClass(slots.length))}
+          data-times-scroll={long || undefined}
         >
           {slots.map((slot, index) => {
             const open = usable(slot);

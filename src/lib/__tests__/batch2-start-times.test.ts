@@ -4,7 +4,7 @@ import { parseStartTimes, startTimesPath } from "@/lib/api/start-times";
 import { cartGoesToInquiry, cartRequiresInquiry, guestRowsFor, offersSeniorPrice, toCartItem } from "@/lib/pricing";
 import { parseRetimeId, retimeHrefFor } from "@/lib/start-time-retry";
 import { createAbortableReader } from "@/lib/use-abortable-read";
-import { availableTimesLine, DUBAI_TIME_LABEL, nextUsableIndex, type TimeSlotPickerSlot } from "@/components/commerce/time-slot-picker";
+import { availableTimesLine, DUBAI_TIME_LABEL, longTimesClass, nextUsableIndex, rowNeighbour, SCROLL_AFTER_SLOTS, scrollTopToReveal, type TimeSlotPickerSlot } from "@/components/commerce/time-slot-picker";
 import { EMPTY_PAX } from "@/lib/utils";
 import type { Activity } from "@/lib/types";
 import type { UnitDefinition } from "@/server/quotes/contracts";
@@ -224,5 +224,52 @@ describe("mixed cart (doc 29 §7.4): an instant listed-start item plus an inquir
     expect(cartRequiresInquiry(cart)).toBe(true);
     expect(cartGoesToInquiry(cart)).toBe(true);
     expect(cartGoesToInquiry(cart.slice(0, 1))).toBe(false);
+  });
+});
+
+describe("long lists of start times (up to 96 per listing)", () => {
+  it("scroll inside the picker only above 12 times, in rem so text zoom grows the box", () => {
+    expect(SCROLL_AFTER_SLOTS).toBe(12);
+    expect(longTimesClass(12)).toBeUndefined();
+    expect(longTimesClass(13)).toContain("overflow-y-auto");
+    expect(longTimesClass(96)).toContain("max-h-[15rem]");
+    // Scroll padding keeps a focused chip's ring clear of the box edge mid-list.
+    expect(longTimesClass(96)).toContain("scroll-py-2");
+  });
+
+  it("reveals a chip inside the box only as far as needed, keeping the padding clear", () => {
+    const box = { top: 100, bottom: 340, scrollTop: 0 };
+    // Already whole: unchanged.
+    expect(scrollTopToReveal(box, { top: 150, bottom: 194 }, 8)).toBe(0);
+    // Below the fold (19:30 in a list scrolled to the top): just enough to show it and its ring.
+    expect(scrollTopToReveal(box, { top: 600, bottom: 644 }, 8)).toBe(644 - 332);
+    // Above, after scrolling down: back up, never below 0.
+    expect(scrollTopToReveal({ ...box, scrollTop: 300 }, { top: 60, bottom: 104 }, 8)).toBe(300 - 48);
+    expect(scrollTopToReveal({ ...box, scrollTop: 10 }, { top: 60, bottom: 104 }, 8)).toBe(0);
+  });
+
+  it("Up and Down in wrapped chips of different widths go to the nearest usable chip in the next row", () => {
+    // Row 1: 0, 1, 2; row 2: 3 (wide), 4; row 3: 5 (sold out), 6.
+    const boxes = [
+      { top: 0, center: 30 }, { top: 0, center: 100 }, { top: 0, center: 170 },
+      { top: 44, center: 60 }, { top: 44, center: 160 },
+      { top: 88, center: 30 }, { top: 88, center: 120 },
+    ];
+    const usableAt = [true, true, true, true, true, false, true];
+    expect(rowNeighbour(2, 1, boxes, usableAt)).toBe(4);
+    expect(rowNeighbour(1, 1, boxes, usableAt)).toBe(3);
+    expect(rowNeighbour(3, 1, boxes, usableAt)).toBe(6);
+    expect(rowNeighbour(6, -1, boxes, usableAt)).toBe(4);
+    expect(rowNeighbour(0, -1, boxes, usableAt)).toBeNull();
+    expect(rowNeighbour(6, 1, boxes, usableAt)).toBeNull();
+    expect(rowNeighbour(1, 1, boxes, [true, true, true, false, false, false, true])).toBe(6);
+  });
+
+  it("arrow keys and Home/End still reach every one of 96 times", () => {
+    const slots: TimeSlotPickerSlot[] = Array.from({ length: 96 }, (_, i) => ({ time: `${String(Math.floor(i / 4)).padStart(2, "0")}:${String((i % 4) * 15).padStart(2, "0")}` }));
+    expect(nextUsableIndex("End", 0, slots, 3)).toBe(95);
+    expect(nextUsableIndex("Home", 95, slots, 3)).toBe(0);
+    expect(nextUsableIndex("ArrowDown", 93, slots, 3)).toBe(0);
+    expect(availableTimesLine(slots)).toBe("96 start times available");
   });
 });

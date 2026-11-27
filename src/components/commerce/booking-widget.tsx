@@ -6,7 +6,7 @@ import { CalendarDays, Check, Lock, ShieldCheck } from "lucide-react";
 import { useApp } from "@/components/providers/app-provider";
 import { Button } from "@/components/ui/button";
 import { DatePickerSheet, DateStrip, GuestSelector, TimeSlots } from "./pickers";
-import { TimeSlotPicker } from "./time-slot-picker";
+import { revealTime, TimeSlotPicker } from "./time-slot-picker";
 import { PaymentMethods } from "./trust";
 import { WhatsAppButton } from "./whatsapp";
 import { ConfirmFirstNote, IndicativePriceNote, ResponsePromise } from "./inquiry-ui";
@@ -186,6 +186,8 @@ export function BookingWidget({
       el.querySelector<HTMLElement>("button:not([disabled])") ??
       el;
     target.focus({ preventScroll: true });
+    // In a long list the target can sit below the box's fold: scroll the box only (the page moved once, above).
+    revealTime(target);
     setFocusTimes(false);
   }, [focusTimes, startTimes.status]);
 

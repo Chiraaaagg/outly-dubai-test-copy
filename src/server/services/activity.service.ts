@@ -9,6 +9,8 @@ import { Errors } from "../lib/errors";
 import { uuidv7 } from "../lib/ids";
 import { revalidateCatalog } from "../lib/catalog-cache";
 import { readinessService } from "./readiness.service";
+import { TOMBSTONE_MARK } from "../suppliers/traveldesk/clean-address";
+import { moveRedirectTo, redirectSlugsStartingWith, slugTaken, takenMessage } from "./slug-reservations";
 import { recordEditorialLocks } from "./listing-locks";
 import {
   activitySchema,
@@ -216,6 +218,12 @@ function nextCopySlug(base: string, taken: Set<string>): string {
   throw Errors.conflict("Too many copies of this activity");
 }
 
+/** A listing moved to its clean address keeps that slug until the move is undone (review P2-1): its redirects depend on it. */
+async function assertSlugChangeAllowed(tx: Tx, id: string, slug: string) {
+  const moved = await moveRedirectTo(tx, id);
+  if (moved) throw Errors.conflict(`"${slug}" was moved to its clean address; undo the move on the TravelDesk import page before changing its slug`, { slug, from: moved.oldSlug });
+}
+
 /**
  * Transaction-aware lifecycle steps shared by the console actions
  * (`activityService.remove` / `restoreVersion`) and indirect paths such as
@@ -264,8 +272,10 @@ export const productLifecycle = {
     if (!old) throw Errors.notFound(`Version ${version}`);
     const restored = { ...toActivity(old.content), fulfilmentMode: before.fulfilmentMode };
     if (restored.slug !== before.slug) {
+      await assertSlugChangeAllowed(tx, id, before.slug);
       const clash = await tx.product.findUnique({ where: { slug: restored.slug }, select: { id: true } });
       if (clash && clash.id !== id) throw Errors.conflict(`Slug "${restored.slug}" from version ${version} is now used by another activity`);
+      if (!clash && (await slugTaken(tx, restored.slug)) === "redirect") throw Errors.conflict(takenMessage(restored.slug, "redirect"), { slug: restored.slug });
     }
     const next = before.version + 1;
     const written = await tx.product.updateMany({
@@ -336,6 +346,7 @@ export const activityService = {
     const run = async (tx: Tx) => {
       const clash = await tx.product.findUnique({ where: { slug: input.slug }, select: { id: true, deletedAt: true } });
       if (clash) throw Errors.conflict(`Slug "${input.slug}" is already in use${clash.deletedAt ? " by a deleted activity (restore it instead)" : ""}`, { slug: input.slug });
+      if ((await slugTaken(tx, input.slug)) === "redirect") throw Errors.conflict(takenMessage(input.slug, "redirect"), { slug: input.slug });
       await assertCategoryExists(tx, input.categorySlug);
 
       const id = uuidv7();
@@ -387,8 +398,9 @@ export const activityService = {
         throw Errors.conflict("This activity was changed by someone else while you were editing — reload and try again", { version: before.version, expectedVersion: opts.expectedVersion });
       }
       if (input.slug !== before.slug) {
-        const clash = await tx.product.findUnique({ where: { slug: input.slug }, select: { id: true } });
-        if (clash) throw Errors.conflict(`Slug "${input.slug}" is already in use`, { slug: input.slug });
+        await assertSlugChangeAllowed(tx, id, before.slug);
+        const taken = await slugTaken(tx, input.slug);
+        if (taken) throw Errors.conflict(takenMessage(input.slug, taken), { slug: input.slug });
       }
       await assertCategoryExists(tx, input.categorySlug);
 
@@ -430,7 +442,8 @@ export const activityService = {
         throw Errors.conflict("Review this imported TravelDesk listing before duplicating it", { id });
       }
       const content = readContent(src);
-      const taken = new Set((await tx.product.findMany({ where: { slug: { startsWith: src.slug.replace(/-copy(-\d+)?$/, "") } }, select: { slug: true } })).map((p) => p.slug));
+      const root = src.slug.replace(/-copy(-\d+)?$/, "");
+      const taken = new Set([...(await tx.product.findMany({ where: { slug: { startsWith: root } }, select: { slug: true } })).map((p) => p.slug), ...(await redirectSlugsStartingWith(tx, root))]);
       const slug = nextCopySlug(src.slug, taken);
       const { id: _id, rating: _r, reviewCount: _rc, bookedThisMonth: _b, ...input } = content;
       const created = await activityService.create(actor, { ...input, slug, title: `${content.title} (copy)`, badges: {} }, { status: "draft", reason: `Duplicated from ${src.slug}`, tx });
@@ -572,6 +585,9 @@ export const activityService = {
       const before = await tx.product.findUnique({ where: { id } });
       if (!before) throw Errors.notFound("Activity");
       if (!before.deletedAt) return toRow(before);
+      // A retired page whose address a TravelDesk listing took (traveldesk-address.ts) comes back only through the
+      // undo on the import page, which gives it its address back first.
+      if (before.slug.includes(TOMBSTONE_MARK)) throw Errors.conflict(`"${before.slug}" gave its address to the listing that replaced it; undo that address move on the TravelDesk import page first`);
       const content = readContent(before);
       const version = before.version + 1;
       const after = await tx.product.update({ where: { id }, data: { deletedAt: null, status: "draft", version }, select: SELECT_ROW });

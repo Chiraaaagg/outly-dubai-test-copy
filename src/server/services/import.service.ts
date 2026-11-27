@@ -17,6 +17,7 @@ import { fetchGoogleExport } from "../imports/fetch";
 import { importHolds, productLifecycle } from "./activity.service";
 import { recordEditorialLocks } from "./listing-locks";
 import { readinessService } from "./readiness.service";
+import { takenMessage, takenSlugs } from "./slug-reservations";
 
 /**
  * Listing imports — CSV upload, Google Sheet link, Google Doc link/paste,
@@ -159,10 +160,13 @@ async function validateCandidates(candidates: Candidate[]): Promise<ImportPrevie
     return typeof v.slug === "string" && v.slug ? v.slug : typeof v.title === "string" ? slugify(v.title) : "";
   };
   const slugs = candidates.map(slugOf).filter(Boolean);
-  const [existing, categories] = await Promise.all([
+  const [existing, categories, redirects] = await Promise.all([
     prisma.product.findMany({ where: { slug: { in: slugs } }, select: { slug: true, deletedAt: true, content: true, version: true, status: true } }),
     prisma.category.findMany({ where: { deletedAt: null, status: { not: "archived" } }, select: { slug: true, name: true, shortName: true } }),
+    prisma.productRedirect.findMany({ where: { oldSlug: { in: slugs } }, select: { oldSlug: true } }),
   ]);
+  // A redirect's old slug is reserved (review P1-1): a new row there would take over a retired or moved page's links.
+  const reserved = new Set(redirects.map((r) => r.oldSlug));
   const existingBySlug = new Map(existing.map((e) => [e.slug, e]));
   const categorySlugs = new Set(categories.map((c) => c.slug));
   const seen = new Map<string, number>();
@@ -209,6 +213,7 @@ async function validateCandidates(candidates: Candidate[]): Promise<ImportPrevie
     }
     const exNow = existingBySlug.get(slug);
     if (exNow?.deletedAt) errors.push({ row: c.row, field: "slug", message: "This slug belongs to a deleted activity — restore it from the console instead" });
+    if (!exNow && reserved.has(slug)) errors.push({ row: c.row, field: "slug", message: takenMessage(slug, "redirect") });
     const ok = errors.length === 0;
     const onlyCategory = !ok && parsed.success && errors.every((e) => e.field === "categorySlug");
     const update = Boolean(exNow && !exNow.deletedAt);
@@ -414,6 +419,9 @@ export const importService = {
       const moved = todo.filter((r) => r.baseVersion != null && existing.get(r.slug) && existing.get(r.slug)!.version !== r.baseVersion);
       if (moved.length) throw Errors.conflict(`${moved.map((r) => `"${r.slug}"`).join(", ")} changed after this preview — preview the file again`, { slugs: moved.map((r) => r.slug) });
       const created = todo.find((r) => r.action === "create" && existing.has(r.slug));
+      const reservedNow = await takenSlugs(tx, todo.filter((r) => r.action === "create" && !existing.has(r.slug)).map((r) => r.slug));
+      const onRedirect = todo.find((r) => reservedNow.has(r.slug));
+      if (onRedirect) throw Errors.conflict(`Row ${onRedirect.row}: ${takenMessage(onRedirect.slug, "redirect")}`);
       if (created) throw Errors.conflict(`Row ${created.row}: "${created.slug}" was created after this preview — preview the file again`);
       const vanished = todo.find((r) => r.action === "update" && !existing.has(r.slug));
       if (vanished) throw Errors.conflict(`Row ${vanished.row}: "${vanished.slug}" no longer exists — preview the file again`);

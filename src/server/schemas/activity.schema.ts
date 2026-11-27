@@ -20,6 +20,18 @@ const short = (max: number) => z.string().trim().min(1).max(max);
 const text = (max: number) => z.string().trim().max(max);
 const strList = (itemMax: number, max: number) => z.array(z.string().trim().min(1).max(itemMax)).max(max);
 
+/**
+ * Most start times one page may list: every 15 minutes for a whole day.
+ * A TravelDesk listing's page times must equal its offers' stored slot starts
+ * exactly (readiness `slotTimesAgree`), so the importer can never trim them to
+ * fit; an observation deck lists 45 (doc 29a ledger, tour 138). Above this
+ * bound a draft is refused with a row error rather than shortened.
+ * Rollback: once a listing is saved with more than 24, a revert must keep this
+ * value, or those documents stop parsing: the editor cannot open them, version
+ * history and restore throw, the upkeep throws and bulk actions skip them.
+ */
+export const MAX_TIME_SLOTS = 96;
+
 export const TIERS = ["A", "B", "C", "D", "E"] as const;
 export const DIETARY = ["veg", "jain", "halal", "non-veg"] as const;
 export const SUITABILITY = ["kids", "seniors", "wheelchair", "infant", "couples", "groups"] as const;
@@ -156,7 +168,7 @@ const activityShape = {
     suitability: z.array(z.enum(SUITABILITY)).max(6).default([]),
     location: short(120),
     meetingPoint: short(240),
-    timeSlots: strList(80, 24).default([]),
+    timeSlots: strList(80, MAX_TIME_SLOTS).default([]),
     price: priceBandSchema,
     quoteOnly: z.boolean().optional(),
     inclusions: strList(300, 30).default([]),

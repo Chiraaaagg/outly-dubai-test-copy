@@ -15,6 +15,7 @@ import { isAppError } from "../../lib/errors";
 const state = vi.hoisted(() => ({
   products: [] as Array<Record<string, unknown>>,
   combos: [] as Array<Record<string, unknown>>,
+  redirects: [] as Array<Record<string, unknown>>,
   modesQuery: null as unknown,
 }));
 
@@ -27,6 +28,7 @@ vi.mock("../../lib/db", () => ({
       }),
     },
     combo: { findMany: vi.fn(async () => state.combos) },
+    productRedirect: { findMany: vi.fn(async () => state.redirects) },
   },
 }));
 
@@ -44,6 +46,7 @@ function honest(): CartItem {
 beforeEach(() => {
   state.products = [row()];
   state.combos = [];
+  state.redirects = [];
   state.modesQuery = null;
 });
 
@@ -143,5 +146,41 @@ describe("fulfilmentModes: published only, effective mode (PRD-25, PRD-11)", () 
     state.products = products();
     state.combos = [];
     expect(Object.values(await catalogService.fulfilmentModes()).every((m) => m === "inquiry")).toBe(true);
+  });
+
+  it("lists a moved listing's old -<n> address with the listing's mode, never a retire redirect (review P3-2)", async () => {
+    vi.stubEnv("INSTANT_RELEASE_ENABLED", "true");
+    resetEnvCache();
+    state.products = products();
+    state.combos = [];
+    state.redirects = [
+      { oldSlug: "live-instant-2", oldProduct: { slug: "live-instant--retired-0192f3a4" }, targetProduct: { slug: "live-instant" } },
+      { oldSlug: "some-old-page", oldProduct: { slug: "some-old-page" }, targetProduct: { slug: "live-instant" } },
+      { oldSlug: "never-evaluated-2", oldProduct: { slug: "never-evaluated--retired-0192f3a4" }, targetProduct: { slug: "elsewhere" } },
+    ];
+    const modes = await catalogService.fulfilmentModes();
+    expect(modes["live-instant-2"]).toBe("instant");
+    expect(modes).not.toHaveProperty("some-old-page");
+    expect(modes).not.toHaveProperty("never-evaluated-2");
+  });
+});
+
+describe("priceCartItems: a line holding a moved listing's old address (doc 30 §3.9 follow-up)", () => {
+  const oldSlug = `${A.slug}-2`;
+  const line = () => ({ ...honest(), slug: oldSlug });
+
+  it("prices as the listing now at the clean address, keeping the line's slug", async () => {
+    state.products = [];
+    state.redirects = [{ oldSlug, oldProduct: { slug: `${A.slug}--retired-0192f3a4` }, targetProduct: row() }];
+    const [p] = await catalogService.priceCartItems([line()]);
+    expect(p).toMatchObject({ productId: "p-1", cartItem: { slug: oldSlug } });
+  });
+
+  it("does not follow a retire redirect (a different product) nor a move whose target is not at the base", async () => {
+    state.products = [];
+    state.redirects = [{ oldSlug, oldProduct: { slug: "some-retired-page" }, targetProduct: row() }];
+    await expect(catalogService.priceCartItems([line()])).rejects.toSatisfy((e) => isAppError(e));
+    state.redirects = [{ oldSlug, oldProduct: { slug: `${A.slug}--retired-0192f3a4` }, targetProduct: row({ slug: "elsewhere" }) }];
+    await expect(catalogService.priceCartItems([line()])).rejects.toSatisfy((e) => isAppError(e));
   });
 });
