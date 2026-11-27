@@ -7,10 +7,10 @@ import type { FulfilmentMode } from "./types";
  * identical in both modes so instant and inquiry SKUs render side by side in
  * the same result set without looking inconsistent (§4.4).
  *
- *  "Check availability & price" was chosen over "Enquire" / "Get a quote" /
- *  "Request booking" because it names the next step, implies speed, and is
- *  literally accurate — the confirm-first story only works if the CTA tells
- *  the truth (§4.3).
+ *  "Request availability & price" names the next step and is literally
+ *  accurate: the visitor sends a request and the team checks availability and
+ *  price with the operator before anything is paid. The confirm-first story
+ *  only works if the CTA tells the truth (§4.3).
  */
 export function ctaFor(mode: FulfilmentMode, opts: { quoteOnly?: boolean } = {}) {
   if (opts.quoteOnly) {
@@ -18,7 +18,7 @@ export function ctaFor(mode: FulfilmentMode, opts: { quoteOnly?: boolean } = {})
       primary: "Request a quote",
       primaryShort: "Get a quote",
       route: "/concierge",
-      microcopy: "Free to ask · quote within 2 hours",
+      microcopy: "Free to request",
       cardAction: "View details",
     };
   }
@@ -28,18 +28,18 @@ export function ctaFor(mode: FulfilmentMode, opts: { quoteOnly?: boolean } = {})
       primaryShort: "Book now",
       route: "/checkout",
       // The voucher email is the one delivery that exists; it takes minutes, not seconds (CO-11, audit §4.2).
-      microcopy: "Instant confirmation · voucher by email, usually within a few minutes",
+      microcopy: "Instant confirmation. Your voucher comes by email.",
       cardAction: "View & book",
     };
   }
   return {
-    primary: "Check availability & price",
-    primaryShort: "Check availability",
+    primary: "Request availability & price",
+    primaryShort: "Request availability",
     route: "/inquiry",
-    microcopy: "Free to ask · reply in ~30 min",
+    microcopy: "Free to enquire",
     cardAction: "View details",
   };
 }
 
-export const RESPONSE_PROMISE = "Human reply in 30 minutes";
-export const RESPONSE_PROMISE_SHORT = "Reply in ~30 min";
+export const RESPONSE_PROMISE = "Reply from our team on WhatsApp";
+export const RESPONSE_PROMISE_SHORT = "Reply on WhatsApp";

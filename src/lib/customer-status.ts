@@ -164,6 +164,34 @@ export interface CustomerItemStatus {
   } | null;
 }
 
+/** A channel the order-bound unlock (recovery) can send a code to. */
+export type UnlockChannel = "email" | "phone";
+
+/**
+ * Post-payment batch A3/A8: the order-level ticket message state, summarised
+ * over the order's ticket notifications (one per item):
+ *  - `pending`: queued or retrying, not yet accepted by the provider;
+ *  - `sent`: every item with ticket files has a message the provider accepted;
+ *  - `delivered`: the provider reported delivery for every one (only once the
+ *    signed delivery webhook is live; never inferred);
+ *  - `failed`: at least one could not be sent and is with our team;
+ *  - `bounced`: the provider reported the address rejected a message.
+ */
+export type TicketDeliveryState = "pending" | "sent" | "delivered" | "failed" | "bounced";
+
+export interface TicketDeliveryView {
+  channel: "email";
+  state: TicketDeliveryState;
+  /** Masked by the server, e.g. "j•••@example.com". Never the full address. */
+  recipientMasked: string | null;
+  /** When the latest state was recorded, UTC ISO, or null. */
+  at: string | null;
+  /** Whether this viewer may ask for the ticket email again now (A4). */
+  canResend: boolean;
+  /** When the next resend is allowed, UTC ISO, when `canResend` is false because of the limit; else null. */
+  resendAvailableAt: string | null;
+}
+
 export interface CustomerOrderStatus {
   reference: string;
   state: CustomerOrderState;
@@ -211,6 +239,23 @@ export interface CustomerOrderStatus {
    * account): the page then offers "Remove access on this browser" (batch 3).
    */
   canRemoveBrowserAccess?: boolean;
+  /**
+   * Post-payment batch A1: the channels the order's contact was verified on
+   * (order-bound `order_contact_verifications`), limited to channels that can
+   * deliver a code right now, preferred first. The unlock form opens on the
+   * first and offers nothing else. Empty when no channel can deliver a code
+   * (the page then points to the emailed link and support). Only ever present
+   * in a projection this viewer may already see, so it reveals nothing new.
+   */
+  unlockChannels?: UnlockChannel[];
+  /**
+   * Post-payment batch A3: what OUTLYY knows about sending this order's ticket
+   * message. Null when nothing has been or will be sent (no ticket files yet,
+   * or no email on the order), and always null for a viewer who may not
+   * download (`canDownload` false). Words follow the recorded state exactly:
+   * "sent" means the provider accepted it, never that it arrived.
+   */
+  delivery?: TicketDeliveryView | null;
   /**
    * Doc 29 Batch 6 (owner decision d): the existing "Send it to our team"
    * inquiry route, offered when an external operator's hold was too short to
@@ -263,6 +308,17 @@ export const RECOVERY_VERIFY_PATH = "/api/recovery/verify";
 export const TICKET_EXCHANGE_PATH = "/api/tickets/exchange";
 /** POST, same-origin, no body: "Remove access on this browser" (checkout redesign batch 3). Always `{ ok: true }`. */
 export const TICKET_REMOVE_ACCESS_PATH = "/api/tickets/remove-access";
+
+/**
+ * POST /api/orders/[reference]/tickets/resend, same-origin, no body (post-payment batch A4, owner limit
+ * of 27 Nov 2026): sends the order's ticket email again, for every item with valid files, to the email
+ * already on the order only. Needs the same access as downloading (`canDownload`).
+ * → 202 `{ ok: true, resendAvailableAt }`; 429 `{ error: { code: "RATE_LIMITED" } }` with Retry-After
+ * (at most 3 per order per 24 hours and one per 2 minutes, plus a per-IP limit; limits fail closed);
+ * 409 `{ error: { code: "NOTHING_TO_SEND" } }` when no item has valid files or the order has no email;
+ * anyone without access gets the uniform 404.
+ */
+export const ORDER_TICKETS_RESEND_PATH = (reference: string) => `/api/orders/${encodeURIComponent(reference)}/tickets/resend`;
 
 /* ---------------------------------------------------------------------------
  * Private customer routes (sitemap, robots, headers, analytics)

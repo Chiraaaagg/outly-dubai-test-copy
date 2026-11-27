@@ -48,12 +48,12 @@ function apiErrorFromEnvelope(status: number, body: unknown): ApiError {
   const err = (body as ErrorEnvelope | null)?.error;
   const message = err?.message || "Something went wrong at our end";
   const fallbackRecovery =
-    "That's on us, not you. Try again in a moment — or message us on WhatsApp and we'll sort it out.";
+    "That's on us, not you. Try again in a moment. Or message us on WhatsApp and we'll sort it out.";
 
   const code = err?.code;
   switch (code) {
     case "RATE_LIMITED":
-      return new ApiError(message, "error", err?.recovery || "Please wait a moment and try again — or message us on WhatsApp.", true, undefined, code, status);
+      return new ApiError(message, "error", err?.recovery || "Please wait a moment and try again. Or message us on WhatsApp.", true, undefined, code, status);
     case "VALIDATION_FAILED": {
       const fields = err?.details?.fields ?? {};
       const listed = Object.values(fields).filter(Boolean);
@@ -109,13 +109,13 @@ async function request<T>(method: "GET" | "POST" | "PATCH" | "PUT", path: string
       throw new ApiError(
         "Request timed out",
         "timeout",
-        "That took too long. Try again, or send it on WhatsApp — nothing you typed is lost.",
+        "That took too long. Try again, or send it on WhatsApp. Nothing you typed is lost.",
       );
     }
     throw new ApiError(
       "Network unreachable",
       "offline",
-      "You appear to be offline. Check your connection and try again — nothing has been sent.",
+      "You appear to be offline. Check your connection and try again. Nothing has been sent.",
     );
   }
   clearTimeout(timer);
@@ -351,7 +351,7 @@ export async function reverifyPrice(items: CartItem[]): Promise<PriceCheckRespon
           oldTotal: total,
           newTotal: bumped,
           reason:
-            "The operator raised the rate for this date since you added it. You have not been charged — confirm the new price to continue, or cancel and nothing happens.",
+            "The operator raised the rate for this date since you added it. You have not been charged. Confirm the new price to continue, or cancel and nothing happens.",
         };
       }
       return { changed: false, newTotal: total };

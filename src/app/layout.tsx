@@ -36,11 +36,11 @@ const body = Plus_Jakarta_Sans({
 export const metadata: Metadata = {
   metadataBase: new URL("https://outlyy.com"),
   title: {
-    default: "OUTLYY: Dubai Experiences, One All-In Price",
+    default: "OUTLYY | Dubai Experiences, Tours & Tickets",
     template: "%s | OUTLYY",
   },
   description:
-    "Book Dubai activities at one all-in price in your own currency, with pure-veg and Jain food options, hotel pickup and WhatsApp support in about 30 minutes. No fees added at checkout.",
+    "Find Dubai attractions, tours and things to do. Browse by hotel pickup or Jain and vegetarian options, then check availability for your dates.",
   openGraph: {
     type: "website",
     siteName: "OUTLYY",

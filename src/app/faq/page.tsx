@@ -9,7 +9,7 @@ import { serializeJsonLd } from "@/lib/json-ld";
 export const metadata: Metadata = {
   title: "Frequently Asked Questions",
   description:
-    "How OUTLYY pricing, UPI payments, Jain and pure-veg food, hotel pickup, vouchers, cancellations and refunds work, answered plainly.",
+    "Find out how OUTLYY checks dates and prices, which listings offer pickup or meal options, and how tickets, cancellation and refunds work.",
   alternates: { canonical: "/faq" },
 };
 
@@ -17,23 +17,23 @@ const SECTIONS: { id: string; title: string; kicker: string; faqs: Faq[] }[] = [
   {
     id: "inquiry",
     kicker: "How it works",
-    title: "Checking availability & price",
+    title: "Requesting availability & price",
     faqs: [
       {
-        q: "Why can't I just book instantly?",
-        a: "Because we confirm with the operator before you pay, so you never get a voucher that fails at the gate. Wrong tickets, rejected vouchers and 'sold out' after payment are the most common complaints on the big booking sites. We take the 30 minutes to avoid them, and nothing is charged until availability is confirmed.",
+        q: "Why do some listings ask me to enquire?",
+        a: "For inquiry experiences, we ask the operator to check your date and price before you pay. Where instant booking is available, you can continue to checkout from the listing.",
       },
       {
         q: "How fast will I hear back?",
-        a: "A named specialist replies on WhatsApp within about 30 minutes during our hours (10am–6pm Gulf Standard Time, Monday to Saturday), the confirmation page and your acknowledgement message both show the exact time, not a vague 'soon'. Out of hours, your inquiry is queued for the first shift and the time shown adjusts to the real one.",
+        a: "We reply on WhatsApp. Our team works from 10 am to 6 pm Gulf Standard Time, Monday to Saturday. Check your inquiry confirmation for its expected reply time.",
       },
       {
         q: "Does the price change?",
-        a: "The price on the site is the all-in price we expect to confirm, and it is right the large majority of the time. If the operator's rate has moved, peak dates, a supplement for your pickup area, we tell you the old and new figure and why, before you pay anything. We never quietly quote higher.",
+        a: "An inquiry price is an estimate until we check your date and options with the operator. If the total changes, we’ll tell you why before you decide whether to pay.",
       },
       {
         q: "How do I pay?",
-        a: "Once you've said yes to the confirmed price, we send a secure Razorpay payment link in the same WhatsApp thread. UPI, cards, netbanking, wallets and EMI on larger amounts; UAE cards for residents. Your voucher follows once payment clears.",
+        a: "Once we’ve confirmed the price and you decide to go ahead, follow the payment instructions in the WhatsApp conversation.",
       },
     ],
   },
@@ -44,15 +44,15 @@ const SECTIONS: { id: string; title: string; kicker: string; faqs: Faq[] }[] = [
     faqs: [
       {
         q: "Is the price I see really the price I pay?",
-        a: "Yes. Every price on OUTLYY includes taxes and booking fees, and it is the amount charged. The only things that change your total are optional extras you deliberately add, hotel pickup, a cake, a photographer. If a fee ever appears that wasn't on the activity page, that is a defect on our side and we refund the difference without argument.",
+        a: "For an inquiry, we confirm the amount before you pay. For instant booking, check the total at checkout. Extras you choose can change it.",
       },
       {
         q: "Why are your prices sometimes higher than the gate price?",
-        a: "Occasionally they are, and we won't pretend otherwise. Where a gate price is genuinely lower we don't show a struck-through comparison. What you get instead is a guaranteed slot, an all-in price with nothing added later, free cancellation where it exists, and someone to call if the operator lets you down.",
+        a: "Compare the ticket type, what it includes and the cancellation terms. Venue and OUTLYY prices can differ.",
       },
       {
         q: "Do you show prices in AED?",
-        a: "Yes, visitors in the UAE see dirham prices automatically, and you can switch currency in the header. AED and INR prices are set independently rather than converted, so changing one never silently changes the other.",
+        a: "Yes. Choose AED in the currency menu to view prices in dirhams. Check the payment currency before you pay.",
       },
       {
         q: "What is TCS and will I be charged it?",
@@ -67,19 +67,19 @@ const SECTIONS: { id: string; title: string; kicker: string; faqs: Faq[] }[] = [
     faqs: [
       {
         q: "Which payment methods do you accept?",
-        a: "UPI (GPay, PhonePe, Paytm or any UPI app), Indian credit and debit cards, netbanking, wallets, and EMI on orders above ₹15,000. UAE residents can pay in AED with a UAE card. UPI is first in the list because it's what most of our customers use.",
+        a: "Instant checkout takes card payment. For an inquiry, confirm which methods you can use when we send the payment instructions.",
       },
       {
         q: "My UPI payment failed but the money left my account.",
-        a: "That is almost always a bank-side timeout, and the amount auto-reverses within 3–5 working days. Your booking is held on our side in the meantime. Message us with the UTR number and we'll confirm exactly what happened and hold your slot while it resolves.",
+        a: "If a payment fails but your account shows a debit, check your booking status before paying again. Contact support if the status is unclear.",
       },
       {
         q: "Can I pay a deposit instead of the full amount?",
-        a: "On orders above ₹25,000 for eligible experiences, yes, 30% now and the balance seven days before you travel. Your booking is confirmed either way, and we remind you on WhatsApp before the balance is due.",
+        a: "Check the payment instructions for the amount due. If you need to split a payment, ask our team which options are available.",
       },
       {
         q: "Do you store my card details?",
-        a: "No. Payments are handled entirely by a PCI-DSS compliant gateway. Card numbers never reach our servers. If you choose to save a method for faster repeat booking, the gateway holds a token, not the card.",
+        a: "For instant checkout, enter your card details on Stripe’s payment page.",
       },
     ],
   },
@@ -90,11 +90,11 @@ const SECTIONS: { id: string; title: string; kicker: string; faqs: Faq[] }[] = [
     faqs: [
       {
         q: "Is Jain food genuinely available?",
-        a: "On the experiences marked for it, yes, cooked to order without onion or garlic, served separately from the main buffet. It must be requested when you book, because the kitchen plans it in advance; 24 hours is the reliable minimum. The confirmation is printed on your voucher so it cannot be denied at the venue.",
+        a: "Check the experience for a Jain meal option. Share your requirements when you enquire so we can confirm what the kitchen offers and how much notice it needs.",
       },
       {
         q: "What if my dietary requirement isn't met on the day?",
-        a: "Message the emergency number on your voucher immediately, while you're still at the venue. We contact the supplier there and then. If the meal genuinely wasn't provided as confirmed, we refund the meal portion of your booking, and the failure is logged against that supplier's reliability score, which affects whether we keep selling them.",
+        a: "If your confirmed meal is missing, use the contact details on your voucher. Tell us what was agreed and what was served.",
       },
       {
         q: "Is 'vegetarian available' the same everywhere?",
@@ -109,11 +109,11 @@ const SECTIONS: { id: string; title: string; kicker: string; faqs: Faq[] }[] = [
     faqs: [
       {
         q: "How does hotel pickup work?",
-        a: "You give us your hotel or building name at checkout. Shared transfers carry a 30-minute pickup window because the vehicle collects several groups. Your driver's name, photo, number and window reach you on WhatsApp the evening before, and you get a live message when they're ten minutes away.",
+        a: "When pickup is included, provide your hotel or building name. Check your confirmation for the meeting point, time and pickup instructions.",
       },
       {
         q: "What if the driver doesn't turn up?",
-        a: "Call the emergency number on your voucher. If pickup is more than 30 minutes late we either dispatch an alternative vehicle or cancel and refund the booking in full. That's the stated remedy, not something you have to negotiate afterwards.",
+        a: "If your pickup hasn’t arrived, use the contact details in your booking instructions. Have your booking reference and pickup location ready.",
       },
       {
         q: "Is my hotel covered?",
@@ -121,7 +121,7 @@ const SECTIONS: { id: string; title: string; kicker: string; faqs: Faq[] }[] = [
       },
       {
         q: "Can you arrange a wheelchair-accessible vehicle?",
-        a: "On most transfers, with 48 hours' notice. Message us before booking and we'll confirm the specific vehicle and the venue's access in writing first, rather than taking the booking and hoping.",
+        a: "Ask us before booking so we can check the vehicle and venue access for your group.",
       },
     ],
   },
@@ -132,11 +132,11 @@ const SECTIONS: { id: string; title: string; kicker: string; faqs: Faq[] }[] = [
     faqs: [
       {
         q: "How quickly do I get my voucher?",
-        a: "For instant-confirmation experiences, under a minute at the median, on WhatsApp, by email and in your account. If it hasn't arrived within ten minutes the system resends automatically and alerts an agent.",
+        a: "After an instant booking, check your confirmation for how to get your ticket. If it hasn’t arrived, check your booking status.",
       },
       {
-        q: "What does 'operator confirms within 2 hours' mean?",
-        a: "Some experiences, private camps, charters, helicopters, need the operator to confirm the slot rather than selling from live inventory. You get a status message within five minutes and the confirmed voucher within two hours. If they can't take it, you get three options, an alternative experience, an alternative date, or a full refund, within two hours, without chasing us.",
+        q: "What happens while the operator checks my date?",
+        a: "We contact the operator to check the date. If they can’t confirm it, we’ll let you know so you can consider another date or experience.",
       },
       {
         q: "Will my voucher work without internet?",
@@ -151,15 +151,15 @@ const SECTIONS: { id: string; title: string; kicker: string; faqs: Faq[] }[] = [
     faqs: [
       {
         q: "How do I cancel?",
-        a: "From Manage booking, using your reference and the phone or email you booked with. You'll see the exact refund amount and the expected credit date before you confirm anything. No form, no waiting for someone to get back to you.",
+        a: "Open Manage booking with your reference and the contact details used to book. Check the cancellation options and terms for your booking.",
       },
       {
         q: "How long do refunds take?",
-        a: "We initiate them within 24 hours of an eligible cancellation and send written confirmation. The money reaches your original payment method in 5–7 working days, depending on your bank.",
+        a: "When a refund is due, it goes back to your original payment method. Your bank or card provider can affect when it appears.",
       },
       {
         q: "Can I change the date instead?",
-        a: "Usually, and often for free. Most operators allow one date change up to 24 hours before travel. Where a fee applies we show it before you confirm. Date changes need the operator to re-confirm, so allow up to two hours.",
+        a: "Request a different date through support. A change depends on the operator’s terms, availability and any applicable fee.",
       },
     ],
   },
@@ -180,7 +180,7 @@ export default function FaqPage() {
         <Breadcrumbs items={[{ label: "Dubai", href: "/" }, { label: "FAQ" }]} className="mb-3" />
         <h1 className="text-[1.75rem] sm:text-3xl">Frequently asked questions</h1>
         <p className="mt-1.5 text-[0.95rem] text-ink-600">
-          Plain answers to the six things people actually ask before booking Dubai from India.
+          How prices, payment, pickup, tickets and cancellations work when you book a Dubai experience.
         </p>
 
         <nav aria-label="FAQ sections" className="mt-6 flex flex-wrap gap-2">
@@ -206,7 +206,7 @@ export default function FaqPage() {
           className="mt-10"
           context={{ intent: "general", placement: "faq" }}
           title="Still not answered?"
-          body="Ask us directly. A real person replies in about 30 minutes during our hours (10am–6pm Gulf Standard Time, Monday to Saturday), and if the answer is 'no, that won't work for your group', they'll say so."
+          body="Ask us on WhatsApp. Our hours are 10 am to 6 pm Gulf Standard Time, Monday to Saturday."
         />
       </div>
 

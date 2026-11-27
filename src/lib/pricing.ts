@@ -138,7 +138,7 @@ export function computeBreakdown(
       return;
     }
     lines.push({
-      label: `${type[0].toUpperCase()}${type.slice(1)}s × ${count}`,
+      label: `${{ adult: "Adults", child: "Children", senior: "Seniors", infant: "Infants" }[type]} × ${count}`,
       detail: "each, all-in",
       unit,
       amount,
@@ -154,7 +154,7 @@ export function computeBreakdown(
       const amount = addOn.perPerson ? scaleMoney(addOn.price, billable) : addOn.price;
       lines.push({
         label: addOn.name,
-        detail: addOn.price.inr === 0 ? "No extra charge" : addOn.perPerson ? "Per person" : "Per booking",
+        detail: addOn.price.inr === 0 ? "No extra charge" : addOn.perPerson ? "per person" : "per booking",
         amount,
         kind: "addon",
       });
@@ -335,7 +335,7 @@ export type CouponResult =
 export function applyCoupon(code: string, subtotal: Money): CouponResult {
   const coupon = couponByCode(code);
   if (!coupon) {
-    return { ok: false, message: "We don't recognise that code. Check the spelling, or ask us on WhatsApp." };
+    return { ok: false, message: "We couldn’t find that promo code. Check the code and try again." };
   }
   if (subtotal.inr < coupon.minOrderINR) {
     const short = coupon.minOrderINR - subtotal.inr;
@@ -353,7 +353,7 @@ export function applyCoupon(code: string, subtotal: Money): CouponResult {
     ok: true,
     coupon,
     discount: { inr, aed },
-    message: `${coupon.code} applied — ₹${inr.toLocaleString("en-IN")} off.`,
+    message: `${coupon.code} applied. You save ₹${inr.toLocaleString("en-IN")}.`,
   };
 }
 

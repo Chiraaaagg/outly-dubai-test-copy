@@ -46,7 +46,7 @@ export function StickyLandingCTA({
           context={{ intent: "general", placement: whatsappPlacement }}
         />
         <ButtonLink href={href} size="md">
-          Check availability
+          Request availability
         </ButtonLink>
       </div>
     </div>

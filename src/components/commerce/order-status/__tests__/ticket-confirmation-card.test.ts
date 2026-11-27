@@ -81,3 +81,58 @@ describe("AnimatedTicket: open-dated ticket additions (doc 29 §8.5, Batch 5)", 
     expect(plain).not.toContain("Download tickets");
   });
 });
+
+describe("AnimatedTicket: post-payment A5 repair", () => {
+  it("leaves the Paid cell out when no amount is given, and groups a large amount", () => {
+    const html = render({ amount: null });
+    expect(html).not.toContain(">Paid<");
+    expect(html).toContain("OUT-000001");
+    expect(render({ amount: 123456.5, currency: "INR" })).toContain("INR 1,23,456.50");
+    expect(render({ amount: 12345 })).toContain("AED 12,345.00");
+  });
+
+  it("takes an h3 under a section heading", () => {
+    const html = render({ headingLevel: 3 });
+    expect(html).toContain("Dhow cruise dinner</h3>");
+    expect(html).not.toContain("<h2");
+  });
+
+  it("the server render is the final state: no entrance attribute, no animation class, no confetti", () => {
+    const html = render({ entrance: true });
+    expect(html).not.toContain("data-entrance=");
+    expect(html).not.toContain("animate-[pop-in");
+    expect(html).not.toContain("confetti");
+  });
+
+  it("clips its cut-outs inside the card (no sideways scroll on a 320 px phone)", () => {
+    const html = render();
+    expect(html).toContain("overflow-hidden");
+    expect(html).toContain("p-5 sm:p-8");
+  });
+
+  it("the check mark and cut-outs are decorative", () => {
+    const html = render();
+    expect(html.match(/aria-hidden="true"/g)?.length ?? 0).toBeGreaterThanOrEqual(3);
+  });
+});
+
+describe("ConfettiBurst", () => {
+  it("is hidden from assistive technology and never takes pointer events", async () => {
+    const { ConfettiBurst } = await import("../ticket-confirmation-card");
+    const html = renderToStaticMarkup(h(ConfettiBurst, {}));
+    expect(html).toMatch(/^<div[^>]*aria-hidden="true"/);
+    expect(html).toContain("pointer-events-none");
+    expect(html).toContain("confetti-fall");
+    // The keyframe lives in globals.css, not in a <style> injected per mount.
+    expect(html).not.toContain("<style");
+  });
+});
+
+describe("Ticket card entrance in print (fix round 1, L9)", () => {
+  it("a card still waiting for its entrance prints in its final state", async () => {
+    const { readFileSync } = await import("node:fs");
+    const css = readFileSync(new URL("../../../../app/globals.css", import.meta.url), "utf8");
+    const blocks = css.split("@media print").slice(1);
+    expect(blocks.some((b) => /\[data-entrance\]\s*\{[^}]*opacity:\s*1\s*!important/.test(b))).toBe(true);
+  });
+});

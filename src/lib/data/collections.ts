@@ -10,11 +10,11 @@ export const collections: Collection[] = [
     slug: "dubai-with-kids",
     name: "Dubai with Kids",
     audience: "Families with children aged 3–14",
-    tagline: "Plans that survive a six-year-old and a grandparent on the same day",
+    tagline: "Dubai days for children and the adults coming along",
     tone: "warm",
     heroImage: "img:collection:dubai-with-kids:0",
     narrative:
-      "The hard part of Dubai with children isn't finding things to do, it's finding things that work for everyone in the group at once. A theme park that thrills a twelve-year-old will bore a four-year-old and exhaust a grandparent. So this list is ordered by how well each experience holds a mixed group: short indoor attractions first, then the half-day outings, then the full-day parks that need a rested family and an early start. Every one has child pricing shown before checkout, and the ones with a vegetarian food problem have been left out entirely.",
+      "Check age bands, height limits and how much moving around the experience involves. Then compare child pricing, meal options and pickup where available.",
     activitySlugs: [
       "dubai-frame-tickets",
       "aya-universe",
@@ -40,11 +40,11 @@ export const collections: Collection[] = [
     slug: "dubai-honeymoon",
     name: "Honeymoon in Dubai",
     audience: "Couples, newly-weds and anniversary trips",
-    tagline: "Private where it matters, and photographed properly",
+    tagline: "Make a plan for two",
     tone: "premium",
     heroImage: "img:collection:dubai-honeymoon:0",
     narrative:
-      "Two things decide whether a honeymoon experience is worth its price in Dubai: whether it is genuinely private, and whether the light is right when you arrive. Both are easy to get wrong. A 'private' desert camp can mean a reserved table in a shared tent; a 'sunset' cruise can leave the marina forty minutes after the sun has gone. Everything in this collection states which it is, plainly, and the timings are set so you're in the right place at golden hour. Occasion add-ons, cake, décor, a photographer, a proposal setup, are arranged by a coordinator on WhatsApp rather than left as a note in a booking form.",
+      "For an evening you want to plan around, look at the route and timing first. Check if you’ll have the space to yourselves and ask about photos or occasion extras before choosing an option.",
     activitySlugs: [
       "premium-private-desert-camp",
       "luxury-yacht-tour-90min",
@@ -68,11 +68,11 @@ export const collections: Collection[] = [
     slug: "jain-veg-friendly",
     name: "Jain & Pure Veg Friendly Dubai",
     audience: "Travellers with strict vegetarian or Jain dietary needs",
-    tagline: "Checked with the kitchen, confirmed on your voucher",
+    tagline: "Check Jain and pure vegetarian meal options",
     tone: "warm",
     heroImage: "img:collection:jain-veg-friendly:0",
     narrative:
-      "'Vegetarian available' means very little on its own. It can mean a separate live-cooking counter with a dozen dishes, or it can mean paneer curry at the end of a meat buffet. And Jain food, cooked without onion and garlic, is not something a camp can produce because you asked the driver on the way there. Everything in this collection has been checked directly with the kitchen. Where we say Jain is available, it is cooked to order, it must be requested at booking, and the confirmation is printed on your voucher so nobody at the venue can claim they weren't told.",
+      "If you need a Jain or pure vegetarian meal, check the listing for food options and tell us what you need when you enquire. Ask how much notice the kitchen needs and whether the meal is included.",
     activitySlugs: [
       "evening-desert-safari-veg-jain",
       "gentle-desert-safari-seniors",
@@ -96,11 +96,11 @@ export const collections: Collection[] = [
     slug: "luxury-dubai",
     name: "Luxury Dubai",
     audience: "Premium travellers and private groups",
-    tagline: "Arranged by a named person who answers the phone",
+    tagline: "Private outings and plans for a special day",
     tone: "premium",
     heroImage: "img:collection:luxury-dubai:0",
     narrative:
-      "At this end of the market the risk is not overpaying, it is a supplier who takes the booking and then handles it casually. Every experience here is operated by a partner we use repeatedly and monitor on a reliability score. Bookings above ₹1,00,000 and all private charters are assigned a named coordinator with a direct WhatsApp number and a phone number, from the moment you enquire until you are back at your hotel. Charters are quoted rather than listed, because the honest number depends on your date, your group and your route.",
+      "Clear up guest capacity, route and price unit before you compare a private charter or flight. Share your date and group size so we can check the right options.",
     activitySlugs: [
       "private-yacht-charter-sunset",
       "helicopter-tour-12min",
@@ -120,11 +120,11 @@ export const collections: Collection[] = [
     slug: "first-time-dubai",
     name: "First Time in Dubai",
     audience: "First-time visitors with three to five days",
-    tagline: "The eight things worth doing before you plan anything clever",
+    tagline: "Start planning your first Dubai visit",
     tone: "playful",
     heroImage: "img:collection:first-time-dubai:0",
     narrative:
-      "If this is your first trip, resist the urge to build an elaborate itinerary. Dubai rewards a simple one: get your bearings with a city tour on day one, do the desert on day two, spend an evening on the water, and use the rest for whatever caught your eye while you were here. This collection is that plan, in order. Book the Burj Khalifa and the Museum of the Future early, both are timed-entry and both sell out several days ahead through the winter.",
+      "A city tour helps you get your bearings. Leave time for the desert or a dinner cruise on another day so you can build the rest of your visit around what catches your eye.",
     activitySlugs: [
       "dubai-city-tour-half-day",
       "burj-khalifa-124-125",
@@ -150,11 +150,11 @@ export const collections: Collection[] = [
     slug: "senior-friendly",
     name: "Dubai with Parents",
     audience: "Groups travelling with parents and grandparents",
-    tagline: "Little walking, seats throughout, nothing that jolts",
+    tagline: "Ideas with comfort and pace in mind",
     tone: "warm",
     heroImage: "img:collection:senior-friendly:0",
     narrative:
-      "Travelling with parents changes what a good day looks like. Distance between activities matters more than the activities themselves; so does whether there is somewhere to sit, whether the transfer is gentle, and whether the food is something they will actually eat. This collection selects for exactly that. Nothing here involves dune bashing, long queues without seating, or more than two kilometres of walking.",
+      "Check the pace of the itinerary, walking distances, seating and the kind of transfer before you book. If someone has a mobility or dietary requirement, ask us to check it with the operator.",
     activitySlugs: [
       "gentle-desert-safari-seniors",
       "dhow-cruise-marina-dinner",
@@ -174,11 +174,11 @@ export const collections: Collection[] = [
     slug: "adventure-dubai",
     name: "Adventure in Dubai",
     audience: "Younger travellers and thrill-seekers",
-    tagline: "The fast, loud and slightly terrifying end of the catalogue",
+    tagline: "Dunes, open water and a different view of Dubai",
     tone: "playful",
     heroImage: "img:collection:adventure-dubai:0",
     narrative:
-      "Dubai does adrenaline unusually well, largely because it has the space and the money to do it safely. Quad bikes on real dunes, jet skis on open water, the fastest rollercoaster on the planet, and a balloon that lifts off before sunrise. Age and height limits are stated on every page here, because being turned away at the gate after a 90-minute drive is a bad morning.",
+      "Choose your terrain: dune buggy, jet ski or a ride in the air. Check age, height, driving licence or other requirements for the activity you pick.",
     activitySlugs: [
       "morning-quad-bike-desert",
       "jet-ski-burj-al-arab",
@@ -197,11 +197,11 @@ export const collections: Collection[] = [
     slug: "budget-dubai",
     name: "Dubai Under ₹3,000",
     audience: "Budget-conscious travellers and large groups",
-    tagline: "Good days out that don't need a big budget",
+    tagline: "Dubai days on a budget",
     tone: "playful",
     heroImage: "img:collection:budget-dubai:0",
     narrative:
-      "Dubai has a reputation for being expensive, which is true of hotels and largely untrue of things to do. Global Village costs less than a cinema ticket in Mumbai. The Creek dhow cruise feeds you for under two thousand rupees. This is the list for a family watching the total, or for a group of seven where every rupee is multiplied by seven.",
+      "Compare tickets at the rate that applies to each guest. Check for add-ons or transfers before choosing, especially when you’re booking for several people.",
     activitySlugs: [
       "global-village",
       "dubai-frame-tickets",
@@ -230,7 +230,7 @@ export const attractions: Attraction[] = [
     slug: "burj-khalifa",
     name: "Burj Khalifa",
     blurb:
-      "At 828 metres it is still the tallest building in the world, and the observation decks on levels 124, 125 and 148 are the reason most first-time visitors come to Downtown Dubai at all. Which ticket you need depends almost entirely on what time you go.",
+      "Pick your view over Downtown Dubai. Choose a visit to Levels 124 and 125 or check ticket options for the SKY deck on Level 148.",
     heroImage: "img:attraction:burj-khalifa:0",
     practical: [
       { label: "Location", value: "Downtown Dubai, entrance inside The Dubai Mall (Lower Ground)" },
@@ -263,7 +263,7 @@ export const attractions: Attraction[] = [
     slug: "atlantis-aquaventure",
     name: "Atlantis Aquaventure & The Lost Chambers",
     blurb:
-      "The largest waterpark in the Middle East sits at the tip of the Palm, with a 65,000-animal aquarium attached to it. Together they are a comfortable two-day plan, or one very full day if your family is the energetic sort.",
+      "Choose waterpark rides at Aquaventure or an aquarium visit at The Lost Chambers. Check which attraction your ticket covers.",
     heroImage: "img:attraction:atlantis-aquaventure:0",
     practical: [
       { label: "Location", value: "Atlantis The Palm, Palm Jumeirah" },
@@ -292,7 +292,7 @@ export const attractions: Attraction[] = [
     slug: "dubai-frame",
     name: "Dubai Frame",
     blurb:
-      "A 150-metre gold picture frame in Zabeel Park, with old Dubai on one side and the new skyline on the other, and a glass floor between them. Short, cheap, and unexpectedly one of the most memorable hours in the city.",
+      "Look out from Dubai Frame over old Dubai and the newer skyline. On the bridge, look down through the glass floor.",
     heroImage: "img:attraction:dubai-frame:0",
     practical: [
       { label: "Location", value: "Zabeel Park, Gate 4" },
@@ -317,7 +317,7 @@ export const attractions: Attraction[] = [
     slug: "museum-of-the-future",
     name: "Museum of the Future",
     blurb:
-      "The silver torus on Sheikh Zayed Road is the most photographed new building in Dubai, and unusually for an Instagram landmark, the inside is better than the outside. Five floors of immersive exhibits, and a children's floor that genuinely holds attention.",
+      "The silver torus on Sheikh Zayed Road houses immersive exhibits about the future. Check what’s open on your preferred date.",
     heroImage: "img:attraction:museum-of-the-future:0",
     practical: [
       { label: "Location", value: "Sheikh Zayed Road, Trade Centre area" },
@@ -342,7 +342,7 @@ export const attractions: Attraction[] = [
     slug: "ferrari-world",
     name: "Ferrari World Abu Dhabi",
     blurb:
-      "Home to Formula Rossa, the fastest rollercoaster in the world at 240km/h, and a mostly indoor park that makes a good pairing with an Abu Dhabi day trip from Dubai.",
+      "Explore Ferrari-themed attractions in Abu Dhabi, including Formula Rossa. Check the ride schedule before planning your visit around it.",
     heroImage: "img:attraction:ferrari-world:0",
     practical: [
       { label: "Location", value: "Yas Island, Abu Dhabi" },
@@ -367,7 +367,7 @@ export const attractions: Attraction[] = [
     slug: "img-worlds",
     name: "IMG Worlds of Adventure",
     blurb:
-      "The largest indoor theme park on earth, with Marvel and Cartoon Network zones under one very large air-conditioned roof. The most dependable plan in Dubai on a punishing summer afternoon.",
+      "Marvel and Cartoon Network zones sit under one roof at IMG Worlds of Adventure. Plan an indoor theme park day away from the Dubai heat.",
     heroImage: "img:attraction:img-worlds:0",
     practical: [
       { label: "Location", value: "City of Arabia, Sheikh Mohammed Bin Zayed Road" },

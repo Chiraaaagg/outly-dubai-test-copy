@@ -49,7 +49,9 @@ describe("OrderStatus (tracker)", () => {
 
   it("prints the amount in the order's currency with two decimals", () => {
     expect(render()).toContain("AED 229.00");
-    expect(render({ currency: "INR", item: { ...base.item, price: 14000 } })).toContain("INR 14000.00");
+    // Grouped in the currency's own way (post-payment break-ui pass).
+    expect(render({ currency: "INR", item: { ...base.item, price: 14000 } })).toContain("INR 14,000.00");
+    expect(render({ currency: "INR", item: { ...base.item, price: 12345678.9 } })).toContain("INR 1,23,45,678.90");
   });
 
   it("has decorative images only, and no button without an action", () => {
@@ -64,5 +66,20 @@ describe("OrderStatus (tracker)", () => {
     expect(html).toContain("text-lagoon-700");
     expect(html).toContain("Ref OUT-000001 · updated 14:39 Dubai time");
     expect(html).not.toMatch(/\b(?:bg|text)-(?:card|foreground|muted-foreground)\b/);
+  });
+});
+
+describe("OrderStatus (tracker): post-payment A6", () => {
+  it("a progress slot replaces the item and summary cards", () => {
+    const html = render({ progress: h("section", { "data-testid": "slot" }, "Booking progress") });
+    expect(html).toContain('data-testid="slot"');
+    expect(html).not.toContain("Dhow cruise dinner");
+    expect(html).not.toContain(">Progress</h2>");
+    // The headline stays the page's one h1.
+    expect(html.match(/<h1/g)).toHaveLength(1);
+  });
+
+  it("the item row wraps on a narrow screen instead of pushing the price out", () => {
+    expect(render()).toContain("flex flex-wrap items-start");
   });
 });

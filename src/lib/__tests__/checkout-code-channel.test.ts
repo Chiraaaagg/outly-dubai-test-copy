@@ -72,7 +72,7 @@ describe("codeCopy", () => {
     expect(codeCopy("email", "tr•••@example.test", 6, null)).toMatchObject({
       title: "Confirm your email",
       helpText: "Wrong email?",
-      description: expect.stringContaining("we sent by email to tr•••@example.test"),
+      description: expect.stringContaining("we emailed to tr•••@example.test"),
     });
     expect(codeCopy(undefined, "+971 •••• 0000", 6, null)).toMatchObject({
       title: "Confirm your mobile number",

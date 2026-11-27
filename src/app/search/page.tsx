@@ -21,7 +21,7 @@ import type { Dietary, SearchFilters, SortKey, Suitability } from "@/lib/types";
 export const metadata: Metadata = {
   title: "Search Dubai Experiences",
   description:
-    "Search Dubai experiences by date, price, dietary needs and who you are travelling with. All-in pricing, voucher on WhatsApp.",
+    "Search Dubai experiences by date, price, group and dietary needs. Open a listing to check its options and booking terms.",
   robots: { index: false, follow: true },
 };
 
@@ -103,8 +103,7 @@ export default async function SearchPage({
         <Breadcrumbs items={[{ label: "Dubai", href: "/" }, { label: "Search" }]} className="mb-3" />
         <h1 className="text-[1.75rem] sm:text-3xl">{heading}</h1>
         <p className="mt-1.5 text-[0.95rem] text-ink-600">
-          {result.total} {result.total === 1 ? "experience" : "experiences"} · all-in pricing ·
-          confirmed with the operator before you pay
+          {result.total} {result.total === 1 ? "experience" : "experiences"} found
         </p>
       </div>
 
@@ -194,8 +193,8 @@ export default async function SearchPage({
             <EmptyState
           illustration="search"
               icon={<SearchX className="h-6 w-6" />}
-              title="Nothing matched that search"
-              body="Nothing matched those filters. Tell us what you are after and we will go and find it, including things that are not listed here."
+              title="No experiences match your search"
+              body="Try different filters, or ask us about the experience you have in mind."
               action={<ButtonLink href="/search">Browse everything</ButtonLink>}
               secondary={
                 <ButtonLink href="/categories/desert-safari" variant="outline">
@@ -212,8 +211,8 @@ export default async function SearchPage({
               question: filters.q ? `I searched for: ${filters.q}` : undefined,
               placement: "search_results",
             }}
-            title="Can't find the right thing?"
-            body="Send us your dates, group size and what you're hoping to do. We'll come back with three options, priced all-in, usually within the hour."
+            title="Need help finding an experience?"
+            body="Send us your dates, group size and what you’d like to do. We’ll help you check your options."
           />
 
           {/* Internal linking, keeps crawl paths short and helps undecided users */}

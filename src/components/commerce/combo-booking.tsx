@@ -165,7 +165,7 @@ export function ComboBooking({ combo }: { combo: Combo }) {
 
         <div className="space-y-2">
           <Button block size="lg" loading={submitting} onClick={book}>
-            {inquiryMode ? "Check availability & price" : "Book this package"}
+            {inquiryMode ? "Request availability & price" : "Book this package"}
           </Button>
           <WhatsAppButton
             block

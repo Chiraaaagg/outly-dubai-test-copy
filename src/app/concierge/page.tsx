@@ -122,8 +122,7 @@ function ConciergeInner() {
         <Card className="p-6">
           <h2 className="text-2xl">Request a quote</h2>
           <p className="mt-1.5 text-sm text-ink-600">
-            Six fields. We come back within two hours during working hours with a firm, itemised
-            all-in figure, not a range that changes later.
+            Share the details of your trip. We’ll use them to prepare your quote.
           </p>
 
           {prefilled && (
@@ -217,7 +216,7 @@ function ConciergeInner() {
               </div>
 
               {state === "error" && (
-                <Alert tone="danger" title="That didn't send">
+                <Alert tone="danger" title="We couldn’t send that">
                   Try again{deskPhone ? `, or call us directly on ${deskPhone}` : ", or message us on WhatsApp"}{" "}
                  , nothing you typed is lost.
                 </Alert>

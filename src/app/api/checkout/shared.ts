@@ -44,7 +44,7 @@ export async function resolveCheckoutOwner(req: NextRequest): Promise<QuoteSnaps
 
 /** No owner: the guest session ended, or the cookie was never set. Same words whatever the cause. */
 export function checkoutSessionEnded() {
-  return Errors.conflict("Your checkout has expired — start again from your trip", { reason: "no_session" });
+  return Errors.conflict("Your checkout has expired. Start again from your trip", { reason: "no_session" });
 }
 
 export function ownerKey(owner: QuoteSnapshot["owner"]): string {

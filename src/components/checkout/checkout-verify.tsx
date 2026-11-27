@@ -22,7 +22,7 @@ export function verifyErrorMessage(err: unknown): { message: string; expired: bo
   if (code === "RATE_LIMITED") return { message: "Too many attempts. Wait a few minutes, then send a new code.", expired: false };
   // A wrong code is a validation error on the `code` field.
   if (err instanceof ApiError && err.fields?.code) {
-    return { message: "That code doesn't match. Check the latest code we sent and try again.", expired: false };
+    return { message: "That code didn’t match. Check the latest code we sent and try again.", expired: false };
   }
   if (err instanceof ApiError) return { message: err.recovery, expired: false };
   return { message: "We couldn't check that code. Try again.", expired: false };
@@ -128,7 +128,7 @@ export function verifyReducer(state: VerifyState, action: VerifyAction): VerifyS
     case "check_started":
       return { ...state, busy: true, error: null, submitted: action.code };
     case "incomplete":
-      return { ...state, error: `Enter all ${CODE_LENGTH} digits.` };
+      return { ...state, error: `Enter the full ${CODE_LENGTH}-digit code.` };
     case "check_failed":
       // A wrong code keeps the field; an expired one unlocks "Send a new code" at once.
       return { ...state, busy: false, error: action.message, resendIn: action.expired ? 0 : state.resendIn };

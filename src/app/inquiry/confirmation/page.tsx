@@ -125,8 +125,8 @@ function Inner() {
         <div className="mx-auto max-w-2xl">
           <h1 className="mb-4 text-[1.75rem] sm:text-3xl">Your inquiry</h1>
           <EmptyState
-            title="We can't confirm an inquiry on this page"
-            body="If you sent us an inquiry, you'll get a WhatsApp reply from our team. You can check its progress with your reference and phone number."
+            title="We can’t verify this inquiry here"
+            body="If you sent an inquiry, use your reference and phone number to track it. Our team replies on WhatsApp."
             action={<ButtonLink href="/inquiry/track">Track an inquiry</ButtonLink>}
             secondary={
               <WhatsAppButton
@@ -155,8 +155,8 @@ function Inner() {
           <h1 className="text-[1.75rem] sm:text-3xl">Got it. {agent.name.split(" ")[0]} has your trip.</h1>
           <p className="mx-auto mt-2 max-w-xl text-[0.975rem] leading-relaxed text-ink-700">
             {outOfHours
-              ? `Our team is offline right now. ${agent.name.split(" ")[0]} will message you on WhatsApp by ${formatDeadline(deadline)} with availability and the confirmed price.`
-              : `You'll hear from ${agent.name.split(" ")[0]} on WhatsApp by ${formatDeadline(deadline)}, with availability confirmed and the exact all-in price. Nothing is charged until you say yes.`}
+              ? `Our team is offline. Expect a WhatsApp update from ${agent.name.split(" ")[0]} around ${formatDeadline(deadline)}.`
+              : `Expect a WhatsApp update from ${agent.name.split(" ")[0]} around ${formatDeadline(deadline)}. We’ll share the operator’s availability and price when checked. There’s no charge for sending this inquiry.`}
           </p>
 
           <div className="mt-5 inline-flex items-center gap-3 rounded-full border border-ink-200 bg-white px-4 py-2.5">
@@ -230,7 +230,7 @@ function Inner() {
                   ))}
                 </ul>
                 <div className="mt-3 flex justify-between border-t border-ink-200 pt-3 text-sm">
-                  <span className="font-bold">Indicative total</span>
+                  <span className="font-bold">Estimated total</span>
                   <span className="font-display text-lg font-bold tnum">
                     {priceIn(stored.total, currency)}
                   </span>
@@ -256,8 +256,9 @@ function Inner() {
             Travelling in the next 48 hours?
           </h2>
           <p className="mt-1.5 text-sm leading-relaxed text-ink-600">
-            Message us on WhatsApp rather than waiting, it&apos;s faster
-            {emergency ? ", and for anything urgent the phone line is answered by a person." : "."}
+            {emergency
+              ? "For an urgent question, message us on WhatsApp or call our support team."
+              : "Message us on WhatsApp if you have a question about your inquiry."}
           </p>
           {emergency && emergencyTel && (
             <a href={emergencyTel} className="mt-2 inline-block text-sm font-bold text-ink-900 underline">
@@ -268,8 +269,7 @@ function Inner() {
 
         {outOfHours && (
           <Alert tone="info" className="mt-6" title="Out of hours">
-            Your inquiry is queued for the first shift. The deadline above already accounts for that —
-            it is the real time, not an estimate.
+            Your inquiry is queued for the next shift. Check the expected reply time above.
           </Alert>
         )}
 

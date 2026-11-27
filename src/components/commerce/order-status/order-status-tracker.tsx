@@ -33,6 +33,12 @@
  *     the server-rendered headline is visible (opacity 0 is not stopped by
  *     reduced motion). The variants stay; the entrance no longer plays.
  * The page still wraps it in <MotionConfig reducedMotion="user">.
+ * Post-payment batch A6 (owner approval 27 Nov 2026): `progress`, when given,
+ * takes the place of the item and summary cards (the Booking Progress Card,
+ * which carries the reference, the activity, its date and the milestones), so
+ * nothing is said twice while the booking is still on its way. The item row
+ * wraps on narrow screens and the price is grouped (12,345.00), so a long
+ * title or an INR amount never pushes past the card at 320 px.
  */
 "use client";
 
@@ -61,6 +67,8 @@ interface OrderStatusProps {
   statusDescription: string;
   item: OrderItemProps;
   summary: OrderSummaryItemProps[];
+  /** A6: shown instead of the item and summary cards while the booking is on its way. */
+  progress?: React.ReactNode;
   trackingStatus: string;
   onTrackOrder?: () => void;
   className?: string;
@@ -92,6 +100,7 @@ export const OrderStatus: React.FC<OrderStatusProps> = ({
   statusDescription,
   item,
   summary,
+  progress,
   trackingStatus,
   onTrackOrder,
   className,
@@ -133,22 +142,30 @@ export const OrderStatus: React.FC<OrderStatusProps> = ({
         <p className="text-ink-600">{statusDescription}</p>
       </motion.div>
 
+      {progress ? (
+        <motion.div variants={itemVariants} className="mb-6">
+          {progress}
+        </motion.div>
+      ) : (
+        <>
       {/* Ordered item details card */}
       <motion.div variants={itemVariants} className="mb-6">
         <InfoCard>
-          <div className="flex items-center space-x-4">
+          {/* Wraps on a narrow screen (post-payment break-ui pass): a long title or a large amount moves the
+              price under the text instead of pushing it past the card's edge at 320 px. */}
+          <div className="flex flex-wrap items-start gap-x-4 gap-y-2">
             <img
               src={item.imageUrl}
               alt=""
-              className="w-12 h-12 sm:w-16 sm:h-16 rounded-[var(--radius-card)] bg-shell object-cover"
+              className="w-12 h-12 sm:w-16 sm:h-16 shrink-0 rounded-[var(--radius-card)] bg-shell object-cover"
             />
-            <div className="flex-1">
-              <p className="font-semibold text-ink-900">{item.name}</p>
+            <div className="min-w-0 flex-1 basis-32">
+              <p className="font-semibold text-ink-900 break-words">{item.name}</p>
               <p className="text-sm text-ink-600">{item.details}</p>
             </div>
             {item.price !== null && Number.isFinite(item.price) ? (
-              <p className="font-bold text-ink-900 tabular-nums whitespace-nowrap">
-                {currency} {item.price.toFixed(2)}
+              <p className="ml-auto font-bold text-ink-900 tabular-nums whitespace-nowrap">
+                {currency} {item.price.toLocaleString(currency === "INR" ? "en-IN" : "en-GB", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
               </p>
             ) : null}
           </div>
@@ -167,6 +184,9 @@ export const OrderStatus: React.FC<OrderStatusProps> = ({
             ))}
         </InfoCard>
       </motion.div>
+
+        </>
+      )}
 
       {/* Action button and final status text */}
       <motion.div variants={itemVariants} className="text-center space-y-3">

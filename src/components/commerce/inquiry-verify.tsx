@@ -91,7 +91,7 @@ export function InquiryVerify({
   const verify = async (value: string) => {
     if (busy || sending) return;
     if (value.length !== CODE_LENGTH) {
-      setError(`Enter all ${CODE_LENGTH} digits.`);
+      setError(`Enter the full ${CODE_LENGTH}-digit code.`);
       return;
     }
     submitted.current = value;

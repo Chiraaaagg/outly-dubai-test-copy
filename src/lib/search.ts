@@ -121,7 +121,7 @@ const RELAXATION_ORDER: {
   {
     key: "dietary",
     describe: (f) =>
-      `No ${f.dietary?.join(" and ")} options match your other filters. Showing everything else that fits — check the food notes on each card, and ask us if you need it confirmed with the kitchen.`,
+      `No ${f.dietary?.join(" and ")} options match your other filters. We’ve kept the matches for your other filters. Check the food notes on each card or ask us about kitchen arrangements.`,
   },
   {
     key: "when",
@@ -131,13 +131,13 @@ const RELAXATION_ORDER: {
   {
     key: "suitability",
     describe: () =>
-      "Nothing matches every suitability filter. Showing the closest options — the attributes are listed on each card.",
+      "No experience matches every suitability filter. Check each card for the features it offers.",
   },
   {
     key: "privateOnly",
     describe: () => "No private-only options here. Showing shared experiences, several of which have a private upgrade.",
   },
-  { key: "pickup", describe: () => "Nothing here includes hotel pickup. Showing options you meet at the venue — most can add a transfer." },
+  { key: "pickup", describe: () => "None of these results includes hotel pickup. Check each listing for where to meet and ask about transfers if you need one." },
   { key: "duration", describe: () => "Nothing in that duration. Showing everything else that matches." },
   {
     key: "maxPrice",
@@ -146,7 +146,7 @@ const RELAXATION_ORDER: {
   },
   { key: "rating", describe: () => "Nothing at that rating. Showing the highest-rated alternatives." },
   { key: "instant", describe: () => "No instant-confirmation options. Showing experiences the operator confirms within two hours." },
-  { key: "freeCancellation", describe: () => "No free-cancellation options here. Showing the rest — each card states its policy." },
+  { key: "freeCancellation", describe: () => "None of these results offers free cancellation. Check each listing for the policy that applies." },
 ];
 
 function relax(f: SearchFilters, list: Activity[]): { message: string; activities: Activity[] } | undefined {
@@ -192,7 +192,7 @@ export interface Suggestion {
 export const POPULAR_SEARCHES: Suggestion[] = [
   { label: "Desert safari with Jain food", sub: "Most searched", href: "/activities/evening-desert-safari-veg-jain", kind: "intent" },
   { label: "Burj Khalifa tickets", sub: "From ₹3,690", href: "/lp/burj-khalifa-tickets", kind: "intent" },
-  { label: "Short notice — this week", sub: "We check same-day", href: "/search?when=tomorrow", kind: "intent" },
+  { label: "Short notice this week", sub: "We check same-day", href: "/search?when=tomorrow", kind: "intent" },
   { label: "Dhow cruise dinner", sub: "From ₹1,990", href: "/lp/marina-cruise-dubai", kind: "intent" },
   { label: "Abu Dhabi day trip", sub: "Grand Mosque included", href: "/abu-dhabi-day-tours-from-dubai", kind: "intent" },
   { label: "Things to do with kids", sub: "Curated for families", href: "/collections/dubai-with-kids", kind: "intent" },

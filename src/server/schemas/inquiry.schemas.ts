@@ -88,7 +88,7 @@ const attributionSchema = z
 
 export const createInquirySchema = z
   .object({
-    items: z.array(cartItemSchema).max(12, "Too many items for one inquiry — message us on WhatsApp instead"),
+    items: z.array(cartItemSchema).max(12, "Too many items for one inquiry. Message us on WhatsApp instead"),
     leadName: z.string().trim().min(1, "So we know who to reply to.").max(120),
     leadPhone: z.string().trim().min(5, "Check the WhatsApp number").max(24),
     countryCode: z.string().trim().regex(/^\+?\d{1,4}$/, "Check the country code"),

@@ -23,11 +23,23 @@ import {
  * The UI flow routes the two recovery calls to the frozen contract
  * responses (src/lib/customer-status.ts) so it does not depend on rate-limit
  * state; the API tests at the end call the real server.
+ *
+ * Post-payment batch A1: the form offers only the channels the server can
+ * deliver a code on right now (email in production while SMS codes are off).
+ * The flow uses email, which is always offered; a phone choice is checked
+ * only when the page offers one.
  */
 
 const START = "/api/recovery/start";
 const VERIFY = "/api/recovery/verify";
 const PHONE = "9000000017";
+const EMAIL = "zz-e2e@outlyy.test";
+
+/** Picks email when the page offers a choice (it opens on the server's first channel). */
+async function chooseEmail(page: Page): Promise<void> {
+  const choice = page.getByLabel("My email", { exact: true });
+  if (await choice.count()) await choice.check();
+}
 
 async function routeRecovery(page: Page): Promise<void> {
   await page.route(`**${START}`, (route) =>
@@ -40,7 +52,8 @@ async function routeRecovery(page: Page): Promise<void> {
 
 async function submitDetails(page: Page, reference = UNKNOWN_REFERENCE): Promise<void> {
   await page.getByLabel("Booking reference").fill(reference);
-  await page.getByLabel("Phone number you booked with").fill(PHONE);
+  await chooseEmail(page);
+  await page.getByLabel("Email you booked with").fill(EMAIL);
   await page.getByRole("button", { name: "Send me a code" }).click();
   await expect(page.getByTestId("recovery-code-step")).toBeVisible();
 }
@@ -50,10 +63,18 @@ test.describe("/manage-booking recovery", () => {
     const res = await page.goto("/manage-booking");
     expectPrivateHeaders(res);
     await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
-    for (const name of ["Booking reference", "My phone number", "My email", "Phone number you booked with", "Country code"]) {
-      await expect(page.getByLabel(name, { exact: true }), name).toBeVisible();
+    await expect(page.getByLabel("Booking reference", { exact: true })).toBeVisible();
+    // A1: never a phone code while texts cannot be sent; when phone is offered, its fields are labelled too.
+    if (await page.getByLabel("My phone number", { exact: true }).count()) {
+      await page.getByLabel("My phone number", { exact: true }).check();
+      for (const name of ["Phone number you booked with", "Country code"]) {
+        await expect(page.getByLabel(name, { exact: true }), name).toBeVisible();
+      }
+    } else {
+      await expect(page.getByTestId("code-destination")).toContainText("We'll email a 6-digit code");
+      await expect(page.getByLabel("Phone number you booked with")).toHaveCount(0);
     }
-    await page.getByLabel("My email", { exact: true }).check();
+    await chooseEmail(page);
     await expect(page.getByLabel("Email you booked with")).toBeVisible();
   });
 
@@ -69,7 +90,8 @@ test.describe("/manage-booking recovery", () => {
 
     // A malformed reference is refused the same way, without a request.
     await ref.fill("OUT-12345");
-    await page.getByLabel("Phone number you booked with").fill(PHONE);
+    await chooseEmail(page);
+    await page.getByLabel("Email you booked with").fill(EMAIL);
     await page.getByRole("button", { name: "Send me a code" }).click();
     await expect(ref).toBeFocused();
     await expect(ref).toHaveAttribute("aria-invalid", "true");
@@ -82,7 +104,7 @@ test.describe("/manage-booking recovery", () => {
     await page.goto("/manage-booking");
     const startBody = page.waitForRequest((r) => new URL(r.url()).pathname === START);
     await submitDetails(page);
-    expect((await startBody).postDataJSON()).toEqual({ reference: UNKNOWN_REFERENCE, channel: "phone", contact: `+91${PHONE}` });
+    expect((await startBody).postDataJSON()).toEqual({ reference: UNKNOWN_REFERENCE, channel: "email", contact: EMAIL });
 
     const message = page.getByTestId("recovery-generic-message");
     await expect(message).toHaveAttribute("role", "status");

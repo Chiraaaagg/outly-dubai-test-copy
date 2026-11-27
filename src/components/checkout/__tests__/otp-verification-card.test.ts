@@ -29,7 +29,7 @@ function render(over: Partial<Parameters<typeof OtpVerificationCard>[0]> = {}): 
 describe("OtpVerificationCard", () => {
   it("its default description names no channel: codes may go by email (doc 29 §8.4 row 10)", () => {
     const html = renderToStaticMarkup(h(OtpVerificationCard, { id: "checkout-code", value: "" }));
-    expect(html).toContain("Enter the 6-digit code we sent you.");
+    expect(html).toContain("Enter the 6-digit verification code.");
     expect(html).not.toMatch(/SMS/);
   });
 
@@ -43,8 +43,8 @@ describe("OtpVerificationCard", () => {
 
   it("shows one error line, tied to the input, only when there is a message", () => {
     expect(render()).not.toContain('role="alert"');
-    const html = render({ invalid: true, message: "That code doesn't match. Check the latest code we sent and try again." });
-    expect(html).toMatch(/<div role="alert"[^>]*id="checkout-code-message"[^>]*>That code doesn&#x27;t match/);
+    const html = render({ invalid: true, message: "That code didn’t match. Check the latest code we sent and try again." });
+    expect(html).toMatch(/<div role="alert"[^>]*id="checkout-code-message"[^>]*>That code didn’t match/);
     expect(html).toMatch(/<input[^>]*aria-invalid="true"/);
     expect(html).toMatch(/<input[^>]*aria-describedby="checkout-code-message"/);
   });
@@ -63,7 +63,7 @@ describe("OtpVerificationCard", () => {
 describe("verifyErrorMessage (the existing /api/checkout/verify answers)", () => {
   it("a wrong code keeps the field and says so", () => {
     const err = new ApiError("Check the details.", "error", "Check the code.", false, { code: "That code isn't right. Check it and try again." }, "VALIDATION_FAILED", 400);
-    expect(verifyErrorMessage(err)).toEqual({ message: "That code doesn't match. Check the latest code we sent and try again.", expired: false });
+    expect(verifyErrorMessage(err)).toEqual({ message: "That code didn’t match. Check the latest code we sent and try again.", expired: false });
   });
 
   it("an expired code (404) offers a new one", () => {

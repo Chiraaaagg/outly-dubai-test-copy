@@ -28,7 +28,7 @@ describe("CheckoutVerify: auto-submit", () => {
     expect(codeToSubmit(s, "12345")).toBeNull();
     expect(codeToSubmit(s, "12 34 56")).toBe("123456");
     s = run(s, { type: "typed", raw: "123456" }, { type: "check_started", code: "123456" });
-    s = run(s, { type: "check_failed", message: "That code doesn't match. Check the latest code we sent and try again.", expired: false });
+    s = run(s, { type: "check_failed", message: "That code didn’t match. Check the latest code we sent and try again.", expired: false });
     // The same six digits again (a re-render, or the field re-emitting) do not retry by themselves.
     expect(codeToSubmit(s, "123456")).toBeNull();
     // A different code does.
@@ -40,15 +40,15 @@ describe("CheckoutVerify: auto-submit", () => {
       initialVerifyState,
       { type: "typed", raw: "654321" },
       { type: "check_started", code: "654321" },
-      { type: "check_failed", message: "That code doesn't match. Check the latest code we sent and try again.", expired: false },
+      { type: "check_failed", message: "That code didn’t match. Check the latest code we sent and try again.", expired: false },
     );
     expect(s.code).toBe("654321");
-    expect(s.error).toMatch(/doesn't match/);
+    expect(s.error).toMatch(/didn’t match/);
     expect(s.busy).toBe(false);
   });
 
   it("asks for all digits when Verify is pressed early", () => {
-    expect(run(initialVerifyState, { type: "typed", raw: "12" }, { type: "incomplete" }).error).toBe("Enter all 6 digits.");
+    expect(run(initialVerifyState, { type: "typed", raw: "12" }, { type: "incomplete" }).error).toBe("Enter the full 6-digit code.");
   });
 });
 

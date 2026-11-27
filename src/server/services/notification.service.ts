@@ -1,11 +1,12 @@
 import "server-only";
 import { Prisma, type Notification } from "@prisma/client";
-import { prisma } from "../lib/db";
+import { prisma, TX_OPTIONS, type Tx } from "../lib/db";
 import { env } from "../lib/env";
 import { uuidv7 } from "../lib/ids";
 import type { Actor } from "../lib/actor";
-import { hasPermission, requirePermission } from "../lib/actor";
-import { audit } from "../lib/audit";
+import { customerActor, hasPermission, requirePermission } from "../lib/actor";
+import { audit, auditFieldChanges } from "../lib/audit";
+import { log } from "../lib/logger";
 import { Errors } from "../lib/errors";
 import { hmacCandidates, KeyUnavailableError } from "../lib/crypto";
 import { emitEvent } from "../lib/structured-events";
@@ -184,6 +185,14 @@ function serialisableContext(ctx: TemplateContext): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(ctx)) as Prisma.InputJsonValue;
 }
 
+/** Who asked for a ticket resend, stored on the row (`payload.resend`) so the minted link gets the right supersede scope (A2, A4). */
+type ResendBy = "staff" | "customer";
+
+function resendByOf(payload: unknown): ResendBy | null {
+  const r = payload && typeof payload === "object" ? (payload as { resend?: unknown }).resend : undefined;
+  return r === "staff" || r === "customer" ? r : null;
+}
+
 function parseTicketRef(payload: unknown): TicketMessageRef | null {
   if (!payload || typeof payload !== "object") return null;
   const p = payload as Record<string, unknown>;
@@ -285,7 +294,10 @@ async function prepareTicketMessage(row: Notification, ref: TicketMessageRef, no
     grantId = existing.id;
     expiresAt = existing.expiresAt;
   } else {
-    const issuedFor: CapabilityIssuedFor = row.dedupKey?.includes("|resend:") ? "staff_resend" : "ticket_notification";
+    // A customer's own resend (A4) is a ticket message like the first one: its link replaces only the same item's
+    // older links (A2). A staff resend (rows before A4 carry no marker) keeps the order-wide rule.
+    const by = resendByOf(row.payload);
+    const issuedFor: CapabilityIssuedFor = by === "customer" ? "ticket_notification" : by === "staff" || row.dedupKey?.includes("|resend:") ? "staff_resend" : "ticket_notification";
     // The previous link stays live until this message is known to be sent (R-B4-4): `supersedePrevious` below.
     const minted = await capabilityService.mint(prisma, { orderId: ref.orderId, purpose: "download_tickets", issuedFor, notificationId: row.id, keepForRetry: true, supersede: "after_sent" }, now);
     token = minted.token;
@@ -464,7 +476,10 @@ async function insertQueued(
   return { duplicate: existing };
 }
 
-async function sendTicketMessage(input: { ref: TicketMessageRef; recipient: string; resendOf?: string | null }, now: Date): Promise<DispatchResult> {
+async function sendTicketMessage(
+  input: { ref: TicketMessageRef; recipient: string; resendOf?: string | null; resendBy?: ResendBy; keepGrantId?: string | null },
+  now: Date,
+): Promise<DispatchResult> {
   const { ref } = input;
   const [dedupKey, ...olderKeys] = dedupKeysFor(
     {
@@ -484,7 +499,16 @@ async function sendTicketMessage(input: { ref: TicketMessageRef; recipient: stri
       recipient: input.recipient,
       orderId: ref.orderId,
       // Ids and the document version only: never contact data, never a token (TKT-6).
-      payload: { kind: ref.kind, orderId: ref.orderId, orderItemId: ref.orderItemId, documentVersion: ref.documentVersion },
+      payload: {
+        kind: ref.kind,
+        orderId: ref.orderId,
+        orderItemId: ref.orderItemId,
+        documentVersion: ref.documentVersion,
+        ...(input.resendOf ? { resend: input.resendBy ?? "staff" } : {}),
+        // Fix round 1 (M1): the grant the asking browser used, which this message's link must not supersede.
+        // A grant id only (no contact data); read by `supersedeScope`, also on a sweep retry of this row.
+        ...(input.resendOf && input.resendBy === "customer" && input.keepGrantId ? { keepGrantId: input.keepGrantId } : {}),
+      },
       dedupKey,
     },
     now,
@@ -492,6 +516,111 @@ async function sendTicketMessage(input: { ref: TicketMessageRef; recipient: stri
   );
   if ("duplicate" in inserted) return resultOf(inserted.duplicate.id, rowOutcome(inserted.duplicate), { duplicate: true, providerId: inserted.duplicate.providerId });
   return attemptAndRecord(inserted.row, now, inserted.claimUntil);
+}
+
+/* ------------------------------------------------- ticket resends (A4) */
+
+/**
+ * The ticket message of every item that has a valid, customer-visible
+ * tickets or voucher file, at its latest valid version (post-payment batch
+ * A4: every item, not only the first). In the order `documentService`
+ * lists the items.
+ */
+async function ticketRefsForOrder(orderId: string): Promise<TicketMessageRef[]> {
+  const items = await documentService.listForOrder(orderId);
+  const refs: TicketMessageRef[] = [];
+  for (const item of items) {
+    const valid = item.documents.filter((d) => d.status === "valid" && (d.kind === "tickets_pdf" || d.kind === "voucher_pdf"));
+    if (!valid.length) continue;
+    refs.push({ kind: "ticket_message", orderId, orderItemId: item.orderItemId, documentVersion: Math.max(...valid.map((d) => d.version)) });
+  }
+  return refs;
+}
+
+const OUTCOME_RANK: Record<OutboxOutcome, number> = { sent: 0, suppressed: 1, queued: 2, unknown: 3, failed: 4 };
+
+/** The least good outcome of a batch (a staff resend of several items reports its weakest send). */
+function worstOutcome(results: readonly DispatchResult[]): OutboxOutcome {
+  return results.reduce<OutboxOutcome>((w, r) => (OUTCOME_RANK[r.outcome] > OUTCOME_RANK[w] ? r.outcome : w), "sent");
+}
+
+/** Owner decision of 27 Nov 2026: a customer may ask for the ticket email again at most 3 times per order in any 24 hours, and once per 2 minutes. */
+export const CUSTOMER_RESEND_LIMITS = Object.freeze({ perDay: 3, windowMs: 24 * 3600_000, minGapMs: 2 * 60_000 });
+
+/** The audit action that is also the customer-resend ledger (append-only, so the limit cannot be reset by deleting rows). */
+export const CUSTOMER_RESEND_ACTION = "tickets.customer_resend";
+
+export type CustomerResendResult =
+  | { ok: true; availableAt: Date }
+  | { ok: false; reason: "rate_limited"; availableAt: Date }
+  | { ok: false; reason: "nothing_to_send" };
+
+/**
+ * Whether one more customer resend is allowed at `now`, given the times of
+ * the accepted ones (any order), and when the next one is allowed. A sliding
+ * 24-hour window and a minimum gap, never a fixed calendar window. Pure.
+ */
+export function customerResendAvailability(times: readonly Date[], now: Date): { allowed: boolean; availableAt: Date | null } {
+  const L = CUSTOMER_RESEND_LIMITS;
+  const t = now.getTime();
+  // A ledger time a little after `now` (the database clock, or a request that committed while this one started) counts as recent.
+  const recent = times.map((d) => d.getTime()).filter((x) => x > t - L.windowMs).sort((a, b) => b - a);
+  let next = t;
+  if (recent.length) next = Math.max(next, recent[0] + L.minGapMs);
+  // With perDay accepted inside the window, the next one waits until the oldest of the newest perDay leaves it.
+  if (recent.length >= L.perDay) next = Math.max(next, recent[L.perDay - 1] + L.windowMs);
+  return next <= t ? { allowed: true, availableAt: null } : { allowed: false, availableAt: new Date(next) };
+}
+
+/** The times of this order's accepted customer resends in the last 24 hours, from the audit ledger. */
+export async function customerResendTimes(orderId: string, now: Date = new Date(), db: Tx | typeof prisma = prisma): Promise<Date[]> {
+  const rows = await db.auditLog.findMany({
+    where: { entityType: "order", entityId: orderId, action: CUSTOMER_RESEND_ACTION, createdAt: { gt: new Date(now.getTime() - CUSTOMER_RESEND_LIMITS.windowMs) } },
+    select: { createdAt: true },
+    orderBy: { createdAt: "desc" },
+    take: 10,
+  });
+  return rows.map((r) => r.createdAt);
+}
+
+/* ------------------------------------------- ticket delivery state (A3) */
+
+/** What one ticket message row says about delivery, in the words of the status contract (`TicketDeliveryState`). */
+export type TicketRowDelivery = "pending" | "sent" | "delivered" | "failed" | "bounced";
+
+/** The provider error code a verified Resend bounce writes (A8): a definite failure, never retried. */
+export const BOUNCED_ERROR = "definite:bounced";
+
+/**
+ * One `TICKETS_READY` row, read as a delivery state (A3). Pure.
+ *  - `delivered`/`read`: only the signed delivery webhook writes these;
+ *  - `sent`: the provider accepted it (never "arrived");
+ *  - `bounced`: the webhook recorded a bounce;
+ *  - `failed`: definitely not sent, suppressed, or handed to our team
+ *    (attention, or retries used up);
+ *  - `pending`: queued, ambiguous or a retryable failure the sweep still retries.
+ */
+export function ticketRowDeliveryState(
+  row: { status: string; providerError: string | null; attentionRequiredAt: Date | null; attempt: number; createdAt: Date },
+  now: Date,
+): TicketRowDelivery {
+  switch (row.status) {
+    case "delivered":
+    case "read":
+      return "delivered";
+    case "sent":
+      return "sent";
+    case "suppressed":
+      return "failed";
+    case "failed": {
+      if (row.providerError === BOUNCED_ERROR) return "bounced";
+      const retrying = !row.providerError?.startsWith("definite:") && row.attempt < MAX_ATTEMPTS && now.getTime() - row.createdAt.getTime() < RETRY_WINDOW_MS;
+      return retrying ? "pending" : "failed";
+    }
+    default:
+      // queued or unknown: still being resolved by the sweep, unless a human now owns it.
+      return row.attentionRequiredAt ? "failed" : "pending";
+  }
 }
 
 /* ------------------------------------------------------------ service */
@@ -682,7 +811,7 @@ export const notificationService = {
    * item's latest valid document; refuses when the order has no valid ticket
    * document or no email.
    */
-  async resendTickets(actor: Actor, input: { orderId?: string; orderReference?: string; orderItemId?: string }): Promise<DispatchResult> {
+  async resendTickets(actor: Actor, input: { orderId?: string; orderReference?: string; orderItemId?: string }): Promise<DispatchResult & { results: DispatchResult[] }> {
     requirePermission(actor, "tickets.resend");
     const where = input.orderId ? { id: input.orderId } : input.orderReference ? { reference: input.orderReference } : null;
     if (!where) throw Errors.notFound("Order");
@@ -691,24 +820,109 @@ export const notificationService = {
     const recipient = order.leadEmail?.trim();
     if (!recipient) throw Errors.conflict("This order has no email address to send tickets to");
 
-    const items = await documentService.listForOrder(order.id);
-    let ref: TicketMessageRef | null = null;
-    for (const item of items) {
-      if (input.orderItemId && item.orderItemId !== input.orderItemId) continue;
-      const valid = item.documents.filter((d) => d.status === "valid");
-      if (!valid.length) continue;
-      const version = Math.max(...valid.map((d) => d.version));
-      ref = { kind: "ticket_message", orderId: order.id, orderItemId: item.orderItemId, documentVersion: version };
-      break;
-    }
-    if (!ref) throw Errors.conflict("No tickets are ready to send for this order");
+    // Post-payment batch A4: every item with a valid file, not only the first (a console resend of one message names its item).
+    const refs = (await ticketRefsForOrder(order.id)).filter((r) => !input.orderItemId || r.orderItemId === input.orderItemId);
+    if (!refs.length) throw Errors.conflict("No tickets are ready to send for this order");
 
-    const result = await sendTicketMessage({ ref, recipient, resendOf: uuidv7() }, new Date());
+    // One batch id for every item: the batch's links never supersede each other, only older links (A2).
+    const batch = uuidv7();
+    const now = new Date();
+    // Fix round 1 (L5): each item is tried on its own, and the audit row is written whatever happened, so a
+    // resend whose first message already replaced links is recorded even when a later item throws.
+    const attempts: ({ ok: true; result: DispatchResult } | { ok: false; error: unknown })[] = [];
+    for (const ref of refs) {
+      try {
+        attempts.push({ ok: true, result: await sendTicketMessage({ ref, recipient, resendOf: batch, resendBy: "staff" }, now) });
+      } catch (error) {
+        attempts.push({ ok: false, error });
+      }
+    }
+    const results = attempts.flatMap((a) => (a.ok ? [a.result] : []));
+    const firstOk = attempts.findIndex((a) => a.ok);
     // Field names and ids only: the audit row never holds the address (PRV-2).
     await audit(actor, "tickets.resend", { type: "order", id: order.id }, {
-      after: { notificationId: result.id, outcome: result.outcome, orderItemId: ref.orderItemId, documentVersion: ref.documentVersion, recipientField: "orders.lead_email" },
+      after: {
+        notificationId: firstOk >= 0 ? (attempts[firstOk] as { result: DispatchResult }).result.id : null,
+        outcome: attempts.some((a) => !a.ok) ? "error" : worstOutcome(results),
+        orderItemId: refs[0].orderItemId,
+        documentVersion: refs[0].documentVersion,
+        resendBatch: batch,
+        items: refs.map((r, i) => {
+          const a = attempts[i];
+          return { notificationId: a.ok ? a.result.id : null, outcome: a.ok ? a.result.outcome : "error", orderItemId: r.orderItemId, documentVersion: r.documentVersion };
+        }),
+        recipientField: "orders.lead_email",
+      },
     });
-    return result;
+    // The staff route reports a failure as before; the audit row above already says which items went out.
+    const thrown = attempts.find((a) => !a.ok);
+    if (thrown) throw (thrown as { error: unknown }).error;
+    const worst = worstOutcome(results);
+    return { ...results[0], status: legacyStatus(worst), outcome: worst, results };
+  },
+
+  /**
+   * Post-payment batch A4: the customer's own "send my tickets again". The
+   * caller (the resend route) has already decided that this viewer may
+   * download the order's tickets. Sends the ticket email again, for every
+   * item with a valid file, to `orders.lead_email` only (never an address
+   * from the request). Owner limit of 27 Nov 2026: at most
+   * `CUSTOMER_RESEND_LIMITS.perDay` per order in any 24 hours and one per
+   * `minGapMs`, decided in the order's row lock against the audit ledger so
+   * two requests at once cannot both pass; the route adds a per-IP limit.
+   * Any database failure throws (the route answers 5xx): the limit fails
+   * closed. Each accepted request is audited (`tickets.customer_resend`) with
+   * ids and counts only. The send outcomes are not returned: the route gives
+   * one uniform answer, and the status page reads them from the rows.
+   *
+   * `keepGrantId` (fix round 1, M1): the grant the asking browser used. The
+   * new links replace the item's older links as usual (A2), except that one,
+   * so the asker keeps the page they asked from.
+   */
+  async resendTicketsForCustomer(input: { orderId: string; actor?: Actor; keepGrantId?: string | null }, now: Date = new Date()): Promise<CustomerResendResult> {
+    const order = await prisma.order.findUnique({ where: { id: input.orderId }, select: { id: true, leadEmail: true } });
+    const recipient = order?.leadEmail?.trim();
+    if (!order || !recipient) return { ok: false, reason: "nothing_to_send" };
+    const refs = await ticketRefsForOrder(order.id);
+    if (!refs.length) return { ok: false, reason: "nothing_to_send" };
+
+    const batch = uuidv7();
+    const actor = input.actor ?? customerActor();
+    const decision = await prisma.$transaction(async (tx) => {
+      // The order row is the lock: concurrent resends for one order queue here and see each other's ledger rows.
+      await tx.$queryRaw`SELECT 1 FROM orders WHERE id = ${order.id}::uuid FOR UPDATE`;
+      const times = await customerResendTimes(order.id, now, tx);
+      const window = customerResendAvailability(times, now);
+      if (!window.allowed) return { allowed: false as const, availableAt: window.availableAt };
+      await auditFieldChanges(actor, CUSTOMER_RESEND_ACTION, { type: "order", id: order.id }, {
+        fields: ["notifications"],
+        ids: { resendBatch: batch },
+        counts: { items: refs.length },
+        codes: { recipientField: "orders.lead_email" },
+      }, tx);
+      // This one now counts: the next is at least the minimum gap away.
+      const next = customerResendAvailability([...times, now], now).availableAt ?? new Date(now.getTime() + CUSTOMER_RESEND_LIMITS.minGapMs);
+      return { allowed: true as const, availableAt: next };
+    }, TX_OPTIONS);
+    if (!decision.allowed) {
+      // Ids stay out of the log: the limit is visible in the ledger (audit rows) and the route's 429.
+      log.info("tickets.customer_resend_limited", { scope: "order" });
+      return { ok: false, reason: "rate_limited", availableAt: decision.availableAt ?? new Date(now.getTime() + CUSTOMER_RESEND_LIMITS.minGapMs) };
+    }
+
+    const outcomes: OutboxOutcome[] = [];
+    for (const ref of refs) {
+      try {
+        outcomes.push((await sendTicketMessage({ ref, recipient, resendOf: batch, resendBy: "customer", keepGrantId: input.keepGrantId ?? null }, now)).outcome);
+      } catch {
+        // A row that could not be written or sent is the sweep's to resolve; the customer's answer does not change.
+        outcomes.push("queued");
+        emitEvent("notification.failed", { event: TICKETS_READY, channel: "email", reason: "customer_resend_error" }, "error");
+      }
+    }
+    // Each message already reported itself (`notification.*`); this line carries counts only.
+    log.info("tickets.customer_resend", { items: refs.length, sent: outcomes.filter((o) => o === "sent").length });
+    return { ok: true, availableAt: decision.availableAt };
   },
 
   /* ------------------------------------------------------------ console */

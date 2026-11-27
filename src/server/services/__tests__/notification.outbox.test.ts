@@ -320,7 +320,8 @@ describe.skipIf(!dbEnabled)("notification outbox (TKT-6)", () => {
     expect(again.id).not.toBe(first!.id);
     const row = await prisma.notification.findUniqueOrThrow({ where: { id: again.id } });
     expect(row.dedupKey).toContain("|resend:");
-    expect(row.payload).toEqual({ kind: "ticket_message", orderId: o.id, orderItemId: o.itemId, documentVersion: 2 });
+    // A4: the row says who asked for the resend, so its link gets the staff (order-wide) supersede scope.
+    expect(row.payload).toEqual({ kind: "ticket_message", orderId: o.id, orderItemId: o.itemId, documentVersion: 2, resend: "staff" });
     const newToken = tokenOf(provider.callsFor(again.id)[0]);
     expect(newToken).not.toBe(oldToken);
     const grants = await prisma.guestCapabilityGrant.findMany({ where: { orderId: o.id }, orderBy: { createdAt: "asc" } });

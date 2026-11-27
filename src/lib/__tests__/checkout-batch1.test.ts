@@ -251,7 +251,7 @@ describe("CO-07: the reason a trip goes to the inquiry form", () => {
 
 describe("CO-11: the instant CTA", () => {
   it("promises the voucher email, not a time it does not meet", () => {
-    expect(ctaFor("instant").microcopy).toBe("Instant confirmation · voucher by email, usually within a few minutes");
+    expect(ctaFor("instant").microcopy).toBe("Instant confirmation. Your voucher comes by email.");
     expect(ctaFor("instant").microcopy).not.toMatch(/under a minute|WhatsApp/);
   });
 });

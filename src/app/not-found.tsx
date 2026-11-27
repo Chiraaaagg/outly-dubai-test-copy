@@ -38,11 +38,10 @@ export default async function NotFound() {
           Error 404
         </p>
         <h1 className="mt-2 text-[2rem] leading-tight sm:text-4xl">
-          This page has wandered off into the desert
+          We couldn’t find that page
         </h1>
         <p className="mx-auto mt-3 max-w-xl text-[1.02rem] leading-relaxed text-ink-600">
-          The link is broken or the page has moved. Nothing has gone wrong with any booking you
-          have, your voucher is still in WhatsApp, your email and your account.
+          The link may have changed. If you already have a booking, use your reference to find it.
         </p>
         <div className="mt-6 flex flex-wrap justify-center gap-3">
           <ButtonLink href="/search" size="lg">
@@ -57,7 +56,7 @@ export default async function NotFound() {
 
       <section className="mt-12" aria-labelledby="popular-404">
         <h2 id="popular-404" className="mb-4 text-center text-xl">
-          Or start with what people book most
+          Find something to do in Dubai
         </h2>
         <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
           {popular.map((a, i) => (
@@ -96,7 +95,7 @@ export default async function NotFound() {
         <WhatsAppCard
           context={{ intent: "general", placement: "404" }}
           title="Looking for something specific?"
-          body="Tell us what you were trying to find and we'll send you the right link, or just book it for you."
+          body="Tell us what you were looking for and we’ll help you find it."
         />
       </div>
     </div>

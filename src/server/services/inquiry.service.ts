@@ -281,7 +281,7 @@ export const inquiryService = {
     if (!leadName || leadName.length < 2) throw Errors.validation({ name: "So we know who to reply to." });
     const leadEmail = input.leadEmail?.trim().toLowerCase() || undefined;
     if (leadEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(leadEmail)) throw Errors.validation({ email: "Check the email address" });
-    if (input.items.length > 12) throw Errors.validation({ items: "Too many items for one inquiry — message us on WhatsApp instead" });
+    if (input.items.length > 12) throw Errors.validation({ items: "Too many items for one inquiry. Message us on WhatsApp instead" });
 
     // 2. Rate limits — per phone and per IP (§17 §9 #1)
     await enforceRateLimit({ key: `inquiry:phone:${sha256Hex(phone.e164).slice(0, 16)}`, limit: e.INQUIRY_RATE_LIMIT_PER_PHONE_PER_HOUR, windowSeconds: 3600 });

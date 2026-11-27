@@ -179,7 +179,7 @@ export function clampSubject(subject: string): string {
 }
 
 function itemLines(ctx: TemplateContext): string {
-  if (!ctx.items.length) return "No specific activities yet — we'll suggest a plan around your dates.";
+  if (!ctx.items.length) return "You haven’t chosen activities yet. We’ll suggest ideas around your dates.";
   return ctx.items.map((i) => `• ${i.title}${i.date ? ` · ${i.date}` : ""}${i.time ? ` · ${i.time}` : ""}`).join("\n");
 }
 
@@ -246,7 +246,7 @@ export function renderTemplate(event: NotificationEvent, channel: NotificationCh
         ? `Our team is offline right now. ${ctx.agentFirstName} will message you by ${ctx.deadlineLabel}.`
         : `${ctx.agentFirstName} is checking with the operator now and will message you by ${ctx.deadlineLabel}.`;
       const text = [
-        `Hi ${ctx.leadFirstName}, got it — your reference is ${ctx.reference}.`,
+        `Hi ${ctx.leadFirstName}, we received your inquiry. Your reference is ${ctx.reference}.`,
         when,
         `What we're checking:\n${itemLines(ctx)}`,
         `Nothing is charged until you say yes. If anything changes from the price you saw, we tell you first.`,
@@ -255,7 +255,7 @@ export function renderTemplate(event: NotificationEvent, channel: NotificationCh
         .filter(Boolean)
         .join("\n\n");
       return email(
-        `Got it — ${ctx.reference}. ${ctx.agentFirstName} replies by ${ctx.deadlineLabel}`,
+        `Inquiry ${ctx.reference} received. Reply by ${ctx.deadlineLabel}`,
         `Got it, ${ctx.leadFirstName}.`,
         p(escapeHtml(when)) +
           p(`<strong>Reference:</strong> ${escapeHtml(ctx.reference)}`) +
@@ -319,8 +319,8 @@ export function renderTemplate(event: NotificationEvent, channel: NotificationCh
       if (channel === "whatsapp") {
         return whatsapp("inquiry_followup_v1", [ctx.leadFirstName, ctx.reference, FOLLOWUP_SENTENCES.stillChecking, ctx.agentFirstName]);
       }
-      const text = `Hi ${ctx.leadFirstName}, about your OUTLYY inquiry ${ctx.reference} — ${FOLLOWUP_SENTENCES.stillChecking}\n\nReply to this email and ${ctx.agentFirstName} will pick it up.`;
-      return email(`${ctx.reference} — still checking with the operator`, `Still checking — ${ctx.reference}`, p(pre(text)), text, ctx);
+      const text = `Hi ${ctx.leadFirstName}, we’re still waiting for the operator’s reply about your OUTLYY inquiry ${ctx.reference}. We’ll update you when we hear back.\n\nReply to this email to reach ${ctx.agentFirstName}.`;
+      return email(`Inquiry ${ctx.reference} is still with the operator`, `Still checking inquiry ${ctx.reference}`, p(pre(text)), text, ctx);
     }
 
     case "INQUIRY_FOLLOWUP": {
@@ -329,9 +329,14 @@ export function renderTemplate(event: NotificationEvent, channel: NotificationCh
       if (channel === "whatsapp") {
         return whatsapp("inquiry_followup_v1", [ctx.leadFirstName, ctx.reference, sentence, ctx.agentFirstName]);
       }
-      const text = `Hi ${ctx.leadFirstName}, about your OUTLYY inquiry ${ctx.reference} — ${sentence}\n\nReply to this email and ${ctx.agentFirstName} will pick it up.`;
-      const subjectTail = stage <= 1 ? "did the options work?" : stage === 2 ? "checking in" : "last note from us";
-      return email(`${ctx.reference} — ${subjectTail}`, `About ${ctx.reference}`, p(pre(text)), text, ctx);
+      const text =
+        stage <= 1
+          ? `Hi ${ctx.leadFirstName}, did the options for OUTLYY inquiry ${ctx.reference} work for you? Let us know if you’d like to check another date or experience.\n\nReply to this email to reach ${ctx.agentFirstName}.`
+          : stage === 2
+            ? `Hi ${ctx.leadFirstName}, tell us if the price or dates for OUTLYY inquiry ${ctx.reference} didn’t work. We can check other options.\n\nReply to this email to reach ${ctx.agentFirstName}.`
+            : `Hi ${ctx.leadFirstName}, this is our last follow-up on OUTLYY inquiry ${ctx.reference}. Reply if you’d like us to keep looking at options.\n\nReply to this email to reach ${ctx.agentFirstName}.`;
+      const subject = stage <= 1 ? `Did the options for inquiry ${ctx.reference} work for you?` : stage === 2 ? `Checking in about inquiry ${ctx.reference}` : `Last update on inquiry ${ctx.reference}`;
+      return email(subject, `About ${ctx.reference}`, p(pre(text)), text, ctx);
     }
 
     case "TRAVELDESK_UPKEEP_DIGEST":
@@ -340,7 +345,7 @@ export function renderTemplate(event: NotificationEvent, channel: NotificationCh
     case "INQUIRY_WON": {
       const booking = ctx.orderReference ?? ctx.reference;
       const text = `Hi ${ctx.leadFirstName}, your trip is confirmed. Booking reference ${booking} (inquiry ${ctx.reference}). Your vouchers and pickup details follow from ${ctx.agentFirstName} on WhatsApp.`;
-      return email(`Confirmed — booking ${booking}`, "Your trip is confirmed", p(escapeHtml(text)), text, ctx);
+      return email(`Booking ${booking} confirmed`, "Your trip is confirmed", p(escapeHtml(text)), text, ctx);
     }
 
     case "ACCOUNT_DELETION_REQUEST": {

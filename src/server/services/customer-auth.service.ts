@@ -304,7 +304,7 @@ export const customerAuthService = {
       ({ phoneE164 } = await verifyWidgetToken({ authKey: cfg.authKey, accessToken: input.accessToken }));
     } catch {
       // The provider reason is already in the log; the customer gets one line.
-      throw Errors.unauthorized("We couldn't confirm that code. Please try again.");
+      throw Errors.unauthorized("We couldn't confirm that code. Try again.");
     }
 
     const now = new Date();

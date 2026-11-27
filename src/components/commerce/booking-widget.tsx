@@ -27,7 +27,7 @@ import { EMPTY_PAX, TICKET_NON_REFUNDABLE_STATEMENT, cancellationPolicyBeforeQuo
  * `activity.fulfilmentMode` decides one thing (pivot plan §2.1, §4.4):
  *
  *   inquiry → no availability call, price labelled indicative, primary CTA
- *             "Check availability & price" → cart → /inquiry. No "spots left",
+ *             "Request availability & price" → cart → /inquiry. No "spots left",
  *             no price-lock timer, no instant-confirmation claim.
  *   instant → "Book now" → /checkout. Availability, cutoff and the price are
  *             checked by the server quote when the visitor continues
@@ -262,9 +262,7 @@ export function BookingWidget({
           {priceIn(activity.price.adult, currency)}
         </p>
         <p className="mt-2 text-sm leading-relaxed text-ink-600">
-          Priced per booking, not per person, so the honest number depends on your date, group and
-          route. Send us the details and you&apos;ll have a firm all-in quote within two hours during
-          working hours.
+          The price is per booking. Share your date, group size and route to request a confirmed quote.
         </p>
         <div className="mt-4 space-y-2">
           <Button block size="lg" onClick={() => router.push(`/concierge?sku=${activity.slug}`)}>
@@ -301,7 +299,7 @@ export function BookingWidget({
         <div className="flex items-end justify-between gap-3">
           <div>
             <p className="text-xs font-bold uppercase tracking-wide text-ink-500">
-              {inquiryMode ? "Indicative total" : paxBillable(shownPax) > 1 ? "Total for your group" : "Total"}
+              {inquiryMode ? "Estimated total" : paxBillable(shownPax) > 1 ? "Total for your group" : "Total"}
               {paxBillable(shownPax) > 1 && inquiryMode ? ` · ${paxBillable(shownPax)} guests` : ""}
             </p>
             <p className="font-display text-3xl font-bold tnum text-ink-900">
@@ -399,7 +397,7 @@ export function BookingWidget({
           <DateStrip value={date} onChange={setDate} />
           {inquiryMode ? (
             <p className="mt-2 text-xs text-ink-500">
-              Not fixed yet? Pick your best guess, you can mark dates flexible on the next step.
+              Pick your preferred date. You can mark it as flexible in the next step.
             </p>
           ) : (
             <p className="mt-2 text-xs text-ink-500">
@@ -514,7 +512,7 @@ export function BookingWidget({
         {activity.addOns.length > 0 && (
           <fieldset>
             <legend className="mb-2 text-sm font-bold text-ink-900">
-              {inquiryMode ? "Interested in adding" : "Add to your booking"}
+              {inquiryMode ? "Optional extras to ask about" : "Optional extras"}
             </legend>
             <div className="space-y-2">
               {activity.addOns.map((a) => {
@@ -577,7 +575,7 @@ export function BookingWidget({
               ))}
             </ul>
             <div className="mt-2.5 flex justify-between border-t border-ink-200 pt-2.5 text-[0.95rem] font-bold">
-              <span>{inquiryMode ? "Indicative total" : "Total"}</span>
+              <span>{inquiryMode ? "Estimated total" : "Total"}</span>
               <span className="tnum">{priceIn(breakdown.total, currency)}</span>
             </div>
           </div>
@@ -639,7 +637,7 @@ export function BookingWidget({
             // Instant products are paid by card on Stripe's page only (CO-12): no UPI or wallet marks here.
             <p className="flex items-center gap-1.5">
               <Lock className="h-3.5 w-3.5 shrink-0 text-lagoon-500" />
-              Pay by card on Stripe&apos;s secure page.
+              You’ll pay by card on Stripe’s payment page.
             </p>
           )}
         </div>
@@ -703,7 +701,7 @@ export function StickyBookingBar({ activity }: { activity: Activity }) {
       <div className="flex items-center gap-3">
         <div className="min-w-0 flex-1">
           <p className="truncate text-2xs font-semibold text-ink-500">
-            {activity.quoteOnly ? "From" : "From, all-in"}
+            From
           </p>
           <p className="font-display text-lg font-bold leading-tight tnum text-ink-900">
             {priceIn(activity.price.adult, currency)}

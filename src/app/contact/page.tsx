@@ -8,7 +8,7 @@ import { Alert, Breadcrumbs, Card } from "@/components/ui/primitives";
 import { track } from "@/lib/analytics";
 import { requestQuote } from "@/lib/api";
 import { emergencyDisplay, emergencyHref, siteConfig } from "@/lib/site-config";
-import { RESPONSE_SLA, SUPPORT_HOURS } from "@/lib/whatsapp";
+import { SUPPORT_HOURS } from "@/lib/whatsapp";
 import { cn } from "@/lib/utils";
 
 const TOPICS = [
@@ -41,9 +41,9 @@ export default function ContactPage() {
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     const next: Record<string, string> = {};
-    if (!form.name.trim()) next.name = "We need a name to reply to.";
+    if (!form.name.trim()) next.name = "Enter your name.";
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(form.email)) next.email = "Enter a valid email address.";
-    if (!form.message.trim()) next.message = "Tell us what you need, even a line is enough.";
+    if (!form.message.trim()) next.message = "Tell us what you need help with.";
     setErrors(next);
     if (Object.keys(next).length) return;
 
@@ -67,8 +67,7 @@ export default function ContactPage() {
         <Breadcrumbs items={[{ label: "Dubai", href: "/" }, { label: "Contact" }]} className="mb-3" />
         <h1 className="text-[1.75rem] sm:text-3xl">Contact us</h1>
         <p className="mt-1.5 text-[0.95rem] text-ink-600">
-          For anything about an existing booking, WhatsApp is genuinely faster, {RESPONSE_SLA.toLowerCase()}.
-          The form below is for invoices, group bookings and supplier enquiries.
+          For help with an existing booking, message us on WhatsApp and have your booking reference ready.
         </p>
 
         <div className="mt-8 grid grid-safe gap-6 lg:grid-cols-[1.2fr_1fr] lg:items-start">
@@ -152,9 +151,8 @@ export default function ContactPage() {
                 </div>
 
                 {state === "error" && (
-                  <Alert tone="danger" title="That didn't send">
-                    Something failed at our end, not yours. Try again, or message us on WhatsApp —
-                    nothing you typed has been lost.
+                  <Alert tone="danger" title="We couldn’t send your message">
+                    Your message is still here. You can contact us on WhatsApp.
                   </Alert>
                 )}
 
@@ -169,11 +167,10 @@ export default function ContactPage() {
             <Card className="p-5">
               <h2 className="flex items-center gap-2 text-lg">
                 <MessageCircle className="h-5 w-5 text-whatsapp" aria-hidden="true" />
-                Faster: WhatsApp
+                Contact us on WhatsApp
               </h2>
               <p className="mt-1.5 text-sm leading-relaxed text-ink-600">
-                {RESPONSE_SLA} during {SUPPORT_HOURS}. Out of hours you get an acknowledgement within
-                a minute with an expected reply time.
+                Our team is available from {SUPPORT_HOURS}.
               </p>
               <div className="mt-3">
                 <WhatsAppButton block context={{ intent: "general", placement: "contact" }} />

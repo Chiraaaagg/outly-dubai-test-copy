@@ -29,9 +29,9 @@ import { Amount } from "@/components/commerce/price";
 import { serializeJsonLd } from "@/lib/json-ld";
 
 export const metadata: Metadata = {
-  title: "OUTLYY: Dubai Experiences, One All-In Price",
+  title: "Dubai Experiences, Tours & Tickets | OUTLYY",
   description:
-    "Curated Dubai activities at one all-in price in your own currency, with pure-veg and Jain food options, hotel pickup and WhatsApp help in about 30 minutes. Instant vouchers, no hidden fees.",
+    "Find Dubai experiences worth going out for, from desert safaris to dinner cruises. Browse tours, attractions and tickets, then check options for your dates.",
   alternates: { canonical: "/" },
 };
 
@@ -49,31 +49,31 @@ export const metadata: Metadata = {
 const HOME_FAQS: Faq[] = [
   {
     q: "Is the price I see the price I pay?",
-    a: "Yes. Every price on OUTLYY includes taxes and booking fees, and it is the amount charged to your card or UPI. The only things that change your total are optional extras you deliberately add, hotel pickup, a cake, a photographer.",
+    a: "An inquiry starts with an estimated price. We confirm the total before you pay. For instant booking, review the total at checkout. Selected extras can change the total.",
   },
   {
     q: "Can I pay with UPI?",
-    a: "UPI, cards, netbanking, wallets and EMI on orders above ₹15,000 are all accepted. If you're in the UAE, prices switch to dirhams and UAE cards work normally.",
+    a: "Instant checkout uses card payment. For an inquiry, ask which methods are available when we confirm your booking details.",
   },
   {
     q: "Is pure vegetarian and Jain food actually available?",
-    a: "On the experiences marked for it, yes. It is confirmed with the supplier's kitchen, must be requested when you book, and is printed on your voucher so it cannot be denied at the venue. Jain meals need at least 24 hours' notice because they are cooked to order without onion or garlic.",
+    a: "Check listings marked for vegetarian or Jain meals and request your meal when you enquire. Tell us about any requirements so we can confirm the options and notice period with the operator.",
   },
   {
-    q: "Why can't I just book instantly?",
-    a: "Because we confirm with the operator before you pay, so you never get a voucher that fails at the gate. You pick what you want, we check availability and the exact price with the supplier, and a named person replies on WhatsApp in about 30 minutes. Only then do you pay, by UPI, card or EMI, through a secure link.",
+    q: "Why do some experiences ask me to enquire?",
+    a: "For inquiry experiences, we check your date and the exact price with the operator, then reply on WhatsApp. You can decide whether to go ahead once you have the details.",
   },
   {
     q: "How quickly do I get my ticket?",
-    a: "Once you've paid, your QR voucher reaches WhatsApp within minutes for most experiences, and also lands in your email and account. The step before that, a human confirming availability, is what takes the 30 minutes, and it is the reason the voucher works when you arrive.",
+    a: "After you pay, check your booking confirmation for ticket delivery details. If your experience starts with an inquiry, we’ll confirm availability and the price before you pay.",
   },
   {
     q: "What if I'd rather just talk to someone?",
-    a: "Tap any WhatsApp button and a real person replies in about 30 minutes during our hours (10am–6pm Gulf Standard Time, Monday to Saturday). They can see which activity and dates you were looking at, and can plan and confirm the whole trip in one conversation, the form is there for people who prefer it, not a toll gate.",
+    a: "Message us on WhatsApp with the experience and dates you’re considering. Our hours are 10 am to 6 pm Gulf Standard Time, Monday to Saturday.",
   },
   {
-    q: "Can my elderly parents do a desert safari?",
-    a: "Book the gentle safari, a separate activity with no dune bashing at any point, chairs with backs at the camp, and the same dinner and shows. It reaches the same camp at the same time as the standard tour, so families frequently split across both.",
+    q: "Can older travellers go on a desert safari?",
+    a: "Check whether the plan includes dune bashing, and ask the operator about gentler options, seating and any age or mobility restrictions before you book.",
   },
 ];
 
@@ -131,18 +131,17 @@ export default async function HomePage() {
           <div className="relative z-10 min-w-0">
             <p className="mb-3 inline-flex items-center gap-2 rounded-full border border-ink-900/10 bg-white/70 px-3 py-1.5 text-xs font-bold text-ink-800 backdrop-blur">
               <Sparkles className="h-3.5 w-3.5 text-sun-600" aria-hidden="true" />
-              Dubai experiences · Built for Indian travellers
+              Things to do in Dubai
             </p>
 
             <h1 className="text-[2.25rem] leading-[1.05] sm:text-5xl lg:text-[3.4rem]">
-              Dubai, planned properly.
-              <span className="mt-1 block text-sun-600">One price, confirmed by a person before you pay.</span>
+              Make a day of Dubai
+              <span className="mt-1 block text-sun-600">Find and book Dubai tours, attractions and things to do.</span>
             </h1>
 
             <p className="mt-4 max-w-xl text-[1.05rem] leading-relaxed text-ink-700">
-              Every price here includes taxes and fees, and you can filter for pure-veg and Jain
-              food. Tell us your dates and a named person checks with the operator, then sends you
-              the real price. Nothing is charged until you say yes.
+              Start with the experiences that fit your plans. When a listing asks you to enquire, we
+              check your date and price with the operator before you pay.
             </p>
 
             <div className="mt-6">
@@ -164,13 +163,13 @@ export default async function HomePage() {
                 {heroExample.categorySlug.replace(/-/g, " ")}
               </p>
               <Amount money={heroExample.price.adult} className="mt-1 block font-display text-xl font-bold text-ink-900" />
-              <p className="text-2xs text-ink-500">Per adult, all-in. Taxes and fees included.</p>
+              <p className="text-2xs text-ink-500">Starting price per adult</p>
             </div>
             )}
             <div className="absolute -right-4 top-8 w-44 rotate-2 rounded-[var(--radius-card)] border border-ink-200 bg-paper p-3 shadow-[var(--shadow-lift)]">
               <p className="text-2xs font-bold text-[var(--color-success)]">Replies on WhatsApp</p>
               <p className="mt-0.5 text-xs leading-snug text-ink-600">
-                In about 30 minutes, from a named person
+                Ask our team about an experience or date
               </p>
             </div>
           </div>
@@ -195,12 +194,13 @@ export default async function HomePage() {
       <section className="container-page py-12" aria-labelledby="last-minute">
         <SectionHeading
           id="last-minute"
-          kicker="Travelling this week?"
-          title="Good at short notice"
-          sub="Operators who usually confirm the same day. For tonight or tomorrow, message us on WhatsApp, it's faster than the form."
+          kicker="Planning at short notice?"
+          title="Things to do this week"
+          sub="Ask us on WhatsApp about your date if you’re looking for something today or tomorrow."
           href="/last-minute-dubai-activities"
+          hrefLabel="See last-minute activities"
         />
-        <Rail ariaLabel="Activities available today and tomorrow">
+        <Rail ariaLabel="Experiences for short-notice plans">
           {lastMinute.map((a, i) => (
             <RailItem key={a.slug}>
               <ActivityCard activity={toCard(a)} layout="rail" position={i + 1} source="home_last_minute" />
@@ -215,12 +215,13 @@ export default async function HomePage() {
       <section className="container-page py-12" aria-labelledby="top-experiences">
         <SectionHeading
           id="top-experiences"
-          kicker="Most booked this month"
-          title="The experiences Indian families keep coming back for"
-          sub="Ranked by what people actually book, not by what pays us most to show you."
+          kicker="Dubai experiences"
+          title="Ideas for your Dubai days"
+          sub="Compare experiences and see which ones fit your group."
           href="/search?sort=popularity"
+          hrefLabel="See Dubai experiences"
         />
-        <Rail ariaLabel="Most booked experiences">
+        <Rail ariaLabel="Dubai experience ideas">
           {topExperiences.map((a, i) => (
             <RailItem key={a.slug}>
               <ActivityCard
@@ -242,10 +243,11 @@ export default async function HomePage() {
         <div className="container-page">
           <SectionHeading
             id="combos"
-            kicker="Bundles with verifiable savings"
-            title="Save with our Dubai packages"
-            sub="Every package shows what the same experiences cost bought separately. Check the maths, that's the point."
+            kicker="Multi-experience packages"
+            title="Dubai days that go together"
+            sub="Open a package to see which experiences it lists and what’s included."
             href="/dubai-attraction-combos"
+            hrefLabel="See Dubai packages"
           />
           <Rail ariaLabel="Dubai packages and combos">
             {combos.map((c) => (
@@ -263,9 +265,9 @@ export default async function HomePage() {
       <section className="container-page py-12" aria-labelledby="categories">
         <SectionHeading
           id="categories"
-          kicker="Browse by what you feel like"
-          title="Pick a kind of day"
-          sub={`${categories.length} categories, ${activities.length} things to do. Every one is bookable today, at the price shown.`}
+          kicker="Browse by interest"
+          title="What are you in the mood for?"
+          sub={`Browse ${activities.length} things to do across ${categories.length} categories.`}
         />
         <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
           {categories.map((c) => (
@@ -291,16 +293,14 @@ export default async function HomePage() {
             </div>
             <div className="p-6 sm:p-8">
               <Badge tone="heat" className="mb-3">
-                Most-booked category
+                Desert safaris
               </Badge>
               <h2 id="desert" className="text-2xl sm:text-3xl">
-                The desert safari, done in a way that suits your family
+                A desert safari that suits your group
               </h2>
               <p className="mt-3 max-w-xl text-[0.975rem] leading-relaxed text-ink-600">
-                Three things decide whether this goes well: the pickup, the dune bashing and the
-                food. We&apos;ve made all three bookable decisions rather than things you find out on
-                the day. Jain thali at no extra cost. A gentle safari with zero dune bashing for
-                grandparents. Driver name, photo and number the evening before.
+                Start with pickup, dune bashing and dinner. Check what your safari includes and ask
+                about Jain meals or a gentler itinerary before you choose.
               </p>
               <div className="mt-5 flex flex-wrap gap-2.5">
                 <ButtonLink href="/lp/desert-safari-dubai">Compare all safaris</ButtonLink>
@@ -327,7 +327,7 @@ export default async function HomePage() {
           id="collections"
           kicker="Sorted by who's coming"
           title="Who are you travelling with?"
-          sub="The same catalogue, sorted by who you're bringing."
+          sub="Start with the collection that suits your group."
         />
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           {collections
@@ -346,10 +346,11 @@ export default async function HomePage() {
       <section className="container-page py-12" aria-labelledby="family">
         <SectionHeading
           id="family"
-          kicker="Works for a six-year-old and a sixty-eight-year-old"
-          title="Family-friendly favourites"
-          sub="Child, infant and senior rates shown before checkout, not discovered at it."
+          kicker="Going out with family"
+          title="Family-friendly Dubai experiences"
+          sub="Check each listing for age limits and for child, infant or senior rates where offered."
           href="/collections/dubai-with-kids"
+          hrefLabel="See family experiences"
         />
         <Rail ariaLabel="Family-friendly activities">
           {familyPicks.map((a, i) => (
@@ -371,11 +372,11 @@ export default async function HomePage() {
                 On the water
               </p>
               <h2 id="water" className="text-2xl text-white sm:text-[1.75rem]">
-                Dubai looks better from the water
+                See Dubai from the water
               </h2>
               <p className="mt-1.5 text-[0.95rem] leading-relaxed text-white/70">
-                We say plainly whether a boat is private or shared, and how many guests are on it.
-                Twenty-four, not two hundred.
+                Look for shared cruises and private charters. Check the listing for group size
+                before you choose.
               </p>
             </div>
             <Link
@@ -402,8 +403,9 @@ export default async function HomePage() {
           id="couples"
           kicker="For two"
           title="Couple &amp; honeymoon experiences"
-          sub="Private where it matters, and timed so you're in the right place at golden hour."
+          sub="Start here when you’re planning a day or evening together."
           href="/collections/dubai-honeymoon"
+          hrefLabel="See experiences for two"
         />
         <Rail ariaLabel="Couple and honeymoon experiences">
           {couplePicks.map((a, i) => (
@@ -417,10 +419,11 @@ export default async function HomePage() {
       <section className="container-page py-12" aria-labelledby="luxury">
         <SectionHeading
           id="luxury"
-          kicker="Handled by a named person"
+          kicker="Private tours and premium outings"
           title="Premium &amp; private experiences"
-          sub="Charters and helicopters are quoted rather than listed, because an honest number depends on your date and group."
+          sub="Explore charters, helicopter flights and other outings. Open a listing to check its options or request a quote where offered."
           href="/categories/luxury-experiences"
+          hrefLabel="See premium experiences"
         />
         <Rail ariaLabel="Luxury experiences">
           {luxuryPicks.map((a, i) => (
@@ -438,15 +441,14 @@ export default async function HomePage() {
         <div className="grid gap-4 lg:grid-cols-2">
           <div className="night-wash relative overflow-hidden rounded-[var(--radius-tile)] p-6 text-white sm:p-8">
             <Badge tone="premium" className="mb-3 border-white/20 bg-white/10 text-dune-200">
-              <Clock3 className="h-3.5 w-3.5" /> Season starts October
+              <Clock3 className="h-3.5 w-3.5" /> Winter ideas
             </Badge>
             <h2 id="seasonal" className="text-2xl text-white">
-              Winter in Dubai, the good months
+              Plan a winter day in Dubai
             </h2>
             <p className="mt-2 max-w-md text-[0.95rem] leading-relaxed text-white/75">
-              November to March is when the desert is comfortable, Global Village is open and the
-              Miracle Garden is in bloom. It is also when Burj Khalifa sunset slots sell out five to
-              seven days ahead, so book those before you fly.
+              Planning a winter visit? Consider an afternoon in the desert, a visit to Global
+              Village or a walk through Miracle Garden. Check opening dates before you make plans.
             </p>
             <ButtonLink href="/collections/first-time-dubai" className="mt-5">
               See the first-timer plan
@@ -462,9 +464,9 @@ export default async function HomePage() {
                 ₹
               </span>
               <span>
-                <span className="block text-lg font-bold text-ink-900">Pay with UPI</span>
+                <span className="block text-lg font-bold text-ink-900">Check UPI options</span>
                 <span className="mt-1 block text-sm text-ink-600">
-                  GPay, PhonePe, Paytm. No forex markup, no international card needed.
+                  Ask which payment methods are available for your booking before you pay.
                 </span>
               </span>
             </Link>
@@ -476,9 +478,9 @@ export default async function HomePage() {
                 🚐
               </span>
               <span>
-                <span className="block text-lg font-bold text-ink-900">Hotel pickup included</span>
+                <span className="block text-lg font-bold text-ink-900">Experiences with hotel pickup</span>
                 <span className="mt-1 block text-sm text-ink-600">
-                  Driver name, photo and number the evening before. Live message on the day.
+                  Check your listing for eligible hotels and pickup instructions.
                 </span>
               </span>
             </Link>
@@ -492,7 +494,7 @@ export default async function HomePage() {
               <span>
                 <span className="block text-lg font-bold text-ink-900">Jain &amp; pure veg</span>
                 <span className="mt-1 block text-sm text-ink-600">
-                  Confirmed with the kitchen and printed on your voucher.
+                  Ask about Jain and pure vegetarian meals when you enquire.
                 </span>
               </span>
             </Link>
@@ -504,9 +506,9 @@ export default async function HomePage() {
                 ✨
               </span>
               <span>
-                <span className="block text-lg font-bold text-ink-900">Plan my whole trip</span>
+                <span className="block text-lg font-bold text-ink-900">Request a trip plan</span>
                 <span className="mt-1 block text-sm text-ink-600">
-                  A trip designer builds the itinerary. Quote in two hours.
+                  Share your plans with our trip team and ask for a quote.
                 </span>
               </span>
             </Link>
@@ -530,9 +532,9 @@ export default async function HomePage() {
       <section className="container-page py-12" aria-labelledby="why-outlyy">
         <SectionHeading
           id="why-outlyy"
-          kicker="What makes us different"
-          title="Four promises, all of them checkable"
-          sub="We're not trying to be a better Klook. We're trying to beat the travel agent you'd otherwise use, a human who confirms before you pay, at a price you can see."
+          kicker="Booking with OUTLYY"
+          title="Know what you’re booking"
+          sub="Check what your experience includes, how its price is confirmed and what happens if plans change."
         />
         <WhyOutlyy />
       </section>
@@ -543,8 +545,8 @@ export default async function HomePage() {
             <SectionHeading
               id="faq"
               kicker="Before you book"
-              title="Questions we get asked most"
-              sub="If yours isn't here, ask on WhatsApp, a person answers in about 30 minutes."
+              title="Questions about booking"
+              sub="Have another question? Ask us on WhatsApp."
             />
             <WhatsAppCard
               context={{ intent: "general", placement: "homepage_faq" }}
@@ -573,7 +575,7 @@ export default async function HomePage() {
                 name: "OUTLYY",
                 url: "https://outlyy.com",
                 description:
-                  "Curated Dubai activities at one all-in price, with WhatsApp support and a human confirming every booking before payment.",
+                  "OUTLYY helps travellers explore Dubai tours, attractions and activities, with operator checks for experiences booked by inquiry.",
                 areaServed: ["IN", "AE"],
                 contactPoint: {
                   "@type": "ContactPoint",

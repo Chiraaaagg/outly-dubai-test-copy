@@ -16,7 +16,7 @@ export interface Chip {
 }
 
 export const HOME_CHIPS: Chip[] = [
-  { label: "Travelling this week", href: "/search?when=tomorrow", emoji: "⚡" },
+  { label: "Tomorrow", href: "/search?when=tomorrow", emoji: "⚡" },
   { label: "Desert safari", href: "/categories/desert-safari", emoji: "🐪" },
   { label: "With kids", href: "/search?suitability=kids", emoji: "👨‍👩‍👧" },
   { label: "Veg & Jain", href: "/search?dietary=jain", emoji: "🌿" },

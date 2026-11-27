@@ -140,8 +140,8 @@ export default function CartPage() {
       <Breadcrumbs items={[{ label: "Dubai", href: "/" }, { label: "Your trip" }]} className="mb-3" />
       <h1 className="text-[1.75rem] sm:text-3xl">Your Dubai trip</h1>
       <p className="mt-1.5 text-[0.95rem] text-ink-600">
-        Everything you&apos;ve picked, laid out day by day so you can see whether it works.{" "}
-        {inquiry ? "Then one message and we confirm the lot." : "Then book and pay for it in one go."}
+        Review your experiences day by day.{" "}
+        {inquiry ? "Send one inquiry so we can check your choices with the operators." : "Then book and pay for it in one go."}
       </p>
 
       {cart.length === 0 ? (
@@ -149,7 +149,7 @@ export default function CartPage() {
           illustration="cart"
           icon={<Sparkles className="h-6 w-6" />}
           title="Your trip is empty"
-          body="Add a few experiences and they'll appear here as a day-by-day timeline, then one inquiry covers all of them."
+          body="Add an experience to build your trip. Your choices will appear here by date."
           action={<ButtonLink href="/search">Browse experiences</ButtonLink>}
           secondary={
             <ButtonLink href="/collections/first-time-dubai" variant="outline">
@@ -291,7 +291,7 @@ export default function CartPage() {
                 id="add-more"
                 kicker="Goes well with what you've picked"
                 title="Add to the same inquiry"
-                sub="Priced together is usually cheaper. Chosen from what other travellers paired with these, not from what pays us most."
+                sub="Take a look at other experiences you could add to your trip."
               />
               <div className="grid gap-4 sm:grid-cols-3">
                 {(suggestions.length ? suggestions : fallbackSuggestions).map((a, i) => (
@@ -324,11 +324,11 @@ export default function CartPage() {
                 ))}
               </ul>
               <div className="mt-3 flex justify-between border-t border-ink-200 pt-3">
-                <span className="font-bold">{inquiry ? "Indicative total" : "Total"}</span>
+                <span className="font-bold">{inquiry ? "Estimated total" : "Total"}</span>
                 <span className="font-display text-xl font-bold tnum">{priceIn(totalMoney, currency)}</span>
               </div>
               <p className="mt-1 text-xs font-semibold text-[var(--color-success)]">
-                All taxes and fees included, nothing added later
+                Review your total again before you pay.
               </p>
               {inquiry && <IndicativePriceNote className="mt-2" />}
 
@@ -374,7 +374,7 @@ export default function CartPage() {
                   placement: "cart",
                 }}
                 title="Want us to check this plan?"
-                body="Send it over and we'll tell you if the timings work, whether the pickups clash, and if a package would be cheaper."
+                body="Ask us to check how the dates and pickups fit together."
               />
             )}
           </aside>

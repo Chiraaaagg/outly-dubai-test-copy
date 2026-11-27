@@ -106,7 +106,7 @@ describe("phone: customer-facing reasons (audit S10)", () => {
   it("explains an 11-digit Indian number", () => {
     const r = normalisePhone("79900000000", "+91");
     expect(r.valid).toBe(false);
-    expect(r.reason).toBe("Indian mobile numbers are 10 digits — you entered 11 digits.");
+    expect(r.reason).toBe("Indian mobile numbers have 10 digits. You entered 11 digits.");
   });
   it("explains a bad first digit", () => {
     const r = normalisePhone("1234567890", "+91");
@@ -121,6 +121,6 @@ describe("phone: customer-facing reasons (audit S10)", () => {
   });
   it("explains a short UAE number", () => {
     const r = normalisePhone("5012345", "+971");
-    expect(r.reason).toBe("UAE mobile numbers are 9 digits — you entered 7 digits.");
+    expect(r.reason).toBe("UAE mobile numbers have 9 digits. You entered 7 digits.");
   });
 });

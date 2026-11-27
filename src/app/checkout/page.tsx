@@ -228,7 +228,7 @@ function detailErrors(t: Traveller, selfServe: boolean): Record<string, string> 
   else if (selfServe && supplierGuestName(t.fullName) === null) next.fullName = GUEST_NAME_LATIN_MESSAGE;
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(t.email)) next.email = "Enter an email we can send the voucher to.";
   if (!/^\d{7,12}$/.test(t.phone.replace(/\s/g, "")))
-    next.phone = "We need a working mobile number to reach you about your booking.";
+    next.phone = "Enter a working mobile number so we can reach you about this booking.";
   else if (!normalisePhone(t.phone, t.countryCode).valid)
     next.phone = normalisePhone(t.phone, t.countryCode).reason ?? "Check the number.";
   return next;
@@ -680,13 +680,13 @@ export default function CheckoutPage() {
         if (r.refused === "quote_expired") {
           verification.current = null;
           setPayment("idle");
-          setNotice("Your price check expired before payment started, so we checked it again with the operator. Nothing was charged. Review it and pay.");
+          setNotice("The price check expired before you paid. We checked the price again with the operator. You haven’t been charged. Review the updated price before you pay.");
           focusPayWhenReady.current = true;
           void requestQuote();
         } else if (r.refused === "verification_required") {
           verification.current = null;
           setPayment("idle");
-          setNotice("We need to confirm your contact details again for this booking. Press pay to get a new code.");
+          setNotice("We need to verify your contact details again. Continue to payment to request a new code.");
           focusPayWhenReady.current = true;
         } else if (r.refused === "try_again") {
           setPayment("failed");
@@ -979,16 +979,16 @@ export default function CheckoutPage() {
                   {/* `awaiting_payment` also covers "paid, Stripe's confirmation not in yet": the words allow for both. */}
                   <p className="font-bold">
                     {leftPayment.state === "closed"
-                      ? "That payment page can no longer be used."
+                      ? "This payment page can’t be used anymore."
                       : leftPayment.state === "unchecked"
-                        ? "We couldn't check your earlier payment just now."
+                        ? "We couldn’t check your previous payment."
                         : "You left the payment page."}
                   </p>
                   <p className="mt-1 leading-relaxed">
                     {leftPayment.state === "closed"
-                      ? "If you paid on it, don't pay again: your booking page shows the payment as soon as Stripe confirms it. If you didn't, start again; your details are kept."
-                      : "If you've just paid, don't pay again: we're checking with Stripe, and your booking page updates by itself. If you didn't pay, you can go back to the same payment page. Your details are kept."}
-                    {leftPayment.state === "failed" ? " We couldn't open the payment page just now. Try again in a moment." : ""}
+                      ? "If you paid, don’t pay again. Your booking page updates when Stripe confirms payment. If you didn’t pay, start again. We’ve kept your details."
+                      : "If you paid, don’t pay again. We’re checking with Stripe, and your booking page updates by itself. If you didn’t pay, you can return to the same payment page. We’ve kept your details."}
+                    {leftPayment.state === "failed" ? " We couldn’t open the payment page. Try again in a moment." : ""}
                   </p>
                   <div className="mt-3 flex flex-wrap gap-2">
                     {leftPaymentActions(leftPayment.state).returnToPayment && (
@@ -1068,8 +1068,8 @@ export default function CheckoutPage() {
             >
               <p>
                 {inquiryReasonText(inquiryReason)}
-                {outstanding ? "" : " Nothing has been charged."} Our team confirms it with the operator and replies on
-                WhatsApp; your details go with it.
+                {outstanding ? "" : " Nothing has been charged."} We’ll carry over your details, check with the
+                operator and reply on WhatsApp.
               </p>
             </BlockingNotice>
           )}
@@ -1108,7 +1108,7 @@ export default function CheckoutPage() {
                     Mobile number
                   </label>
                   <p id="phone-hint" className="mt-0.5 text-sm text-ink-600">
-                    We send a code to confirm your booking, to this number or to your email.
+                    Use a mobile number where we can reach you about your booking.
                   </p>
                   <PhoneInput
                     id="phone"
@@ -1321,8 +1321,8 @@ export default function CheckoutPage() {
                   tone={payment === "timeout" ? "warning" : "danger"}
                   title={
                     payment === "timeout"
-                      ? "We haven't heard back from the payment gateway"
-                      : "That payment didn't go through"
+                      ? "We’re still waiting for a response from the payment service"
+                      : "We couldn’t start checkout"
                   }
                   action={
                     <div className="flex flex-wrap gap-2">
@@ -1345,8 +1345,8 @@ export default function CheckoutPage() {
                 >
                   {error?.recovery ??
                     (outstanding
-                      ? "Your trip is exactly as you left it. Try again, or we'll send you a payment link on WhatsApp."
-                      : "Nothing has been charged and your trip is exactly as you left it. Try again, or we'll send you a payment link on WhatsApp.")}
+                      ? "We’ve kept your trip details. If you may have paid, check the booking status before trying again. Need help? Message us on WhatsApp."
+                      : "You haven’t been charged. We’ve kept your trip details. Try again or ask us for help on WhatsApp.")}
                 </Alert>
               )}
 
@@ -1432,7 +1432,7 @@ export default function CheckoutPage() {
                           setOtp(null);
                           setPayment("idle");
                           if (stepRef.current === 2) {
-                            setNotice("Your booking details changed, so we need to confirm your contact details again. Press pay to get a new code.");
+                            setNotice("Your booking details changed. Continue to payment to request a new verification code.");
                           }
                         }
                         return;
@@ -1470,8 +1470,8 @@ export default function CheckoutPage() {
                 <p className="flex gap-1.5 px-1 text-sm text-ink-600">
                   <Lock aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0" />
                   <span>
-                    First we send a 6-digit code to {phoneShown} or to your email. Then you pay by card on Stripe&apos;s secure page, charged in{" "}
-                    {payCurrency}, and come straight back here.
+                    First, enter the 6-digit verification code. Then pay by card on Stripe’s payment page in{" "}
+                    {payCurrency}. You’ll return here after payment.
                   </span>
                 </p>
               </section>
@@ -1480,9 +1480,7 @@ export default function CheckoutPage() {
 
           {hasManual && (
             <Alert tone="info" title="One of these needs the operator to confirm">
-              You&apos;ll get a status message within five minutes and the confirmed voucher within
-              two hours. If the operator can&apos;t take it, we offer you an alternative SKU, an
-              alternative date or a full refund, within two hours, without you having to chase.
+              Check your booking status for the operator’s response and any next steps.
             </Alert>
           )}
 

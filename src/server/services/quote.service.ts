@@ -693,11 +693,11 @@ export function createQuoteService(deps: QuoteDeps): QuoteServiceImpl {
         }
         const sameOwner = ownerKey(q.owner) === ownerKey(owner);
         const sameContent = canonicalJson(q.request) === content;
-        if (!sameOwner || !sameContent) throw Errors.conflict("This quote conflicts with another one — start again from your trip", { reason: "fingerprint_conflict" });
+        if (!sameOwner || !sameContent) throw Errors.conflict("This quote conflicts with another one. Start again from your trip", { reason: "fingerprint_conflict" });
         supersede.push(q.id);
       }
       const inserted = await guarded("quote_write", () => deps.store.replace({ expire, supersede, quote: snapshot, request, now }));
-      if (!inserted) throw Errors.conflict("This quote is already being prepared — try again in a moment", { reason: "fingerprint_race" });
+      if (!inserted) throw Errors.conflict("This quote is already being prepared. Try again in a moment", { reason: "fingerprint_race" });
       return snapshot;
     },
   };

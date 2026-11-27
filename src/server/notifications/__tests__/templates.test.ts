@@ -194,7 +194,7 @@ describe("renderTemplate — every event/channel", () => {
     const email = renderTemplate("INQUIRY_ACK", "email", fixture({ outOfHours: true, deadlineLabel: "9:30 am IST tomorrow" }));
     expect(email.text).toContain("Our team is offline right now");
     expect(email.text).toContain("by 9:30 am IST tomorrow");
-    expect(email.subject).toBe("Got it — INQ-240913-7. Jyoti replies by 9:30 am IST tomorrow");
+    expect(email.subject).toBe("Inquiry INQ-240913-7 received. Reply by 9:30 am IST tomorrow");
   });
 
   it("no urgency theatre: copy never claims scarcity or counts down", () => {
@@ -223,7 +223,7 @@ describe("renderTemplate — every event/channel", () => {
   });
 
   it("subjects are clamped to 78 characters even with long names and labels", () => {
-    const r = renderTemplate("INQUIRY_ACK", "email", fixture({ agentFirstName: "Venkatanarasimharajuvaripeta", deadlineLabel: "11:00 pm IST on Monday 21 September" }));
+    const r = renderTemplate("INQUIRY_ACK", "email", fixture({ agentFirstName: "Venkatanarasimharajuvaripeta", deadlineLabel: "11:00 pm India Standard Time on Monday 21 September 2026" }));
     expect(r.subject!.length).toBeLessThanOrEqual(MAX_SUBJECT_LENGTH);
     expect(r.subject!.endsWith("…")).toBe(true);
     expect(clampSubject("short")).toBe("short");
@@ -232,12 +232,12 @@ describe("renderTemplate — every event/channel", () => {
 
   it("empty item lists fall back to a sensible line", () => {
     const r = renderTemplate("INQUIRY_ACK", "email", fixture({ items: [], itemCount: 0 }));
-    expect(r.text).toContain("No specific activities yet");
+    expect(r.text).toContain("You haven’t chosen activities yet");
   });
 
   it("won email uses the order reference and still names the inquiry", () => {
     const r = renderTemplate("INQUIRY_WON", "email", fixture({ orderReference: "OUT-240914-3" }));
-    expect(r.subject).toBe("Confirmed — booking OUT-240914-3");
+    expect(r.subject).toBe("Booking OUT-240914-3 confirmed");
     expect(r.text).toContain("inquiry INQ-240913-7");
   });
 

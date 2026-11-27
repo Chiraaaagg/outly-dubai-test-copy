@@ -1,7 +1,7 @@
 import { Download, FileText } from "lucide-react";
 import type { CustomerItemStatus, CustomerOrderState } from "@/lib/customer-status";
 import { cn } from "@/lib/utils";
-import { documentLinkText, ticketStatusText } from "./presenters";
+import { documentLinkText, ticketStatusText, type DocumentWord } from "./presenters";
 
 /**
  * One item's tickets: a status sentence, then the downloadable files as a
@@ -10,6 +10,10 @@ import { documentLinkText, ticketStatusText } from "./presenters";
  * `/api/tickets/documents/<id>` (never a Next `Link`, so nothing prefetches
  * it), and its text names the file type and size so the accessible name
  * carries them. The route re-checks ownership on every download.
+ *
+ * Post-payment A5/A7: `word` names the files ("tickets" or "voucher"); with
+ * `showFiles` false the links are left to the item's ticket card on the same
+ * page, so one file is not offered twice under the same name.
  */
 export function TicketList({
   tickets,
@@ -17,6 +21,8 @@ export function TicketList({
   canDownload,
   headingId,
   className,
+  word = "voucher",
+  showFiles = true,
 }: {
   tickets: CustomerItemStatus["tickets"];
   /** The item's state, so the sentence fits it (no "no ticket files" before confirmation, CO-15). */
@@ -26,11 +32,15 @@ export function TicketList({
   /** id of the heading that labels this list. */
   headingId?: string;
   className?: string;
+  /** What the files are called (A7). */
+  word?: DocumentWord;
+  /** False when the item's ticket card above carries the downloads (A5). */
+  showFiles?: boolean;
 }) {
-  const docs = tickets.documents;
+  const docs = showFiles ? tickets.documents : [];
   return (
     <div className={className}>
-      <p className="text-sm leading-relaxed text-ink-700">{ticketStatusText(tickets, itemState, canDownload ?? true)}</p>
+      <p className="text-sm leading-relaxed text-ink-700">{ticketStatusText(tickets, itemState, canDownload ?? true, word)}</p>
       {docs.length > 0 && (
         <ul className="mt-3 space-y-2" aria-labelledby={headingId} data-testid="ticket-list">
           {docs.map((doc) => {

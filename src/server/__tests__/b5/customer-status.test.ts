@@ -180,7 +180,7 @@ describe.skipIf(!dbEnabled)("customer status route: access, projection and priva
     await prisma.notification.create({
       data: { id: uuidv7(), event: "TICKETS_READY", channel: "email", recipient: `zz-sec-${run}@outlyy.test`, orderId: orderA.id, status: "sent", sentAt: new Date(), payload: { kind: "tickets_ready", orderId: orderA.id, orderItemId: orderA.itemId, documentVersion: 1 } },
     });
-    expect((await ok(await status(orderA.reference, both))).nextStep).toMatch(/We've also emailed you a link to it/);
+    expect((await ok(await status(orderA.reference, both))).nextStep).toMatch(/We've also emailed you a link to them/);
     await ok(await status(orderGuest.reference, both));
 
     await capability.capabilityService.revoke(prisma, first.grantId, "staff");

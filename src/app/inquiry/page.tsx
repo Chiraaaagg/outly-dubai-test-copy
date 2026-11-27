@@ -97,13 +97,13 @@ function InquiryInner() {
         items={[
           { label: "Dubai", href: "/" },
           { label: "Your trip", href: "/cart" },
-          { label: "Check availability & price" },
+          { label: "Request availability & price" },
         ]}
         className="mb-3"
       />
 
       <div className="mb-6 max-w-2xl">
-        <h1 className="text-[1.75rem] sm:text-3xl">Check availability &amp; price</h1>
+        <h1 className="text-[1.75rem] sm:text-3xl">Request availability &amp; price</h1>
         <p className="mt-1.5 hidden text-[0.95rem] leading-relaxed text-ink-600 sm:block">
           Two fields and thirty seconds. A named person confirms with the operator and replies on
           WhatsApp in about 30 minutes, with the exact price. Nothing is charged until you say yes.
@@ -162,7 +162,7 @@ function InquiryInner() {
                 ))}
               </ul>
               <div className="mt-3 flex items-baseline justify-between border-t border-ink-200 pt-3">
-                <span className="text-sm font-bold">Indicative total</span>
+                <span className="text-sm font-bold">Estimated total</span>
                 <span className="font-display text-xl font-bold tnum">{priceIn(total, currency)}</span>
               </div>
               <IndicativePriceNote className="mt-2" />
@@ -206,9 +206,8 @@ function Sidebar({ compact }: { compact?: boolean }) {
       <Card className="p-5">
         <h2 className="text-lg">Who replies</h2>
         <p className="mt-1 text-sm text-ink-600">
-          A real person on the OUTLYY team, {siteConfig.supportHours}. Send it whenever suits you —
-          anything that arrives after we close is answered when we open. A named specialist is
-          assigned the moment you send.
+          Our team reviews inquiries during {siteConfig.supportHours}. Check your confirmation for the
+          expected reply time.
         </p>
         <div className="mt-3 space-y-2">
           {SHIFTS.map((s) => (

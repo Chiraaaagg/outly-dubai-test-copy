@@ -24,7 +24,7 @@ import {
 import { useCustomerHint } from "@/lib/use-customer-hint";
 import { serverErrorCode } from "@/lib/server-error";
 import { track } from "@/lib/analytics";
-import { BUDGET_BANDS, SLA } from "@/lib/inquiry";
+import { BUDGET_BANDS } from "@/lib/inquiry";
 import type { BudgetBand, CartItem, Dietary, PaxCount } from "@/lib/types";
 import { cn, EMPTY_PAX, formatDateKey, paxLabel, paxTotal, priceIn, toDateKey } from "@/lib/utils";
 import { normalisePhone } from "@/lib/phone";
@@ -321,7 +321,7 @@ export function InquiryForm({
           new ApiError(
             `${gone.map((i) => i.title).join(", ")} ${gone.length === 1 ? "is" : "are"} no longer available`,
             "error",
-            `We've taken ${gone.length === 1 ? "it" : "them"} out of your trip. Check the rest and send again, nothing has been sent yet.`,
+            `We removed ${gone.length === 1 ? "that item" : "those items"}. Review the rest of your trip, then try again. Your inquiry hasn’t been sent.`,
             true,
           ),
         );
@@ -591,22 +591,21 @@ export function InquiryForm({
 
       {/* Contract terms are accepted by sending, and said so before the button, not after. */}
       <p className="text-xs leading-relaxed text-ink-500">
-        By sending this enquiry you agree to our{" "}
+        By sending this inquiry, you agree to our{" "}
         <Link href="/terms" className="font-semibold underline underline-offset-2 hover:text-ink-700">
           Terms
         </Link>{" "}
-        and confirm you have read the{" "}
+        and confirm that you’ve read our{" "}
         <Link href="/privacy" className="font-semibold underline underline-offset-2 hover:text-ink-700">
           Privacy Policy
         </Link>
-        , which explains what we do with your name, number and trip details, and how to have them
-        deleted.
+        . It explains how we use your name, phone number and trip details, and how to request deletion.
       </p>
 
       {state === "error" && (
-        <Alert tone="danger" title="That didn't send">
+        <Alert tone="danger" title="We couldn’t send your inquiry">
           {error?.recovery ??
-            "Something failed at our end. Nothing you typed is lost, try again, or send it on WhatsApp instead."}
+            "Your details are still here. Try again or send your inquiry on WhatsApp."}
         </Alert>
       )}
 
@@ -660,11 +659,11 @@ export function InquiryForm({
           <div className="hidden sm:block">
             <Button type="submit" block size="lg" loading={state === "sending"} loadingLabel="Sending…">
               <Send className="h-[1.15rem] w-[1.15rem]" />
-              Send inquiry, we reply in ~{SLA.responseMinutes} min
+              Send inquiry
             </Button>
           </div>
           <WhatsAppButton block size="lg" context={whatsappContext} />
-          <ResponsePromise className="justify-center pt-1" prefix="Free to ask" />
+          <ResponsePromise className="justify-center pt-1" prefix="Free to enquire" />
           <ConfirmFirstNote className="justify-center text-center" />
         </div>
       )}
@@ -682,7 +681,7 @@ export function InquiryForm({
             loadingLabel="Sending…"
           >
             <Send className="h-[1.15rem] w-[1.15rem]" />
-            Send inquiry, reply in ~{SLA.responseMinutes} min
+            Send inquiry
           </Button>
         </div>
       )}

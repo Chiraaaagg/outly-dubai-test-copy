@@ -7,6 +7,8 @@ import { documentService } from "./document.service";
 import { orderAccessService, type OrderAccess } from "./order-access.service";
 import { evaluateCancellation, loadCancellationFacts, serviceStartUtc, type CancellationFacts } from "./cancellation.service";
 import { ticketFactsForOrder } from "./ticket-facts.service";
+import { codeChannelsAvailable } from "./contact-verification.service";
+import { customerResendAvailability, customerResendTimes, ticketRowDeliveryState, type TicketRowDelivery } from "./notification.service";
 import { EXTERNAL_RELEASE_CODES } from "../suppliers/external-confirmation";
 import { inquiryHref } from "@/lib/inquiry-handoff";
 import type { CustomerTicketFacts } from "@/lib/ticket-validity";
@@ -23,6 +25,9 @@ import {
   type CustomerStep,
   type CustomerTone,
   type StepStatus,
+  type TicketDeliveryState,
+  type TicketDeliveryView,
+  type UnlockChannel,
 } from "@/lib/customer-status";
 
 /**
@@ -113,14 +118,52 @@ export interface StatusItemSnapshot {
   ticket?: CustomerTicketFacts | null;
 }
 
+/** One `TICKETS_READY` notification row of the order (post-payment batch A3). No recipient, no payload beyond the item. */
+export interface TicketMessageSnapshot {
+  orderItemId: string;
+  /** The document version the message was for (`payload.documentVersion`), or null when not recorded. */
+  documentVersion?: number | null;
+  status: string;
+  providerError: string | null;
+  attentionRequiredAt: Date | null;
+  attempt: number;
+  createdAt: Date;
+  sentAt: Date | null;
+  deliveredAt: Date | null;
+  failedAt: Date | null;
+}
+
 export interface StatusSnapshot {
-  order: { reference: string; status: string; rail: "self_serve" | "assisted"; currency: Currency; totalMinor: bigint; placedAt: Date; updatedAt: Date; paidAt: Date | null };
+  order: {
+    reference: string;
+    status: string;
+    rail: "self_serve" | "assisted";
+    currency: Currency;
+    totalMinor: bigint;
+    placedAt: Date;
+    updatedAt: Date;
+    paidAt: Date | null;
+    /** A3: the order has an email to send tickets to. Absent reads as true (snapshots built before A3). */
+    hasEmail?: boolean;
+    /**
+     * A3: the address the newest ticket message went to, masked on the server
+     * ("j•••@example.com"); `orders.lead_email` masked when no message
+     * recorded one (fix round 1, L8). Never the address itself.
+     */
+    recipientMasked?: string | null;
+  };
   saga: { orderItemId: string; state: string; deadlineAt: Date | null; attentionRequiredAt: Date | null; updatedAt: Date } | null;
   /** The saga's payment, or the order's latest payment. */
   payment: { status: string; capturedMinor: bigint; refundedMinor: bigint; authorizedAt: Date | null; capturedAt: Date | null } | null;
   items: StatusItemSnapshot[];
   /** Whether the caller may download documents (documents are listed only then). */
   canDownload: boolean;
+  /** A1: the order's verified contact channels that can deliver a code now, preferred first. */
+  unlockChannels?: UnlockChannel[];
+  /** A3: the order's ticket messages, every status. */
+  ticketMessages?: TicketMessageSnapshot[];
+  /** A4: when this order's accepted customer resends happened (last 24 hours). */
+  customerResends?: Date[];
 }
 
 /* ---------------------------------------------------------------------------
@@ -409,14 +452,39 @@ function ticketsStep(s: StatusSnapshot, items: StatusItemSnapshot[], state: Cust
   return ticketsStepOf(items.find((i) => i.id === s.saga!.orderItemId), state);
 }
 
+/**
+ * Post-payment batch A7 (server half): what one item's entry document is
+ * called. "tickets" when a tickets PDF is listed (or, before any file, the
+ * item is an open-dated ticket item); otherwise "voucher".
+ */
+type DocNoun = "voucher" | "tickets";
+
+export function itemDocNoun(item: Pick<StatusItemSnapshot, "tickets" | "ticket">): DocNoun {
+  const kinds = item.tickets.documents.filter((d) => d.status === "valid" || d.status === "pending").map((d) => d.kind);
+  if (kinds.includes("tickets_pdf")) return "tickets";
+  if (kinds.includes("voucher_pdf")) return "voucher";
+  return item.ticket ? "tickets" : "voucher";
+}
+
+/** The words for several items' documents: "voucher", "vouchers", "tickets" or "tickets and vouchers", with pronouns. */
+function docPhrase(nouns: readonly DocNoun[]): { noun: string; plural: boolean; it: string; is: string; itIs: string } {
+  const tickets = nouns.filter((n) => n === "tickets").length;
+  const vouchers = nouns.length - tickets;
+  const noun = tickets && vouchers ? "tickets and vouchers" : tickets ? "tickets" : vouchers > 1 ? "vouchers" : "voucher";
+  const plural = noun !== "voucher";
+  return { noun, plural, it: plural ? "them" : "it", is: plural ? "are" : "is", itIs: plural ? "they're" : "it's" };
+}
+
 function ticketsStepOf(item: StatusItemSnapshot | undefined, state: CustomerOrderState): CustomerStep {
   const f = item?.tickets.fulfilment ?? "not_applicable";
+  const noun = item ? itemDocNoun(item) : "voucher";
+  const Noun = noun === "tickets" ? "Tickets" : "Voucher";
   if (f === "issued") {
     const at = item!.tickets.documents.map((d) => Date.parse(d.createdAt)).filter(Number.isFinite);
-    return step("done", "Voucher ready", at.length ? new Date(Math.max(...at)) : null);
+    return step("done", `${Noun} ready`, at.length ? new Date(Math.max(...at)) : null);
   }
-  if (f === "ticket_pending") return step("in_progress", "Voucher being prepared");
-  if (f === "attention") return step("in_progress", "Our team is getting your voucher");
+  if (f === "ticket_pending") return step("in_progress", `${Noun} being prepared`);
+  if (f === "attention") return step("in_progress", `Our team is getting your ${noun}`);
   if (item?.booking && BOOKING_HELD.includes(item.booking.state)) return step("done", "No voucher needed");
   if (["refunded", "payment_released", "payment_failed", "cancelled", "refund_processing"].includes(state)) return step("not_applicable", "Not needed");
   return step("not_started", "Follows the operator's confirmation");
@@ -574,22 +642,26 @@ function words(
         };
       }
       return { headline: `Payment received. We're booking ${what} with the operator.`, nextStep: `This page updates by itself.${remedy}${team}` };
-    case "confirmed_ticket_pending":
+    case "confirmed_ticket_pending": {
+      // A7: "tickets" or "voucher" by item. A3: an email is promised only when the order has an address.
+      const p = docPhrase(s.items.filter((i) => i.status !== "rejected").map(itemDocNoun));
+      const email = s.order.hasEmail !== false ? `, and we email ${p.it} to you too` : "";
       return {
-        headline: multi ? "Booked. Your vouchers are being prepared." : "Booked. Your voucher is being prepared.",
-        nextStep: "This page updates by itself when it's ready, and we email it to you too.",
+        headline: `Booked. Your ${p.noun} ${p.is} being prepared.`,
+        nextStep: `This page updates by itself when ${p.itIs} ready${email}.`,
       };
+    }
     case "confirmed": {
       // R-B5-10: say the tickets were emailed only when that email is recorded as sent.
       const issued = s.items.filter((i) => i.tickets.fulfilment === "issued");
       const headline = multi ? "Your activities are booked." : `${what.charAt(0).toUpperCase()}${what.slice(1)} is booked.`;
       let nextStep: string;
-      const plural = issued.length > 1;
+      const p = docPhrase(issued.map(itemDocNoun));
       if (!issued.length) nextStep = "Keep your booking reference to hand for the day. Message us on WhatsApp if you need anything.";
-      else if (canDownload) nextStep = plural ? "Your vouchers are ready to download. Show them on your phone or print them for the day." : "Your voucher is ready to download. Show it on your phone or print it for the day.";
+      else if (canDownload) nextStep = `Your ${p.noun} ${p.is} ready to download. Show ${p.it} on your phone or print ${p.it} for the day.`;
       else {
-        nextStep = plural ? "Your vouchers are ready. To keep them private, confirm it's you." : "Your voucher is ready. To keep it private, confirm it's you.";
-        if (issued.every((i) => i.ticketsEmailed)) nextStep += " We've also emailed you a link to it.";
+        nextStep = `Your ${p.noun} ${p.is} ready. To keep ${p.it} private, confirm it's you.`;
+        if (issued.every((i) => i.ticketsEmailed)) nextStep += ` We've also emailed you a link to ${p.it}.`;
       }
       return { headline, nextStep };
     }
@@ -653,6 +725,101 @@ export function pollAfterFor(s: StatusSnapshot, state: CustomerOrderState, per: 
   };
   const all = [cadence(state, per.length === 1 ? per[0].item : null), ...per.map((p) => cadence(p.state, p.item))].filter((x): x is number => x !== null);
   return all.length ? Math.min(...all) : null;
+}
+
+/* ---------------------------------------------------------------------------
+ * Ticket delivery (post-payment batch A3, A4)
+ * ------------------------------------------------------------------------ */
+
+/**
+ * "j•••@example.com": the first character of the local part, then a fixed
+ * mask, then the domain. Computed on the server; the address never reaches
+ * the projection. Null for anything that is not an address.
+ */
+export function maskEmail(email: string | null | undefined): string | null {
+  const v = (email ?? "").trim();
+  const at = v.lastIndexOf("@");
+  if (at < 1 || at === v.length - 1) return null;
+  const domain = v.slice(at + 1).toLowerCase();
+  if (domain.length > 120 || /\s/.test(domain)) return null;
+  return `${Array.from(v)[0].toLowerCase()}•••@${domain}`;
+}
+
+const latest = (dates: (Date | null | undefined)[]): Date | null => {
+  const t = dates.filter((d): d is Date => d instanceof Date).map((d) => d.getTime());
+  return t.length ? new Date(Math.max(...t)) : null;
+};
+
+/** When a ticket message reached `state`. */
+function rowAt(r: TicketMessageSnapshot, state: TicketRowDelivery): Date {
+  switch (state) {
+    case "delivered":
+      return r.deliveredAt ?? r.sentAt ?? r.createdAt;
+    case "sent":
+      return r.sentAt ?? r.createdAt;
+    case "bounced":
+      return r.failedAt ?? r.createdAt;
+    case "failed":
+      return r.failedAt ?? r.attentionRequiredAt ?? r.createdAt;
+    default:
+      return r.createdAt;
+  }
+}
+
+/**
+ * One item's delivery (fix round 1, L1): decided by the newest message for
+ * the item's current file version, so an older message that was delivered
+ * never hides a newer one that failed, bounced or is still on its way, and a
+ * message for a replaced file never speaks for the current one. While the
+ * newest is still pending (a resend in flight), the newest settled message
+ * of the same version says where things stand. No message for the current
+ * version yet: pending. `version` null (not known) reads every message.
+ */
+function itemDelivery(rows: TicketMessageSnapshot[], version: number | null, now: Date): { state: TicketRowDelivery; at: Date | null } {
+  const current = version === null ? rows : rows.filter((r) => r.documentVersion === version);
+  if (!current.length) return { state: "pending", at: null };
+  const sorted = [...current].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+  const states = sorted.map((r) => ticketRowDeliveryState(r, now));
+  const i = states[0] === "pending" ? states.findIndex((st) => st !== "pending") : 0;
+  if (i < 0) return { state: "pending", at: sorted[0].createdAt };
+  return { state: states[i], at: rowAt(sorted[i], states[i]) };
+}
+
+/** The item's current tickets/voucher file version (the newest valid one), or null without one. */
+function currentTicketVersion(item: StatusItemSnapshot): number | null {
+  const v = item.tickets.documents.filter((d) => d.status === "valid" && (d.kind === "tickets_pdf" || d.kind === "voucher_pdf")).map((d) => d.version);
+  return v.length ? Math.max(...v) : null;
+}
+
+/** Which item state the order shows: the one that needs the customer's attention first. */
+const DELIVERY_PRIORITY: TicketDeliveryState[] = ["bounced", "failed", "pending", "sent", "delivered"];
+
+/**
+ * The order-level ticket message view (contract `TicketDeliveryView`). Null
+ * when the order has no email, or no item has a ticket file yet (nothing has
+ * been or will be sent), and null for a viewer who may not download (fix
+ * round 1, L2, lead decision of least exposure: the masked address and the
+ * delivery state are shown only to viewers who may download the files).
+ * "delivered" only when the signed webhook recorded delivery for every
+ * item. `canResend` and `resendAvailableAt` follow the customer resend
+ * limit. Pure.
+ */
+export function ticketDelivery(s: StatusSnapshot, now: Date): TicketDeliveryView | null {
+  if (!s.canDownload || s.order.hasEmail === false || !s.ticketMessages) return null;
+  const withFiles = s.items.filter((i) => currentTicketVersion(i) !== null);
+  if (!withFiles.length) return null;
+  const per = withFiles.map((i) => itemDelivery(s.ticketMessages!.filter((m) => m.orderItemId === i.id), currentTicketVersion(i), now));
+  const state = DELIVERY_PRIORITY.find((p) => per.some((x) => x.state === p)) ?? "pending";
+  const at = latest(per.filter((x) => x.state === state).map((x) => x.at));
+  const limit = customerResendAvailability(s.customerResends ?? [], now);
+  return {
+    channel: "email",
+    state,
+    recipientMasked: s.order.recipientMasked ?? null,
+    at: iso(at),
+    canResend: limit.allowed,
+    resendAvailableAt: limit.allowed ? null : iso(limit.availableAt),
+  };
 }
 
 /** Builds the customer status from a loaded snapshot. Pure; `now` decides deadlines and completion. */
@@ -723,6 +890,8 @@ export function projectCustomerStatus(s: StatusSnapshot, now: Date): CustomerOrd
     },
     items,
     canDownload: s.canDownload,
+    unlockChannels: s.unlockChannels ?? [],
+    delivery: ticketDelivery(s, now),
     inquiryHref: ext.holdUnusable && ["payment_released", "refund_processing", "refunded"].includes(state) ? inquiryHref("external_hold", "booking") : null,
     pollAfterMs: pollable ?? null,
   };
@@ -746,6 +915,7 @@ export async function loadStatusSnapshot(access: Pick<OrderAccess, "orderId" | "
       placedAt: true,
       updatedAt: true,
       paidAt: true,
+      leadEmail: true,
       items: {
         select: { id: true, titleSnapshot: true, serviceDate: true, timeslot: true, pax: true, status: true, fulfilmentOrigin: true, pickupHotelNameSnapshot: true },
         orderBy: [{ serviceDate: "asc" }, { id: "asc" }],
@@ -774,14 +944,35 @@ export async function loadStatusSnapshot(access: Pick<OrderAccess, "orderId" | "
   });
   if (!order) return null;
   const itemIds = order.items.map((i) => i.id);
-  const [refunds, tickets, facts, ticketEmails, ticketFacts] = await Promise.all([
+  const [refunds, tickets, facts, ticketEmails, ticketFacts, verifications, resends] = await Promise.all([
     itemIds.length ? prisma.refund.findMany({ where: { orderItemId: { in: itemIds } }, select: { orderItemId: true, status: true, createdAt: true, updatedAt: true } }) : Promise.resolve([]),
     documentService.listForOrder(access.orderId),
     loadCancellationFacts(access.orderId),
-    prisma.notification.findMany({ where: { orderId: access.orderId, event: "TICKETS_READY", status: { in: ["sent", "delivered", "read"] } }, select: { payload: true } }),
+    // A3: every ticket message of the order, whatever its status, newest first.
+    prisma.notification.findMany({
+      where: { orderId: access.orderId, event: "TICKETS_READY", channel: "email" },
+      // The recipient is read only to mask the newest one here (L8); it never enters the snapshot.
+      select: { payload: true, recipient: true, status: true, providerError: true, attentionRequiredAt: true, attempt: true, createdAt: true, sentAt: true, deliveredAt: true, failedAt: true },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+    }),
     ticketFactsForOrder(access.orderId),
+    // A1: the channels the order's contact was verified on (order-bound rows only).
+    prisma.orderContactVerification.findMany({ where: { orderId: access.orderId }, select: { channel: true } }),
+    customerResendTimes(access.orderId),
   ]);
-  const emailedItems = new Set(ticketEmails.map((n) => (n.payload as { orderItemId?: unknown } | null)?.orderItemId).filter((x): x is string => typeof x === "string"));
+  const ticketMessages: TicketMessageSnapshot[] = ticketEmails.flatMap((n) => {
+    const p = n.payload as { orderItemId?: unknown; documentVersion?: unknown } | null;
+    const orderItemId = p?.orderItemId;
+    if (typeof orderItemId !== "string") return [];
+    const documentVersion = typeof p?.documentVersion === "number" && Number.isInteger(p.documentVersion) ? p.documentVersion : null;
+    return [{ orderItemId, documentVersion, status: n.status, providerError: n.providerError, attentionRequiredAt: n.attentionRequiredAt, attempt: n.attempt, createdAt: n.createdAt, sentAt: n.sentAt, deliveredAt: n.deliveredAt, failedAt: n.failedAt }];
+  });
+  // L8: the address the newest ticket message went to (rows are newest first), else the order's email; masked here.
+  const recipientMasked = maskEmail(ticketEmails.find((n) => maskEmail(n.recipient) !== null)?.recipient ?? order.leadEmail);
+  const emailedItems = new Set(ticketMessages.filter((m) => ["sent", "delivered", "read"].includes(m.status)).map((m) => m.orderItemId));
+  // A1: verified and deliverable now, in checkout's order of preference.
+  const verified = new Set(verifications.map((v) => v.channel));
+  const unlockChannels = codeChannelsAvailable().filter((c) => verified.has(c));
   const payment = order.paymentSaga?.paymentId ? (order.payments.find((p) => p.id === order.paymentSaga!.paymentId) ?? null) : (order.payments[0] ?? null);
 
   return {
@@ -794,7 +985,12 @@ export async function loadStatusSnapshot(access: Pick<OrderAccess, "orderId" | "
       placedAt: order.placedAt,
       updatedAt: order.updatedAt,
       paidAt: order.paidAt,
+      hasEmail: Boolean(order.leadEmail?.trim()),
+      recipientMasked,
     },
+    unlockChannels,
+    ticketMessages,
+    customerResends: resends,
     saga: order.paymentSaga ? { orderItemId: order.paymentSaga.orderItemId, state: order.paymentSaga.state, deadlineAt: order.paymentSaga.deadlineAt, attentionRequiredAt: order.paymentSaga.attentionRequiredAt, updatedAt: order.paymentSaga.updatedAt } : null,
     payment: payment ? { status: payment.status, capturedMinor: payment.capturedMinor, refundedMinor: payment.refundedMinor, authorizedAt: payment.authorizedAt, capturedAt: payment.capturedAt } : null,
     canDownload: access.canDownload,

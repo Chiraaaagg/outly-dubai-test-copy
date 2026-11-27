@@ -301,6 +301,91 @@ export function accessCookieGrants(value: string | undefined | null, now: Date =
   return accessEntries(value, now).map((e) => ({ grantId: e.grantId, checkout: e.checkout }));
 }
 
+/** The order item a ticket message is for, from its stored payload (`TicketMessageRef`), or null. */
+function itemOfPayload(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") return null;
+  const p = payload as { kind?: unknown; orderItemId?: unknown };
+  return p.kind === "ticket_message" && typeof p.orderItemId === "string" ? p.orderItemId : null;
+}
+
+/**
+ * The grant a customer resend must leave live (`payload.keepGrantId`): the
+ * one the requesting browser used to ask (fix round 1, M1), or null.
+ */
+function keptGrantOfPayload(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") return null;
+  const k = (payload as { keepGrantId?: unknown }).keepGrantId;
+  return typeof k === "string" && k.length > 0 && k.length <= 64 ? k : null;
+}
+
+/** The `resend:<id>` part of a notification's dedup key (dedupKeyOf), shared by every message of one resend. */
+function resendBatchOf(dedupKey: string | null | undefined): string | null {
+  const m = /\|resend:([^|]+)$/.exec(dedupKey ?? "");
+  return m ? m[1] : null;
+}
+
+/**
+ * Post-payment batch A2: which of `candidates` (older live grants of the same
+ * order and purpose, never recovery or checkout grants) the new grant `g`
+ * supersedes, through each grant's notification (grant ↔ notification ↔
+ * order item):
+ *
+ *  - a `ticket_notification` grant (the ticket email, and a customer's own
+ *    resend) revokes the older grants whose message was for the same order
+ *    item. A grant whose message can no longer say which item it was for
+ *    (the row is gone, or its payload was cleared by an erasure, which
+ *    matches rows by recipient and so can touch an order that is kept) is
+ *    revoked by any ticket message of the order, the rule before A2: a link
+ *    of unknown scope is never left behind. A grant with no message at all
+ *    (a direct mint) is left alone;
+ *  - a `staff_resend` grant revokes every older grant of the order, as
+ *    before, except the grants of messages in the same resend batch;
+ *  - a grant with no message of its own (or one whose message is gone)
+ *    keeps the order-wide rule;
+ *  - whatever the rule, a customer resend never revokes the grant the
+ *    requesting browser used to ask for it (`payload.keepGrantId`, fix
+ *    round 1, M1): pressing "Email my tickets again" must not lock the
+ *    asker out of the page they pressed it on. With a kept grant only the
+ *    links created before it go (fix round 2, N2): a newer link is at least
+ *    as trustworthy as the asker's, so the holder of an old forwarded link
+ *    cannot use the button to remove the booker's newer one and keep their
+ *    own. When the kept grant cannot be read, the rule above applies as is.
+ */
+async function supersedeScope(
+  db: Db,
+  g: { issuedFor: string; notificationId: string | null },
+  candidates: { id: string; notificationId: string | null; createdAt: Date }[],
+): Promise<{ id: string }[]> {
+  if (!candidates.length || !g.notificationId) return candidates;
+  const ids = [...new Set([g.notificationId, ...candidates.map((c) => c.notificationId).filter((x): x is string => Boolean(x))])];
+  const rows = await db.notification.findMany({ where: { id: { in: ids } }, select: { id: true, payload: true, dedupKey: true } });
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const own = byId.get(g.notificationId);
+  if (!own) return candidates;
+  const keep = keptGrantOfPayload(own.payload);
+  const scoped = (() => {
+    if (g.issuedFor === "staff_resend") {
+      const batch = resendBatchOf(own.dedupKey);
+      if (!batch) return candidates;
+      return candidates.filter((c) => !c.notificationId || resendBatchOf(byId.get(c.notificationId)?.dedupKey) !== batch);
+    }
+    if (g.issuedFor !== "ticket_notification") return candidates;
+    const item = itemOfPayload(own.payload);
+    if (!item) return candidates;
+    return candidates.filter((c) => {
+      if (c.notificationId === null) return false;
+      const theirs = itemOfPayload(byId.get(c.notificationId)?.payload);
+      return theirs === null || theirs === item;
+    });
+  })();
+  if (!keep) return scoped;
+  const kept = await db.guestCapabilityGrant.findUnique({ where: { id: keep }, select: { id: true, createdAt: true } });
+  if (!kept) return scoped.filter((c) => c.id !== keep);
+  // Strictly older than the kept grant; ids are time-ordered (UUIDv7) and break a tie on the same instant.
+  const t = kept.createdAt.getTime();
+  return scoped.filter((c) => c.id !== keep && (c.createdAt.getTime() < t || (c.createdAt.getTime() === t && c.id < kept.id)));
+}
+
 function refused(reason: string): { ok: false } {
   emitEvent("capability.refused", { reason });
   return { ok: false };
@@ -355,11 +440,21 @@ export const capabilityService = {
    * known to be `sent`. Revokes nothing when `grantId` is unknown or no
    * longer live, so a failed or withdrawn link never takes the working one
    * with it. Idempotent. Returns the number of grants revoked now.
+   *
+   * Post-payment batch A2 (owner decision, 27 Nov 2026): which older grants
+   * go depends on the new grant's message (`supersedeScope`). A ticket
+   * message revokes only the older links of the same order item, so the
+   * second item's email no longer kills the first item's link. A staff
+   * resend still revokes every older link of the order, except the links
+   * of its own batch (one resend now sends every item).
    */
   async supersedePrevious(db: Db, grantId: string, now: Date = new Date()): Promise<number> {
-    const g = await db.guestCapabilityGrant.findUnique({ where: { id: grantId }, select: { id: true, orderId: true, purpose: true, createdAt: true, revokedAt: true, expiresAt: true } });
+    const g = await db.guestCapabilityGrant.findUnique({
+      where: { id: grantId },
+      select: { id: true, orderId: true, purpose: true, issuedFor: true, notificationId: true, createdAt: true, revokedAt: true, expiresAt: true },
+    });
     if (!g || g.revokedAt || g.expiresAt.getTime() <= now.getTime()) return 0;
-    const older = await db.guestCapabilityGrant.findMany({
+    const candidates = await db.guestCapabilityGrant.findMany({
       where: {
         orderId: g.orderId,
         purpose: g.purpose,
@@ -371,8 +466,9 @@ export const capabilityService = {
         // Created before this grant; ids are time-ordered (UUIDv7) and break a tie on the same instant.
         OR: [{ createdAt: { lt: g.createdAt } }, { createdAt: g.createdAt, id: { lt: g.id } }],
       },
-      select: { id: true },
+      select: { id: true, notificationId: true, createdAt: true },
     });
+    const older = await supersedeScope(db, g, candidates);
     if (!older.length) return 0;
     const r = await db.guestCapabilityGrant.updateMany({
       where: { id: { in: older.map((o) => o.id) }, revokedAt: null },

@@ -23,23 +23,23 @@ import { cn } from "@/lib/utils";
 const DIFFERENTIATORS = [
   {
     icon: Tag,
-    title: "The price you see is the price you pay",
-    body: "Taxes and booking fees are already inside every number on this site. If anything ever gets added at checkout, that's a bug and we treat it as one.",
+    title: "Know your total before you pay",
+    body: "For an inquiry, we confirm the price after checking your date and options. Review the total, including taxes and booking fees, before you pay.",
   },
   {
     icon: Leaf,
-    title: "Jain and pure-veg, confirmed in writing",
-    body: "Not a note in a form. We confirm it with the supplier's kitchen and print it on your voucher, so it can't be denied at the camp.",
+    title: "Find Jain and pure vegetarian options",
+    body: "Filter for activities with Jain or pure vegetarian options. Tell us what you need when you enquire so we can check with the operator.",
   },
   {
     icon: MessageCircle,
-    title: "A real person confirms before you pay",
-    body: "Tell us your dates. A named specialist checks availability with the operator and replies on WhatsApp in about 30 minutes with the exact price. Nothing is charged until you say yes.",
+    title: "We check your inquiry with the operator",
+    body: "Send us your dates. We’ll check availability and price with the operator and reply on WhatsApp. Sending an inquiry is free.",
   },
   {
     icon: CalendarCheck2,
-    title: "Free cancellation, stated plainly",
-    body: "Every activity says exactly when free cancellation ends, in plain language. Where a ticket is non-refundable, we say so before you pay.",
+    title: "See the cancellation terms before you pay",
+    body: "Check the experience for its cancellation deadline and any non-refundable terms.",
   },
 ];
 
@@ -70,14 +70,14 @@ export function WhyOutlyy({ className }: { className?: string }) {
 }
 
 const MARQUEE_ITEMS = [
-  { icon: Tag, label: "All-in pricing" },
-  { icon: Smartphone, label: "Your voucher on WhatsApp" },
-  { icon: MessageCircle, label: "Human reply in 30 minutes" },
+  { icon: Tag, label: "Price details before payment" },
+  { icon: Smartphone, label: "Help on WhatsApp" },
+  { icon: MessageCircle, label: "WhatsApp replies from our team" },
   { icon: Leaf, label: "Jain & pure-veg filters" },
-  { icon: Truck, label: "Hotel pickup with driver details" },
-  { icon: ShieldCheck, label: "Operator confirms before you pay" },
+  { icon: Truck, label: "Hotel pickup on selected experiences" },
+  { icon: ShieldCheck, label: "Operator checks for inquiries" },
   { icon: CalendarCheck2, label: "Free cancellation where available" },
-  { icon: ReceiptText, label: "GST invoice on every booking" },
+  { icon: ReceiptText, label: "Cancellation terms on each listing" },
 ];
 
 /**
@@ -123,10 +123,10 @@ export function TrustMarquee({ className }: { className?: string }) {
  */
 export function SocialProofStrip({ className }: { className?: string }) {
   const items = [
-    { value: "Nothing", label: "Charged before a human confirms your booking" },
-    { value: "30 min", label: `Reply promise, ${siteConfig.supportHours}` },
-    { value: "All-in", label: "One price, in your currency, with nothing added at checkout" },
-    { value: "Jain · veg", label: "Filters and meal requests confirmed in writing" },
+    { value: "Inquire", label: "Ask about a date and price without paying" },
+    { value: "WhatsApp", label: `Support ${siteConfig.supportHours}` },
+    { value: "Total price", label: "Review your total before paying" },
+    { value: "Jain · veg", label: "Meal options you can filter for" },
   ];
   return (
     <div
@@ -148,10 +148,10 @@ export function SocialProofStrip({ className }: { className?: string }) {
 /** Compact trust row for the ADP sidebar and checkout. */
 export function TrustSummary({ className }: { className?: string }) {
   const items = [
-    { icon: ShieldCheck, label: "We check with the operator before you pay" },
-    { icon: Tag, label: "All-in price. Nothing added at checkout" },
+    { icon: ShieldCheck, label: "We check inquiry dates and prices with the operator" },
+    { icon: Tag, label: "See the confirmed total before you pay" },
     { icon: CalendarCheck2, label: "Free cancellation where the operator allows it" },
-    { icon: Smartphone, label: "A named person replies in about 30 minutes" },
+    { icon: Smartphone, label: "Ask our team on WhatsApp" },
   ];
   return (
     <ul className={cn("space-y-2", className)}>

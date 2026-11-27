@@ -7,9 +7,12 @@ import { Button } from "@/components/ui/button";
 import { Alert, Card } from "@/components/ui/primitives";
 import { OrderRequestError, startRecovery, verifyRecovery } from "@/lib/api/order-status";
 import { cn } from "@/lib/utils";
+import { SupportLink } from "./support";
 import {
   CODE_LENGTH,
   CODE_STALE_AFTER_MS,
+  codeDestinationText,
+  offeredChannels,
   RESEND_AFTER_SECONDS,
   recoveryContact,
   validateRecovery,
@@ -33,14 +36,23 @@ import {
  * typed. A code older than the usual lifetime is announced as possibly
  * expired and a new one can be sent without losing the reference
  * (criterion 8). No analytics events are sent from this form.
+ *
+ * Post-payment batch A1 (owner approval 27 Nov 2026): the form offers only
+ * the channels that can deliver a code now (`channels`, from the server: on a
+ * status page the order's own verified channels, `unlockChannels`; on Find my
+ * booking the channels the server can send on), opens on the first, and says
+ * where the code goes. With one channel there is no choice to make; with none
+ * the form is replaced by the emailed link and support. Never "Text me a
+ * code" while texts cannot be sent.
  */
 
+// 16px text in every field (post-payment A1, mobile pass): iOS Safari zooms into a field under 16px and does not zoom back.
 const INPUT =
-  "min-h-12 w-full rounded-[var(--radius-control)] border bg-paper px-3 text-[0.95rem] outline-none focus:border-ink-900 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ink-800";
+  "min-h-12 w-full rounded-[var(--radius-control)] border bg-paper px-3 text-base outline-none focus:border-ink-900 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ink-800";
 const CODE_INPUT =
   "min-h-12 w-full rounded-[var(--radius-control)] border border-ink-200 bg-paper px-3 text-center text-lg font-bold tracking-[0.4em] tnum text-ink-900 outline-none focus:border-ink-900 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ink-800 disabled:opacity-60";
 
-const GENERIC_FAILURE = "We couldn't send that just now. Check your connection and try again, or message us on WhatsApp.";
+const GENERIC_FAILURE = "Check your connection and try again, or message us on WhatsApp.";
 const RATE_LIMITED = "Too many attempts in a short time. Wait a few minutes, then try again.";
 
 /**
@@ -58,13 +70,14 @@ export interface RecoveryUnlock {
   onRecovered: (reference: string) => void;
 }
 
-export function RecoveryForm({ unlock }: { unlock?: RecoveryUnlock } = {}) {
+export function RecoveryForm({ unlock, channels: given }: { unlock?: RecoveryUnlock; channels?: readonly RecoveryChannel[] } = {}) {
   const router = useRouter();
+  const channels = offeredChannels(given);
   const [input, setInput] = useState<RecoveryInput>({
     reference: unlock?.reference ?? "",
-    channel: "phone",
+    channel: channels[0] ?? "email",
     countryCode: unlock?.phone?.countryCode || "+91",
-    phone: unlock?.phone?.phone ?? "",
+    phone: channels.includes("phone") ? (unlock?.phone?.phone ?? "") : "",
     email: "",
   });
   const [errors, setErrors] = useState<RecoveryErrors>({});
@@ -123,6 +136,23 @@ export function RecoveryForm({ unlock }: { unlock?: RecoveryUnlock } = {}) {
     if (await send()) setStage("code");
   };
 
+  if (channels.length === 0) {
+    return (
+      <Card className={unlock ? "p-5" : "mt-6 p-5"} data-testid="recovery-unavailable">
+        <h2 id="recovery-title" ref={titleRef} tabIndex={unlock ? -1 : undefined} className={cn(unlock ? "text-lg" : "text-xl", "outline-none")}>
+          {unlock ? "Confirm it's you" : "Look up a booking"}
+        </h2>
+        <p className="mt-1.5 text-sm leading-relaxed text-ink-700">
+          We can&apos;t send a code for this booking right now. Open it from the link in the email we sent when you booked, or
+          message us with your reference and we&apos;ll help.
+        </p>
+        <div className="mt-3">
+          <SupportLink reference={unlock?.reference} size="sm" />
+        </div>
+      </Card>
+    );
+  }
+
   return (
     <Card className={unlock ? "p-5" : "mt-6 p-5"}>
       {stage === "details" ? (
@@ -131,9 +161,9 @@ export function RecoveryForm({ unlock }: { unlock?: RecoveryUnlock } = {}) {
             {unlock ? "Confirm it's you" : "Look up a booking"}
           </h2>
           {unlock ? (
-            <p className="text-sm text-ink-600">
-              Booking <strong className="tnum text-ink-900">{unlock.reference}</strong>. We send a 6-digit code to the contact you booked
-              with. No account or password needed.
+            <p className="text-sm text-ink-600" data-testid="code-destination">
+              {codeDestinationText(channels)} It confirms booking <strong className="tnum text-ink-900">{unlock.reference}</strong> is
+              yours. You won’t need an account or password.
             </p>
           ) : (
           <div>
@@ -163,35 +193,36 @@ export function RecoveryForm({ unlock }: { unlock?: RecoveryUnlock } = {}) {
           </div>
           )}
 
-          <fieldset>
-            <legend className="mb-1.5 text-sm font-bold text-ink-900">Send the code to</legend>
-            <div className="flex flex-wrap gap-2">
-              {(
-                [
-                  { id: "phone", label: "My phone number" },
-                  { id: "email", label: "My email" },
-                ] as const
-              ).map((c) => (
-                <label
-                  key={c.id}
-                  className={cn(
-                    "flex min-h-11 cursor-pointer items-center gap-2 rounded-full border px-3.5 py-2 text-sm font-semibold",
-                    input.channel === c.id ? "border-ink-900 bg-shell text-ink-900" : "border-ink-300 bg-paper text-ink-700",
-                  )}
-                >
-                  <input
-                    type="radio"
-                    name="channel"
-                    value={c.id}
-                    checked={input.channel === c.id}
-                    onChange={() => set("channel", c.id)}
-                    className="h-4 w-4 accent-ink-900"
-                  />
-                  {c.label}
-                </label>
-              ))}
-            </div>
-          </fieldset>
+          {channels.length > 1 ? (
+            <fieldset>
+              <legend className="mb-1.5 text-sm font-bold text-ink-900">Send the code to</legend>
+              <div className="flex flex-wrap gap-2">
+                {channels.map((id) => (
+                  <label
+                    key={id}
+                    className={cn(
+                      "flex min-h-11 cursor-pointer items-center gap-2 rounded-full border px-3.5 py-2 text-sm font-semibold",
+                      input.channel === id ? "border-ink-900 bg-shell text-ink-900" : "border-ink-300 bg-paper text-ink-700",
+                    )}
+                  >
+                    <input
+                      type="radio"
+                      name="channel"
+                      value={id}
+                      checked={input.channel === id}
+                      onChange={() => set("channel", id)}
+                      className="h-4 w-4 accent-ink-900"
+                    />
+                    {id === "phone" ? "My phone number" : "My email"}
+                  </label>
+                ))}
+              </div>
+            </fieldset>
+          ) : !unlock ? (
+            <p className="-mt-1 text-sm text-ink-600" data-testid="code-destination">
+              {codeDestinationText(channels)}
+            </p>
+          ) : null}
 
           {input.channel === "phone" ? (
             <div>
@@ -203,7 +234,7 @@ export function RecoveryForm({ unlock }: { unlock?: RecoveryUnlock } = {}) {
                   aria-label="Country code"
                   value={input.countryCode}
                   onChange={(e) => set("countryCode", e.target.value)}
-                  className="min-h-12 rounded-[var(--radius-control)] border border-ink-200 bg-paper px-2 text-sm font-semibold"
+                  className="min-h-12 rounded-[var(--radius-control)] border border-ink-200 bg-paper px-2 text-base font-semibold"
                 >
                   <option value="+91">+91</option>
                   <option value="+971">+971</option>
@@ -214,6 +245,7 @@ export function RecoveryForm({ unlock }: { unlock?: RecoveryUnlock } = {}) {
                   type="tel"
                   inputMode="numeric"
                   autoComplete="tel-national"
+                  enterKeyHint="send"
                   value={input.phone}
                   onChange={(e) => set("phone", e.target.value)}
                   aria-invalid={Boolean(errors.phone)}
@@ -237,6 +269,9 @@ export function RecoveryForm({ unlock }: { unlock?: RecoveryUnlock } = {}) {
                 id="recovery-email"
                 type="email"
                 autoComplete="email"
+                autoCapitalize="none"
+                spellCheck={false}
+                enterKeyHint="send"
                 value={input.email}
                 onChange={(e) => set("email", e.target.value)}
                 aria-invalid={Boolean(errors.email)}
@@ -341,7 +376,7 @@ function CodeStep({
   const verify = async (value: string) => {
     if (checking || sending) return;
     if (value.length !== CODE_LENGTH) {
-      setError(`Enter all ${CODE_LENGTH} digits.`);
+      setError(`Enter the full ${CODE_LENGTH}-digit code.`);
       return;
     }
     submitted.current = value;
@@ -392,8 +427,6 @@ function CodeStep({
     }
   }, [locked]);
 
-  const where = channel === "email" ? "the email address you entered" : "the phone number you entered";
-
   return (
     <div role="group" aria-labelledby="recovery-code-title" data-testid="recovery-code-step">
       <div className="flex items-start gap-3">
@@ -404,8 +437,17 @@ function CodeStep({
           </h2>
           <p className="mt-1 text-sm leading-relaxed text-ink-600" role="status" data-testid="recovery-generic-message">
             {sentAgain > 0 ? "We've sent another code if these details match. " : ""}
-            If these details match a booking, we&apos;ve sent a {CODE_LENGTH}-digit code to {where}. It can take a minute to arrive,
-            and it works for a few minutes.
+            {channel === "email" ? (
+              <>
+                If these details match a booking, we’ve sent a {CODE_LENGTH}-digit code to the email address you entered. It
+                may take a minute to arrive and expires after a few minutes.
+              </>
+            ) : (
+              <>
+                If the details match a booking, you’ll receive a {CODE_LENGTH}-digit code. It may take a minute to arrive and
+                expires after a few minutes.
+              </>
+            )}
           </p>
         </div>
       </div>
@@ -435,7 +477,7 @@ function CodeStep({
       </div>
 
       <p className="mt-3 text-sm text-ink-700" role="status" aria-live="polite">
-        {stale ? "Your code may have expired. Send a new one, your booking reference is kept." : ""}
+        {stale ? "Your code may have expired. Send a new one. We’ve kept your booking reference." : ""}
       </p>
 
       {problem && (

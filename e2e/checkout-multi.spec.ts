@@ -372,8 +372,8 @@ test.describe("/checkout with several instant items", () => {
     const left = page.getByTestId("checkout-left-payment");
     // Stripe's confirmation may not be in yet, so the page cannot know nothing was paid.
     await expect(left).toContainText("You left the payment page.");
-    await expect(left).toContainText("If you've just paid, don't pay again");
-    await expect(left).toContainText("Your details are kept.");
+    await expect(left).toContainText("If you paid, don’t pay again. We’re checking with Stripe");
+    await expect(left).toContainText("We’ve kept your details.");
     await expect(left).not.toContainText("Nothing was charged");
     // No way to start a second payment while the first page may still be paid.
     await expect(left.getByRole("button", { name: /Change something|Start again/ })).toHaveCount(0);

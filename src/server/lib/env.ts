@@ -125,6 +125,12 @@ const schema = z.object({
   RESEND_API_KEY: optionalStr,
   EMAIL_FROM_TRANSACTIONAL: optionalStr,
   EMAIL_REPLY_TO: optionalStr,
+  /**
+   * Post-payment batch A8: the signing secret of the Resend delivery webhook
+   * (`whsec_…`, from the Resend dashboard). Unset: `/api/webhooks/resend`
+   * answers 503 and reads nothing, and no row is ever marked delivered.
+   */
+  RESEND_WEBHOOK_SECRET: optionalStr,
   /** Preflight audit name (§18 §1.3); `OPS_ALERT_EMAIL` accepted as alias. */
   EMAIL_OPS_ALERT_TO: csv,
   OPS_ALERT_EMAIL: csv,

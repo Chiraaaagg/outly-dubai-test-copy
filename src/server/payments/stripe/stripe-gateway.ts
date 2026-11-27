@@ -415,7 +415,7 @@ export class StripeGateway implements PaymentGateway {
       session = await this.client.checkout.sessions.create(
         {
           mode: "payment",
-          line_items: [{ quantity: 1, price_data: { currency: currency.toLowerCase(), unit_amount: Number(input.amountMinor), product_data: { name: "Outly booking" } } }],
+          line_items: [{ quantity: 1, price_data: { currency: currency.toLowerCase(), unit_amount: Number(input.amountMinor), product_data: { name: "OUTLYY booking" } } }],
           allowed_payment_method_types: ["card"],
           adaptive_pricing: { enabled: false },
           payment_method_options: { card: { request_three_d_secure: "any" } },

@@ -108,7 +108,7 @@ export function ActivityCard({
       tone: "success",
       title: "Added to your inquiry",
       body: "Dates and guests can be set on the next step.",
-      action: { label: "Check availability & price", href: "/inquiry" },
+      action: { label: "Request availability & price", href: "/inquiry" },
     });
   };
 

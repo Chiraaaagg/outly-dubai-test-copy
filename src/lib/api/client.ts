@@ -157,7 +157,7 @@ export function errorFor(scenario: MockScenario): ApiError {
       return new ApiError(
         "Network unreachable",
         "offline",
-        "You appear to be offline. Check your connection and try again — nothing has been charged.",
+        "You appear to be offline. Check your connection and try again. Nothing has been charged.",
       );
     case "payment_failed":
       return new ApiError(
@@ -168,9 +168,9 @@ export function errorFor(scenario: MockScenario): ApiError {
       );
     case "payment_timeout":
       return new ApiError(
-        "Payment confirmation not received",
+        "Payment confirmation pending",
         "payment_timeout",
-        "We haven't heard back from the payment gateway. Do not pay again — we'll confirm within 10 minutes and message you either way.",
+        "We’re waiting for a response from the payment service. If you may have paid, check your booking status before trying again.",
         false,
       );
     case "sold_out":
@@ -191,7 +191,7 @@ export function errorFor(scenario: MockScenario): ApiError {
       return new ApiError(
         "Something went wrong at our end",
         "error",
-        "That's on us, not you. Try again in a moment — or message us on WhatsApp and we'll book it for you.",
+        "That's on us, not you. Try again in a moment. Or message us on WhatsApp and we'll book it for you.",
       );
   }
 }

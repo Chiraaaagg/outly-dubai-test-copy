@@ -35,8 +35,7 @@ export default function ComparePage() {
         <div>
           <h1 className="text-[1.75rem] sm:text-3xl">Compare experiences</h1>
           <p className="mt-1.5 text-[0.95rem] text-ink-600">
-            The attributes that actually decide it, pickup, confirmation, cancellation and food —
-            side by side.
+            The attributes that actually decide it, pickup, confirmation, cancellation and food. Side by side.
           </p>
         </div>
         {items.length > 0 && (

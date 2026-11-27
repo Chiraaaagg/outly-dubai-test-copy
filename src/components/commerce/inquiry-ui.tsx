@@ -54,7 +54,7 @@ export function ConfirmFirstNote({ className, compact }: { className?: string; c
 
 export function ResponsePromise({
   className,
-  prefix = "Free to ask",
+  prefix = "Free to enquire",
 }: {
   className?: string;
   prefix?: string;
@@ -64,8 +64,8 @@ export function ResponsePromise({
     <p className={cn("flex items-center gap-1.5 text-xs font-semibold text-ink-700", className)}>
       <Clock className="h-3.5 w-3.5 shrink-0 text-sun-500" aria-hidden="true" />
       {open
-        ? `${prefix} · reply in ~${SLA.responseMinutes} min`
-        : `${prefix} · team offline now, first reply when we open (${SLA.businessStart} ${SLA_TZ_LABEL})`}
+        ? `${prefix} · we aim to reply in ${SLA.responseMinutes} min`
+        : `${prefix} · our team opens at ${SLA.businessStart} ${SLA_TZ_LABEL}`}
     </p>
   );
 }
@@ -480,8 +480,7 @@ export function CustomerInquiryCard({
 export function IndicativePriceNote({ className }: { className?: string }) {
   return (
     <p className={cn("text-xs leading-relaxed text-ink-600", className)}>
-      This is the all-in price we expect to confirm. If anything changes, we tell you before you pay
-      anything.{" "}
+      We confirm your final price before you pay.{" "}
       <Link href="/faq#inquiry" className="font-bold text-sun-700 underline underline-offset-2">
         How it works
       </Link>

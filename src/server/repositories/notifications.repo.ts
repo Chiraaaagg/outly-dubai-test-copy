@@ -110,7 +110,17 @@ export const notificationsRepo = {
    * that provider message id. Status only moves forward (sent → delivered →
    * read); a late "delivered" after "read" does not regress the row.
    */
-  async applyProviderStatus(providerId: string, status: "sent" | "delivered" | "read" | "failed", at: Date, error?: string): Promise<number> {
+  async applyProviderStatus(providerId: string, status: "sent" | "delivered" | "read" | "failed" | "bounced", at: Date, error?: string): Promise<number> {
+    if (status === "bounced") {
+      // Post-payment batch A8: the recipient's server rejected the message. A bounce can follow an earlier
+      // "delivered" (the server accepted, then bounced), so it overrides that too, but never a row already failed.
+      // `definite:` keeps the outbox sweep from re-sending it.
+      const r = await prisma.notification.updateMany({
+        where: { providerId, status: { in: ["queued", "sent", "delivered"] } },
+        data: { status: "failed", failedAt: at, providerError: (error ?? "definite:bounced").slice(0, 500) },
+      });
+      return r.count;
+    }
     if (status === "failed") {
       const r = await prisma.notification.updateMany({
         where: { providerId, status: { in: ["queued", "sent"] } },
@@ -160,6 +170,17 @@ export const notificationsRepo = {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") return null;
       throw error;
     }
+  },
+
+  /**
+   * A stored webhook event that was never marked processed (its apply step
+   * failed, or the process died after storing it), by provider event id, or
+   * null when there is none or it was processed. Lets a redelivery finish
+   * the work instead of being dropped as a duplicate (fix round 1, M2).
+   */
+  async findUnprocessedWebhookEvent(provider: string, providerEventId: string): Promise<string | null> {
+    const row = await prisma.webhookEvent.findUnique({ where: { provider_providerEventId: { provider, providerEventId } }, select: { id: true, processedAt: true } });
+    return row && !row.processedAt ? row.id : null;
   },
 
   async markWebhookProcessed(id: string, error?: string): Promise<void> {

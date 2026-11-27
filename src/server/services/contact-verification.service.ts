@@ -146,6 +146,23 @@ export function deliveryReady(channel: Channel): boolean {
   return channel === "phone" ? smsMode() === "msg91" : emailAdapter.provider() === "resend";
 }
 
+/**
+ * Post-payment batch A1: the channels that can deliver a code right now, in
+ * the order checkout prefers them (phone first, then email). In production a
+ * phone code needs the server-owned MSG91 path (`deliveryReady`); while it is
+ * not set up only email is returned. The order-status projection filters an
+ * order's verified channels with this, and the "find your booking" page uses
+ * it to hide a channel whose code could never arrive.
+ */
+export function codeChannelsAvailable(): Channel[] {
+  return (["phone", "email"] as const).filter((c) => deliveryReady(c));
+}
+
+/** Whether a phone (SMS) code can be delivered right now (A1). */
+export function phoneCodesAvailable(): boolean {
+  return deliveryReady("phone");
+}
+
 /** Outside production a real provider sends only to the allowlist; the log adapters never deliver. */
 function suppressed(channel: Channel, recipient: string): boolean {
   const e = env();

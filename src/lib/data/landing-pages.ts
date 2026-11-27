@@ -46,7 +46,7 @@ export const landingPages: LandingPage[] = [
     intentLabel: "For Indian travellers",
     heroKicker: "Built for how Indians actually book Dubai",
     heroSub:
-      "All-in rupee pricing, UPI at checkout, pure-veg and Jain food you can filter for, and a real person on WhatsApp in about eight minutes.",
+      "View prices in rupees, then look for hotel pickup or Jain and pure vegetarian options that suit your group.",
     heroImage: "img:landing:dubai-activities-for-indians:0",
     body: [
       "Booking Dubai from India usually means choosing between three unsatisfying options. A local travel agent will hold your hand and quote in rupees, but the markup is invisible, the choice is whatever they have a relationship with, and there are no reviews to check. A global booking site will show you three hundred options priced in dirhams, take a foreign card, and have no idea what Jain food is. Or you can wait and book at the hotel desk in Dubai, at a twenty to fifty percent premium, from whichever operator pays the concierge the most.",
@@ -130,9 +130,9 @@ export const landingPages: LandingPage[] = [
     relatedCategories: ["desert-safari", "dubai-attractions", "family-activities"],
     whatsappPrompt: "Tell us your dates and group, we'll plan the whole trip in rupees.",
     meta: {
-      title: "Dubai Activities for Indian Travellers. INR Pricing, UPI, Jain Food",
+      title: "Dubai Activities for Indian Travellers",
       description:
-        "Book Dubai experiences in rupees with UPI, pure-veg and Jain food filters, hotel pickup and WhatsApp support in 8 minutes. All-in pricing with no fees added at checkout.",
+        "Plan Dubai activities from India. View prices in INR and look for options with hotel pickup, Jain food or pure vegetarian meals.",
       keywords: [
         "dubai activities for indians",
         "dubai tours in indian rupees",
@@ -147,7 +147,7 @@ export const landingPages: LandingPage[] = [
     intentLabel: "Pay by UPI",
     heroKicker: "Scan, pay, voucher on WhatsApp",
     heroSub:
-      "UPI is the first payment option at OUTLYY checkout. GPay, PhonePe, Paytm and any UPI app. No forex markup, no international card required.",
+      "Ask about UPI when we confirm an inquiry. If your listing uses instant checkout, you’ll pay by card.",
     heroImage: "img:landing:dubai-activities-with-upi:0",
     body: [
       "Most international activity sites treat UPI as an afterthought, if they support it at all. You get a card form built for a European traveller, an international transaction that your bank may decline, a currency conversion you did not choose, and a foreign transaction fee you discover on your statement two days later. For a family booking forty thousand rupees of experiences, that is real money and real friction.",
@@ -209,20 +209,20 @@ export const landingPages: LandingPage[] = [
     relatedCategories: ["dubai-attractions", "desert-safari", "cruises-yachts"],
     whatsappPrompt: "Payment not going through? We'll send you a direct link.",
     meta: {
-      title: "Book Dubai Activities with UPI. GPay, PhonePe, Paytm",
+      title: "UPI for Dubai Activities",
       description:
-        "Pay for Dubai tours and tickets with UPI. No forex markup, no international card needed. EMI above ₹15,000 and 30% deposits above ₹25,000.",
+        "Planning a Dubai booking from India? Check which payment methods are available for your experience and when you’ll see the amount due.",
       keywords: ["dubai activities upi", "book dubai tours with upi", "dubai tickets pay in rupees"],
     },
   },
   {
     slug: "last-minute-dubai-activities",
     topLevel: true,
-    h1: "Last-Minute Dubai Activities. Available Today & Tomorrow",
+    h1: "Last-Minute Dubai Activities",
     intentLabel: "Today & tomorrow",
     heroKicker: "Already in Dubai with an empty afternoon?",
     heroSub:
-      "Live availability, instant confirmation, and a QR voucher on WhatsApp in under a minute. Everything here can be booked for tonight or tomorrow.",
+      "Found something that fits your plans? Check whether it’s available for your date before you make your way there.",
     heroImage: "img:landing:last-minute-dubai-activities:0",
     body: [
       "Half of Dubai's visitors arrive with two days planned and five days booked. By day two the question changes from 'what should we see' to 'what can we actually get tomorrow', and that is a different problem, because the answer depends on live availability rather than on what a listicle recommends.",
@@ -280,9 +280,9 @@ export const landingPages: LandingPage[] = [
     relatedCategories: ["dubai-attractions", "water-activities", "cruises-yachts"],
     whatsappPrompt: "Need it for tonight? Message us, we'll call the operator directly.",
     meta: {
-      title: "Last-Minute Dubai Activities. Book for Today or Tomorrow",
+      title: "Last-Minute Dubai Activities",
       description:
-        "Same-day and next-day Dubai tours and tickets with live availability, instant confirmation and a WhatsApp voucher in under a minute. AED pricing for UAE residents.",
+        "Looking for something to do in Dubai today or tomorrow? Browse ideas and ask about availability for the date you need.",
       keywords: [
         "last minute dubai activities",
         "dubai activities today",
@@ -297,7 +297,7 @@ export const landingPages: LandingPage[] = [
     intentLabel: "Hotel pickup included",
     heroKicker: "No taxis, no meeting points, no herding seven people",
     heroSub:
-      "Door-to-door transfers with the driver's name, photo and number sent to you the evening before, and a live message when they're ten minutes away.",
+      "Check the pickup area and whether your ticket includes a shared or private transfer.",
     heroImage: "img:landing:dubai-activities-with-hotel-pickup:0",
     body: [
       "The single most common complaint about Dubai activity bookings is not the activity. It is the pickup. A vague ninety-minute window, no driver contact, a call centre that does not answer, and a family of seven standing in a hotel lobby wondering whether to give up and take two taxis. It happens constantly, and it is entirely preventable.",
@@ -370,9 +370,9 @@ export const landingPages: LandingPage[] = [
     relatedCategories: ["desert-safari", "dubai-city-tours", "family-activities"],
     whatsappPrompt: "Not sure your hotel is covered? Send us the name and we'll check.",
     meta: {
-      title: "Dubai Activities with Hotel Pickup. Door-to-Door Transfers",
+      title: "Dubai Activities with Hotel Pickup",
       description:
-        "Dubai tours with hotel pickup and drop included. Driver name, photo and number sent the night before. Private vehicle upgrades for groups of five or more.",
+        "Look for Dubai tours with hotel pickup. Check your listing for eligible locations, meeting instructions and private transfer options.",
       keywords: [
         "dubai activities with hotel pickup",
         "dubai tours with transfers",
@@ -387,7 +387,7 @@ export const landingPages: LandingPage[] = [
     intentLabel: "Save with combos",
     heroKicker: "Two or three at once, for less",
     heroSub:
-      "Every bundle shows what the same tickets cost bought separately, so you can check the saving instead of taking our word for it.",
+      "If you’re planning several visits, compare what each package includes and check which options are currently available.",
     heroImage: "img:landing:dubai-attraction-combos:0",
     body: [
       "Bundle pricing in travel is frequently dishonest. A 'combo' is advertised with a large percentage saving calculated against a gate price nobody pays, or against a walk-up rate that exists only in July. The number looks impressive and means nothing.",
@@ -450,9 +450,9 @@ export const landingPages: LandingPage[] = [
     relatedCategories: ["dubai-attractions", "theme-parks", "family-activities"],
     whatsappPrompt: "Want a custom bundle? Tell us what you'd like in it.",
     meta: {
-      title: "Dubai Attraction Combos. Verifiable Savings on Bundles",
+      title: "Dubai Attraction Combos & Bundles",
       description:
-        "Dubai combo tickets that show the separate-purchase price next to the bundle price. Burj Khalifa, Museum of the Future, Aquaventure, IMG Worlds and more.",
+        "Explore Dubai attraction combinations and see which visits each package lists. Check what is included before you choose.",
       keywords: ["dubai attraction combo", "dubai combo tickets", "dubai bundle deals"],
     },
   },
@@ -463,7 +463,7 @@ export const landingPages: LandingPage[] = [
     intentLabel: "Day trip",
     heroKicker: "One long day, properly organised",
     heroSub:
-      "Sheikh Zayed Grand Mosque, Qasr Al Watan and the Corniche, with hotel pickup from Dubai and a Hindi-speaking guide if you want one.",
+      "Look for the Abu Dhabi stops you want to see, then check pickup, admission and guide options before choosing your tour.",
     heroImage: "img:landing:abu-dhabi-day-tours-from-dubai:0",
     body: [
       "Abu Dhabi is ninety minutes from central Dubai, which makes it an easy day trip and a poor half-day one. The mosque alone deserves two hours, Qasr Al Watan another ninety minutes, and the drive is three hours of your day in total. Anyone selling you Abu Dhabi plus Ferrari World plus the Louvre in a single day is selling you a coach seat and a series of photographs taken through a window.",
@@ -519,9 +519,9 @@ export const landingPages: LandingPage[] = [
     relatedCategories: ["dubai-city-tours", "theme-parks", "family-activities"],
     whatsappPrompt: "Only have one day for Abu Dhabi? We'll build the timing around you.",
     meta: {
-      title: "Abu Dhabi Day Tours from Dubai. Grand Mosque & Qasr Al Watan",
+      title: "Abu Dhabi Day Tours from Dubai",
       description:
-        "Full-day Abu Dhabi tours from Dubai with hotel pickup, Sheikh Zayed Grand Mosque, Qasr Al Watan and lunch. Hindi-speaking guide available. All-in rupee pricing.",
+        "Compare day tours from Dubai to Abu Dhabi. Look for routes that visit Sheikh Zayed Grand Mosque or Qasr Al Watan, and check pickup details.",
       keywords: [
         "abu dhabi day tours from dubai",
         "sheikh zayed grand mosque from dubai",
@@ -538,7 +538,7 @@ export const landingPages: LandingPage[] = [
     intentLabel: "Burj Khalifa",
     heroKicker: "₹3,690 all-in, voucher on WhatsApp in a minute",
     heroSub:
-      "Levels 124 & 125, or SKY on 148. We tell you which slot is genuinely worth paying more for.",
+      "Choose the levels you’d like to visit and check what your preferred time slot includes.",
     heroImage: "img:landing:burj-khalifa-tickets:0",
     body: [
       "There are three Burj Khalifa tickets and the difference between them is mostly about crowds and time of day, not height. Levels 124 and 125 are the standard observation decks, and they carry the view that appears in every photograph of Dubai. Level 148, sold as At the Top SKY, is higher, has a separate lift, a lounge with refreshments and a hosted experience, and about a tenth of the people.",
@@ -588,9 +588,9 @@ export const landingPages: LandingPage[] = [
     relatedCategories: ["dubai-attractions", "dubai-city-tours", "luxury-experiences"],
     whatsappPrompt: "Sunset slot sold out? We watch for cancellations, ask us.",
     meta: {
-      title: "Burj Khalifa Tickets from India, ₹3,690 All-In",
+      title: "Burj Khalifa Tickets from India",
       description:
-        "Book Burj Khalifa level 124 & 125 tickets in rupees at ₹3,690 all-in. Instant WhatsApp voucher, free cancellation to 24 hours, level 148 SKY also available.",
+        "Compare Burj Khalifa tickets for Levels 124 and 125 or SKY on Level 148. Check your preferred time, ticket inclusions and applicable terms.",
       keywords: [
         "burj khalifa tickets",
         "burj khalifa ticket price in india",
@@ -601,11 +601,11 @@ export const landingPages: LandingPage[] = [
   {
     slug: "desert-safari-dubai",
     topLevel: false,
-    h1: "Desert Safari Dubai. Booked Properly",
+    h1: "Dubai Desert Safaris",
     intentLabel: "Desert safari",
     heroKicker: "From ₹2,990 with hotel pickup and dinner",
     heroSub:
-      "Pure-veg and Jain camps, a gentle option with no dune bashing, and driver details sent the night before.",
+      "Check pickup, the level of dune bashing and meal choices before you pick your safari.",
     heroImage: "img:landing:desert-safari-dubai:0",
     body: [
       "The desert safari is the most-booked experience in Dubai and the one that most often disappoints, for three predictable reasons: the pickup, the dune bashing and the food. All three are solvable at the point of booking, and none of them is solvable afterwards.",
@@ -664,9 +664,9 @@ export const landingPages: LandingPage[] = [
     relatedCategories: ["desert-safari", "family-activities", "luxury-experiences"],
     whatsappPrompt: "Travelling with parents? Ask us which safari actually suits them.",
     meta: {
-      title: "Desert Safari Dubai from ₹2,990. Veg, Jain & Gentle Options",
+      title: "Dubai Desert Safaris, Tours & Pickup Options",
       description:
-        "Dubai desert safari with hotel pickup, BBQ dinner and shows from ₹2,990 all-in. Pure-veg and Jain camps, plus a gentle safari with no dune bashing for seniors.",
+        "Compare Dubai desert safaris by hotel pickup, dune bashing, dinner and shows. Check the listing for meal choices and what’s included.",
       keywords: [
         "desert safari dubai",
         "desert safari dubai price",
@@ -680,7 +680,7 @@ export const landingPages: LandingPage[] = [
     h1: "Dubai Frame Tickets",
     intentLabel: "Dubai Frame",
     heroKicker: "₹1,690 all-in, about an hour, glass floor included",
-    heroSub: "Old Dubai on one side, the new skyline on the other, and the best-value view in the city.",
+    heroSub: "Old Dubai in one direction, the newer skyline in the other, and a glass floor beneath you.",
     heroImage: "img:landing:dubai-frame-tickets:0",
     body: [
       "The Dubai Frame is the most efficient hour in Dubai. A 150-metre gold picture frame standing in Zabeel Park, with the old city on one side and the modern skyline on the other, and a glass-floored walkway across the top that turns opaque as you step off it. It costs ₹1,690 all-in, takes about an hour, and is the single best-value attraction in the city.",
@@ -719,9 +719,9 @@ export const landingPages: LandingPage[] = [
     relatedCategories: ["dubai-attractions", "family-activities", "dubai-city-tours"],
     whatsappPrompt: "Planning a full day around this? We'll sequence it for you.",
     meta: {
-      title: "Dubai Frame Tickets, ₹1,690 All-In with Glass Floor",
+      title: "Dubai Frame Tickets",
       description:
-        "Book Dubai Frame tickets in rupees at ₹1,690 all-in including Zabeel Park entry. Instant WhatsApp voucher, glass-floor sky deck, free cancellation to 24 hours.",
+        "See old Dubai and the newer skyline from Dubai Frame’s glass-floor sky deck. Check the ticket inclusions and entry terms before you go.",
       keywords: ["dubai frame tickets", "dubai frame ticket price", "dubai frame booking"],
     },
   },
@@ -732,7 +732,7 @@ export const landingPages: LandingPage[] = [
     intentLabel: "Aquaventure",
     heroKicker: "₹7,290 all-in, and yes, lockers cost extra at the park",
     heroSub:
-      "The largest waterpark in the region. Full-day ticket, towels included, and we tell you what isn't.",
+      "Plan your waterpark day around your ticket. Check what’s included, which rides suit your group and what costs extra.",
     heroImage: "img:landing:atlantis-aquaventure-tickets:0",
     body: [
       "Aquaventure at Atlantis The Palm is the largest waterpark in the Middle East and needs an entire day to be worth its ticket. Families who arrive at one in the afternoon consistently report managing about half of it, which is a waste of ₹7,290. Arrive at opening.",
@@ -771,9 +771,9 @@ export const landingPages: LandingPage[] = [
     relatedCategories: ["water-activities", "family-activities", "theme-parks"],
     whatsappPrompt: "Booking for a big family? Ask us about group rates.",
     meta: {
-      title: "Atlantis Aquaventure Tickets, ₹7,290 All-In",
+      title: "Atlantis Aquaventure Waterpark Tickets",
       description:
-        "Aquaventure Waterpark tickets in rupees with towels included, senior rates at 60+, and honest information about what costs extra at the park.",
+        "Plan a day at Atlantis Aquaventure Waterpark. Check ticket options, what’s included and any costs or restrictions before you go.",
       keywords: ["atlantis aquaventure tickets", "aquaventure waterpark price", "atlantis dubai tickets"],
     },
   },
@@ -784,7 +784,7 @@ export const landingPages: LandingPage[] = [
     intentLabel: "Marina cruise",
     heroKicker: "₹2,790 all-in for two hours and dinner",
     heroSub:
-      "Skyline from the water, a proper vegetarian buffet, and calm enough for anyone prone to seasickness.",
+      "See the Marina skyline from a dhow over dinner. Check the menu if you have specific meal requirements.",
     heroImage: "img:landing:marina-cruise-dubai:0",
     body: [
       "Dubai looks better from the water than from any observation deck, and a Marina dhow cruise is the cheapest way to find that out. Two hours, dinner included, a live tanoura performance, and the towers of Dubai Marina lit up on both sides of a sheltered waterway that barely moves.",
@@ -829,9 +829,9 @@ export const landingPages: LandingPage[] = [
     relatedCategories: ["cruises-yachts", "family-activities", "luxury-experiences"],
     whatsappPrompt: "Need a Jain meal on board? Ask us and we'll confirm it in writing.",
     meta: {
-      title: "Dubai Marina Cruise with Dinner, ₹2,790 All-In",
+      title: "Dubai Marina Dinner Cruise",
       description:
-        "Two-hour Dubai Marina dhow cruise with buffet dinner and a full vegetarian section from ₹2,790 all-in. Jain meals on request. Calm water, two decks.",
+        "Take in the Dubai Marina skyline on a dhow dinner cruise. Check seating and meal options when you choose your ticket.",
       keywords: ["marina cruise dubai", "dhow cruise dubai marina", "dubai dinner cruise price"],
     },
   },
@@ -842,7 +842,7 @@ export const landingPages: LandingPage[] = [
     intentLabel: "For families",
     heroKicker: "Plans that work for a six-year-old and a sixty-eight-year-old",
     heroSub:
-      "Child and senior pricing shown before checkout, dietary filters that mean something, and pickup you can rely on.",
+      "Check age ranges and ticket rates for everyone going, then look for the pickup and meal options your group needs.",
     heroImage: "img:landing:dubai-activities-for-families:0",
     body: [
       "A family booking is not a bigger version of a solo booking. It is a different problem, with three constraints that most travel sites ignore entirely: everyone in the group has to be able to enjoy it, everyone has to be able to eat, and everyone has to get there together.",
@@ -889,9 +889,9 @@ export const landingPages: LandingPage[] = [
     relatedCategories: ["family-activities", "theme-parks", "desert-safari"],
     whatsappPrompt: "Group of five or more? Send us the ages and we'll plan the week.",
     meta: {
-      title: "Dubai Activities for Families. Child & Senior Rates Shown Up Front",
+      title: "Dubai Activities for Families",
       description:
-        "Family-friendly Dubai experiences with child, infant and senior pricing before checkout, Jain and pure-veg filters, gentle alternatives and reliable hotel pickup.",
+        "Plan a family day in Dubai. Compare experiences by age limits, available child or senior rates, pickup and meal options.",
       keywords: ["dubai activities for families", "dubai with kids", "family tours dubai"],
     },
   },
@@ -902,7 +902,7 @@ export const landingPages: LandingPage[] = [
     intentLabel: "For couples",
     heroKicker: "Private where it matters, timed for the right light",
     heroSub:
-      "We say plainly whether an experience is private or shared, and we schedule the ones that depend on golden hour.",
+      "Choose the kind of outing you want to share, then check the listed time and whether the experience is private or shared.",
     heroImage: "img:landing:dubai-activities-for-couples:0",
     body: [
       "Two things decide whether a couple's experience in Dubai is worth what it costs: whether it is genuinely private, and whether you are in the right place when the light is good. Both are routinely misrepresented.",
@@ -944,9 +944,9 @@ export const landingPages: LandingPage[] = [
     relatedCategories: ["luxury-experiences", "cruises-yachts", "desert-safari"],
     whatsappPrompt: "Planning a proposal or an anniversary? Tell us the date.",
     meta: {
-      title: "Dubai Activities for Couples. Private Experiences & Honeymoon Ideas",
+      title: "Dubai Activities for Couples & Honeymoons",
       description:
-        "Couple's experiences in Dubai with private versus shared stated plainly, golden-hour timing and occasion arrangements handled by a coordinator on WhatsApp.",
+        "Find ideas for two in Dubai. Compare private and shared outings, then check timing and what’s included for your date.",
       keywords: ["dubai activities for couples", "dubai honeymoon activities", "romantic things to do dubai"],
     },
   },
@@ -957,7 +957,7 @@ export const landingPages: LandingPage[] = [
     intentLabel: "Luxury",
     heroKicker: "A named coordinator, not a contact form",
     heroSub:
-      "Private charters, helicopters and desert camps, arranged by someone whose phone number you have.",
+      "Planning a charter, flight or desert outing? Share your date and group size to ask about available options and pricing.",
     heroImage: "img:landing:luxury-experiences-in-dubai:0",
     body: [
       "At this level, the risk is not the price. It is a supplier who takes a large booking and then handles it casually, a boat that leaves late, a helicopter slot that quietly moves, a camp that seats you next to a party of thirty. Failure costs far more than money when the occasion cannot be repeated.",
@@ -1002,9 +1002,9 @@ export const landingPages: LandingPage[] = [
     relatedCategories: ["luxury-experiences", "cruises-yachts", "desert-safari"],
     whatsappPrompt: "Tell us the date and group size, quote within two hours.",
     meta: {
-      title: "Luxury Experiences in Dubai. Private Charters & Concierge",
+      title: "Luxury Dubai Experiences & Private Charters",
       description:
-        "Private yacht charters, helicopter flights and exclusive desert camps in Dubai, each with a named coordinator, honest quotes within two hours and GST invoicing.",
+        "Explore private yacht charters, helicopter flights and desert experiences in Dubai. Check available options for your date and group.",
       keywords: ["luxury experiences dubai", "private yacht charter dubai", "dubai concierge"],
     },
   },

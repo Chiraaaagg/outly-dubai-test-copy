@@ -77,20 +77,18 @@ export function SisterBrandReviews({ limit, className }: { limit?: number; class
         What travellers say about {SISTER_BRAND.name}
       </h2>
       <p className="mt-2 max-w-3xl text-sm leading-relaxed text-ink-700">
-        OUTLYY is new, so it has no reviews yet, and we would rather show you nothing of our own than
-        make some up. These {sisterReviewStats.total} Google reviews belong to{" "}
-        <strong>{SISTER_BRAND.name}</strong>, {SISTER_BRAND.relationship}, which has been sending people
-        on holiday for years. They&rsquo;re about Holiday Planner&rsquo;s service, not about anything
-        you&rsquo;d book here. Same team, same phones.
+        These {sisterReviewStats.total} Google reviews are about the service at{" "}
+        <strong>{SISTER_BRAND.name}</strong>, {SISTER_BRAND.relationship}. OUTLYY hasn’t collected reviews of its
+        own yet.
       </p>
       <p className="mt-1 text-xs text-ink-500">
         {sisterReviewStats.average} average across {sisterReviewStats.total} reviews, as exported on {captured}.
-        Names are shortened and photographs left out because we do not have the reviewers&rsquo; permission to republish them.
+        We shorten names and leave out photos because we don’t have permission to republish them.
         {listing && (
           <>
             {" "}
             <a href={listing} target="_blank" rel="noreferrer noopener" className="font-semibold underline underline-offset-2">
-              Read them on Google
+              Read the reviews on Google
             </a>
             .
           </>

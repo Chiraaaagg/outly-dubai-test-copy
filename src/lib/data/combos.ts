@@ -45,7 +45,7 @@ export const combos: Combo[] = [
   {
     slug: "dubai-icons-combo",
     name: "Dubai Icons: Burj Khalifa + Frame + Museum of the Future",
-    tagline: "The three that everyone photographs, in one booking",
+    tagline: "Three Dubai landmarks for a first visit",
     heroImage: "img:combo:dubai-icons-combo:0",
     tier: "C",
     audience: "everyone",
@@ -80,7 +80,7 @@ export const combos: Combo[] = [
   {
     slug: "desert-and-dhow-family",
     name: "Desert Safari + Marina Dhow Cruise. Family Pack",
-    tagline: "Two evenings sorted, with veg and Jain food on both",
+    tagline: "A desert evening and dinner on the Marina",
     heroImage: "img:combo:desert-and-dhow-family:0",
     tier: "C",
     audience: "family",
@@ -115,7 +115,7 @@ export const combos: Combo[] = [
   {
     slug: "family-fun-pack",
     name: "Family Fun Pack: Aquaventure + Lost Chambers + IMG Worlds",
-    tagline: "Three days of children being too tired to argue",
+    tagline: "Water slides, aquarium exhibits and an indoor theme park",
     heroImage: "img:combo:family-fun-pack:0",
     tier: "C",
     audience: "family",
@@ -146,7 +146,7 @@ export const combos: Combo[] = [
   {
     slug: "honeymoon-signature",
     name: "Honeymoon Signature: Private Desert Camp + Sunset Yacht + Helicopter",
-    tagline: "Three days, three photographs you will actually print",
+    tagline: "A private camp, a sunset on the water and Dubai from above",
     heroImage: "img:combo:honeymoon-signature:0",
     tier: "D",
     audience: "couple",
@@ -185,7 +185,7 @@ export const combos: Combo[] = [
   {
     slug: "abu-dhabi-day-combo",
     name: "Abu Dhabi in a Day: Grand Mosque Tour + Ferrari World",
-    tagline: "Two Abu Dhabi headliners without booking two separate trips",
+    tagline: "A mosque visit and Ferrari World in one Abu Dhabi plan",
     heroImage: "img:combo:abu-dhabi-day-combo:0",
     tier: "C",
     audience: "family",
@@ -216,7 +216,7 @@ export const combos: Combo[] = [
   {
     slug: "theme-park-double",
     name: "Theme Park Double: IMG Worlds + Motiongate",
-    tagline: "Two parks, two days, one much smaller bill",
+    tagline: "Two theme parks over two days",
     heroImage: "img:combo:theme-park-double:0",
     tier: "C",
     audience: "family",

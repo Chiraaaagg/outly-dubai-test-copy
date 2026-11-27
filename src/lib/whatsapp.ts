@@ -95,7 +95,7 @@ const OPENERS: Record<WhatsAppIntent, string> = {
   dietary:
     "Hi OUTLYY! I need to check the food options (veg / Jain / halal) for this activity.",
   checkout_help: "Hi OUTLYY! I'm at checkout and need a hand finishing my booking.",
-  payment_help: "Hi OUTLYY! My payment didn't go through — can you help?",
+  payment_help: "Hi OUTLYY! My payment didn't go through. Can you help?",
   abandoned_checkout: "Hi OUTLYY! I'd like to finish the booking I started.",
   booking_support: "Hi OUTLYY! I need help with an existing booking.",
   cancellation: "Hi OUTLYY! I'd like to cancel a booking and check my refund.",

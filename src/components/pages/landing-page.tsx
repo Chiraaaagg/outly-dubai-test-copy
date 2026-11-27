@@ -75,7 +75,7 @@ export async function LandingPageView({ page }: { page: LandingPage }) {
           </p>
           <div className="mt-6 flex flex-wrap gap-3">
             <ButtonLink href="#experiences" size="lg">
-              Check availability &amp; price
+              Request availability &amp; price
               {Number.isFinite(cheapest) && ` · from ₹${cheapest.toLocaleString("en-IN")}`}
             </ButtonLink>
             <ButtonLink href="#faq" variant="outline" size="lg" className="bg-white/10 text-white">

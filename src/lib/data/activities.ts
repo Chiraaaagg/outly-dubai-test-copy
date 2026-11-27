@@ -204,7 +204,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "burj-khalifa-124-125",
     title: "Burj Khalifa: Level 124 & 125 Entry",
-    subtitle: "The view everyone comes to Dubai for, booked at the honest price",
+    subtitle: "Look out over Downtown Dubai from Levels 124 and 125.",
     tier: "A",
     categorySlug: "dubai-attractions",
     secondaryCategorySlugs: ["family-activities", "dubai-city-tours"],
@@ -320,7 +320,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "burj-khalifa-148-sky",
     title: "Burj Khalifa: Level 148 SKY + 124 & 125",
-    subtitle: "The highest deck, a separate lift, and somewhere to sit down",
+    subtitle: "Head to the SKY deck on Level 148 and visit Levels 124 and 125.",
     tier: "B",
     categorySlug: "dubai-attractions",
     secondaryCategorySlugs: ["luxury-experiences"],
@@ -373,7 +373,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "dubai-frame-tickets",
     title: "Dubai Frame Entry Ticket",
-    subtitle: "Old Dubai on one side, new Dubai on the other, glass floor in between",
+    subtitle: "Look across old Dubai and the newer skyline, with a glass floor beneath you.",
     tier: "A",
     categorySlug: "dubai-attractions",
     secondaryCategorySlugs: ["family-activities", "dubai-city-tours"],
@@ -434,7 +434,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "museum-of-the-future",
     title: "Museum of the Future Entry Ticket",
-    subtitle: "The most photographed building in Dubai, and worth the inside too",
+    subtitle: "Step inside the silver torus on Sheikh Zayed Road to explore exhibits about the future.",
     tier: "A",
     categorySlug: "dubai-attractions",
     secondaryCategorySlugs: ["family-activities"],
@@ -486,7 +486,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "dubai-aquarium-underwater-zoo",
     title: "Dubai Aquarium & Underwater Zoo",
-    subtitle: "Inside the Dubai Mall, a good hour when the heat wins",
+    subtitle: "Plan an aquarium and underwater zoo visit inside Dubai Mall.",
     tier: "A",
     categorySlug: "dubai-attractions",
     secondaryCategorySlugs: ["family-activities", "water-activities"],
@@ -523,7 +523,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "global-village",
     title: "Global Village Entry Ticket",
-    subtitle: "Ninety countries, street food and fireworks, for under a thousand rupees",
+    subtitle: "Browse country pavilions and try street food at Global Village.",
     tier: "A",
     categorySlug: "theme-parks",
     secondaryCategorySlugs: ["family-activities"],
@@ -562,7 +562,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "miracle-garden",
     title: "Dubai Miracle Garden Entry",
-    subtitle: "150 million flowers, and the photograph your mother will want",
+    subtitle: "Walk between flower-covered displays in Dubai Miracle Garden.",
     tier: "A",
     categorySlug: "dubai-attractions",
     secondaryCategorySlugs: ["family-activities"],
@@ -598,7 +598,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "evening-desert-safari-veg-jain",
     title: "Evening Desert Safari with Pure Veg & Jain Dinner",
-    subtitle: "Dune drive, camel ride, live shows, and food your family can actually eat",
+    subtitle: "Ride the dunes, try a camel ride and settle in for the camp shows. Check the vegetarian and Jain meal options when booking.",
     tier: "B",
     categorySlug: "desert-safari",
     secondaryCategorySlugs: ["family-activities"],
@@ -766,7 +766,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "gentle-desert-safari-seniors",
     title: "Gentle Desert Safari. No Dune Bashing",
-    subtitle: "Same camp, same dinner, same shows. A scenic drive instead of the rollercoaster.",
+    subtitle: "Take a scenic desert drive, then join the camp for dinner and shows.",
     tier: "B",
     categorySlug: "desert-safari",
     secondaryCategorySlugs: ["family-activities"],
@@ -844,7 +844,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "premium-private-desert-camp",
     title: "Private Desert Camp with Falconry & Fine Dining",
-    subtitle: "Your own camp, your own table, and nobody else's music",
+    subtitle: "Spend the evening at a private desert camp with a table for your group.",
     tier: "C",
     categorySlug: "desert-safari",
     secondaryCategorySlugs: ["luxury-experiences"],
@@ -925,7 +925,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "morning-quad-bike-desert",
     title: "Morning Quad Bike & Dune Buggy Ride",
-    subtitle: "Ninety minutes in the dunes before the heat arrives",
+    subtitle: "Head into the dunes for a 90-minute morning quad bike ride.",
     tier: "B",
     categorySlug: "desert-safari",
     secondaryCategorySlugs: ["water-activities"],
@@ -980,7 +980,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "dhow-cruise-marina-dinner",
     title: "Dubai Marina Dhow Cruise with Dinner",
-    subtitle: "Two hours on the water with a veg buffet and the skyline lit up",
+    subtitle: "See the Marina lights from a dhow during a two-hour cruise with a vegetarian buffet option.",
     tier: "B",
     categorySlug: "cruises-yachts",
     secondaryCategorySlugs: ["family-activities"],
@@ -1059,7 +1059,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "dhow-cruise-creek-heritage",
     title: "Dubai Creek Heritage Dhow Cruise with Dinner",
-    subtitle: "The old city from the water, on a traditional wooden dhow",
+    subtitle: "See old Dubai from a traditional wooden dhow on the Creek.",
     tier: "B",
     categorySlug: "cruises-yachts",
     secondaryCategorySlugs: ["dubai-city-tours", "family-activities"],
@@ -1097,7 +1097,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "luxury-yacht-tour-90min",
     title: "Shared Luxury Yacht Tour. Marina & Burj Al Arab",
-    subtitle: "Ninety minutes, open deck, and the photo you came for",
+    subtitle: "Spend 90 minutes on the water with time on the open deck.",
     tier: "C",
     categorySlug: "cruises-yachts",
     secondaryCategorySlugs: ["luxury-experiences", "water-activities"],
@@ -1152,7 +1152,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "atlantis-aquaventure",
     title: "Atlantis Aquaventure Waterpark, Palm Jumeirah",
-    subtitle: "The region's biggest waterpark, a genuine full day out",
+    subtitle: "Set aside a day for the rides and pools at Aquaventure.",
     tier: "B",
     categorySlug: "water-activities",
     secondaryCategorySlugs: ["family-activities", "theme-parks"],
@@ -1226,7 +1226,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "lost-chambers-aquarium",
     title: "The Lost Chambers Aquarium, Atlantis",
-    subtitle: "65,000 marine animals in an air-conditioned hour",
+    subtitle: "Spend some time indoors exploring the aquarium’s marine life.",
     tier: "A",
     categorySlug: "water-activities",
     secondaryCategorySlugs: ["family-activities", "dubai-attractions"],
@@ -1258,7 +1258,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "jet-ski-burj-al-arab",
     title: "30-Minute Jet Ski. Burj Al Arab Route",
-    subtitle: "The fastest way to the photograph everyone recognises",
+    subtitle: "Ride a jet ski with the Burj Al Arab in view.",
     tier: "B",
     categorySlug: "water-activities",
     secondaryCategorySlugs: ["cruises-yachts"],
@@ -1309,7 +1309,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "img-worlds-of-adventure",
     title: "IMG Worlds of Adventure Entry",
-    subtitle: "The world's largest indoor theme park, the summer answer",
+    subtitle: "Spend a Dubai afternoon indoors with theme park rides and attractions.",
     tier: "A",
     categorySlug: "theme-parks",
     secondaryCategorySlugs: ["family-activities"],
@@ -1351,7 +1351,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "motiongate-dubai",
     title: "Motiongate Dubai Entry",
-    subtitle: "Hollywood rides, and the zone that works for under-tens",
+    subtitle: "Look for Hollywood-themed rides and check the age and height requirements for your group.",
     tier: "A",
     categorySlug: "theme-parks",
     secondaryCategorySlugs: ["family-activities"],
@@ -1387,7 +1387,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "aya-universe",
     title: "AYA Universe Immersive Light Experience",
-    subtitle: "Twelve rooms of light and sound, gentle, indoor, ninety minutes",
+    subtitle: "Move through 12 indoor rooms of light and sound.",
     tier: "B",
     categorySlug: "theme-parks",
     secondaryCategorySlugs: ["family-activities", "dubai-attractions"],
@@ -1423,7 +1423,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "dubai-city-tour-half-day",
     title: "Half-Day Dubai City Tour with Hindi Guide",
-    subtitle: "Old Creek to Downtown in four hours, do this on day one",
+    subtitle: "See the old Creek and Downtown on a four-hour tour.",
     tier: "B",
     categorySlug: "dubai-city-tours",
     secondaryCategorySlugs: ["family-activities"],
@@ -1481,7 +1481,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "old-dubai-souk-walking-tour",
     title: "Old Dubai Souks & Street Food Walking Tour",
-    subtitle: "Three hours, an abra ride, and dinner you'll talk about",
+    subtitle: "Walk the souks, ride an abra and sit down to dinner on this three-hour tour.",
     tier: "B",
     categorySlug: "dubai-city-tours",
     secondaryCategorySlugs: ["family-activities"],
@@ -1537,7 +1537,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "abu-dhabi-city-tour-grand-mosque",
     title: "Abu Dhabi Day Trip with Sheikh Zayed Grand Mosque",
-    subtitle: "The mosque, the Corniche and Qasr Al Watan, one long, worthwhile day",
+    subtitle: "Plan a day around the Grand Mosque, the Corniche and Qasr Al Watan.",
     tier: "B",
     categorySlug: "dubai-city-tours",
     secondaryCategorySlugs: ["family-activities", "dubai-attractions"],
@@ -1618,7 +1618,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "ferrari-world-abu-dhabi",
     title: "Ferrari World Abu Dhabi Entry",
-    subtitle: "The fastest rollercoaster on earth, and a lot of air conditioning",
+    subtitle: "Spend time at Ferrari World’s mostly indoor park and check ride availability before you go.",
     tier: "A",
     categorySlug: "theme-parks",
     secondaryCategorySlugs: ["family-activities"],
@@ -1655,7 +1655,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "la-perle-show",
     title: "La Perle by Dragone. Aqua Theatre Show",
-    subtitle: "Ninety minutes of high diving and stagecraft, in the middle of the city",
+    subtitle: "See 90 minutes of high diving and stagecraft at La Perle.",
     tier: "B",
     categorySlug: "dubai-attractions",
     secondaryCategorySlugs: ["family-activities", "luxury-experiences"],
@@ -1711,7 +1711,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "private-yacht-charter-sunset",
     title: "Private Yacht Charter. Sunset, Marina",
-    subtitle: "The whole boat, your own guest list, priced per hour",
+    subtitle: "Charter the boat by the hour for your own group.",
     tier: "D",
     categorySlug: "luxury-experiences",
     secondaryCategorySlugs: ["cruises-yachts"],
@@ -1784,7 +1784,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "helicopter-tour-12min",
     title: "12-Minute Helicopter Tour over Palm & Burj Al Arab",
-    subtitle: "Twelve minutes that everyone who takes them talks about for years",
+    subtitle: "See Dubai from above on a 12-minute helicopter flight.",
     tier: "D",
     categorySlug: "luxury-experiences",
     secondaryCategorySlugs: ["dubai-attractions"],
@@ -1850,7 +1850,7 @@ export const activities: Activity[] = [
   makeActivity({
     slug: "hot-air-balloon-sunrise",
     title: "Sunrise Hot Air Balloon over the Dubai Desert",
-    subtitle: "Up before dawn, over the dunes, with falcons flying alongside",
+    subtitle: "Rise over the dunes before the day begins.",
     tier: "C",
     categorySlug: "luxury-experiences",
     secondaryCategorySlugs: ["desert-safari"],

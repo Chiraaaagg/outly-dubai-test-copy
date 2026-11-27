@@ -82,6 +82,8 @@ export const ROUTES: RouteCase[] = [
   R("POST", "tickets/exchange", "public", "json", () => import("@/app/api/tickets/exchange/route")),
   // Checkout redesign batch 3 review: "Remove access on this browser" (no body; idempotent).
   R("POST", "tickets/remove-access", "public", "none", () => import("@/app/api/tickets/remove-access/route")),
+  // Post-payment batch A4: the customer resend (download access checked inside, uniform 404).
+  R("POST", "orders/[reference]/tickets/resend", "public", "none", () => import("@/app/api/orders/[reference]/tickets/resend/route"), { params: { reference: "OUT-10000017" } }),
   R("POST", "tickets/orders/[reference]/resend", "admin", "none", () => import("@/app/api/tickets/orders/[reference]/resend/route"), { params: { reference: "OUT-10000017" } }),
   // B5 customer journeys (F15, F23, F51). Public: ownership (or the recovery
   // challenge) is checked inside, after the origin and media-type checks.
@@ -98,6 +100,7 @@ export const ROUTES: RouteCase[] = [
  */
 export const NON_BROWSER = new Set([
   "POST webhooks/whatsapp",
+  "POST webhooks/resend",
   "POST jobs/inquiry-sweep",
   "POST jobs/offline-conversions",
   "POST jobs/supplier-worker",

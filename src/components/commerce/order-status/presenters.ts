@@ -105,10 +105,14 @@ const STEP_TITLES: Record<TimelineRow["key"], string> = {
   refund: "Refund",
 };
 
-/** Payment, booking and tickets in that order, then the refund row when one applies. */
-export function timelineRows(steps: CustomerOrderStatus["steps"]): TimelineRow[] {
+/**
+ * Payment, booking and tickets in that order, then the refund row when one applies.
+ * Post-payment A7: the tickets row is named for what the order's files are (`orderDocumentWord`).
+ */
+export function timelineRows(steps: CustomerOrderStatus["steps"], word: OrderDocumentWord = "voucher"): TimelineRow[] {
   const keys = ["payment", "booking", "tickets"] as const;
-  const rows: TimelineRow[] = keys.map((key) => ({ key, title: STEP_TITLES[key], step: steps[key], statusText: STEP_STATUS_TEXT[steps[key].status] }));
+  const title = (key: (typeof keys)[number]) => (key === "tickets" ? capitalise(ORDER_WORD[word].noun) : STEP_TITLES[key]);
+  const rows: TimelineRow[] = keys.map((key) => ({ key, title: title(key), step: steps[key], statusText: STEP_STATUS_TEXT[steps[key].status] }));
   if (steps.refund) rows.push({ key: "refund", title: STEP_TITLES.refund, step: steps.refund, statusText: STEP_STATUS_TEXT[steps.refund.status] });
   return rows;
 }
@@ -134,6 +138,52 @@ export function formatMinor(minor: string, currency: "INR" | "AED"): string {
   const text = fraction === 0n ? whole : `${whole}.${fraction.toString().padStart(2, "0")}`;
   const sign = negative ? "-" : "";
   return currency === "INR" ? `${sign}₹${text}` : `${sign}AED ${text}`;
+}
+
+/* ---------------------------------------------------------------------------
+ * Tickets or voucher (post-payment A7)
+ * ------------------------------------------------------------------------ */
+
+/** What one item's entry document is called. */
+export type DocumentWord = "tickets" | "voucher";
+/** What an order's documents are called, together ("vouchers": several voucher items). */
+export type OrderDocumentWord = DocumentWord | "vouchers" | "mixed";
+
+/**
+ * "tickets" or "voucher" for one item, from what the projection says: the
+ * kind of its listed files first; then, when none is listed to this viewer
+ * (not ready yet, or locked), an open-dated ticket item (`ticket`) is
+ * tickets. Everything else keeps the established word, voucher.
+ */
+export function documentWord(item: Pick<CustomerItemStatus, "tickets" | "ticket">): DocumentWord {
+  const docs = item.tickets.documents;
+  if (docs.length > 0) return docs.every((d) => d.kind === "tickets_pdf") ? "tickets" : "voucher";
+  return item.ticket ? "tickets" : "voucher";
+}
+
+/** The order's word: one word when every item agrees (plural for several vouchers), "mixed" otherwise. No items reads as voucher. */
+export function orderDocumentWord(items: ReadonlyArray<Pick<CustomerItemStatus, "tickets" | "ticket">>): OrderDocumentWord {
+  const words = new Set(items.map(documentWord));
+  if (words.size > 1) return "mixed";
+  if (words.has("tickets")) return "tickets";
+  return items.length > 1 ? "vouchers" : "voucher";
+}
+
+/** Grammar per word: "Your tickets are ready" / "Your voucher is ready". */
+export const ORDER_WORD: Record<OrderDocumentWord, { noun: string; is: "is" | "are"; it: "it" | "them" }> = {
+  tickets: { noun: "tickets", is: "are", it: "them" },
+  voucher: { noun: "voucher", is: "is", it: "it" },
+  vouchers: { noun: "vouchers", is: "are", it: "them" },
+  mixed: { noun: "tickets and vouchers", is: "are", it: "them" },
+};
+
+function capitalise(text: string): string {
+  return text ? `${text.charAt(0).toUpperCase()}${text.slice(1)}` : text;
+}
+
+/** "Tickets" / "Voucher": an item's own heading. */
+export function documentHeading(word: OrderDocumentWord): string {
+  return capitalise(ORDER_WORD[word].noun);
 }
 
 /* ---------------------------------------------------------------------------
@@ -171,23 +221,25 @@ export function ticketStatusText(
   tickets: CustomerItemStatus["tickets"],
   itemState?: CustomerOrderState,
   canDownload = true,
+  word: DocumentWord = "voucher",
 ): string {
+  const { noun, is, it } = ORDER_WORD[word];
   switch (tickets.fulfilment) {
     case "issued":
-      if (tickets.documents.length) return "Your voucher is ready. Download it and keep it with you on the day.";
+      if (tickets.documents.length) return `Your ${noun} ${is} ready. Download ${it} and keep ${it} with you on the day.`;
       return canDownload
-        ? "Your voucher is being prepared. It appears here as soon as the file is ready."
-        : "Your voucher is ready. To keep it private, confirm it's you.";
+        ? `Your ${noun} ${is} being prepared. ${word === "tickets" ? "They appear" : "It appears"} here as soon as the file is ready.`
+        : `Your ${noun} ${is} ready. To keep ${it} private, confirm it's you.`;
     case "ticket_pending":
       // An item can hold its own confirmed booking while the order is still settling (e2e, final run).
-      if (itemState && BEFORE_CONFIRMATION.includes(itemState)) return "Your voucher will appear here once the operator confirms.";
-      return "Booked. Your voucher is being prepared.";
+      if (itemState && BEFORE_CONFIRMATION.includes(itemState)) return `Your ${noun} will appear here once the operator confirms.`;
+      return `Booked. Your ${noun} ${is} being prepared.`;
     case "attention":
-      return "We are having trouble getting your voucher from the operator. Our team has been alerted and is looking into it.";
+      return `We are having trouble getting your ${noun} from the operator. Our team has been alerted and is looking into it.`;
     case "not_applicable":
     default:
-      if (itemState && BEFORE_CONFIRMATION.includes(itemState)) return "Your voucher will appear here once the operator confirms.";
-      if (itemState && !["confirmed", "paid_confirmed_by_team", "completed", "cancellation_processing"].includes(itemState)) return "There is no voucher for this activity.";
+      if (itemState && BEFORE_CONFIRMATION.includes(itemState)) return `Your ${noun} will appear here once the operator confirms.`;
+      if (itemState && !["confirmed", "paid_confirmed_by_team", "completed", "cancellation_processing"].includes(itemState)) return `There ${word === "tickets" ? "are no tickets" : "is no voucher"} for this activity.`;
       return "There are no ticket files for this activity.";
   }
 }
@@ -278,8 +330,10 @@ export function announcementFor(
     const was = before.get(i.orderItemId);
     return i.tickets.fulfilment === "issued" && was && was.tickets.fulfilment !== "issued";
   });
-  if (ready.length === 1) return `${ready[0].title}: voucher ready.`;
-  if (ready.length > 1) return `${ready.length} vouchers ready.`;
+  if (ready.length === 1) return `${ready[0].title}: ${ORDER_WORD[documentWord(ready[0])].noun} ready.`;
+  if (ready.length > 1) {
+    return `${capitalise(ORDER_WORD[orderDocumentWord(ready)].noun)} ready for ${ready.length} activities.`;
+  }
   return null;
 }
 
@@ -328,4 +382,198 @@ export function statusSignature(s: Pick<CustomerOrderStatus, "state" | "updatedA
  */
 export function remedyText(kind: "release" | "refund" | null, multi = false): string | null {
   return kind ? remedySentence("then", multi) : null;
+}
+
+/* ---------------------------------------------------------------------------
+ * Progress while waiting (post-payment A6)
+ * ------------------------------------------------------------------------ */
+
+/** The order states while the booking is still on its way: the progress card shows in these. */
+export const IN_FLIGHT_STATES: readonly CustomerOrderState[] = Object.freeze([
+  "awaiting_payment",
+  "payment_processing",
+  "booking_processing",
+  "confirmed_ticket_pending",
+]);
+
+/** An item the operator has confirmed: its own ticket card shows (post-payment A5). */
+export const BOOKED_ITEM_STATES: readonly CustomerOrderState[] = Object.freeze(["confirmed_ticket_pending", "confirmed"]);
+
+export type MilestoneState = "done" | "current" | "waiting" | "failed" | "skipped";
+
+export interface Milestone {
+  key: "payment" | "operator" | "tickets";
+  /** What this milestone is, in its state: "Checking your payment", "Payment received". */
+  title: string;
+  state: MilestoneState;
+  /** The state in words, never colour alone (criterion 4). */
+  stateText: string;
+  /** One more fact from the projection (the server's step label, or "1 of 2 activities confirmed"), or null. */
+  detail: string | null;
+  /** When it happened (UTC ISO), only once done; null otherwise. */
+  at: string | null;
+}
+
+const MILESTONE_STATE_TEXT: Record<MilestoneState, string> = {
+  done: "Done",
+  current: "In progress",
+  waiting: "Waiting",
+  failed: "Did not complete",
+  skipped: "Not needed",
+};
+
+function milestoneState(status: StepStatus): MilestoneState {
+  switch (status) {
+    case "done":
+      return "done";
+    case "in_progress":
+      return "current";
+    case "failed":
+      return "failed";
+    case "not_applicable":
+      return "skipped";
+    default:
+      return "waiting";
+  }
+}
+
+/**
+ * The progress card's rows, from the projection's own steps and nothing else
+ * (no percentage, countdown or estimate: none has a true source, 20-status-ui
+ * §3.3). Payment, operator confirmation and tickets, for one item and for
+ * several alike (a multi-item order keeps its payment row). The first row not
+ * yet done is the current one; a time is shown only for a row that is done.
+ */
+export function progressMilestones(status: Pick<CustomerOrderStatus, "steps" | "items">): Milestone[] {
+  const { payment, booking, tickets } = status.steps;
+  const noun = ORDER_WORD[orderDocumentWord(status.items)].noun;
+  const Noun = capitalise(noun);
+  const multi = status.items.length > 1;
+
+  // Only one row is "current": the first that is in progress. A later in-progress row waits behind it.
+  const states = [payment, booking, tickets].map((step) => milestoneState(step.status));
+  const first = states.indexOf("current");
+  const [pay, op, tk] = states.map((st, i) => (st === "current" && i !== first ? "waiting" : st)) as [MilestoneState, MilestoneState, MilestoneState];
+
+  const booked = status.items.filter((i) => BOOKED_ITEM_STATES.includes(i.state) || i.state === "completed").length;
+  const operatorDetail =
+    multi && op !== "done" && booked > 0 ? `${booked} of ${status.items.length} activities confirmed` : booking.label || null;
+
+  const row = (key: Milestone["key"], state: MilestoneState, title: string, detail: string | null, at: string | null): Milestone => ({
+    key,
+    title,
+    state,
+    stateText: MILESTONE_STATE_TEXT[state],
+    // The server's step label, unless it only repeats the title.
+    detail: detail && detail.trim().toLowerCase() !== title.toLowerCase() ? detail : null,
+    at: state === "done" ? at : null,
+  });
+  // Titles are neutral until done, so a row never reads as done when it is not (review fix 3).
+  return [
+    row("payment", pay, pay === "done" ? "Payment received" : pay === "failed" ? "Payment did not go through" : "Checking your payment", payment.label || null, payment.at),
+    row("operator", op, op === "done" ? "Confirmed by the operator" : "Operator confirmation", operatorDetail, booking.at),
+    row(
+      "tickets",
+      tk,
+      tk === "done" ? `${Noun} ready` : tk === "skipped" ? `No ${noun} needed` : tk === "current" ? `Getting your ${noun}` : Noun,
+      tickets.label || null,
+      tickets.at,
+    ),
+  ];
+}
+
+/** The milestone the order is on now, or null when every row is settled. */
+export function currentMilestone(rows: readonly Milestone[]): Milestone | null {
+  return rows.find((r) => r.state === "current") ?? rows.find((r) => r.state === "waiting") ?? null;
+}
+
+/* ---------------------------------------------------------------------------
+ * Ticket email (post-payment A3, A4)
+ * ------------------------------------------------------------------------ */
+
+/** "14:43" in Dubai time, or "" for an unreadable instant. */
+export function dubaiClock(iso: string): string {
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return "";
+  return new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Dubai", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(ms));
+}
+
+export interface DeliveryText {
+  /** The one sentence on where the ticket email stands, in the recorded state's own word. */
+  line: string;
+  /** What the customer can do now, or null. */
+  next: string | null;
+  tone: "success" | "info" | "warning";
+}
+
+/**
+ * Words for `status.delivery` (contract: `TicketDeliveryView`). "Sent" means
+ * the provider accepted the message; "delivered" is said only for the
+ * `delivered` state, which comes from a verified provider event. A failure or
+ * bounce never hides the files: it says where they are on this page.
+ */
+export function deliveryText(
+  delivery: { state: "pending" | "sent" | "delivered" | "failed" | "bounced"; recipientMasked: string | null },
+  word: OrderDocumentWord,
+  canDownload: boolean,
+): DeliveryText {
+  const { noun, is } = ORDER_WORD[word];
+  const Noun = capitalise(noun);
+  const to = delivery.recipientMasked ? ` to ${delivery.recipientMasked}` : "";
+  const here = canDownload ? `You can download ${ORDER_WORD[word].it} on this page.` : `Confirm it's you on this page to download ${ORDER_WORD[word].it}.`;
+  switch (delivery.state) {
+    case "delivered":
+      return { line: `${Noun} delivered${to}.`, next: null, tone: "success" };
+    case "sent":
+      return { line: `${Noun} sent${to}.`, next: "If it isn't in your inbox, check your spam folder.", tone: "success" };
+    case "pending":
+      return { line: `We're emailing your ${noun}${to}.`, next: `It can take a few minutes. ${here}`, tone: "info" };
+    case "failed":
+      return { line: `We couldn't email your ${noun}${to}. Our team has been alerted.`, next: here, tone: "warning" };
+    case "bounced":
+      return {
+        line: `The email with your ${noun} couldn't be delivered${to}: the address rejected it.`,
+        next: `${here} To use another address, message us.`,
+        tone: "warning",
+      };
+    default:
+      return { line: `Your ${noun} ${is} on this page.`, next: null, tone: "info" };
+  }
+}
+
+function dubaiDay(ms: number): string {
+  return new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Dubai", weekday: "short", day: "numeric", month: "short" }).format(new Date(ms)).replace(",", "");
+}
+
+/**
+ * The resend button's wait, in words: "You can ask again at 14:52 Dubai time.",
+ * naming the day when it is not today in Dubai (the 24-hour limit can move it
+ * to tomorrow): "You can ask again on Wed 2 Jan at 13:12 Dubai time."
+ */
+export function resendWaitText(availableAtIso: string | null, nowMs: number = Date.now()): string {
+  const clock = availableAtIso ? dubaiClock(availableAtIso) : "";
+  if (!availableAtIso || !clock) return "You can ask again a little later.";
+  const at = Date.parse(availableAtIso);
+  const day = dubaiDay(at);
+  return day === dubaiDay(nowMs) ? `You can ask again at ${clock} Dubai time.` : `You can ask again on ${day} at ${clock} Dubai time.`;
+}
+
+/**
+ * The days of several activities, short: one day as "Tue 15 Jan 2030", two as
+ * "Fri 11 Jan and Tue 15 Jan 2030", more as a span "Fri 11 Jan to Tue 15 Jan
+ * 2030" (the progress card's label; each activity's own day is in its row
+ * below). Calendar days (YYYY-MM-DD, Dubai); unreadable keys are skipped.
+ */
+export function dateSpanText(dateKeys: readonly string[]): string {
+  const days = [...new Set(dateKeys.filter((k) => /^\d{4}-\d{2}-\d{2}$/.test(k)))].sort();
+  if (days.length === 0) return "";
+  const fmt = (k: string, year: boolean) =>
+    new Intl.DateTimeFormat("en-GB", { timeZone: "UTC", weekday: "short", day: "numeric", month: "short", ...(year ? { year: "numeric" } : {}) })
+      .format(new Date(`${k}T00:00:00Z`))
+      .replace(",", "");
+  const first = days[0];
+  const last = days[days.length - 1];
+  if (days.length === 1) return fmt(first, true);
+  const sameYear = first.slice(0, 4) === last.slice(0, 4);
+  return `${fmt(first, !sameYear)} ${days.length === 2 ? "and" : "to"} ${fmt(last, true)}`;
 }

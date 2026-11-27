@@ -85,7 +85,7 @@ describe("computeBreakdown", () => {
     const b = computeBreakdown(activity, pax({ adult: 2, child: 1, senior: 1 }));
     expect(b.lines.map((l) => [l.label, l.amount.inr, l.kind])).toEqual([
       ["Adults × 2", 2000, "base"],
-      ["Childs × 1", 700, "base"],
+      ["Children × 1", 700, "base"],
       ["Seniors × 1", 900, "base"],
     ]);
     expect(b.subtotal).toEqual({ inr: 3600, aed: 144 });
@@ -134,8 +134,8 @@ describe("computeBreakdown", () => {
     const b = computeBreakdown(activity, pax({ adult: 2, infant: 1 }), undefined, ["photo", "meal", "water"]);
     const addons = b.lines.filter((l) => l.kind === "addon");
     expect(addons.map((l) => [l.label, l.amount.inr, l.detail])).toEqual([
-      ["Photo pack", 500, "Per booking"],
-      ["Dinner upgrade", 600, "Per person"],
+      ["Photo pack", 500, "per booking"],
+      ["Dinner upgrade", 600, "per person"],
       ["Water", 0, "No extra charge"],
     ]);
     expect(b.total).toEqual({ inr: 3100, aed: 124 });
@@ -197,7 +197,7 @@ describe("applyCoupon", () => {
   it("rejects an unknown code", () => {
     const r = applyCoupon("NOPE", { inr: 10000, aed: 400 });
     expect(r.ok).toBe(false);
-    expect(r.message).toMatch(/don't recognise/);
+    expect(r.message).toMatch(/couldn’t find that promo code/);
   });
 
   it("is case- and whitespace-insensitive", () => {
@@ -219,7 +219,7 @@ describe("applyCoupon", () => {
   it("fixed coupons take their face value", () => {
     const r = applyCoupon("FAMILY7", { inr: 25000, aed: 1000 });
     expect(r.ok && r.discount).toEqual({ inr: 1500, aed: 65 });
-    expect(r.message).toBe("FAMILY7 applied — ₹1,500 off.");
+    expect(r.message).toBe("FAMILY7 applied. You save ₹1,500.");
   });
 });
 

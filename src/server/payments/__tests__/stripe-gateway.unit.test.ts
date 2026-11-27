@@ -70,7 +70,7 @@ describe("case 2: minor units", () => {
   it("AED is sent in fils and INR in paise: unit_amount equals amountMinor", async () => {
     const s = setup({ rails: ["aed_card", "inr_pacb"] });
     await session(s);
-    expect(createParams(s).line_items).toEqual([{ quantity: 1, price_data: { currency: "aed", unit_amount: 10_000, product_data: { name: "Outly booking" } } }]);
+    expect(createParams(s).line_items).toEqual([{ quantity: 1, price_data: { currency: "aed", unit_amount: 10_000, product_data: { name: "OUTLYY booking" } } }]);
     await session(s, { currency: "INR", amountMinor: 230_000n, idempotencyKey: "pay:order-a1:inr" });
     expect(createParams(s).line_items[0].price_data).toMatchObject({ currency: "inr", unit_amount: 230_000 });
   });

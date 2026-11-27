@@ -7,7 +7,7 @@ import type { MetadataRoute } from "next";
  */
 export default function manifest(): MetadataRoute.Manifest {
   return {
-    name: "OUTLYY: Dubai experiences",
+    name: "OUTLYY: Dubai Experiences",
     short_name: "OUTLYY",
     start_url: "/",
     display: "standalone",

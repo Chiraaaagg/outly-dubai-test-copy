@@ -73,7 +73,7 @@ function snap(sagaState: string, over: { item?: Partial<Item>; snapshot?: Partia
 }
 
 const confirmedBooking = { state: "confirmed", startMinutes: 600, confirmedAt: T0, cancelledAt: null, updatedAt: T0 };
-const validDoc = { id: DOC, kind: "tickets_pdf" as const, version: 1, status: "valid" as const, contentType: "application/pdf", byteSize: 2048, createdAt: T0.toISOString() };
+const validDoc = { id: DOC, kind: "voucher_pdf" as const, version: 1, status: "valid" as const, contentType: "application/pdf", byteSize: 2048, createdAt: T0.toISOString() };
 
 /** Keys that must never appear anywhere in a customer projection. */
 const FORBIDDEN = /^(net.*|.*NetMinor|margin.*|supplierBookingId|supplierId|supplierName|storageKey|sha256|code|ticketCode.*|gateway.*|providerPaymentId|providerRefundId|orderId|errorCode|reasonCode|leadPhone|leadEmail)$/i;
@@ -179,7 +179,7 @@ describe("projectCustomerStatus: one honest state per saga state", () => {
     // Batch 4 (CO-40): the voucher usually lands seconds after the confirm, so 5 s, not 15 s.
     expect(pending.pollAfterMs).toBe(5_000);
     const ready = projectCustomerStatus(snap("fulfilled", { captured: true, item: { booking: confirmedBooking, tickets: { fulfilment: "issued", documents: [validDoc] } } }), NOW);
-    expect(ready.items[0].tickets.documents).toEqual([{ id: DOC, kind: "tickets_pdf", version: 1, contentType: "application/pdf", byteSize: 2048, href: `/api/tickets/documents/${DOC}` }]);
+    expect(ready.items[0].tickets.documents).toEqual([{ id: DOC, kind: "voucher_pdf", version: 1, contentType: "application/pdf", byteSize: 2048, href: `/api/tickets/documents/${DOC}` }]);
     expect(ready.steps.tickets).toMatchObject({ status: "done", label: "Voucher ready" });
     expect(ready.pollAfterMs).toBeNull();
     // A caller who may only view (a guest session, a view_status grant) sees the state but no links.

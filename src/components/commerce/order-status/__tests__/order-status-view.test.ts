@@ -59,13 +59,23 @@ function status(over: Partial<CustomerOrderStatus> = {}): CustomerOrderStatus {
 const render = (s: CustomerOrderStatus) => renderToStaticMarkup(h(OrderStatusView, { initial: s }));
 
 describe("OrderStatusView: download access", () => {
-  it("authorised and ready: a real link to the document, one per document", () => {
+  it("authorised and ready: a real link to the document in the item's card, offered once", () => {
     const html = render(status());
-    expect(html).toContain('data-testid="voucher-actions"');
+    // A5: a booked item's file is in its own card; the top block is for items without a card.
+    expect(html).not.toContain('data-testid="voucher-actions"');
+    expect(html).toContain('data-testid="ticket-card-download"');
     const links = html.match(/<a [^>]*data-slot="download-button"[^>]*>/g) ?? [];
     expect(links).toHaveLength(1);
     expect(links[0]).toContain(`href="${DOC_HREF}"`);
     expect(links[0]).not.toContain("download=");
+    // The item list does not repeat the same link.
+    expect(html.match(new RegExp(`href="${DOC_HREF}"`, "g"))).toHaveLength(1);
+  });
+
+  it("an item without a card (completed) keeps its download in the top block", () => {
+    const html = render(status({ state: "completed", items: [item({ state: "completed", tickets: { fulfilment: "issued", documents: [doc] } })] }));
+    expect(html).toContain('data-testid="voucher-actions"');
+    expect(html).not.toContain('data-testid="ticket-card"');
   });
 
   it("not authorised (canDownload false): no download link and no document URL, the code unlock instead", () => {
@@ -73,9 +83,41 @@ describe("OrderStatusView: download access", () => {
     expect(html).not.toContain('data-testid="voucher-actions"');
     expect(html).not.toContain("/api/tickets/documents/");
     expect(html).toContain("Send me a code");
-    // Channel-neutral while codes may go by email (doc 29 §8.4 row 10).
     expect(html).not.toContain("Text me a code");
-    expect(html).toContain("mobile number or email you booked with");
+  });
+});
+
+describe("OrderStatusView: honest unlock (A1)", () => {
+  const lockedStatus = (unlockChannels?: ("email" | "phone")[]) =>
+    status({ canDownload: false, unlockChannels, items: [item({ tickets: { fulfilment: "issued", documents: [] } })] });
+
+  it("an order verified by email: the code goes to the email, and the page says so", () => {
+    const html = render(lockedStatus(["email"]));
+    expect(html).toContain("Send me a code");
+    expect(html).toContain("We&#x27;ll email a 6-digit code to the address you booked with.");
+    expect(html).not.toMatch(/text a 6-digit code|phone number you booked with/);
+  });
+
+  it("an order verified by phone, while texts work: the page names the phone", () => {
+    expect(render(lockedStatus(["phone"]))).toContain("We&#x27;ll text a 6-digit code to the phone number you booked with.");
+  });
+
+  it("no channel can deliver a code now: no code button, the emailed link and support instead", () => {
+    const html = render(lockedStatus([]));
+    expect(html).not.toContain("Send me a code");
+    expect(html).toContain("open this booking from the link in the email we sent you");
+    expect(html).toContain("Message us on WhatsApp");
+  });
+
+  it("an older projection without the field: email only, never a phone code", () => {
+    const html = render(lockedStatus(undefined));
+    expect(html).toContain("We&#x27;ll email a 6-digit code");
+    expect(html).not.toContain("text a 6-digit code");
+  });
+
+  it("the card says the file is ready but locked, and points to the unlock", () => {
+    const html = render(lockedStatus(["email"]));
+    expect(html).toContain("Your voucher is ready. Confirm it&#x27;s you above to download it.");
   });
 });
 
@@ -101,34 +143,54 @@ describe("OrderStatusView: confirmation card", () => {
     expect(html).not.toContain('data-testid="booking-confirmation"');
   });
 
-  it("not shown without a start time, rather than printing 00:00", () => {
-    expect(render(status({ items: [item({ timeslot: null, tickets: { fulfilment: "issued", documents: [doc] } })] }))).not.toContain(
-      'data-testid="booking-confirmation"',
-    );
+  it("without a start time: the date-only card, never 00:00", () => {
+    const html = render(status({ items: [item({ timeslot: null, tickets: { fulfilment: "issued", documents: [doc] } })] }));
+    expect(html).toContain('data-testid="booking-confirmation"');
+    expect(html).toContain('data-variant="date_only"');
+    const card = html.slice(html.indexOf('data-testid="ticket-card"'), html.indexOf("items-heading"));
+    expect(card).not.toContain("00:00");
+    expect(card).not.toContain("When (Dubai time)");
+  });
+
+  it("a free-text time (an agent's '21:00 sailing') falls back to the date, with the time as given", () => {
+    const html = render(status({ items: [item({ timeslot: "21:00 sailing", tickets: { fulfilment: "issued", documents: [doc] } })] }));
+    expect(html).toContain('data-variant="date_only"');
+    expect(html).toContain("21:00 sailing");
+  });
+
+  it("names a known pickup in the card instead of 'where to go is on your voucher'", () => {
+    const html = render(status({ items: [item({ pickup: { time: "16:30", hotel: "Synthetic Marina Hotel" }, tickets: { fulfilment: "issued", documents: [doc] } })] }));
+    const card = html.slice(html.indexOf('data-testid="ticket-card"'), html.indexOf("items-heading"));
+    expect(card).toContain("Pickup at");
+    expect(card).toContain("16:30");
+    expect(card).toContain("Synthetic Marina Hotel");
+    expect(card).toContain("Have the voucher PDF ready at pickup.");
+    expect(card).not.toContain("Where to go is on your voucher.");
+  });
+
+  it("a single-item order shows its total on the card", () => {
+    expect(render(status())).toContain(">Paid</p>");
   });
 });
 
 describe("OrderStatusView: tracker", () => {
-  it("single item: neutral row names with the state in words, never a done-sounding name beside a state that is not done", () => {
-    const html = render(
-      status({
-        state: "booking_processing",
-        steps: {
-          payment: { status: "done", label: "Payment received", at: null },
-          booking: { status: "in_progress", label: "", at: null },
-          tickets: { status: "not_started", label: "", at: null },
-          refund: null,
-        },
-        items: [item({ state: "booking_processing", tickets: { fulfilment: "not_applicable", documents: [] } })],
-      }),
-    );
+  it("single item, booked: neutral row names with the state in words", () => {
+    const html = render(status());
     expect(html).toMatch(/>Payment<\/p>/);
     expect(html).toMatch(/>Booking with the operator<\/p>/);
     expect(html).toMatch(/>Voucher<\/p>/);
-    expect(html).toContain(">Not started</p>");
-    expect(html).not.toContain("Voucher ready</p>");
+    expect(html).not.toContain('data-testid="booking-progress"');
     // The headline is visible in the server render (no opacity 0 from the entrance).
     expect(html).not.toMatch(/style="opacity:0/);
+  });
+
+  it("an open-dated tickets order names its row Tickets (A7)", () => {
+    const html = render(
+      status({ items: [item({ timeslot: null, ticket: { validUntil: null, validityCopy: null, nonRefundableCopy: "Non-refundable.", types: [] }, tickets: { fulfilment: "issued", documents: [{ ...doc, kind: "tickets_pdf" }] } })] }),
+    );
+    expect(html).toMatch(/>Tickets<\/p>/);
+    expect(html).toMatch(/<h4[^>]*>Tickets<\/h4>/);
+    expect(html).not.toMatch(/>Voucher<\/(p|h4)>/);
   });
 
   it("several items: one row per activity with its own state, including a partial outcome", () => {
@@ -146,7 +208,11 @@ describe("OrderStatusView: tracker", () => {
     expect(html).toContain("2 activities");
     expect(html).toMatch(/>Dhow cruise dinner<\/p><p[^>]*>[^<]+<\/p>/);
     expect(html).toMatch(/>Desert safari<\/p><p[^>]*>[^<]+<\/p>/);
-    expect(html).not.toContain('data-testid="booking-confirmation"');
+    // A5: the booked item gets its card; the refunding one does not.
+    expect(html).toContain('data-testid="booking-confirmation"');
+    expect(html.match(/data-testid="ticket-card"/g)).toHaveLength(1);
+    expect(html).toContain('data-item-id="a"');
+    expect(html).not.toContain('data-item-id="b"');
   });
 
   it("an unreadable total does not throw", () => {
@@ -155,10 +221,11 @@ describe("OrderStatusView: tracker", () => {
 });
 
 describe("OrderStatusView: unreadable amount (follow-up C)", () => {
-  it("hides the price and the confirmation card instead of printing 0.00", () => {
+  it("hides the price instead of printing 0.00; the card stays, without its Paid cell", () => {
     const html = render(status({ totalMinor: "not-a-number" }));
     expect(html).not.toContain("AED 0.00");
-    expect(html).not.toContain('data-testid="booking-confirmation"');
+    expect(html).toContain('data-testid="booking-confirmation"');
+    expect(html).not.toContain(">Paid</p>");
   });
 });
 

@@ -181,4 +181,4 @@ export const BUDGET_BANDS: { id: NonNullable<import("./types").BudgetBand>; labe
 
 /** The one sentence every inquiry-mode CTA traces back to (pivot §3.1). */
 export const CONFIRM_FIRST =
-  "We confirm with the operator before you pay — so you never get a voucher that fails at the gate.";
+  "We check availability with the operator before you pay.";

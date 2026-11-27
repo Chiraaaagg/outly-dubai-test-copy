@@ -15,12 +15,12 @@ import { WhatsAppCard } from "@/components/commerce/whatsapp";
 import { ButtonLink } from "@/components/ui/button";
 import { Breadcrumbs, Card, SectionHeading } from "@/components/ui/primitives";
 import { emergencyDisplay, emergencyHref, whatsappDisplay } from "@/lib/site-config";
-import { RESPONSE_SLA, SUPPORT_HOURS } from "@/lib/whatsapp";
+import { SUPPORT_HOURS } from "@/lib/whatsapp";
 
 export const metadata: Metadata = {
   title: "Help & Support",
   description:
-    "Find a booking, change a date, cancel, or reach a human on WhatsApp in about 30 minutes during our working hours.",
+    "Find support for an OUTLYY booking, ticket, date change, cancellation or payment.",
   alternates: { canonical: "/support" },
 };
 
@@ -35,35 +35,35 @@ const TASKS = [
   {
     icon: CalendarX2,
     title: "Cancel or change a date",
-    body: "Self-serve where the operator allows it. The exact refund or fee is shown before you confirm.",
+    body: "Open your booking to see the changes or cancellations it allows. Check the terms before you confirm.",
     href: "/manage-booking",
     cta: "Manage booking",
   },
   {
     icon: Truck,
     title: "My driver hasn't arrived",
-    body: "Call the emergency number on your voucher. Past 30 minutes we send another vehicle or refund in full.",
+    body: "Use the contact details in your booking instructions and share your reference and pickup location.",
     href: "/faq#pickup",
     cta: "Pickup help",
   },
   {
     icon: Utensils,
     title: "Dietary requirement wasn't met",
-    body: "Tell us the same day. We refund the meal portion and it goes on the supplier's scorecard.",
+    body: "Contact us while you’re at the venue and share what was confirmed and what was served.",
     href: "/faq#food",
     cta: "Read the policy",
   },
   {
     icon: CreditCard,
     title: "Payment problem",
-    body: "Failed UPI, double charge, or money debited without a booking, we reconcile these within an hour.",
+    body: "If you see a failed or duplicate payment, check your booking status and contact support before paying again.",
     href: "/faq#payments",
     cta: "Payment FAQs",
   },
   {
     icon: FileText,
     title: "GST invoice",
-    body: "Emailed with every confirmation. We can reissue with company billing details on request.",
+    body: "Contact us with your booking reference and ask which invoice details we can provide.",
     href: "/contact",
     cta: "Request an invoice",
   },
@@ -89,12 +89,11 @@ export default function SupportPage() {
         <Breadcrumbs items={[{ label: "Dubai", href: "/" }, { label: "Help" }]} className="mb-3" />
         <h1 className="text-[1.75rem] sm:text-3xl">How can we help?</h1>
         <p className="mt-1.5 text-[0.95rem] text-ink-600">
-          Most things below are faster to do yourself. If they&apos;re not, a real person answers on
-          WhatsApp in about 30 minutes.
+          Find your booking, check your options or contact our team on WhatsApp.
         </p>
 
         <section className="mt-8" aria-labelledby="tasks">
-          <SectionHeading id="tasks" kicker="Fastest route" title="Do it yourself" />
+          <SectionHeading id="tasks" kicker="Fastest route" title="Manage your booking" />
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {TASKS.map((t) => (
               <Card key={t.title} className="flex flex-col p-5">
@@ -119,17 +118,16 @@ export default function SupportPage() {
             title="How to reach us"
             sub={
               channelCount === 3
-                ? "Three channels, each for a different kind of problem."
+                ? "Choose the contact option that fits what you need."
                 : "One channel, a real person on the other end."
             }
           />
           <div className={`grid gap-4 ${channelCount === 3 ? "sm:grid-cols-3" : "sm:max-w-md"}`}>
             <Card className="p-5">
               <MessageCircle className="mb-2 h-5 w-5 text-whatsapp" aria-hidden="true" />
-              <h3 className="text-[1.02rem]">WhatsApp, the main one</h3>
+              <h3 className="text-[1.02rem]">WhatsApp</h3>
               <p className="mt-1.5 text-sm leading-relaxed text-ink-600">
-                {RESPONSE_SLA} during {SUPPORT_HOURS}. Out of hours you get an automatic
-                acknowledgement within a minute telling you when we&apos;ll reply.
+                Our team is available from {SUPPORT_HOURS}.
               </p>
               {wa && <p className="mt-2 font-bold text-ink-900">{wa}</p>}
             </Card>
@@ -148,10 +146,9 @@ export default function SupportPage() {
                 </Card>
                 <Card className="border-[color-mix(in_oklab,var(--color-danger)_25%,white)] p-5">
                   <Phone className="mb-2 h-5 w-5 text-[var(--color-danger)]" aria-hidden="true" />
-                  <h3 className="text-[1.02rem]">24/7 emergency</h3>
+                  <h3 className="text-[1.02rem]">Urgent booking help</h3>
                   <p className="mt-1.5 text-sm leading-relaxed text-ink-600">
-                    On every voucher. For anything happening right now in Dubai, a driver who
-                    hasn&apos;t come, a ticket rejected at a gate.
+                    Check your ticket or booking instructions for urgent contact details if a driver hasn’t arrived or you have trouble at the entrance.
                   </p>
                   <a href={emergencyTel} className="mt-2 block font-bold text-ink-900 underline">
                     {emergency}
@@ -166,7 +163,7 @@ export default function SupportPage() {
           className="mt-10"
           context={{ intent: "booking_support", placement: "support" }}
           title="Tell us what's happened"
-          body="Send your booking reference and what's gone wrong. We keep your order, supplier contact and driver details in one view, so you never have to explain it twice."
+          body="Send your booking reference and a short description of what happened."
         />
 
         <div className="mt-8 flex flex-wrap gap-2">

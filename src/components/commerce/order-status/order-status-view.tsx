@@ -1,12 +1,12 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
-import { Clock, Lock, RefreshCw, ShieldCheck, Users, WifiOff } from "lucide-react";
+import { Clock, Lock, RefreshCw, ShieldCheck, WifiOff } from "lucide-react";
 import { MotionConfig } from "motion/react";
 import { DownloadLink } from "@/components/checkout/download-button";
 import { Button, ButtonLink } from "@/components/ui/button";
 import { Alert, Card } from "@/components/ui/primitives";
-import type { CustomerOrderStatus } from "@/lib/customer-status";
+import type { CustomerOrderStatus, UnlockChannel } from "@/lib/customer-status";
 import type { ReturnHint } from "@/lib/checkout-return";
 import { fetchOrderStatus, OrderRequestError, removeBrowserAccess } from "@/lib/api/order-status";
 import { ticketTypeLine } from "@/lib/ticket-validity";
@@ -24,15 +24,26 @@ import {
 } from "@/lib/checkout-draft";
 import { useOptionalApp } from "@/components/providers/app-provider";
 import { resumePayment } from "@/lib/resume-payment";
+import { BookingProgressCard } from "./booking-progress-card";
 import { OrderStatus } from "./order-status-tracker";
-import { AnimatedTicket } from "./ticket-confirmation-card";
+import { celebrationAllowed, ConfettiBurst, markCelebrated, whenVisible } from "./ticket-confirmation-card";
+import { bookedItems, BookedItemCards, celebratesOnThisLoad, downloadLabel } from "./ticket-cards";
+import { TicketDelivery } from "./ticket-delivery";
 import {
   announcementFor,
+  BOOKED_ITEM_STATES,
+  dateSpanText,
+  documentHeading,
   documentLinkText,
+  documentWord,
   downloadableItems,
+  dubaiClock,
   formatMinor,
+  IN_FLIGHT_STATES,
   lockedVoucherItems,
+  orderDocumentWord,
   pollDelay,
+  progressMilestones,
   remedyText,
   stateLabel,
   statusSignature,
@@ -41,6 +52,7 @@ import {
   toneForState,
 } from "./presenters";
 import { RecoveryForm } from "./recovery-form";
+import { codeDestinationText, offeredChannels } from "./recovery";
 import { StatePill } from "./state-pill";
 import { DubaiTime } from "./status-timeline";
 import { SupportLink } from "./support";
@@ -78,6 +90,22 @@ type Connection = "ok" | "offline" | "rate_limited" | "lost_access";
  * the operator, the Ticket Confirmation Card follows (no barcode; "Show the
  * voucher PDF at the meeting point" only once a voucher is listed; confetti
  * once per session, never with reduced motion).
+ *
+ * Post-payment batch A (owner approval 27 Nov 2026):
+ *  - A1: "Send me a code" opens on the order's own verified channel
+ *    (`unlockChannels`) and names it; nothing is offered that cannot work;
+ *  - A3/A4: where the ticket email stands (`delivery`, in its recorded word)
+ *    and "Email my tickets again" under the server's limits;
+ *  - A5: one Ticket Confirmation Card per booked item, each with its own
+ *    downloads (the top block keeps only files of items without a card); one
+ *    celebration per order reference, when the first celebrating card is in
+ *    view, and only on a fresh confirmation (owner decision 27 Nov 2026: an
+ *    item booked while the page is open, or the Stripe return); the confetti
+ *    waits for the tab to be visible;
+ *  - A6: while the booking is on its way, the Booking Progress Card replaces
+ *    the tracker's item and progress cards (milestones from the projection's
+ *    steps, an indeterminate bar, no percentage or estimate);
+ *  - A7: "tickets" or "voucher" by what the files are.
  */
 /** Whether the page is visible, from `visibilitychange`; the server render assumes it is. */
 function subscribeVisibility(onChange: () => void): () => void {
@@ -92,14 +120,8 @@ function usePageVisible(): boolean {
   );
 }
 
-/** Booked by the operator: the states that show the confirmation card. */
-const BOOKED_STATES: CustomerOrderStatus["state"][] = ["confirmed_ticket_pending", "confirmed"];
-
-/** "14:43" in Dubai time. */
-function dubaiClockOf(iso: string): string {
-  const ms = Date.parse(iso);
-  if (!Number.isFinite(ms)) return "";
-  return new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Dubai", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(ms));
+function noSubscription(): () => void {
+  return () => {};
 }
 
 /** Major units of a minor-unit string, or null when it is unreadable: never a wrong figure (as `formatMinor`). */
@@ -192,8 +214,12 @@ export function OrderStatusView({ initial, returnHint = null }: { initial: Custo
     clearPaymentHandoff();
   }, [status.state, status.reference, cartLoaded, cart, clearCart]);
 
-  const downloads = downloadableItems(status);
+  const word = orderDocumentWord(status.items);
+  const carded = bookedItems(status.items);
+  // A5: a booked item's files are in its own card; the block at the top keeps the files of any other item.
+  const downloads = downloadableItems(status).filter((i) => !BOOKED_ITEM_STATES.includes(i.state));
   const allDocs = downloads.flatMap((i) => i.tickets.documents.map((doc) => ({ item: i, doc })));
+  const cardDocCount = carded.reduce((n, i) => n + i.tickets.documents.length, 0);
   const locked = lockedVoucherItems(status);
   const remedy = status.deadlines.remedyAtUtc ? remedyText(status.deadlines.remedyKind, status.items.length > 1) : null;
   const multi = status.items.length > 1;
@@ -214,27 +240,61 @@ export function OrderStatusView({ initial, returnHint = null }: { initial: Custo
     ? status.items.map((i) => ({ label: i.title, value: stateLabel(i.state) }))
     : // Neutral row names ("Payment", "Booking with the operator", "Voucher") with the state in words, so a
       // row never reads as done when it is not (review fix 3).
-      timelineRows(status.steps).map((row) => ({ label: row.title, value: STEP_STATUS_TEXT[row.step.status] }));
-  // The confirmation card: a single item the operator has confirmed, with a start time to show.
-  const ticketItem = !multi && BOOKED_STATES.includes(status.state) && firstItem?.timeslot && /^\d{2}:\d{2}$/.test(firstItem.timeslot) ? firstItem : null;
-  const ticketDate = ticketItem ? new Date(`${ticketItem.serviceDate}T${ticketItem.timeslot}:00+04:00`) : null;
-  // Doc 29 Batch 5: an open-dated ticket has no start time; the card shows the visit date, the validity and the download.
-  const openTicketItem = !multi && !ticketItem && BOOKED_STATES.includes(status.state) && firstItem?.ticket ? firstItem : null;
-  const openTicketDate = openTicketItem ? new Date(`${openTicketItem.serviceDate}T12:00:00+04:00`) : null;
-  const openTicketDocs = openTicketItem ? allDocs.filter((d) => d.item.orderItemId === openTicketItem.orderItemId) : [];
+      timelineRows(status.steps, word).map((row) => ({ label: row.title, value: STEP_STATUS_TEXT[row.step.status] }));
+  // A6: while the booking is on its way, the progress card stands in for the item and progress cards.
+  const onItsWay = IN_FLIGHT_STATES.includes(status.state);
+  const progress = onItsWay ? (
+    <BookingProgressCard
+      reference={status.reference}
+      activity={trackerItem.name}
+      dateText={multi || !firstItem ? dateSpanText(status.items.map((i) => i.serviceDate)) : [formatDateLong(firstItem.serviceDate), firstItem.timeslot].filter(Boolean).join(" · ")}
+      milestones={progressMilestones(status)}
+      active={status.pollAfterMs !== null && connection === "ok"}
+    />
+  ) : undefined;
 
-  // After an unlock the "Send me a code" form is gone: focus moves to the download that replaced it.
+  // A5 (fix round 2, owner decision 27 Nov 2026): celebrate only a fresh confirmation. The items booked in the
+  // status this load started with show their final card at once, unless this is the Stripe return; an item
+  // booked by a later poll enters. One burst per order reference, started when the first celebrating card is
+  // in view and the tab is visible, never with reduced motion (checked again at start).
+  const [bookedAtLoad] = useState(() => new Set(bookedItems(initial.items).map((i) => i.orderItemId)));
+  const entranceFor = useCallback((orderItemId: string) => celebratesOnThisLoad(orderItemId, bookedAtLoad, returnHint), [bookedAtLoad, returnHint]);
+  const [confetti, setConfetti] = useState(false);
+  const reference = status.reference;
+  const celebration = useRef<(() => void) | null>(null);
+  const startCelebration = useCallback(() => {
+    if (celebration.current || !celebrationAllowed(reference)) return;
+    celebration.current = whenVisible(document, () => {
+      if (!celebrationAllowed(reference)) return;
+      markCelebrated(reference);
+      setConfetti(true);
+    });
+  }, [reference]);
+  useEffect(
+    () => () => {
+      celebration.current?.();
+      celebration.current = null;
+    },
+    [],
+  );
+
+  // After an unlock the "Send me a code" form is gone: focus moves to the first download that replaced it
+  // (the top block, or the first card's).
   const focusDownloads = useRef(false);
   const downloadsRef = useRef<HTMLDivElement>(null);
+  const pageRef = useRef<HTMLDivElement>(null);
+  const visibleDocs = allDocs.length + cardDocCount;
   useEffect(() => {
-    if (focusDownloads.current && allDocs.length > 0) {
+    if (focusDownloads.current && visibleDocs > 0) {
       focusDownloads.current = false;
-      downloadsRef.current?.focus();
+      const target = downloadsRef.current ?? pageRef.current?.querySelector<HTMLElement>('[data-testid="ticket-card-download"] a');
+      target?.focus();
     }
-  }, [allDocs.length]);
+  }, [visibleDocs]);
 
   return (
-    <div className="mx-auto max-w-3xl" data-testid="order-status-page">
+    <div ref={pageRef} className="mx-auto max-w-3xl" data-testid="order-status-page">
+      {confetti && <ConfettiBurst onDone={() => setConfetti(false)} />}
       {/* One polite announcement per change of state (criterion 3). */}
       <p className="sr-only" role="status" aria-live="polite" aria-atomic="true" data-testid="status-announcer">
         {announcement}
@@ -287,7 +347,8 @@ export function OrderStatusView({ initial, returnHint = null }: { initial: Custo
             item={trackerItem}
             summaryTitle={multi ? "Your activities" : "Progress"}
             summary={trackerRows}
-            trackingStatus={`Ref ${status.reference} · updated ${dubaiClockOf(status.updatedAt)} Dubai time`}
+            progress={progress}
+            trackingStatus={`Ref ${status.reference} · updated ${dubaiClock(status.updatedAt)} Dubai time`}
             currency={status.currency}
           />
         </MotionConfig>
@@ -314,13 +375,10 @@ export function OrderStatusView({ initial, returnHint = null }: { initial: Custo
                 <div key={doc.id} className="space-y-1.5">
                   {/* A real link (review fix 5): the browser handles the file, a refused one shows its own
                       answer, it works without JavaScript and opens in a new tab. The route re-checks access. */}
-                  <DownloadLink
-                    href={doc.href}
-                    rel="noreferrer"
-                    className="w-full"
-                    label={downloadLabel(doc.kind, allDocs.length > 1 ? item.title : null)}
-                    aria-describedby={fileId}
-                  />
+                  <DownloadLink href={doc.href} rel="noreferrer" className="h-auto min-h-12 w-full py-2.5 text-center" aria-describedby={fileId}>
+                    {downloadLabel(doc.kind, null)}
+                    {allDocs.length > 1 ? <span className="sr-only">: {item.title}</span> : null}
+                  </DownloadLink>
                   <p id={fileId} className="text-sm text-ink-600">
                     {documentLinkText(doc, allDocs.map((d) => d.doc)).file}
                   </p>
@@ -329,10 +387,22 @@ export function OrderStatusView({ initial, returnHint = null }: { initial: Custo
             })}
           </div>
         )}
+        {status.delivery && (
+          <TicketDelivery
+            delivery={status.delivery}
+            word={word}
+            canDownload={status.canDownload !== false}
+            reference={status.reference}
+            onAnnounce={setAnnouncement}
+            onSent={() => void refresh()}
+            onLostAccess={() => setConnection("lost_access")}
+          />
+        )}
         {locked.length > 0 && (
           <div className="mx-auto max-w-md">
             <VoucherUnlock
               reference={status.reference}
+              channels={status.unlockChannels}
               onUnlocked={() => {
                 focusDownloads.current = true;
                 void refresh();
@@ -350,62 +420,13 @@ export function OrderStatusView({ initial, returnHint = null }: { initial: Custo
         </p>
       </section>
 
-      {ticketItem && ticketDate && paidMajor !== null && (
-        <section aria-label="Booking confirmation" className="mt-8 px-2" data-testid="booking-confirmation">
-          <AnimatedTicket
-            className="mx-auto"
-            title={ticketItem.title}
-            subtitle={
-              status.steps.booking.at
-                ? `Confirmed by the operator at ${dubaiClockOf(status.steps.booking.at)} Dubai time.`
-                : "Confirmed by the operator."
-            }
-            ticketId={status.reference}
-            amount={paidMajor}
-            currency={status.currency}
-            date={ticketDate}
-            cardHolder={ticketItem.paxLabel}
-            last4Digits="Where to go is on your voucher."
-            icon={<Users aria-hidden="true" className="size-6 shrink-0 text-sun-700" />}
-            // Only once this viewer has the voucher, and wherever the activity starts (review fix 4).
-            barcodeValue={allDocs.length > 0 ? "Show the voucher PDF at the meeting point" : ""}
-          />
-        </section>
-      )}
-
-      {openTicketItem?.ticket && openTicketDate && paidMajor !== null && (
-        <section aria-label="Booking confirmation" className="mt-8 px-2" data-testid="booking-confirmation">
-          <AnimatedTicket
-            className="mx-auto"
-            title={openTicketItem.title}
-            subtitle={
-              status.steps.booking.at
-                ? `Confirmed by the operator at ${dubaiClockOf(status.steps.booking.at)} Dubai time.`
-                : "Confirmed by the operator."
-            }
-            ticketId={status.reference}
-            amount={paidMajor}
-            currency={status.currency}
-            date={openTicketDate}
-            dateOnly
-            dateLabel="Visit date"
-            cardHolder={openTicketItem.paxLabel}
-            last4Digits="Show the tickets PDF at the entrance."
-            icon={<Users aria-hidden="true" className="size-6 shrink-0 text-sun-700" />}
-            barcodeValue=""
-            details={<TicketFacts ticket={openTicketItem.ticket} />}
-            action={
-              openTicketDocs.length > 0 ? (
-                <div className="flex flex-col gap-2" data-testid="ticket-card-download">
-                  {openTicketDocs.map(({ doc }) => (
-                    <DownloadLink key={doc.id} href={doc.href} rel="noreferrer" className="w-full" label={downloadLabel(doc.kind, null)} />
-                  ))}
-                </div>
-              ) : null
-            }
-          />
-        </section>
-      )}
+      <BookedItemCards
+        status={status}
+        items={carded}
+        amount={paidMajor}
+        entrance={entranceFor}
+        onEntranceStart={startCelebration}
+      />
 
       {/* TKT-8 (doc 22 B5): the time the remedy runs by itself. It can still move when the saga's own
           deadline moves; a fixed time from authorisation needs a server change (CO-05, reported). */}
@@ -428,6 +449,8 @@ export function OrderStatusView({ initial, returnHint = null }: { initial: Custo
         <ul className="space-y-4">
           {status.items.map((item, index) => {
             const ticketsHeading = `tickets-${index}`;
+            const itemWord = documentWord(item);
+            const hasCard = BOOKED_ITEM_STATES.includes(item.state);
             return (
               <Card as="li" key={item.orderItemId} className="p-5">
                 <div data-testid="order-item" data-item-state={item.state}>
@@ -490,7 +513,7 @@ export function OrderStatusView({ initial, returnHint = null }: { initial: Custo
 
                   <div className="mt-4 border-t border-dashed border-ink-300 pt-4">
                     <h4 id={ticketsHeading} className="text-[0.95rem] font-bold text-ink-900">
-                      Voucher
+                      {documentHeading(itemWord)}
                     </h4>
                     {item.pickup && (
                       <p className="mt-1 text-sm text-ink-700" data-testid="voucher-pickup">
@@ -504,6 +527,9 @@ export function OrderStatusView({ initial, returnHint = null }: { initial: Custo
                       canDownload={status.canDownload !== false}
                       headingId={ticketsHeading}
                       className="mt-1.5"
+                      word={itemWord}
+                      // A5: a booked item's files are in its card above; listing them again would repeat the link.
+                      showFiles={!hasCard}
                     />
                   </div>
 
@@ -550,34 +576,6 @@ export function OrderStatusView({ initial, returnHint = null }: { initial: Custo
   );
 }
 
-/** The download's visible name: tickets for a tickets PDF (doc 29 Batch 5), voucher otherwise; the activity when several files are listed. */
-function downloadLabel(kind: "tickets_pdf" | "voucher_pdf", title: string | null): string {
-  const base = kind === "tickets_pdf" ? "Download tickets" : "Download voucher";
-  return title ? `${base}: ${title}` : base;
-}
-
-/** The ticket card's rows for an open-dated ticket: validity, the tickets per type (combo offers list each type), non-refundable. */
-function TicketFacts({ ticket }: { ticket: NonNullable<CustomerOrderStatus["items"][number]["ticket"]> }) {
-  return (
-    <>
-      {ticket.validUntil && ticket.validityCopy ? (
-        <p>
-          <time dateTime={ticket.validUntil}>{ticket.validityCopy}</time>
-        </p>
-      ) : null}
-      {ticket.validityConcern ? <p className="text-ink-900">{ticket.validityConcern}</p> : null}
-      {ticket.types.length > 0 && (
-        <ul aria-label="Tickets issued" className="list-disc pl-5">
-          {ticket.types.map((t) => (
-            <li key={t.label}>{ticketTypeLine(t)}</li>
-          ))}
-        </ul>
-      )}
-      <p className="font-semibold text-ink-900">{ticket.nonRefundableCopy}</p>
-    </>
-  );
-}
-
 /**
  * Voucher ready, but this browser may not download it (CO-02): say so, and
  * start the existing order-bound recovery in place. The code goes only to the
@@ -585,13 +583,32 @@ function TicketFacts({ ticket }: { ticket: NonNullable<CustomerOrderStatus["item
  * access as Find my booking, and the page refreshes to show the download. No
  * account, no document link before that.
  */
-function VoucherUnlock({ reference, onUnlocked }: { reference: string; onUnlocked: () => void }) {
+function VoucherUnlock({ reference, channels: given, onUnlocked }: { reference: string; channels?: UnlockChannel[]; onUnlocked: () => void }) {
   const [open, setOpen] = useState(false);
   const [phone, setPhone] = useState<{ countryCode: string; phone: string } | undefined>(undefined);
+  // A1: only the channels the order was verified on that can deliver a code now, preferred first.
+  const channels = offeredChannels(given);
+  if (channels.length === 0) {
+    return (
+      <div className="mt-4 text-sm text-ink-700" data-testid="voucher-unlock">
+        <p className="flex gap-2">
+          <Lock className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+          <span>
+            To keep it private, open this booking from the link in the email we sent you, or message us with your reference and
+            we&apos;ll help.
+          </span>
+        </p>
+        <div className="mt-3">
+          <SupportLink reference={reference} size="sm" />
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="mt-4" data-testid="voucher-unlock">
       {open ? (
         <RecoveryForm
+          channels={channels}
           unlock={{
             reference,
             phone,
@@ -614,9 +631,9 @@ function VoucherUnlock({ reference, onUnlocked }: { reference: string; onUnlocke
           >
             Send me a code
           </Button>
-          <p className="mt-2 flex gap-2 text-sm text-ink-700">
+          <p className="mt-2 flex gap-2 text-sm text-ink-700" data-testid="unlock-destination">
             <Lock className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
-            We send a 6-digit code to the mobile number or email you booked with. No account or password needed.
+            <span>{codeDestinationText(channels)} You won’t need an account or password.</span>
           </p>
         </>
       )}
@@ -661,8 +678,8 @@ function RemoveBrowserAccess({ reference }: { reference: string }) {
       ) : (
         <div ref={confirmRef} tabIndex={-1} className="outline-none focus-visible:outline-3 focus-visible:outline-offset-2 focus-visible:outline-ink-800">
           <p>
-            This browser will stop showing this booking and its voucher. You can still open it from the email we sent, or with a code
-            sent to the phone you booked with.
+            This browser will stop showing this booking and its voucher. To reopen it, use the link in your email or request a new
+            verification code.
           </p>
           {phase === "failed" && (
             <p className="mt-2" role="alert">
@@ -681,10 +698,6 @@ function RemoveBrowserAccess({ reference }: { reference: string }) {
       )}
     </div>
   );
-}
-
-function noSubscription(): () => void {
-  return () => {};
 }
 
 /**
@@ -746,8 +759,8 @@ function ReturnToPayment({ reference, hint = null }: { reference: string; hint?:
               </ButtonLink>
             }
           >
-            If you paid on it, don&apos;t pay again: this page shows the payment as soon as Stripe confirms it. If you didn&apos;t, check
-            the price again at checkout; your details are kept.
+            If you paid, don’t pay again. This page updates when Stripe confirms payment. If you didn’t pay, check the price again at
+            checkout. We’ve kept your details.
           </Alert>
         </div>
       ) : (
@@ -758,7 +771,7 @@ function ReturnToPayment({ reference, hint = null }: { reference: string; hint?:
             </p>
           )}
           <Button variant={hint === "cancel" ? "primary" : "outline"} loading={busy} loadingLabel="Opening the payment page…" onClick={() => void go()}>
-            {hint === "cancel" ? "Return to payment" : "I left without paying: return to payment"}
+            {hint === "cancel" ? "Return to payment" : "Return to payment if you haven’t paid"}
           </Button>
           {outcome === "failed" && (
             <div ref={outcomeRef} tabIndex={-1} className="mt-2 text-sm text-ink-700 outline-none" role="status">

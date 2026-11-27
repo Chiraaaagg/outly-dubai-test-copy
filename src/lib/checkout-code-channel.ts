@@ -58,7 +58,9 @@ export function codeCopy(channel: CodeChannel | undefined, masked: string, codeL
     title: email ? "Confirm your email" : "Confirm your mobile number",
     description: resentAt
       ? `We sent a new code at ${resentAt} to ${masked}. The previous code no longer works.`
-      : `Enter the ${codeLength}-digit code we sent by ${email ? "email" : "SMS"} to ${masked}.${email ? " Check your spam folder if it isn't there in a minute." : ""}`,
+      : email
+        ? `Enter the ${codeLength}-digit code we emailed to ${masked}. If it doesn’t arrive, check your spam folder.`
+        : `Enter the ${codeLength}-digit code we sent by SMS to ${masked}.`,
     helpText: email ? "Wrong email?" : "Wrong number?",
   };
 }

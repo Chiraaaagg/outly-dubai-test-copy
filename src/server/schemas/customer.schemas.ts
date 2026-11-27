@@ -28,7 +28,7 @@ export const verifyOtpSchema = z
     code: z
       .string()
       .trim()
-      .min(OTP_LENGTH, `Enter all ${OTP_LENGTH} digits.`)
+      .min(OTP_LENGTH, `Enter the full ${OTP_LENGTH}-digit code.`)
       .max(OTP_LENGTH + 4, `Enter the ${OTP_LENGTH}-digit code.`),
   })
   .strict();
@@ -44,7 +44,7 @@ export const verifyOtpSchema = z
  */
 export const verifyWidgetSchema = z
   .object({
-    accessToken: z.string().trim().min(16, "Please try again.").max(4096, "Please try again."),
+    accessToken: z.string().trim().min(16, "Try again.").max(4096, "Try again."),
   })
   .strict();
 

@@ -84,7 +84,7 @@ export function normalisePhone(raw: string, countryCode = "+91"): NormalisedPhon
       countryCode: cc,
       national: digits,
       valid: false,
-      reason: `${rule.name} mobile numbers are ${describeLength(rule)} — you entered ${plural(digits.length)}.`,
+      reason: `${rule.name} mobile numbers have ${describeLength(rule)}. You entered ${plural(digits.length)}.`,
     };
   }
   if (rule.first && !rule.first.test(digits)) {
