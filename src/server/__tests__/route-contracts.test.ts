@@ -272,6 +272,13 @@ describe("API route contracts (no database)", () => {
     expect([...JOB_GETS.keys()].filter((k) => !present.has(k))).toEqual([]);
   });
 
+  it("routes that read payment gateways load the composition root (review 102c D5: the sweep's duplicate alerts)", () => {
+    for (const rel of ["jobs/inquiry-sweep", "jobs/payments-tick", "jobs/booking-tick", "checkout"]) {
+      const src = readFileSync(path.join(API_ROOT, rel, "route.ts"), "utf8");
+      expect(src, rel).toMatch(/^import "@\/server\/wiring";$/m);
+    }
+  });
+
   it("every private customer API route answers with private, no-store and no-referrer", () => {
     expect(privateHeaderProblems(API_ROOT)).toEqual([]);
   });

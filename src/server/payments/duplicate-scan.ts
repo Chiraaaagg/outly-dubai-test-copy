@@ -122,8 +122,11 @@ export function duplicateScanIncident(kind: Extract<OpsIncidentKind, "duplicate_
  * Read by the ops-alert sweep (ops-alert.service.ts `collectOpsIncidents`):
  *  - `duplicate_scan_full`: the tick's page (served providers) is full, so a
  *    newer duplicate may wait behind it;
- *  - `duplicate_no_gateway`: duplicates of a provider this deployment has no
- *    gateway for (or of another account of it) are held and not refunded.
+ *  - `duplicate_no_gateway`: duplicates of a provider account this
+ *    deployment has no gateway for (no gateway for the provider, or one for
+ *    another environment or account id) are held and not refunded. Such
+ *    rows are never marked, so the alert repeats daily until the
+ *    configuration is back or finance closes them.
  * Needs `src/server/wiring.ts` in the process (the inquiry-sweep route
  * imports it); without it nothing is raised and
  * `payments.duplicate_scan_unwired` is logged.

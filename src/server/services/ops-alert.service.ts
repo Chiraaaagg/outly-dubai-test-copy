@@ -188,7 +188,7 @@ export const OPS_INCIDENT_TITLES: Record<OpsIncidentKind, string> = {
   owner_alert_failed: "Owner alert of a one-person approval was not delivered",
   bulk_item_disarmed: "Bulk free-cancellation run left an armed listing on inquiry",
   duplicate_scan_full: "Duplicate payments waiting: automatic refunds may be held up",
-  duplicate_no_gateway: "Duplicate payments held: no payment gateway configured for their provider",
+  duplicate_no_gateway: "Duplicate payments held: no payment gateway for their provider account",
 };
 
 /** The stored row payload: what the email says plus its idempotency scope. */
