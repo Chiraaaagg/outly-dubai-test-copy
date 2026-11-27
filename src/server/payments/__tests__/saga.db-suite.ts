@@ -1,7 +1,7 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { dbEnabled, runId } from "../../__tests__/helpers/fixtures";
 import { assertDisposableDb, assertDisposableDbLive } from "../../__tests__/helpers/target-guard";
-import { checkedOut, cleanupB3, deliver, harness, sagaState, type Harness } from "./_b3-harness";
+import { checkedOut, cleanupB3, deliver, harness, sagaState, TRAVELLER_PHONE, type Harness } from "./_b3-harness";
 
 /**
  * The payment saga on Postgres against fake gateways and a fake engine
@@ -1068,6 +1068,214 @@ describe.skipIf(!dbEnabled)("B3 payment saga (disposable database)", () => {
       };
       expect(await x.saga.advanceOpen({ budgetMs: 2_500 })).toBe(3);
       expect((await checkedAtOf(ids)).every((v) => v !== null)).toBe(true);
+    });
+  });
+
+  describe("review 102c D5: the tick's duplicate scan never stalls", () => {
+    const DAY = 86_400_000;
+    /** Rows a test wrote straight into the scan's set: retired after it, so no later suite reads them. */
+    const written: string[] = [];
+    let k = 0;
+
+    afterEach(async () => {
+      if (written.length) await prisma.payment.updateMany({ where: { id: { in: written.splice(0) }, failureCode: null }, data: { failureCode: "zz_test_retired" } });
+      vi.restoreAllMocks();
+    });
+
+    async function ids() {
+      return (await import("../../lib/ids")).uuidv7;
+    }
+
+    /** An order with no saga (checkout never writes one; only a hand-made order has none). */
+    async function sagaLessOrder(): Promise<string> {
+      const uuidv7 = await ids();
+      k += 1;
+      const guest = await prisma.guest.create({ data: { id: uuidv7(), phoneE164: TRAVELLER_PHONE, fullName: `zz-b3-d5 Specimen ${run}` } });
+      const order = await prisma.order.create({
+        data: { id: uuidv7(), reference: `OUT-ZD5${run.toUpperCase()}${k}`, guestId: guest.id, status: "paid", rail: "self_serve", currency: "INR", subtotalInr: 230_000n, subtotalAed: 0n, totalInr: 230_000n, totalAed: 0n, leadName: `zz-b3-d5 Specimen ${run}`, leadPhone: TRAVELLER_PHONE, paidAt: new Date() },
+      });
+      return order.id;
+    }
+
+    /**
+     * A duplicate the scan has not settled yet, as `admit` leaves it once its first read is synced: gateway-verified,
+     * money held, no saga, no failure code. `providerPaymentId` names a payment at the fake provider, or none.
+     */
+    async function unsettledDuplicate(x: Harness, c: { r: { orderId: string }; providerOrderId: string }, providerPaymentId: string, over: { orderId?: string; provider?: string; providerAccountId?: string; status?: "authorized" | "captured"; createdAt?: Date } = {}) {
+      const uuidv7 = await ids();
+      const id = uuidv7();
+      const provider = over.provider ?? x.inr.provider;
+      await prisma.payment.create({
+        data: {
+          id,
+          orderId: over.orderId ?? c.r.orderId,
+          gateway: provider,
+          gatewayOrderId: c.providerOrderId,
+          gatewayPaymentId: providerPaymentId,
+          source: "gateway_verified",
+          rail: "inr_pacb",
+          provider,
+          providerAccountId: over.providerAccountId ?? x.inr.account().accountId,
+          environment: "test",
+          method: "upi",
+          amountMinor: 230_000n,
+          currency: "INR",
+          status: over.status ?? "captured",
+          ...(over.createdAt ? { createdAt: over.createdAt } : {}),
+        },
+      });
+      written.push(id);
+      return id;
+    }
+
+    const paymentOf = (id: string) => prisma.payment.findUniqueOrThrow({ where: { id } });
+    const readsOf = (x: Harness, providerPaymentId: string) => x.inr.callsOf("getPayment").filter((a) => a[0] === providerPaymentId).length;
+
+    it("a duplicate whose provider read no longer matches is quarantined and never read again; a config mismatch is not marked", async () => {
+      const x = await harness(prisma);
+      const c = await checkedOut(x, run, "INR", "upi");
+      const pid = c.gw.pay(c.providerOrderId);
+      const dup = await unsettledDuplicate(x, c, pid);
+      // The provider's read now differs from the row (found at settle time, not at admit).
+      x.inr.payments.get(pid)!.amountMinor = 229_999n;
+      // A row of another account than this deployment's gateway: configuration, which can heal, so never marked;
+      // it is left out of the page (never read) and reported like a provider with no gateway.
+      const other = c.gw.pay(c.providerOrderId);
+      const drift = await unsettledDuplicate(x, c, other, { providerAccountId: "fake-account-other" });
+      await x.saga.advanceOpen();
+      expect(await paymentOf(dup)).toMatchObject({ failureCode: "quarantined_amount_mismatch", status: "captured", capturedMinor: 0n });
+      expect(await paymentOf(drift)).toMatchObject({ failureCode: null, status: "captured", capturedMinor: 0n });
+      const reads = readsOf(x, pid);
+      expect(reads).toBe(1);
+      await x.saga.advanceOpen();
+      expect(readsOf(x, pid)).toBe(reads);
+      expect(readsOf(x, other)).toBe(0);
+      expect(await prisma.refund.count({ where: { paymentId: { in: [dup, drift] } } })).toBe(0);
+      expect(x.inr.callsOf("refund").filter((a) => a[0] === pid || a[0] === other)).toEqual([]);
+    });
+
+    it("a duplicate on an order with no saga is synced, left for finance and never read again", async () => {
+      const x = await harness(prisma);
+      const c = await checkedOut(x, run, "INR", "upi");
+      const pid = c.gw.pay(c.providerOrderId);
+      const dup = await unsettledDuplicate(x, c, pid, { orderId: await sagaLessOrder() });
+      await x.saga.advanceOpen();
+      // The provider's read is still recorded (captured, and its ledger entry), then nothing moves.
+      expect(await paymentOf(dup)).toMatchObject({ failureCode: "duplicate_no_saga", status: "captured", capturedMinor: 230_000n });
+      expect(await ledgerOf(dup)).toMatchObject({ kinds: ["capture"], sum: 230_000n });
+      const reads = readsOf(x, pid);
+      await x.saga.advanceOpen();
+      expect(readsOf(x, pid)).toBe(reads);
+      expect(await prisma.refund.count({ where: { paymentId: dup } })).toBe(0);
+    });
+
+    it("a duplicate hold the provider releases by itself waits for its expiry plus the grace; still held after that, it is left for finance", async () => {
+      const x = await harness(prisma);
+      const c = await checkedOut(x, run, "INR", "card");
+      await deliver(x, c.gw, "payment.authorized", c.gw.pay(c.providerOrderId));
+      expect((await sagaState(x, c.sagaId)).state).toBe("reserve_pending");
+
+      // INR card: debited at authorization, released by the provider (no void), three-day life.
+      const held = c.gw.pay(c.providerOrderId);
+      await deliver(x, c.gw, "payment.authorized", held);
+      const heldDup = await prisma.payment.findFirstOrThrow({ where: { orderId: c.r.orderId, gatewayPaymentId: held } });
+      written.push(heldDup.id);
+      expect(heldDup).toMatchObject({ status: "authorized", failureCode: null });
+
+      // One the provider gives no expiry and never lets go: its expiry is its authorisation time plus the method's life.
+      const forever = c.gw.pay(c.providerOrderId);
+      x.inr.payments.get(forever)!.authorizationExpiresAt = null;
+      await deliver(x, c.gw, "payment.authorized", forever);
+      const foreverDup = await prisma.payment.findFirstOrThrow({ where: { orderId: c.r.orderId, gatewayPaymentId: forever } });
+      written.push(foreverDup.id);
+      expect(foreverDup).toMatchObject({ status: "authorized", failureCode: null, authorizationExpiresAt: null });
+
+      // Inside their life both stay in the scan and are read again.
+      const reads = readsOf(x, forever);
+      await x.saga.advanceOpen();
+      expect(await paymentOf(heldDup.id)).toMatchObject({ status: "authorized", failureCode: null });
+      expect(readsOf(x, forever)).toBe(reads + 1);
+
+      // Past the expiry: the provider reports the first expired (synced, out of the scan, never marked); the
+      // other is still held, but inside the grace it is not marked yet.
+      x.clock.advance(3 * DAY + 60_000);
+      await x.saga.advanceOpen();
+      expect(await paymentOf(heldDup.id)).toMatchObject({ status: "expired", failureCode: null });
+      expect(await paymentOf(foreverDup.id)).toMatchObject({ status: "authorized", failureCode: null });
+
+      // Past the grace and still held: nothing here can release it, so finance decides; it is not read again.
+      x.clock.advance(60 * 60_000);
+      await x.saga.advanceOpen();
+      expect(await paymentOf(foreverDup.id)).toMatchObject({ status: "authorized", failureCode: "duplicate_hold_not_released" });
+      const after = readsOf(x, forever);
+      await x.saga.advanceOpen();
+      expect(readsOf(x, forever)).toBe(after);
+      expect(x.inr.callsOf("void")).toEqual([]);
+      expect(await prisma.refund.count({ where: { paymentId: { in: [heldDup.id, foreverDup.id] } } })).toBe(0);
+    });
+
+    it("rows with no gateway here never fill the page and are alerted; the page is oldest first; a full page is reported and alerted", async () => {
+      const uuidv7 = await ids();
+      const x = await harness(prisma);
+      const c = await checkedOut(x, run, "INR", "upi");
+      await deliver(x, c.gw, "payment.captured", c.gw.pay(c.providerOrderId));
+      const bare = await sagaLessOrder();
+      const tag = `zz-d5-${run}-${uuidv7().slice(-6)}`;
+      // More than a page of a provider this deployment has no gateway for (as Group C's Stripe fixtures are here), oldest of all.
+      const noGateway = Array.from({ length: 60 }, (_, i) => ({ id: uuidv7(), i }));
+      await prisma.payment.createMany({
+        data: noGateway.map(({ id, i }) => ({
+          id, orderId: bare, gateway: "zz-no-gateway", gatewayOrderId: `${tag}-o`, gatewayPaymentId: `${tag}-ng-${i}`, source: "gateway_verified", rail: "inr_pacb", provider: "zz-no-gateway",
+          providerAccountId: "zz-acct", environment: "test", method: "upi", amountMinor: 230_000n, currency: "INR", status: "captured", createdAt: new Date(Date.UTC(2000, 0, 1, 0, 0, i)),
+        })),
+      });
+      written.push(...noGateway.map((r) => r.id));
+      // The real duplicate, older than a page of this provider's rows that cannot be read (unknown at the provider).
+      // Before the fix (no order) the page was the 60 rows above on every tick, and this one was never refunded.
+      const pid = c.gw.pay(c.providerOrderId);
+      const dup = await unsettledDuplicate(x, c, pid, { createdAt: new Date(Date.UTC(2002, 0, 1)) });
+      const unreadable = Array.from({ length: 50 }, (_, i) => ({ id: uuidv7(), i }));
+      await prisma.payment.createMany({
+        data: unreadable.map(({ id, i }) => ({
+          id, orderId: bare, gateway: x.inr.provider, gatewayOrderId: `${tag}-o`, gatewayPaymentId: `${tag}-ur-${i}`, source: "gateway_verified", rail: "inr_pacb", provider: x.inr.provider,
+          providerAccountId: x.inr.account().accountId, environment: "test", method: "upi", amountMinor: 230_000n, currency: "INR", status: "captured",
+          // After the duplicate, before any row another suite left behind.
+          createdAt: new Date(Date.UTC(2003, 0, 1, 0, 0, i)),
+        })),
+      });
+      written.push(...unreadable.map((r) => r.id));
+
+      const { duplicateScanIncidents } = await import("../duplicate-scan");
+      const servedHere = (p: string) => (p === x.inr.provider ? x.inr : p === x.aed.provider ? x.aed : null);
+      const kinds = async () => {
+        const now = new Date();
+        return (await duplicateScanIncidents(new Date(now.getTime() - 72 * 3_600_000), now, servedHere)).map((i) => [i.kind, i.entityKind, i.entityId]);
+      };
+      // Before the tick: this provider's page (the duplicate and 50 unreadable rows) is full, and the 60 are held.
+      expect(await kinds()).toEqual([
+        ["duplicate_scan_full", "payment_saga", "duplicate_scan"],
+        ["duplicate_no_gateway", "payment_saga", "duplicate_scan"],
+      ]);
+
+      const errors: string[] = [];
+      const warns: string[] = [];
+      vi.spyOn(console, "error").mockImplementation((line: unknown) => void errors.push(String(line)));
+      vi.spyOn(console, "warn").mockImplementation((line: unknown) => void warns.push(String(line)));
+      await x.saga.advanceOpen();
+
+      // The duplicate is refunded although 60 older rows and 50 newer ones are waiting.
+      expect(await paymentOf(dup)).toMatchObject({ status: "refunded", refundedMinor: 230_000n, failureCode: null });
+      expect((await prisma.refund.findMany({ where: { paymentId: dup } })).map((r) => [r.reason, r.status])).toEqual([["duplicate_payment", "succeeded"]]);
+      // Rows with no gateway are neither read nor marked: they are refunded once the gateway is back.
+      expect(await prisma.payment.count({ where: { id: { in: noGateway.map((r) => r.id) }, failureCode: null, status: "captured" } })).toBe(60);
+      expect(warns.filter((l) => l.includes('"payments.duplicate_no_gateway"') && l.includes('"zz-no-gateway"'))).toHaveLength(1);
+      // An unreadable row is only a failed read: retried, never marked.
+      expect(await prisma.payment.count({ where: { id: { in: unreadable.map((r) => r.id) }, failureCode: null } })).toBe(50);
+      expect(x.inr.callsOf("getPayment").filter((a) => String(a[0]).startsWith(`${tag}-ur-`))).toHaveLength(49);
+      // The page (the duplicate and 49 unreadable rows) was full: the tick says so.
+      expect(errors.filter((l) => l.includes('"payments.duplicate_scan_full"'))).toHaveLength(1);
+      // After it: the held rows are still alerted.
+      expect(await kinds()).toContainEqual(["duplicate_no_gateway", "payment_saga", "duplicate_scan"]);
     });
   });
 });

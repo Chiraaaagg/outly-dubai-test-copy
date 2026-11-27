@@ -6,7 +6,7 @@ import { traveldeskListingService, type ReviewQueueRow } from "@/server/services
 import { BATCHES_HEADING_ID } from "./import-ui";
 import { requirePage } from "../../../../_lib/guard";
 import { DataTable, PageHeader, Panel, StatusPill, fmtDateTime, type DataColumn } from "../../../../_components/ui";
-import { ApplyBatchForm, CopyPhotosForm, PreviewForm, PublishForm, RestoreReplacedForm, ReviewForm, RollbackBatchForm } from "./import-forms";
+import { ApplyBatchForm, CopyPhotosForm, PreviewForm, PublishForm, ReviewActions, ReviewForm, RollbackBatchForm } from "./import-forms";
 
 /**
  * /admin/suppliers/traveldesk/import — the TravelDesk importer (doc 30 §2
@@ -57,7 +57,7 @@ const previewColumns: DataColumn<TdPreviewRow>[] = [
   { key: "notes", header: "Notes", cell: (r) => <span className="text-2xs text-ink-600">{[...r.reasons, ...r.warnings, ...(r.skippedOffers.length ? [`already linked: ${r.skippedOffers.join(", ")}`] : [])].join("; ") || "—"}</span> },
 ];
 
-function queueColumns(canPublish: boolean): DataColumn<ReviewQueueRow>[] {
+function queueColumns(canPublish: boolean, confirm: boolean): DataColumn<ReviewQueueRow>[] {
   return [
     {
       key: "listing",
@@ -96,9 +96,26 @@ function queueColumns(canPublish: boolean): DataColumn<ReviewQueueRow>[] {
       header: "Review",
       cell: (r) =>
         r.reviewedAt ? (
-          <div className="space-y-1 text-2xs text-ink-700">
-            <p>{r.replaces ? `Replaces ${r.replaces.slug}${r.replaces.deletedAt ? " (retired)" : ""}` : "Replaces nothing"}</p>
-            {canPublish && r.replaces?.deletedAt && <RestoreReplacedForm linkId={r.linkId} />}
+          <div className="space-y-2 text-2xs text-ink-700">
+            <p>
+              {r.movedFrom
+                ? `Replaces ${r.replaces?.title ?? "the old page"} (retired; its address ${r.slug} moved here from ${r.movedFrom})`
+                : r.replaces
+                  ? `Replaces ${r.replaces.slug}${r.replaces.deletedAt ? " (retired)" : ""}`
+                  : "Replaces nothing"}
+            </p>
+            {canPublish && (
+              <ReviewActions
+                linkId={r.linkId}
+                title={r.title}
+                slug={r.slug}
+                retireOptions={r.retireOptions}
+                cleanAddress={r.cleanAddress}
+                movedFrom={r.movedFrom}
+                canRestore={Boolean(r.replaces?.deletedAt)}
+                confirm={confirm}
+              />
+            )}
           </div>
         ) : (
           <ReviewForm linkId={r.linkId} title={r.title} suggestions={r.suggestions} needsConfirm={r.pendingFields.includes("tier") || r.pendingFields.includes("categorySlug")} />
@@ -193,7 +210,7 @@ export default async function TravelDeskImportPage({ searchParams }: { searchPar
       )}
 
       <Panel className="mb-5" title="2 · Review queue" sub="Fill location, meeting point, tier and category; give sibling pages their own copy; pick the old page this one replaces; then mark reviewed.">
-        <DataTable caption={`Imported listings, ${env}`} rows={queue} rowKey={(r) => r.linkId} columns={queueColumns(canPublish)} empty="No imported listing yet." />
+        <DataTable caption={`Imported listings, ${env}`} rows={queue} rowKey={(r) => r.linkId} columns={queueColumns(canPublish, env === "production")} empty="No imported listing yet." />
       </Panel>
 
       {canPublish && (

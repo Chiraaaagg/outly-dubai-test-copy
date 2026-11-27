@@ -94,6 +94,11 @@ export function configurePaymentGateways(next: GatewaySource | null): void {
   built = null;
 }
 
+/** Whether this process imported `src/server/wiring.ts` (a source is set, even one that configures no gateway). */
+export function paymentGatewaysWired(): boolean {
+  return source !== null;
+}
+
 function current(): GatewayRegistry {
   if (built) return built;
   const s = source?.();

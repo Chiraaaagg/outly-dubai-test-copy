@@ -25,6 +25,8 @@ import { readinessService } from "./readiness.service";
 import { recordEditorialLocks } from "./listing-locks";
 import { lockOfferLinks, TRAVELDESK_SUPPLIER_CODE, travelDeskMappingRow } from "./supplier-catalog.service";
 import { traveldeskDryRunService } from "./traveldesk-dry-run.service";
+import { latestReason, REDIRECT_ONLY_REASON_PREFIX, RETIRE_REASON_PREFIX, retireMarkerOf, undoCleanAddressInTx } from "./traveldesk-address";
+import { TOMBSTONE_MARK } from "../suppliers/traveldesk/clean-address";
 
 /**
  * TravelDesk importer, build N1 (doc 30 §2 step 2, §3.3–§3.5, §3.8, §5).
@@ -182,7 +184,7 @@ export const traveldeskImportService = {
 
     const tourIds = [...new Set(planned.map((l) => String(l.tourId)))];
     const offerIds = [...new Set(planned.flatMap((l) => l.options.map((o) => String(o.offerId))))];
-    const [contents, offerRows, tourRows, links, categories, products] = await Promise.all([
+    const [contents, offerRows, tourRows, links, categories, products, redirectSlugs] = await Promise.all([
       // Never the `raw` column (N0 review): the parsed fields only.
       prisma.supplierTourContent.findMany({
         where: { supplierId: supplier.id, environment, tourExternalId: { in: tourIds } },
@@ -193,6 +195,8 @@ export const traveldeskImportService = {
       prisma.supplierListingLink.findMany({ where: { supplierId: supplier.id, environment, deactivatedAt: null }, select: { tourExternalId: true, kind: true, arrival: true, route: true, fulfilment: true, splitNumber: true, offerExternalIds: true, product: { select: { slug: true } } } }),
       prisma.category.findMany({ where: { deletedAt: null }, select: { slug: true } }),
       prisma.product.findMany({ select: { slug: true } }),
+      // A redirect's old slug is reserved too (review P1-1): a new listing there would take over a retired or moved page's links.
+      prisma.productRedirect.findMany({ select: { oldSlug: true } }),
     ]);
     const moved = [...offerRows.map((o) => ["offer", o.externalId, o.payloadHash] as const), ...tourRows.map((t) => ["tour", t.externalId, t.payloadHash] as const)].filter(([k, id, h]) => hashesBefore.get(`${k}:${id}`) !== h);
     if (moved.length || offerRows.length !== offerIds.length) throw Errors.conflict("The TravelDesk catalogue changed while this preview was built — preview again");
@@ -222,7 +226,7 @@ export const traveldeskImportService = {
     const linkedSlugsByTour = new Map<number, string[]>();
     for (const l of links) linkedSlugsByTour.set(Number(l.tourExternalId), [...(linkedSlugsByTour.get(Number(l.tourExternalId)) ?? []), l.product.slug]);
     const known = new Set(categories.map((c) => c.slug));
-    const taken = new Set(products.map((p) => p.slug));
+    const taken = new Set([...products.map((p) => p.slug), ...redirectSlugs.map((r) => r.oldSlug)]);
     const sb = supplierBlock(supplier);
     const siblings = new Map<number, number>();
     for (const l of report.listings) siblings.set(l.tourId, (siblings.get(l.tourId) ?? 0) + 1);
@@ -658,33 +662,44 @@ const OPEN_ORDER = ["pending_payment", "paid", "supplier_pending", "confirmed", 
 
 /**
  * Undo the retire of the page this link replaced (doc 30 §3.9 restore path):
- * the old listing is restored and published again, the redirect to this
- * link's listing removed, and the link no longer names it. Shared by the
- * batch rollback and the publish service's restore. Refused when the old page
- * changed after the retire (deleted again for another reason, say: its latest
- * version is not the retire this link wrote; review 106 N1-11). No-op when
- * nothing was retired for this link.
+ * the redirect to this link's listing is removed and the link no longer
+ * names the page. A page this flow soft-deleted ("Replaced by ") is restored
+ * and published again; a page that was already archived and only got the
+ * redirect ("Redirected to ", review P2-2) stays archived. Shared by the
+ * batch rollback and the publish service's restore. A move to the clean
+ * address is undone first. Refused when the old page changed after the
+ * retire (its latest version carries no retire marker; review 106 N1-11) or
+ * still carries a tombstone address. No-op when nothing was retired.
  */
 export async function restoreReplacedInTx(tx: Tx, actor: Actor, linkId: string, reason: string, touched: string[]) {
+  // A listing moved to its clean address goes back to "<base>-<n>" first, so the old page gets its own slug back
+  // (traveldesk-address.ts); then the restore below runs on the state the publish left.
+  await undoCleanAddressInTx(tx, actor, linkId, reason);
   const redirect = await tx.productRedirect.findFirst({ where: { linkId } });
   if (!redirect) return null;
   const old = await tx.product.findUnique({ where: { id: redirect.oldProductId } });
+  let redirectOnly = false;
   if (old?.deletedAt) {
     requirePermission(actor, "products.publish");
-    const latest = await tx.productVersion.findUnique({ where: { productId_version: { productId: old.id, version: old.version } }, select: { reason: true } });
-    if (!latest?.reason?.startsWith(RETIRE_REASON_PREFIX)) throw Errors.conflict(`"${old.slug}" changed after it was retired — restore it from the console instead`, { slug: old.slug });
-    const version = old.version + 1;
-    const written = await tx.product.updateMany({ where: { id: old.id, version: old.version }, data: { deletedAt: null, status: "published", version, publishedAt: old.publishedAt ?? new Date() } });
-    if (written.count !== 1) throw Errors.conflict(`"${old.slug}" changed while it was being restored — try again`);
-    await tx.productVersion.create({ data: { id: uuidv7(), productId: old.id, version, content: old.content as Prisma.InputJsonValue, status: "published", actorId: actor.id, reason } });
-    await audit(actor, "activity.restore", { type: "product", id: old.id }, { before: { status: old.status, deletedAt: old.deletedAt }, after: { status: "published", deletedAt: null, restoredFrom: "replacement_rollback", linkId }, reason }, tx);
-    touched.push(old.id);
+    // Never published under a tombstone (review P2-1): the move must be undone first.
+    if (old.slug.includes(TOMBSTONE_MARK)) throw Errors.conflict(`"${old.slug}" gave its address to the listing that replaced it; undo that address move first`, { slug: old.slug });
+    const marker = retireMarkerOf(await latestReason(tx, old));
+    if (!marker) throw Errors.conflict(`"${old.slug}" changed after it was retired — restore it from the console instead`, { slug: old.slug });
+    if (marker === REDIRECT_ONLY_REASON_PREFIX) redirectOnly = true;
+    else {
+      const version = old.version + 1;
+      const written = await tx.product.updateMany({ where: { id: old.id, version: old.version }, data: { deletedAt: null, status: "published", version, publishedAt: old.publishedAt ?? new Date() } });
+      if (written.count !== 1) throw Errors.conflict(`"${old.slug}" changed while it was being restored — try again`);
+      await tx.productVersion.create({ data: { id: uuidv7(), productId: old.id, version, content: old.content as Prisma.InputJsonValue, status: "published", actorId: actor.id, reason } });
+      await audit(actor, "activity.restore", { type: "product", id: old.id }, { before: { status: old.status, deletedAt: old.deletedAt }, after: { status: "published", deletedAt: null, restoredFrom: "replacement_rollback", linkId }, reason }, tx);
+      touched.push(old.id);
+    }
   }
   await tx.productRedirect.delete({ where: { id: redirect.id } });
   await tx.supplierListingLink.updateMany({ where: { id: linkId, replacesProductId: redirect.oldProductId }, data: { replacesProductId: null } });
-  await audit(actor, "product_redirect.remove", { type: "product", id: redirect.oldProductId }, { before: { oldSlug: redirect.oldSlug, targetProductId: redirect.targetProductId }, reason }, tx);
-  return redirect;
+  await audit(actor, "product_redirect.remove", { type: "product", id: redirect.oldProductId }, { before: { oldSlug: redirect.oldSlug, targetProductId: redirect.targetProductId }, after: { redirectOnly }, reason }, tx);
+  return { ...redirect, redirectOnly };
 }
 
-/** The version reason of a retire written by the publish service; restore checks it (N1-11). */
-export const RETIRE_REASON_PREFIX = "Replaced by ";
+/** The version reason of a retire written by the publish service; restore checks it (N1-11). Defined with the retire rules. */
+export { RETIRE_REASON_PREFIX };

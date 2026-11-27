@@ -1,6 +1,6 @@
 "use client";
 
-import { useId, useMemo, useState } from "react";
+import { useId, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { CalendarDays, ChevronLeft, ChevronRight, Minus, Plus, Users } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Sheet } from "@/components/ui/sheet";
@@ -8,6 +8,7 @@ import { track } from "@/lib/analytics";
 import { guestRowAges, type GuestRowAge, type PaxAgeType } from "@/lib/pax-ages";
 import type { ActivityStatus, PaxCount } from "@/lib/types";
 import { addDays, cn, formatDateKey, paxLabel, paxTotal, parseDateKey, toDateKey } from "@/lib/utils";
+import { longTimesClass, nextUsableIndex, revealTime, rowNeighbour, SCROLL_AFTER_SLOTS } from "./time-slot-picker";
 
 /**
  * Date, time and guest selection.
@@ -422,6 +423,9 @@ export function GuestSheet({
  * Time slots
  * ------------------------------------------------------------------------ */
 
+/** Keys the long time list handles itself; every other key keeps its native behaviour. */
+const NAV_KEYS = new Set(["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"]);
+
 export function TimeSlots({
   slots,
   value,
@@ -433,25 +437,84 @@ export function TimeSlots({
   onChange: (time: string) => void;
   className?: string;
 }) {
+  const refs = useRef<(HTMLButtonElement | null)[]>([]);
+  const hintId = useId();
+  const [focused, setFocused] = useState<number | null>(null);
+  // A long list (up to 96 times) is one Tab stop with arrow keys, Home and End, like the listed-time picker;
+  // a short list keeps one Tab stop per time, as before.
+  const long = slots.length > SCROLL_AFTER_SLOTS;
+  const open = (i: number) => !!slots[i] && slots[i].status !== "sold_out";
+  const selected = slots.findIndex((s, i) => s.time === value && open(i));
+  const stop = focused !== null && open(focused) ? focused : selected >= 0 ? selected : slots.findIndex((_, i) => open(i));
+
+  // Show the chosen time inside the scroll box when the list mounts or the choice changes, never moving the page.
+  useLayoutEffect(() => {
+    if (long && selected >= 0) revealTime(refs.current[selected]);
+  }, [long, selected, slots.length]);
+
   if (!slots.length) return null;
+
+  const onKey = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
+    if (!NAV_KEYS.has(event.key)) return; // Tab, Enter and Space keep their native behaviour.
+    const usableAt = slots.map((_, i) => open(i));
+    const next =
+      event.key === "ArrowUp" || event.key === "ArrowDown"
+        ? rowNeighbour(
+            index,
+            event.key === "ArrowDown" ? 1 : -1,
+            refs.current.map((b) => (b ? { top: b.offsetTop, center: b.offsetLeft + b.offsetWidth / 2 } : null)),
+            usableAt,
+          )
+        : nextUsableIndex(event.key, index, slots.map((_, i) => ({ time: slots[i].time, status: usableAt[i] ? "available" : "sold_out" })), 1);
+    // A navigation key is consumed even at the first or last row, so it never scrolls the page or box instead.
+    event.preventDefault();
+    if (next === null) return;
+    refs.current[next]?.focus();
+  };
+
   return (
-    <div className={cn("flex flex-wrap gap-2", className)} role="group" aria-label="Choose a time">
-      {slots.map((slot) => {
+    <div
+      className={cn("flex flex-wrap gap-2", longTimesClass(slots.length), className)}
+      role="group"
+      aria-label="Choose a time"
+      aria-describedby={long ? hintId : undefined}
+      data-times-scroll={long || undefined}
+    >
+      {long && (
+        <span id={hintId} hidden>
+          Use the arrow keys to move between times, then Enter to choose one.
+        </span>
+      )}
+      {slots.map((slot, index) => {
         const soldOut = slot.status === "sold_out";
-        const selected = slot.time === value;
+        const isSelected = slot.time === value;
         return (
           <button
             key={slot.time}
+            ref={(node) => {
+              refs.current[index] = node;
+            }}
             type="button"
             disabled={soldOut}
-            aria-pressed={selected}
+            aria-pressed={isSelected}
+            tabIndex={long ? (index === stop ? 0 : -1) : undefined}
+            onFocus={long ? () => setFocused(index) : undefined}
+            // Leaving the list: the Tab stop goes back to the chosen (or first open) time, as in the listed-time picker.
+            onBlur={
+              long
+                ? (event) => {
+                    if (!event.currentTarget.parentElement?.contains(event.relatedTarget as Node | null)) setFocused(null);
+                  }
+                : undefined
+            }
+            onKeyDown={long ? (event) => onKey(event, index) : undefined}
             onClick={() => {
               onChange(slot.time);
               track("time_selected", { selected_time: slot.time });
             }}
             className={cn(
               "rounded-full border px-3.5 py-2 text-sm font-semibold transition-colors",
-              selected
+              isSelected
                 ? "border-ink-900 bg-ink-900 text-white"
                 : soldOut
                   ? "cursor-not-allowed border-ink-200 bg-ink-100 text-ink-400 line-through"
@@ -459,7 +522,7 @@ export function TimeSlots({
             )}
           >
             {slot.time}
-            {slot.status === "limited" && !selected && (
+            {slot.status === "limited" && !isSelected && (
               <span className="ml-1.5 text-2xs font-bold text-[var(--color-warning)]">
                 {slot.spotsLeft} left
               </span>

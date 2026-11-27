@@ -1,6 +1,8 @@
 import type { NextRequest } from "next/server";
 import { inquiryService } from "@/server/services/inquiry.service";
 import { handle, json, requireCron } from "@/server/lib/http";
+// The sweep's ops alerts read the payment gateways (duplicate payments, review 102c D5): wire them, as the payments job does.
+import "@/server/wiring";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";

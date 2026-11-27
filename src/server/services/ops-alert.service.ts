@@ -15,6 +15,7 @@ import { crmReturnIncidents } from "../crm/crm.return.alerts";
 import { ownerAlertIncidents } from "./owner-alert";
 import { bulkDisarmIncidents } from "./bulk-guard";
 import { accountIncidents, emailVolumeIncidents, signInCodeBudgetIncidents } from "./account-alerts";
+import { duplicateScanIncidents } from "../payments/duplicate-scan";
 
 /**
  * Ops alert emails for instant-path incidents (doc 22 §32.24: alerts by
@@ -82,7 +83,14 @@ import { accountIncidents, emailVolumeIncidents, signInCodeBudgetIncidents } fro
  *  - `quote_budget_refused`: customer quotes were refused because the quote
  *    share of the supplier read budget was spent, so customers were sent to
  *    the inquiry (one incident per episode of refusals, raised at its first;
- *    thresholds in quote-budget-alert.ts). Codes only.
+ *    thresholds in quote-budget-alert.ts). Codes only;
+ *  - `duplicate_scan_full` / `duplicate_no_gateway` (review 102c D5): the
+ *    payments tick's scan of duplicate payments still holding money came
+ *    back full (50 rows), so a newer duplicate may not be refunded
+ *    automatically; or duplicates of a provider with no configured gateway
+ *    are held. Entity `payment_saga:duplicate_scan` (no new entity kind);
+ *    raised again each UTC day while it lasts (payments/duplicate-scan.ts).
+ *    No ids, codes only.
  *
  * Dedup and throttle (`ops_alerts`, one row per entity and reason, under one
  * row lock so concurrent sweeps decide one at a time):
@@ -147,7 +155,11 @@ export type OpsIncidentKind =
   /** Group B (owner Q-B6): email volume reached the alert share of the Resend plan's daily or monthly cap. */
   | "email_volume_high"
   /** Group B (re-review 103b N1): today's sign-in code budget reached 80 % or is spent (account-alerts.ts). */
-  | "signin_code_budget";
+  | "signin_code_budget"
+  /** Review 102c D5: the payments tick's duplicate-payment scan came back full (payments/duplicate-scan.ts). */
+  | "duplicate_scan_full"
+  /** Review 102c D5: duplicates of a provider with no configured gateway are held (payments/duplicate-scan.ts). */
+  | "duplicate_no_gateway";
 /**
  * `crm_subject` needs migration 20261122140000 (ops_alerts_entity_kind_check). Its entity id is `inquiry:<id>`
  * or `order:<id>`, or `portal:<environment>` for the CRM worker's own pause (C2b, no new entity kind).
@@ -194,6 +206,8 @@ export const OPS_INCIDENT_TITLES: Record<OpsIncidentKind, string> = {
   supabase_user_delete_due: "Erased account: delete its Supabase Auth user by hand",
   email_volume_high: "Email volume near the Resend plan cap",
   signin_code_budget: "Email sign-in codes: today's budget is nearly or fully spent (Google sign-in still works)",
+  duplicate_scan_full: "Duplicate payments waiting: automatic refunds may be held up",
+  duplicate_no_gateway: "Duplicate payments held: no payment gateway for their provider account",
 };
 
 /** The stored row payload: what the email says plus its idempotency scope. */
@@ -501,6 +515,8 @@ export async function collectOpsIncidents(since: Date, now: Date, limit = COLLEC
   out.push(...(await accountIncidents(since, now, limit).catch(() => groupBReadFailed("account"))));
   out.push(...(await emailVolumeIncidents(now).catch(() => groupBReadFailed("volume"))));
   out.push(...(await signInCodeBudgetIncidents(now).catch(() => groupBReadFailed("signin_budget"))));
+  // Review 102c D5: entity kind `payment_saga`, so no constraint change.
+  out.push(...(await duplicateScanIncidents(since, now)));
   return out;
 }
 

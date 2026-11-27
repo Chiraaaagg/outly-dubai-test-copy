@@ -9,11 +9,12 @@ import { uuidv7 } from "../lib/ids";
 import { revalidateCatalog } from "../lib/catalog-cache";
 import { activitySchema } from "../schemas/activity.schema";
 import { PENDING_TEXT } from "../suppliers/traveldesk/traveldesk.listing-build";
-import { staticSlugReferences } from "../suppliers/traveldesk/slug-references";
-import { productLifecycle } from "./activity.service";
+import { cleanSlugOf } from "../suppliers/traveldesk/clean-address";
+import { tombstoneBase } from "./slug-reservations";
 import { importService } from "./import.service";
 import { readinessService } from "./readiness.service";
-import { restoreReplacedInTx, RETIRE_REASON_PREFIX } from "./traveldesk-import.service";
+import { restoreReplacedInTx } from "./traveldesk-import.service";
+import { moveToCleanAddressInTx, redirectArchivedInTx, retireCheck, retireInTx, undoCleanAddressInTx } from "./traveldesk-address";
 import { recordEditorialLocks } from "./listing-locks";
 import { env } from "../lib/env";
 import { log } from "../lib/logger";
@@ -37,11 +38,14 @@ import { log } from "../lib/logger";
  *    site data or another listing's related or combo slugs stops the item
  *    until it is repointed.
  *  - Restore: the retired page comes back published and its redirect goes.
+ *  - Retire old page (after publish): the same retire rules for a page the
+ *    listing was published without retiring; an old page already archived
+ *    some other way only gets the redirect (and a retire version, so restore
+ *    works). The link records it as the page it replaces.
+ *  - Move to clean address, and its undo: traveldesk-address.ts.
  */
 
 export const PUBLISH_BATCH_LIMIT = 50;
-const OPEN_INQUIRY = ["new", "assigned", "contacted", "quoted", "negotiating", "payment_pending"] as const;
-const OPEN_ORDER = ["pending_payment", "paid", "supplier_pending", "confirmed", "partially_confirmed"] as const;
 
 export interface ReviewQueueRow {
   linkId: string;
@@ -62,6 +66,12 @@ export interface ReviewQueueRow {
   replaces: { productId: string; slug: string; title: string; deletedAt: Date | null } | null;
   suggestions: { productId: string; slug: string; title: string; score: number }[];
   importBatchId: string | null;
+  /** Published, nothing retired yet: old pages "Retire old page" offers (the suggestions and the page holding the clean address). */
+  retireOptions: { productId: string; slug: string; title: string; archived: boolean }[];
+  /** Published as "<base>-<n>" with "<base>" retired and redirecting here: the address it can move to. */
+  cleanAddress: string | null;
+  /** Moved to its clean address: the "<base>-<n>" it came from (undo moves it back). */
+  movedFrom: string | null;
 }
 
 export type PublishItemResult =
@@ -92,19 +102,6 @@ function assertEnvironment(link: { environment: string }) {
   if (env().isProduction && link.environment !== "production") throw Errors.conflict("This listing was imported from the TravelDesk test catalogue; it cannot be reviewed or published here", { environment: link.environment });
 }
 
-/** Other listings (any product) whose related or combo slugs name `slug`, plus categories that feature it. */
-async function dbSlugReferences(db: Prisma.TransactionClient, slug: string, excludeProductId: string): Promise<string[]> {
-  const [products, categories] = await Promise.all([
-    db.$queryRaw<{ slug: string }[]>`
-      SELECT slug FROM products
-      WHERE deleted_at IS NULL AND id <> ${excludeProductId}::uuid
-        AND (content->'relatedSlugs' ? ${slug} OR content->'comboSlugs' ? ${slug})
-      ORDER BY slug LIMIT 50`,
-    db.category.findMany({ where: { deletedAt: null, featuredSlugs: { has: slug } }, select: { slug: true } }),
-  ]);
-  return [...products.map((p) => `listing:${p.slug}`), ...categories.map((c) => `category:${c.slug}`)];
-}
-
 export const traveldeskListingService = {
   async queue(actor: Actor, filters: { environment?: "test" | "production"; batchId?: string; reviewed?: boolean } = {}): Promise<ReviewQueueRow[]> {
     requirePermission(actor, "products.edit");
@@ -123,6 +120,35 @@ export const traveldeskListingService = {
       where: { offerExternalId: { in: [...new Set(links.flatMap((l) => l.offerExternalIds))] }, source: { not: "import" }, state: { in: ["suggested", "approved"] }, product: { deletedAt: null } },
       select: { offerExternalId: true, score: true, product: { select: { id: true, slug: true, title: true } } },
     });
+    // The address clean-up (traveldesk-address.ts): who holds each "<base>", and the redirects of these links.
+    const active = links.filter((l) => !l.product.deletedAt);
+    const live = active.filter((l) => l.product.status === "published" && l.reviewedAt);
+    const bases = [...new Set(live.flatMap((l) => cleanSlugOf(l.product.slug) ?? []))];
+    const [holders, redirects] = await Promise.all([
+      bases.length ? prisma.product.findMany({ where: { slug: { in: bases } }, select: { id: true, slug: true, title: true, deletedAt: true } }) : Promise.resolve([]),
+      active.length
+        ? prisma.productRedirect.findMany({ where: { OR: [{ oldSlug: { in: bases } }, { linkId: { in: active.map((l) => l.id) } }] }, select: { oldSlug: true, oldProductId: true, targetProductId: true, linkId: true, oldProduct: { select: { slug: true } } } })
+        : Promise.resolve([]),
+    ]);
+    const holderBy = new Map(holders.map((h) => [h.slug, h]));
+    const address = (l: (typeof links)[number]) => {
+      // A move is found by its redirect (slug-reservations.ts), published or not: the undo stays offered.
+      const move = redirects.find((x) => x.linkId === l.id && x.targetProductId === l.productId && cleanSlugOf(x.oldSlug) !== null && cleanSlugOf(x.oldSlug) === tombstoneBase(x.oldProduct.slug));
+      const movedFrom = move?.oldSlug ?? null;
+      if (!live.includes(l)) return { retireOptions: [], cleanAddress: null, movedFrom };
+      const r = l.replaces;
+      const base = cleanSlugOf(l.product.slug);
+      const holder = base ? holderBy.get(base) : undefined;
+      const cleanAddress = base && holder?.deletedAt && redirects.some((x) => x.oldSlug === base && x.targetProductId === l.productId && x.oldProductId === holder.id) ? base : null;
+      const options = new Map<string, ReviewQueueRow["retireOptions"][number]>();
+      // The page the link names, when it is still live, is the only one it may retire (retireOld refuses another).
+      if (r && !r.deletedAt) options.set(r.id, { productId: r.id, slug: r.slug, title: r.title, archived: false });
+      else if (!r) {
+        for (const c of candidates) if (l.offerExternalIds.includes(c.offerExternalId) && c.product.id !== l.productId) options.set(c.product.id, { productId: c.product.id, slug: c.product.slug, title: c.product.title, archived: false });
+        if (holder && holder.id !== l.productId && !(holder.deletedAt && redirects.some((x) => x.oldSlug === holder.slug))) options.set(holder.id, { productId: holder.id, slug: holder.slug, title: holder.title, archived: Boolean(holder.deletedAt) });
+      }
+      return { retireOptions: [...options.values()].slice(0, 6), cleanAddress, movedFrom };
+    };
     return links
       .filter((l) => !l.product.deletedAt)
       .map((l) => {
@@ -151,6 +177,7 @@ export const traveldeskListingService = {
           replaces: l.replaces ? { productId: l.replaces.id, slug: l.replaces.slug, title: l.replaces.title, deletedAt: l.replaces.deletedAt } : null,
           suggestions: [...best.values()].sort((a, b) => b.score - a.score).slice(0, 5),
           importBatchId: l.importBatchId,
+          ...address(l),
         };
       });
   },
@@ -239,7 +266,99 @@ export const traveldeskListingService = {
     if (!redirect) throw Errors.conflict("Nothing was retired for this listing");
     revalidateCatalog();
     await readinessService.reevaluateMany(touched, "restore");
-    return { restored: touched.length, oldSlug: redirect.oldSlug };
+    return { restored: touched.length, oldSlug: redirect.oldSlug, redirectOnly: redirect.redirectOnly };
+  },
+
+  /**
+   * Retire the old page of an already published listing (one published with "replaces: none", or whose old page
+   * was archived some other way). The publish path's rules: a reference to the old slug, an open order or inquiry,
+   * an instant or unpublished old page each refuse it with the reason. An old page already archived only gets the
+   * permanent redirect (refused if its slug already has one, or on open work); references to its slug are returned,
+   * not refused (they already name a page that is gone). The link records the page as the one it replaces,
+   * so restoreReplaced undoes either case (the old page comes back published).
+   */
+  async retireOld(actor: Actor, linkId: string, oldProductId: string, reason: string) {
+    requirePermission(actor, "products.publish");
+    requirePermission(actor, "products.delete");
+    if (!actor.id) throw Errors.unauthorized();
+    if (reason.trim().length < 8) throw Errors.validation({ reason: "Give a reason of at least 8 characters — it goes in the audit log" });
+    const why = reason.trim();
+    const out = await prisma.$transaction(async (tx) => {
+      const pre = await tx.supplierListingLink.findUnique({ where: { id: linkId }, select: { productId: true } });
+      if (!pre) throw Errors.notFound("Imported listing");
+      if (oldProductId === pre.productId) throw Errors.validation({ oldProductId: "A listing cannot replace itself" });
+      // The product rows first, by id (review 110 R110-01).
+      await tx.$queryRaw`SELECT id FROM products WHERE id = ANY(${[pre.productId, oldProductId].sort()}::uuid[]) ORDER BY id FOR UPDATE`;
+      const link = await tx.supplierListingLink.findUniqueOrThrow({ where: { id: linkId }, include: { product: true } });
+      if (link.deactivatedAt) throw Errors.notFound("Imported listing");
+      assertEnvironment(link);
+      const p = link.product;
+      if (!link.reviewedAt || link.noindex) throw Errors.conflict("This listing is not marked reviewed");
+      if (p.deletedAt || p.status !== "published") throw Errors.conflict("Publish this listing first; publishing retires the page it replaces");
+      if (link.replacesProductId && link.replacesProductId !== oldProductId) throw Errors.conflict("This listing already replaces another page; restore that one first");
+      const old = await tx.product.findUnique({ where: { id: oldProductId }, include: { listingLink: { select: { deactivatedAt: true } } } });
+      if (!old) throw Errors.validation({ oldProductId: "The old listing does not exist" });
+      if (old.listingLink && !old.listingLink.deactivatedAt) throw Errors.validation({ oldProductId: "That listing is itself an imported TravelDesk listing" });
+      let mode: "retired" | "redirected";
+      let references: string[] = [];
+      let takeover: { linkId: string; title: string } | null = null;
+      if (!old.deletedAt) {
+        const check = await retireCheck(tx, old, p);
+        if (check.kind === "stop") throw Errors.conflict(`${check.reason}: ${check.references.join(", ")} — repoint those first`, { references: check.references });
+        if (check.kind === "keep") throw Errors.conflict(`Not retired: ${check.reason}`);
+        ({ takeover } = await retireInTx(tx, actor, old, p, linkId, why));
+        mode = "retired";
+      } else {
+        ({ references, takeover } = await redirectArchivedInTx(tx, actor, old, p, linkId, why));
+        mode = "redirected";
+      }
+      if (!link.replacesProductId) await tx.supplierListingLink.update({ where: { id: linkId }, data: { replacesProductId: old.id } });
+      return { listingId: p.id, oldId: old.id, oldSlug: old.slug, slug: p.slug, mode, references, releasedFrom: takeover?.title ?? null };
+    }, TX_OPTIONS).catch((e: unknown) => {
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") throw Errors.conflict("Another imported listing already replaces that old listing");
+      throw e;
+    });
+    revalidateCatalog();
+    await readinessService.reevaluateMany([out.listingId, out.oldId], "status_change");
+    return out;
+  },
+
+  /** Move a published "<base>-<n>" listing to "<base>" (traveldesk-address.ts). */
+  async moveToCleanAddress(actor: Actor, linkId: string, reason: string) {
+    requirePermission(actor, "products.publish");
+    requirePermission(actor, "products.delete");
+    if (!actor.id) throw Errors.unauthorized();
+    if (reason.trim().length < 8) throw Errors.validation({ reason: "Give a reason of at least 8 characters — it goes in the audit log" });
+    const moved = await prisma.$transaction(async (tx) => {
+      const link = await tx.supplierListingLink.findUnique({ where: { id: linkId }, select: { environment: true } });
+      if (!link) throw Errors.notFound("Imported listing");
+      assertEnvironment(link);
+      return moveToCleanAddressInTx(tx, actor, linkId, reason);
+    }, TX_OPTIONS).catch((e: unknown) => {
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") throw Errors.conflict("Another listing took one of these addresses, or already replaces that old page, just now — reload and try again");
+      throw e;
+    });
+    revalidateCatalog();
+    await readinessService.reevaluateMany([moved.listingId], "editor_save");
+    return moved;
+  },
+
+  /** Undo a move to the clean address: back to "<base>-<n>", the retired page gets "<base>" back. */
+  async undoCleanAddress(actor: Actor, linkId: string, reason: string) {
+    requirePermission(actor, "products.publish");
+    requirePermission(actor, "products.delete");
+    if (!actor.id) throw Errors.unauthorized();
+    if (reason.trim().length < 8) throw Errors.validation({ reason: "Give a reason of at least 8 characters — it goes in the audit log" });
+    const moved = await prisma.$transaction(async (tx) => {
+      const link = await tx.supplierListingLink.findUnique({ where: { id: linkId }, select: { environment: true, deactivatedAt: true } });
+      if (!link || link.deactivatedAt) throw Errors.notFound("Imported listing");
+      assertEnvironment(link);
+      return undoCleanAddressInTx(tx, actor, linkId, reason);
+    }, TX_OPTIONS);
+    if (!moved) throw Errors.conflict("This listing was not moved to a clean address");
+    revalidateCatalog();
+    await readinessService.reevaluateMany([moved.listingId], "editor_save");
+    return moved;
   },
 
   /** The spreadsheet round trip for imported listings (D13): the import-compatible CSV of these listings only. */
@@ -271,17 +390,9 @@ async function publishOne(actor: Actor, linkId: string, reason: string): Promise
     let retire = false;
     let notRetired: string | undefined;
     if (old && !old.deletedAt) {
-      const refs = [...staticSlugReferences(old.slug), ...(await dbSlugReferences(tx, old.slug, p.id))].filter((r) => r !== `listing:${p.slug}`);
-      if (refs.length) return { linkId, outcome: "stopped", reason: `the old slug "${old.slug}" is still named elsewhere`, references: refs };
-      const eligibility = await tx.productEligibility.findUnique({ where: { productId: old.id }, select: { effectiveMode: true } });
-      const [inquiries, orders] = await Promise.all([
-        tx.inquiryItem.count({ where: { productId: old.id, inquiry: { status: { in: [...OPEN_INQUIRY] } } } }),
-        tx.orderItem.count({ where: { productId: old.id, order: { status: { in: [...OPEN_ORDER] } } } }),
-      ]);
-      if (old.fulfilmentMode === "instant" || eligibility?.effectiveMode === "instant") notRetired = "old listing is instant";
-      else if (orders > 0) notRetired = "old listing has an open order";
-      else if (inquiries > 0) notRetired = "old listing has an open inquiry";
-      else if (old.status !== "published") notRetired = "old listing is not published";
+      const check = await retireCheck(tx, old, p);
+      if (check.kind === "stop") return { linkId, outcome: "stopped", reason: check.reason, references: check.references };
+      if (check.kind === "keep") notRetired = check.reason;
       else retire = true;
     }
 
@@ -293,15 +404,7 @@ async function publishOne(actor: Actor, linkId: string, reason: string): Promise
       await audit(actor, "activity.publish", { type: "product", id: p.id }, { before: { status: p.status }, after: { status: "published", linkId }, reason }, tx);
     }
 
-    if (retire && old) {
-      await productLifecycle.softDeleteInTx(tx, actor, old.id, `${RETIRE_REASON_PREFIX}${p.slug}: ${reason}`);
-      await tx.productRedirect.upsert({
-        where: { oldSlug: old.slug },
-        create: { id: uuidv7(), oldSlug: old.slug, oldProductId: old.id, targetProductId: p.id, linkId, createdBy: actor.id },
-        update: { oldProductId: old.id, targetProductId: p.id, linkId, createdBy: actor.id },
-      });
-      await audit(actor, "traveldesk_listing.retire", { type: "product", id: old.id }, { after: { oldSlug: old.slug, replacedBy: p.id, linkId, redirect: "permanent" }, reason }, tx);
-    }
+    if (retire && old) await retireInTx(tx, actor, old, p, linkId, reason);
     return { linkId, outcome: "published", slug: p.slug, retired: retire && old ? old.slug : null, ...(notRetired ? { notRetired } : {}) };
   }, TX_OPTIONS);
 }
