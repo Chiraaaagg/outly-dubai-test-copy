@@ -1131,20 +1131,26 @@ describe.skipIf(!dbEnabled)("B3 payment saga (disposable database)", () => {
     const paymentOf = (id: string) => prisma.payment.findUniqueOrThrow({ where: { id } });
     const readsOf = (x: Harness, providerPaymentId: string) => x.inr.callsOf("getPayment").filter((a) => a[0] === providerPaymentId).length;
 
-    it("a duplicate whose provider read no longer matches is quarantined and never read again", async () => {
+    it("a duplicate whose provider read no longer matches is quarantined and never read again; a config mismatch is not marked", async () => {
       const x = await harness(prisma);
       const c = await checkedOut(x, run, "INR", "upi");
       const pid = c.gw.pay(c.providerOrderId);
-      // The row names another account than the provider's read (found at settle time, not at admit).
-      const dup = await unsettledDuplicate(x, c, pid, { providerAccountId: "fake-account-other" });
+      const dup = await unsettledDuplicate(x, c, pid);
+      // The provider's read now differs from the row (found at settle time, not at admit).
+      x.inr.payments.get(pid)!.amountMinor = 229_999n;
+      // A row of another account than this deployment's gateway: configuration, which can heal, so never marked.
+      const other = c.gw.pay(c.providerOrderId);
+      const drift = await unsettledDuplicate(x, c, other, { providerAccountId: "fake-account-other" });
       await x.saga.advanceOpen();
-      expect(await paymentOf(dup)).toMatchObject({ failureCode: "quarantined_account_mismatch", status: "captured", capturedMinor: 0n });
+      expect(await paymentOf(dup)).toMatchObject({ failureCode: "quarantined_amount_mismatch", status: "captured", capturedMinor: 0n });
+      expect(await paymentOf(drift)).toMatchObject({ failureCode: null, status: "captured", capturedMinor: 0n });
       const reads = readsOf(x, pid);
       expect(reads).toBe(1);
       await x.saga.advanceOpen();
       expect(readsOf(x, pid)).toBe(reads);
-      expect(await prisma.refund.count({ where: { paymentId: dup } })).toBe(0);
-      expect(x.inr.callsOf("refund").filter((a) => a[0] === pid)).toEqual([]);
+      expect(readsOf(x, other)).toBe(2);
+      expect(await prisma.refund.count({ where: { paymentId: { in: [dup, drift] } } })).toBe(0);
+      expect(x.inr.callsOf("refund").filter((a) => a[0] === pid || a[0] === other)).toEqual([]);
     });
 
     it("a duplicate on an order with no saga is synced, left for finance and never read again", async () => {
@@ -1162,7 +1168,7 @@ describe.skipIf(!dbEnabled)("B3 payment saga (disposable database)", () => {
       expect(await prisma.refund.count({ where: { paymentId: dup } })).toBe(0);
     });
 
-    it("a duplicate hold the provider releases by itself waits for its expiry; one with no expiry is left for finance", async () => {
+    it("a duplicate hold the provider releases by itself waits for its expiry plus the grace; still held after that, it is left for finance", async () => {
       const x = await harness(prisma);
       const c = await checkedOut(x, run, "INR", "card");
       await deliver(x, c.gw, "payment.authorized", c.gw.pay(c.providerOrderId));
@@ -1175,28 +1181,39 @@ describe.skipIf(!dbEnabled)("B3 payment saga (disposable database)", () => {
       written.push(heldDup.id);
       expect(heldDup).toMatchObject({ status: "authorized", failureCode: null });
 
+      // One the provider gives no expiry and never lets go: its expiry is its authorisation time plus the method's life.
       const forever = c.gw.pay(c.providerOrderId);
       x.inr.payments.get(forever)!.authorizationExpiresAt = null;
       await deliver(x, c.gw, "payment.authorized", forever);
       const foreverDup = await prisma.payment.findFirstOrThrow({ where: { orderId: c.r.orderId, gatewayPaymentId: forever } });
       written.push(foreverDup.id);
-      expect(foreverDup).toMatchObject({ status: "authorized", failureCode: "duplicate_hold_not_released" });
+      expect(foreverDup).toMatchObject({ status: "authorized", failureCode: null, authorizationExpiresAt: null });
 
-      // Inside its life the held one stays in the scan and is read again; the other is not.
-      const foreverReads = readsOf(x, forever);
+      // Inside their life both stay in the scan and are read again.
+      const reads = readsOf(x, forever);
       await x.saga.advanceOpen();
       expect(await paymentOf(heldDup.id)).toMatchObject({ status: "authorized", failureCode: null });
-      expect(readsOf(x, forever)).toBe(foreverReads);
+      expect(readsOf(x, forever)).toBe(reads + 1);
 
-      // Past its expiry the provider reports it expired: synced, out of the scan, never marked.
+      // Past the expiry: the provider reports the first expired (synced, out of the scan, never marked); the
+      // other is still held, but inside the grace it is not marked yet.
       x.clock.advance(3 * DAY + 60_000);
       await x.saga.advanceOpen();
       expect(await paymentOf(heldDup.id)).toMatchObject({ status: "expired", failureCode: null });
+      expect(await paymentOf(foreverDup.id)).toMatchObject({ status: "authorized", failureCode: null });
+
+      // Past the grace and still held: nothing here can release it, so finance decides; it is not read again.
+      x.clock.advance(60 * 60_000);
+      await x.saga.advanceOpen();
+      expect(await paymentOf(foreverDup.id)).toMatchObject({ status: "authorized", failureCode: "duplicate_hold_not_released" });
+      const after = readsOf(x, forever);
+      await x.saga.advanceOpen();
+      expect(readsOf(x, forever)).toBe(after);
       expect(x.inr.callsOf("void")).toEqual([]);
       expect(await prisma.refund.count({ where: { paymentId: { in: [heldDup.id, foreverDup.id] } } })).toBe(0);
     });
 
-    it("rows with no gateway here never fill the page; the page is oldest first; a full page is reported and alerted", async () => {
+    it("rows with no gateway here never fill the page and are alerted; the page is oldest first; a full page is reported and alerted", async () => {
       const uuidv7 = await ids();
       const x = await harness(prisma);
       const c = await checkedOut(x, run, "INR", "upi");
@@ -1227,6 +1244,18 @@ describe.skipIf(!dbEnabled)("B3 payment saga (disposable database)", () => {
       });
       written.push(...unreadable.map((r) => r.id));
 
+      const { duplicateScanIncidents } = await import("../duplicate-scan");
+      const servedHere = (p: string) => p === x.inr.provider || p === x.aed.provider;
+      const kinds = async () => {
+        const now = new Date();
+        return (await duplicateScanIncidents(new Date(now.getTime() - 72 * 3_600_000), now, servedHere)).map((i) => [i.kind, i.entityKind, i.entityId]);
+      };
+      // Before the tick: this provider's page (the duplicate and 50 unreadable rows) is full, and the 60 are held.
+      expect(await kinds()).toEqual([
+        ["duplicate_scan_full", "payment_saga", "duplicate_scan"],
+        ["duplicate_no_gateway", "payment_saga", "duplicate_scan"],
+      ]);
+
       const errors: string[] = [];
       const warns: string[] = [];
       vi.spyOn(console, "error").mockImplementation((line: unknown) => void errors.push(String(line)));
@@ -1242,12 +1271,10 @@ describe.skipIf(!dbEnabled)("B3 payment saga (disposable database)", () => {
       // An unreadable row is only a failed read: retried, never marked.
       expect(await prisma.payment.count({ where: { id: { in: unreadable.map((r) => r.id) }, failureCode: null } })).toBe(50);
       expect(x.inr.callsOf("getPayment").filter((a) => String(a[0]).startsWith(`${tag}-ur-`))).toHaveLength(49);
-      // The page (the duplicate and 49 unreadable rows) was full: the tick says so, and the ops-alert sweep raises it.
+      // The page (the duplicate and 49 unreadable rows) was full: the tick says so.
       expect(errors.filter((l) => l.includes('"payments.duplicate_scan_full"'))).toHaveLength(1);
-      const { duplicateScanIncidents } = await import("../duplicate-scan");
-      const now = new Date();
-      const incidents = await duplicateScanIncidents(new Date(now.getTime() - 72 * 3_600_000), now);
-      expect(incidents).toEqual([expect.objectContaining({ kind: "duplicate_scan_full", entityKind: "payment_saga", entityId: "duplicate_scan", reason: "duplicate_scan_full" })]);
+      // After it: the held rows are still alerted.
+      expect(await kinds()).toContainEqual(["duplicate_no_gateway", "payment_saga", "duplicate_scan"]);
     });
   });
 });

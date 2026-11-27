@@ -83,12 +83,13 @@ import { duplicateScanIncidents } from "../payments/duplicate-scan";
  *    share of the supplier read budget was spent, so customers were sent to
  *    the inquiry (one incident per episode of refusals, raised at its first;
  *    thresholds in quote-budget-alert.ts). Codes only;
- *  - `duplicate_scan_full` (review 102c D5): the payments tick's scan of
- *    duplicate payments still holding money came back full (50 rows), so a
- *    newer duplicate may not be refunded automatically. Entity
- *    `payment_saga:duplicate_scan` (no new entity kind); raised again each
- *    UTC day while it stays full (payments/duplicate-scan.ts). No ids,
- *    codes only.
+ *  - `duplicate_scan_full` / `duplicate_no_gateway` (review 102c D5): the
+ *    payments tick's scan of duplicate payments still holding money came
+ *    back full (50 rows), so a newer duplicate may not be refunded
+ *    automatically; or duplicates of a provider with no configured gateway
+ *    are held. Entity `payment_saga:duplicate_scan` (no new entity kind);
+ *    raised again each UTC day while it lasts (payments/duplicate-scan.ts).
+ *    No ids, codes only.
  *
  * Dedup and throttle (`ops_alerts`, one row per entity and reason, under one
  * row lock so concurrent sweeps decide one at a time):
@@ -143,7 +144,9 @@ export type OpsIncidentKind =
   /** Doc 30 N2 (review N2-04): a free-cancellation bulk item left a listing on inquiry after a failure (bulk-guard.ts). */
   | "bulk_item_disarmed"
   /** Review 102c D5: the payments tick's duplicate-payment scan came back full (payments/duplicate-scan.ts). */
-  | "duplicate_scan_full";
+  | "duplicate_scan_full"
+  /** Review 102c D5: duplicates of a provider with no configured gateway are held (payments/duplicate-scan.ts). */
+  | "duplicate_no_gateway";
 /**
  * `crm_subject` needs migration 20261122140000 (ops_alerts_entity_kind_check). Its entity id is `inquiry:<id>`
  * or `order:<id>`, or `portal:<environment>` for the CRM worker's own pause (C2b, no new entity kind).
@@ -185,6 +188,7 @@ export const OPS_INCIDENT_TITLES: Record<OpsIncidentKind, string> = {
   owner_alert_failed: "Owner alert of a one-person approval was not delivered",
   bulk_item_disarmed: "Bulk free-cancellation run left an armed listing on inquiry",
   duplicate_scan_full: "Duplicate payments waiting: automatic refunds may be held up",
+  duplicate_no_gateway: "Duplicate payments held: no payment gateway configured for their provider",
 };
 
 /** The stored row payload: what the email says plus its idempotency scope. */
