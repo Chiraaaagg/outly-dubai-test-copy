@@ -106,6 +106,53 @@ const schema = z.object({
   OTP_RATE_LIMIT_PER_PHONE_PER_15MIN: int(3),
   OTP_RATE_LIMIT_PER_IP_PER_HOUR: int(10),
 
+  // Customer sign-in on Supabase Auth (Group B, side-session plan 92; owner answers 91).
+  // Supabase Auth proves identity server to server; OUTLYY keeps the account and the session.
+  // No NEXT_PUBLIC_SUPABASE_* and no Supabase secret / service-role key: the browser never calls Supabase.
+  /**
+   * Master switch for the Supabase sign-in (email code and Google). Only
+   * "true" turns it on; default off everywhere. While off, every new auth
+   * route answers NOT_CONFIGURED and the hooks answer 404.
+   */
+  CUSTOMER_SUPABASE_AUTH_ENABLED: strictBool("CUSTOMER_SUPABASE_AUTH_ENABLED"),
+  /**
+   * Shows "Continue with Google" (owner Q12; the own-callback flow, Q-B1).
+   * Needs the master switch and the two GOOGLE_OAUTH_* values. Default off;
+   * set only after the Google client and the Supabase Google provider are
+   * configured and tested.
+   */
+  CUSTOMER_OAUTH_ENABLED: strictBool("CUSTOMER_OAUTH_ENABLED"),
+  /**
+   * Links a Supabase sign-in to an existing phone-only account when Supabase
+   * confirmed the same phone (owner Q9). Off until the Send SMS hook batch
+   * ships (review 103 finding 4): even when on, it needs a `phone` identity on
+   * the Supabase user and a phone sign-in our own start route began in the
+   * last 10 minutes. Only "true" turns it on; default off everywhere.
+   */
+  CUSTOMER_PHONE_LINK_ENABLED: strictBool("CUSTOMER_PHONE_LINK_ENABLED"),
+  /** `https://<project>.supabase.co`: the Auth base URL and the JWT issuer host. Server only. */
+  SUPABASE_URL: optionalStr,
+  /** The project's publishable key (public by design), sent as `apikey` on Auth calls. Server only all the same. */
+  SUPABASE_PUBLISHABLE_KEY: optionalStr,
+  /** Send Email hook secret (`v1,whsec_…`, generated in the Supabase dashboard). Secret. */
+  SUPABASE_AUTH_SEND_EMAIL_HOOK_SECRET: optionalStr,
+  /** Before User Created hook secret (`v1,whsec_…`). Secret. */
+  SUPABASE_AUTH_BEFORE_USER_CREATED_HOOK_SECRET: optionalStr,
+  /** Google OAuth web client id (Google Cloud → Google Auth Platform → Clients). Also pasted into Supabase → Google provider. */
+  GOOGLE_OAUTH_CLIENT_ID: optionalStr,
+  /** Google OAuth web client secret. Secret; server only. Used for our own code exchange on outlyy.com (owner Q-B1). */
+  GOOGLE_OAUTH_CLIENT_SECRET: optionalStr,
+  /** Cloudflare Turnstile site key for /login (public by design). Unset: no widget, and in production no email code option. */
+  NEXT_PUBLIC_TURNSTILE_SITE_KEY: optionalStr,
+  /**
+   * Resend volume alert (owner Q-B6, free tier). Caps of the Resend plan in
+   * emails per UTC day and per calendar month (defaults: the free tier, 100
+   * and 3,000), and the share of a cap at which staff are alerted.
+   */
+  EMAIL_DAILY_SEND_CAP: int(100),
+  EMAIL_MONTHLY_SEND_CAP: int(3000),
+  EMAIL_VOLUME_ALERT_PERCENT: int(80),
+
   // SMS — OTP delivery port. `log` writes the code to the server log in non-production only;
   // `msg91` needs every MSG91_* value below (DLT-registered OTP template);
   // `msg91_widget` needs MSG91_AUTH_KEY plus the two NEXT_PUBLIC_MSG91_WIDGET_* values
@@ -525,10 +572,43 @@ export function assertBootEnv(): string[] {
   if (Object.keys(process.env).some((k) => k.startsWith("NEXT_PUBLIC_") && (k.includes("BITRIX") || k.includes("CRM_")))) {
     problems.push("A NEXT_PUBLIC_*BITRIX* or NEXT_PUBLIC_*CRM_* variable exists — CRM settings must never reach the browser");
   }
+  if (e.CUSTOMER_SUPABASE_AUTH_ENABLED) {
+    for (const p of customerAuthConfigProblems(e)) problems.push(`Customer sign-in on but unusable: ${p}`);
+  }
+  if (Object.keys(process.env).some((k) => k.startsWith("NEXT_PUBLIC_") && k.includes("SUPABASE"))) {
+    problems.push("A NEXT_PUBLIC_*SUPABASE* variable exists — the browser never talks to Supabase; remove it");
+  }
   if (Object.keys(process.env).some((k) => k.startsWith("NEXT_PUBLIC_") && k.includes("TRAVELDESK"))) {
     problems.push("A NEXT_PUBLIC_*TRAVELDESK* variable exists — TravelDesk settings must never reach the browser");
   }
   return problems;
+}
+
+/**
+ * What keeps the Supabase sign-in from working while its switch is on (names
+ * only, never values). Shared by the boot check and `customerAuthService.options()`.
+ */
+export function customerAuthConfigProblems(e: Env): string[] {
+  const problems: string[] = [];
+  const url = supabaseUrlProblem(e);
+  if (url) problems.push(url);
+  if (!e.SUPABASE_PUBLISHABLE_KEY) problems.push("SUPABASE_PUBLISHABLE_KEY missing");
+  if (!e.SUPABASE_AUTH_SEND_EMAIL_HOOK_SECRET) problems.push("SUPABASE_AUTH_SEND_EMAIL_HOOK_SECRET missing — no sign-in code can be sent");
+  if (!e.SUPABASE_AUTH_BEFORE_USER_CREATED_HOOK_SECRET) problems.push("SUPABASE_AUTH_BEFORE_USER_CREATED_HOOK_SECRET missing");
+  if (e.isProduction && !e.RESEND_API_KEY) problems.push("RESEND_API_KEY missing — sign-in codes would only be logged");
+  if (e.isProduction && !(e.TURNSTILE_SECRET_KEY && e.NEXT_PUBLIC_TURNSTILE_SITE_KEY)) problems.push("Turnstile keys missing — the email code option stays hidden in production (owner Q-B5)");
+  if (e.CUSTOMER_OAUTH_ENABLED && !(e.GOOGLE_OAUTH_CLIENT_ID && e.GOOGLE_OAUTH_CLIENT_SECRET)) problems.push("CUSTOMER_OAUTH_ENABLED without GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET — Google stays hidden");
+  return problems;
+}
+
+/**
+ * SUPABASE_URL missing, or not `https://<project>.supabase.co` in production.
+ * Shared by the email and the Google options (review 103 finding 15).
+ */
+export function supabaseUrlProblem(e: Pick<Env, "SUPABASE_URL" | "isProduction">): string | null {
+  if (!e.SUPABASE_URL) return "SUPABASE_URL missing";
+  if (!/^https:\/\/[a-z0-9-]+\.supabase\.co$/.test(e.SUPABASE_URL) && e.isProduction) return "SUPABASE_URL must be https://<project>.supabase.co in production";
+  return null;
 }
 
 /** Test/seed helper. */

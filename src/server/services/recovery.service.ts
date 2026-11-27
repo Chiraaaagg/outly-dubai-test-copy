@@ -180,7 +180,7 @@ export const recoveryService = {
       const id = created.id;
       // Delivered after the response: the caller is told nothing either way, so a send failure only retires the code (F57).
       defer("recovery.deliver", async () => {
-        const delivery = await deliverChallengeCode({ challengeId: id, channel, recipient: normalised, code, ttlSeconds });
+        const delivery = await deliverChallengeCode({ challengeId: id, channel, recipient: normalised, code, ttlSeconds, purpose: "recovery" });
         if (delivery === "failed") await retireUnsent(id, created.createdAt);
         emitEvent("recovery.code_delivery", { challengeId: id, channel, outcome: delivery });
       });

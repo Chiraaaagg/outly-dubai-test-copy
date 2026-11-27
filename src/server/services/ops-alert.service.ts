@@ -15,6 +15,8 @@ import { crmReturnIncidents } from "../crm/crm.return.alerts";
 import { ownerAlertIncidents } from "./owner-alert";
 import { bulkDisarmIncidents } from "./bulk-guard";
 import type { OpsEntityKind } from "./ops-alert.kinds";
+import { accountIncidents, emailVolumeIncidents, signInCodeBudgetIncidents } from "./account-alerts";
+import { duplicateScanIncidents } from "../payments/duplicate-scan";
 
 /**
  * Ops alert emails for instant-path incidents (doc 22 §32.24: alerts by
@@ -82,7 +84,14 @@ import type { OpsEntityKind } from "./ops-alert.kinds";
  *  - `quote_budget_refused`: customer quotes were refused because the quote
  *    share of the supplier read budget was spent, so customers were sent to
  *    the inquiry (one incident per episode of refusals, raised at its first;
- *    thresholds in quote-budget-alert.ts). Codes only.
+ *    thresholds in quote-budget-alert.ts). Codes only;
+ *  - `duplicate_scan_full` / `duplicate_no_gateway` (review 102c D5): the
+ *    payments tick's scan of duplicate payments still holding money came
+ *    back full (50 rows), so a newer duplicate may not be refunded
+ *    automatically; or duplicates of a provider with no configured gateway
+ *    are held. Entity `payment_saga:duplicate_scan` (no new entity kind);
+ *    raised again each UTC day while it lasts (payments/duplicate-scan.ts).
+ *    No ids, codes only.
  *
  * Dedup and throttle (`ops_alerts`, one row per entity and reason, under one
  * row lock so concurrent sweeps decide one at a time):
@@ -141,7 +150,23 @@ export type OpsIncidentKind =
   /** Group C (review 102 findings 11, 13): a branded entry file failed for good after repeated faults (generated-document.service.ts). */
   | "entry_file_failed"
   /** Group C (findings 11, 13): a supplier file has waited too long for its branded entry file (for example the code reader cannot load). */
-  | "entry_file_waiting";
+  | "entry_file_waiting"
+  /** Group B (owner Q-B4): "This was not me" detached an automatically attached booking (account-alerts.ts). */
+  | "account_attach_disputed"
+  /** Group B: one sign-in matched more than 20 guest orders; none were attached. */
+  | "account_attach_capped"
+  /** Group B (review 103 finding 5): the notice of an automatic attach will not be sent; staff tell the buyer. */
+  | "account_attach_notice_failed"
+  /** Group B (owner Q-B3): an erased account's Supabase Auth user must be deleted by hand. */
+  | "supabase_user_delete_due"
+  /** Group B (owner Q-B6): email volume reached the alert share of the Resend plan's daily or monthly cap. */
+  | "email_volume_high"
+  /** Group B (re-review 103b N1): today's sign-in code budget reached 80 % or is spent (account-alerts.ts). */
+  | "signin_code_budget"
+  /** Review 102c D5: the payments tick's duplicate-payment scan came back full (payments/duplicate-scan.ts). */
+  | "duplicate_scan_full"
+  /** Review 102c D5: duplicates of a provider with no configured gateway are held (payments/duplicate-scan.ts). */
+  | "duplicate_no_gateway";
 /**
  * `crm_subject` needs migration 20261122140000 (ops_alerts_entity_kind_check). Its entity id is `inquiry:<id>`
  * or `order:<id>`, or `portal:<environment>` for the CRM worker's own pause (C2b, no new entity kind).
@@ -185,6 +210,14 @@ export const OPS_INCIDENT_TITLES: Record<OpsIncidentKind, string> = {
   fiscal_attention: "Fiscal document needs staff: invoice or credit note not issued automatically",
   entry_file_failed: "Branded entry PDF failed: the operator's PDF stays the entry document",
   entry_file_waiting: "Branded entry PDF not made in time: check the documents job and the code reader",
+  account_attach_disputed: "Customer said a booking added to an account was not theirs: booking detached",
+  account_attach_capped: "One sign-in matched more than 20 guest bookings: none attached",
+  account_attach_notice_failed: "Booking added to an account, but its notice email was not sent",
+  supabase_user_delete_due: "Erased account: delete its Supabase Auth user by hand",
+  email_volume_high: "Email volume near the Resend plan cap",
+  signin_code_budget: "Email sign-in codes: today's budget is nearly or fully spent (Google sign-in still works)",
+  duplicate_scan_full: "Duplicate payments waiting: automatic refunds may be held up",
+  duplicate_no_gateway: "Duplicate payments held: no payment gateway for their provider account",
 };
 
 /** The stored row payload: what the email says plus its idempotency scope. */
@@ -273,6 +306,12 @@ export function bookingReason(b: { state: string; errorCode: string | null; atte
 
 /** Doc 29 Batch 6: a failed external charge still unrefunded this long after the rejection raises an alert (within the 24 h funds window). */
 export const EXTERNAL_REFUND_ALERT_AFTER_MS = 3 * 3_600_000;
+
+/** A Group B alert read failed: no incident from it, and a log line instead of silence (re-review 103b N3). */
+function groupBReadFailed(part: "account" | "volume" | "signin_budget"): OpsIncident[] {
+  emitEvent("customer.identity_alerts_failed", { part }, "error");
+  return [];
+}
 
 export async function collectOpsIncidents(since: Date, now: Date, limit = COLLECT_LIMIT): Promise<OpsIncident[]> {
   const out: OpsIncident[] = [];
@@ -484,6 +523,14 @@ export async function collectOpsIncidents(since: Date, now: Date, limit = COLLEC
   out.push(...(await fiscalIncidents(since, now, limit)));
   // Group C (findings 11, 13): branded entry files that failed for good or wait too long; nothing while the switch is off.
   out.push(...(await entryFileIncidents(since, now, limit)));
+  // Group B: needs migration 20261130120000 (entity kinds `order_account_link`, `customer`, `email_volume`).
+  // A read failure here (tables not yet migrated) yields no incident, never a failed sweep; each part of
+  // `accountIncidents` reads on its own and logs its own failure (re-review 103b N3).
+  out.push(...(await accountIncidents(since, now, limit).catch(() => groupBReadFailed("account"))));
+  out.push(...(await emailVolumeIncidents(now).catch(() => groupBReadFailed("volume"))));
+  out.push(...(await signInCodeBudgetIncidents(now).catch(() => groupBReadFailed("signin_budget"))));
+  // Review 102c D5: entity kind `payment_saga`, so no constraint change.
+  out.push(...(await duplicateScanIncidents(since, now)));
   return out;
 }
 

@@ -69,6 +69,10 @@ export const ROUTES: RouteCase[] = [
   R("POST", "auth/otp/request", "public", "json", () => import("@/app/api/auth/otp/request/route")),
   R("POST", "auth/otp/verify", "public", "json", () => import("@/app/api/auth/otp/verify/route")),
   R("POST", "auth/otp/widget", "public", "json", () => import("@/app/api/auth/otp/widget/route")),
+  // Group B: Supabase sign-in by email code, and the "this was not me" detach (owner Q10).
+  R("POST", "auth/email/start", "public", "json", () => import("@/app/api/auth/email/start/route")),
+  R("POST", "auth/email/verify", "public", "json", () => import("@/app/api/auth/email/verify/route")),
+  R("POST", "orders/account-link/dispute", "public", "json", () => import("@/app/api/orders/account-link/dispute/route")),
   R("POST", "inquiries", "public", "json", () => import("@/app/api/inquiries/route")),
   R("POST", "inquiries/lookup", "public", "json", () => import("@/app/api/inquiries/lookup/route")),
   R("POST", "me/delete-request", "customer", "optional", () => import("@/app/api/me/delete-request/route")),
@@ -101,6 +105,9 @@ export const ROUTES: RouteCase[] = [
 export const NON_BROWSER = new Set([
   "POST webhooks/whatsapp",
   "POST webhooks/resend",
+  // Group B: Supabase Auth hooks, Standard Webhooks signature (src/server/auth/auth-hook.ts).
+  "POST auth/hooks/send-email",
+  "POST auth/hooks/before-user-created",
   "POST jobs/inquiry-sweep",
   "POST jobs/offline-conversions",
   "POST jobs/supplier-worker",

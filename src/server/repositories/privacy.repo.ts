@@ -148,6 +148,8 @@ export async function findSubjectRecords(db: Db, s: ErasureSubject): Promise<Sub
   const customerOr: Prisma.CustomerWhereInput[] = [];
   if (s.phoneE164) customerOr.push({ phoneE164: s.phoneE164 });
   if (s.email) customerOr.push({ email: { equals: s.email, mode: "insensitive" } });
+  // Group B: an account found by the email its sign-in identity verified (lower case, exact).
+  if (s.email) customerOr.push({ identities: { some: { email: s.email.trim().toLowerCase() } } });
   const customers = customerOr.length ? await db.customer.findMany({ where: { OR: customerOr }, select: { id: true } }) : [];
   const customerIds = customers.map((c) => c.id);
 
@@ -368,6 +370,28 @@ export async function eraseSubjectRows(tx: Tx, plan: ErasurePlan): Promise<Erasu
     customers += 1;
   }
   if (customers) note("customers", "phoneE164", "email", "fullName", "dietary", "hotel", "deletedAt");
+  // Group B: sign-in identities go with the account; attach links close as `erasure` (the order history stays).
+  // The Supabase Auth user itself is deleted by staff by hand (owner Q-B3): the ops sweep alerts on this audit row.
+  if (closedCustomerIds.length) {
+    const links = await tx.orderAccountLink.updateMany({ where: { customerId: { in: closedCustomerIds }, detachedAt: null }, data: { detachedAt: now, detachReason: "erasure", disputeTokenCiphertext: null } });
+    if (links.count) note("order_account_links", "detachedAt", "detachReason", "disputeTokenCiphertext");
+    const identities = await tx.customerIdentity.findMany({ where: { customerId: { in: closedCustomerIds } }, select: { customerId: true, providerSubject: true } });
+    if (identities.length) {
+      await tx.customerIdentity.deleteMany({ where: { customerId: { in: closedCustomerIds } } });
+      note("customer_identities", "deleted");
+      for (const id of new Set(identities.map((i) => i.customerId))) {
+        await tx.auditLog.create({
+          data: {
+            actorType: "system",
+            action: "customer.supabase_user_delete_due",
+            entityType: "customer_supabase_user",
+            entityId: id,
+            after: { supabaseUserIds: identities.filter((i) => i.customerId === id).map((i) => i.providerSubject) },
+          },
+        });
+      }
+    }
+  }
   const sessions = closedCustomerIds.length
     ? await tx.customerSession.updateMany({ where: { customerId: { in: closedCustomerIds }, revokedAt: null }, data: { revokedAt: now } })
     : { count: 0 };

@@ -36,7 +36,7 @@ const INPUT =
 export interface ProfileFormCustomer {
   fullName: string;
   email: string;
-  phoneMasked: string;
+  phoneMasked: string | null;
   dietary?: Dietary;
   hotel: string;
   preferredCurrency: Currency;
@@ -116,13 +116,15 @@ function DetailsCard({ customer }: { customer: ProfileFormCustomer }) {
         className="mt-4 space-y-4"
         noValidate
       >
-        <div>
-          <p className="text-2xs font-bold uppercase tracking-wide text-ink-500">WhatsApp number</p>
-          <p className="text-[0.95rem] font-semibold tnum text-ink-900">{customer.phoneMasked}</p>
-          <p className="mt-0.5 text-xs text-ink-500">
-            This is how you sign in and where we reply. To change it, message us on WhatsApp from the new number.
-          </p>
-        </div>
+        {customer.phoneMasked ? (
+          <div>
+            <p className="text-2xs font-bold uppercase tracking-wide text-ink-500">WhatsApp number</p>
+            <p className="text-[0.95rem] font-semibold tnum text-ink-900">{customer.phoneMasked}</p>
+            <p className="mt-0.5 text-xs text-ink-500">
+              This is how you sign in and where we reply. To change it, message us on WhatsApp from the new number.
+            </p>
+          </div>
+        ) : null}
 
         <Field id="pf-name" label="Full name" error={errors.fullName}>
           <input

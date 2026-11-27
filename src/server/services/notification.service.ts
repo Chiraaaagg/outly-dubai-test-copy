@@ -8,7 +8,7 @@ import { customerActor, hasPermission, requirePermission } from "../lib/actor";
 import { audit, auditFieldChanges } from "../lib/audit";
 import { log } from "../lib/logger";
 import { Errors } from "../lib/errors";
-import { hmacCandidates, KeyUnavailableError } from "../lib/crypto";
+import { decryptFor, hmacCandidates, KeyUnavailableError, safeEqual, sha256Hex } from "../lib/crypto";
 import { emitEvent } from "../lib/structured-events";
 import { analyticsService } from "./analytics.service";
 import { capabilityService } from "./capability.service";
@@ -32,6 +32,7 @@ import {
   type TicketNotificationEvent,
 } from "../notifications/templates";
 import { emailAdapter, type EmailOutcome, type EmailSend } from "../notifications/email.adapter";
+import { ACCOUNT_LINK_NOTICE_EVENT, notMeLink, renderAccountLinkNotice, type AttachRule } from "../notifications/auth-templates";
 import { whatsappAdapter, WhatsAppSendError } from "../notifications/whatsapp.adapter";
 import { isRecipientAllowed } from "../notifications/allowlist";
 import { latestConsent } from "../repositories/consent.repo";
@@ -121,6 +122,12 @@ export interface DispatchInput {
 /** Row states a dispatch can end in. `queued`: the outcome could not be recorded; the sweep resolves it. */
 export type OutboxOutcome = "sent" | "failed" | "unknown" | "suppressed" | "queued";
 
+/** An attach notice row written in the sign-in request; its send runs after the response (re-review 103b N4). */
+export interface QueuedAccountLinkNotice {
+  row: Notification;
+  claimUntil: Date;
+}
+
 export interface DispatchResult {
   id: string;
   /** Coarse status kept for existing callers: `unknown` and `queued` read as `failed` with an `error` code. */
@@ -174,9 +181,9 @@ interface PaymentMessageRef {
 }
 
 /** Attempts per row for retryable failures and for ambiguous (`unknown`, stale `queued`) rows. */
-const MAX_ATTEMPTS = 4;
+export const MAX_ATTEMPTS = 4;
 /** Retryable failures are retried for this long after the row was created. */
-const RETRY_WINDOW_MS = 24 * 3600_000;
+export const RETRY_WINDOW_MS = 24 * 3600_000;
 /**
  * Ambiguous rows are re-sent under the same idempotency key only while the
  * provider still remembers it. Resend keeps keys 24 hours; we stop 30
@@ -323,6 +330,44 @@ function emailOutcome(r: EmailOutcome, template?: string): Outcome {
 const dateLabel = (d: Date) => d.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
 
 /* ------------------------------------------------------------ render */
+
+const dubaiDateTime = (d: Date) =>
+  `${d.toLocaleString("en-GB", { day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "Asia/Dubai" })} Dubai time`;
+
+function parseAccountLinkRef(payload: unknown): { linkId: string } | null {
+  if (!payload || typeof payload !== "object") return null;
+  const p = payload as Record<string, unknown>;
+  return p.kind === "account_link_notice" && typeof p.linkId === "string" && /^[0-9a-f-]{36}$/.test(p.linkId) ? { linkId: p.linkId } : null;
+}
+
+/**
+ * Group B (owner Q10): the "booking added to an account" notice, rendered at
+ * send time from the link row. The "not me" token is kept encrypted on the
+ * row until this message's outcome is known, so a retry re-renders the same
+ * body under the same idempotency key; it is never in the payload.
+ */
+async function prepareAccountLinkNotice(ref: { linkId: string }): Promise<Prepared> {
+  const link = await prisma.orderAccountLink.findUnique({
+    where: { id: ref.linkId },
+    select: { rule: true, attachedAt: true, detachedAt: true, disputeTokenHash: true, disputeTokenCiphertext: true, disputeExpiresAt: true, order: { select: { reference: true } } },
+  });
+  if (!link || (link.rule !== "verified_email" && link.rule !== "guest_session")) return { ok: false, outcome: { status: "failed", retryable: false, code: "link_missing" } };
+  // Already detached (the customer used the link, or staff did): nothing left to tell.
+  if (link.detachedAt) return { ok: false, outcome: { status: "failed", retryable: false, code: "link_detached" } };
+  if (!link.disputeTokenCiphertext || !link.disputeTokenHash || !link.disputeExpiresAt) return { ok: false, outcome: { status: "failed", retryable: false, code: "token_unavailable" } };
+  const token = decryptFor("capability_tokens", link.disputeTokenCiphertext);
+  if (!safeEqual(sha256Hex(token), link.disputeTokenHash)) return { ok: false, outcome: { status: "failed", retryable: false, code: "token_unavailable" } };
+  const e = env();
+  const rendered = renderAccountLinkNotice({
+    orderReference: link.order.reference,
+    rule: link.rule as AttachRule,
+    attachedLabel: dubaiDateTime(link.attachedAt),
+    notMeLink: notMeLink(e.NEXT_PUBLIC_SITE_URL, token),
+    expiresLabel: dateLabel(link.disputeExpiresAt),
+    supportEmail: e.NEXT_PUBLIC_SUPPORT_EMAIL ?? e.EMAIL_REPLY_TO,
+  });
+  return { ok: true, rendered };
+}
 
 type Prepared = { ok: true; rendered: Rendered; grantId?: string; attachments?: EmailSend["attachments"] } | { ok: false; outcome: Outcome };
 
@@ -505,7 +550,10 @@ async function attempt(row: Notification, now: Date): Promise<{ outcome: Outcome
   const isInvoice = row.event === INVOICE_ISSUED;
   const invoiceRef = isInvoice ? parseInvoiceRef(row.payload) : null;
   if (isInvoice && (!invoiceRef || channel !== "email")) return { outcome: { status: "failed", retryable: false, code: "bad_payload" } };
-  if (!isTicket && !isPayment && !isInvoice && !supportsChannel(row.event as NotificationEvent, channel)) return { outcome: { status: "suppressed", reason: "unsupported_channel" } };
+  const isAccountLink = row.event === ACCOUNT_LINK_NOTICE_EVENT;
+  const linkRef = isAccountLink ? parseAccountLinkRef(row.payload) : null;
+  if (isAccountLink && (!linkRef || channel !== "email")) return { outcome: { status: "failed", retryable: false, code: "bad_payload" } };
+  if (!isTicket && !isPayment && !isInvoice && !isAccountLink && !supportsChannel(row.event as NotificationEvent, channel)) return { outcome: { status: "suppressed", reason: "unsupported_channel" } };
 
   // 1. Environment guard — staging can never message a real customer. Checked before any
   //    capability is minted, so a suppressed message creates no grant.
@@ -524,6 +572,7 @@ async function attempt(row: Notification, now: Date): Promise<{ outcome: Outcome
     if (ref) prepared = await prepareTicketMessage(row, ref, now);
     else if (paymentRef) prepared = await preparePaymentMessage(paymentRef);
     else if (invoiceRef) prepared = await prepareInvoiceMessage(invoiceRef);
+    else if (linkRef) prepared = await prepareAccountLinkNotice(linkRef);
     else prepared = { ok: true, rendered: renderTemplate(row.event as NotificationEvent, channel, (row.payload as unknown as TemplateContext) ?? ({} as TemplateContext)) };
   } catch {
     return { outcome: { status: "failed", retryable: true, code: "render" } };
@@ -580,6 +629,9 @@ async function attemptAndRecord(row: Notification, now: Date, claimUntil: Date):
     if (id && outcome.status === "sent") await supersedeAfterSent(row, id, now);
     if (id) await capabilityService.clearCiphertext(id).catch(() => {});
   }
+  const linkRef = final && row.event === ACCOUNT_LINK_NOTICE_EVENT ? parseAccountLinkRef(row.payload) : null;
+  // The notice's outcome is known: the kept "not me" token is no longer needed (its hash stays for the link).
+  if (linkRef) await prisma.orderAccountLink.updateMany({ where: { id: linkRef.linkId }, data: { disputeTokenCiphertext: null } }).catch(() => {});
 
   const base = { notificationId: row.id, event: row.event, channel: row.channel };
   switch (outcome.status) {
@@ -838,6 +890,46 @@ function recipientHashesOrNull(recipient: string): string[] | null {
   }
 }
 
+/**
+ * Step 1 of the attach notice (re-review 103b N4): writes the queued outbox
+ * row and links it to the attach, inside the sign-in request, before the
+ * response. Once the row exists, a send that never runs (the function was
+ * stopped after the response) is still sent by the outbox sweep when the
+ * row's claim lapses. Never throws: null when the row could not be written
+ * (the link then has no row and raises `attach_notice_missing` for staff).
+ */
+async function queueAccountLinkNotice(input: { linkId: string; orderId: string; recipient: string }): Promise<QueuedAccountLinkNotice | { duplicate: DispatchResult } | null> {
+  try {
+    const now = new Date();
+    const hashes = recipientHashesOrNull(input.recipient);
+    const [dedupKey = null, ...olderKeys] = hashes
+      ? dedupKeysFor({ event: `${ACCOUNT_LINK_NOTICE_EVENT}:email:${input.linkId}`, orderId: input.orderId, inquiryId: null, resendOf: null }, hashes)
+      : [];
+    const id = uuidv7();
+    const inserted = await insertQueued(
+      { id, event: ACCOUNT_LINK_NOTICE_EVENT, channel: "email", recipient: input.recipient, orderId: input.orderId, payload: { kind: "account_link_notice", linkId: input.linkId }, dedupKey },
+      now,
+      olderKeys,
+    );
+    if ("duplicate" in inserted) return { duplicate: resultOf(inserted.duplicate.id, rowOutcome(inserted.duplicate), { duplicate: true }) };
+    await prisma.orderAccountLink.updateMany({ where: { id: input.linkId, notificationId: null }, data: { notificationId: inserted.row.id } });
+    return { row: inserted.row, claimUntil: inserted.claimUntil };
+  } catch {
+    emitEvent("notification.failed", { event: ACCOUNT_LINK_NOTICE_EVENT, channel: "email", reason: "dispatch_failed" }, "error");
+    return null;
+  }
+}
+
+/** Step 2 of the attach notice: the send of a queued row, deferred until after the response. Never throws. */
+async function sendQueuedAccountLinkNotice(queued: QueuedAccountLinkNotice): Promise<DispatchResult | null> {
+  try {
+    return await attemptAndRecord(queued.row, new Date(), queued.claimUntil);
+  } catch {
+    emitEvent("notification.failed", { event: ACCOUNT_LINK_NOTICE_EVENT, channel: "email", reason: "dispatch_failed" }, "error");
+    return null;
+  }
+}
+
 export const notificationService = {
   async dispatch(input: DispatchInput): Promise<DispatchResult> {
     const now = new Date();
@@ -882,6 +974,23 @@ export const notificationService = {
     }
     return attemptAndRecord(inserted.row, now, inserted.claimUntil);
   },
+
+  /**
+   * Group B (owner Q10): one notice per automatic attach, to the order's
+   * verified email, through the outbox (one row per link; a second call for
+   * the same link is a duplicate and sends nothing). Never throws: a failed
+   * notice leaves the attach in place and the row for the retry sweep.
+   * The same as `queueAccountLinkNotice` then `sendQueuedAccountLinkNotice`.
+   */
+  async sendAccountLinkNotice(input: { linkId: string; orderId: string; recipient: string }): Promise<DispatchResult | null> {
+    const queued = await queueAccountLinkNotice(input);
+    if (!queued) return null;
+    if ("duplicate" in queued) return queued.duplicate;
+    return sendQueuedAccountLinkNotice(queued);
+  },
+
+  queueAccountLinkNotice,
+  sendQueuedAccountLinkNotice,
 
   /* -------------------------------------------------- inquiry triggers */
 

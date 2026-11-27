@@ -61,3 +61,22 @@ export function publishResultRows(results: readonly PublishOutcome[], titles: Re
 
 /** The batches table's heading (page.tsx): focus lands here when an import or rollback dialog closes after its batch changed, since the dialog's own trigger is gone (review 109 INT-04). */
 export const BATCHES_HEADING_ID = "td-import-batches-heading";
+
+/** Open a confirmation only for a form the browser accepts: shows its validation messages otherwise (review P3-3). */
+export function openWhenValid(form: { reportValidity(): boolean } | null): boolean {
+  return form !== null && form.reportValidity();
+}
+
+type Answer = { ok: true; data: { summary: string } } | { ok: false } | null;
+
+/**
+ * An action that hands a success's summary to `onDone` before it returns, so a row-level outcome region learns it
+ * even when the refreshed page unmounts the submitting form in the same commit (final review, P3-4).
+ */
+export function reportingAction<P, R extends Answer>(act: (prev: P, fd: FormData) => Promise<R>, onDone: ((summary: string) => void) | undefined): (prev: P, fd: FormData) => Promise<R> {
+  return async (prev, fd) => {
+    const r = await act(prev, fd);
+    if (r?.ok) onDone?.(r.data.summary);
+    return r;
+  };
+}

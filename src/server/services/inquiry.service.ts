@@ -219,6 +219,17 @@ export function manualPaymentFor(input: {
   return { amountMinor: entered.amountMinor, currency: entered.currency, varianceReason: reason.slice(0, 500) };
 }
 
+/**
+ * `FEATURE_VERIFIED_INQUIRIES` means "this phone was proven". Only a session
+ * that carries a verified phone passes: an email or Google account without a
+ * phone (Group B) is unverified for this purpose (review 103 finding 6), so
+ * the form opens its code step as it does for a visitor without a session.
+ * Pure; the route calls it.
+ */
+export function inquiryNeedsVerification(flagOn: boolean | undefined, customer: { phoneE164: string | null } | null | undefined): boolean {
+  return flagOn === true && !customer?.phoneE164;
+}
+
 export const inquiryService = {
   /* ================================================================ create */
 
@@ -239,7 +250,7 @@ export const inquiryService = {
    */
   async create(
     input: CreateInquiryInput,
-    ctx: { ip?: string; userAgent?: string; customer?: { id: string; phoneE164: string } },
+    ctx: { ip?: string; userAgent?: string; customer?: { id: string; phoneE164: string | null } },
   ): Promise<CreateInquiryResult> {
     if (!input.idempotencyKey) return inquiryService.createVerified(input, ctx);
 
@@ -262,7 +273,7 @@ export const inquiryService = {
 
   async createVerified(
     input: CreateInquiryInput,
-    ctx: { ip?: string; userAgent?: string; customer?: { id: string; phoneE164: string } },
+    ctx: { ip?: string; userAgent?: string; customer?: { id: string; phoneE164: string | null } },
   ): Promise<CreateInquiryResult> {
     const e = env();
     const now = new Date();
@@ -270,9 +281,10 @@ export const inquiryService = {
     // 1. Identity + validation (§12.13)
     const phone = normalisePhone(input.leadPhone, input.countryCode);
     if (!phone.valid) throw Errors.validation({ phone: phone.reason ?? "That doesn't look like a valid WhatsApp number." });
-    // Only meaningful when a verified session is attached; an unverified
-    // submission has no proven number to contradict.
-    if (ctx.customer && phone.e164 !== ctx.customer.phoneE164) {
+    // Only meaningful when a verified session with a phone is attached; an
+    // unverified submission, or an email/Google account without a phone
+    // (Group B), has no proven number to contradict.
+    if (ctx.customer?.phoneE164 && phone.e164 !== ctx.customer.phoneE164) {
       throw Errors.validation({
         phone: "This inquiry goes out under the number you verified. Sign out to use a different one.",
       });

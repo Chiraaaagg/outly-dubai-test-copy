@@ -24,6 +24,8 @@ import { emitEvent } from "../lib/structured-events";
  *    named by no order item, payment or contact verification.
  *  - `guest_sessions` (row 6): past `expires_at` and named by no quote, so a
  *    session behind a live order's quote stays as long as that quote does.
+ *  - `customer_auth_intents` (Group B): the sign-in hook gate, past
+ *    `expires_at` (two minutes) plus the session grace day. Hashes only.
  *
  * Each class runs in batches of `PURGE_BATCH_SIZE` rows (`DELETE … WHERE id IN
  * (SELECT … LIMIT n FOR UPDATE SKIP LOCKED)`), at most `PURGE_MAX_BATCHES`
@@ -70,6 +72,7 @@ export const PURGE_CLASSES = [
   "unbound_contact_verifications",
   "quotes",
   "guest_sessions",
+  "customer_auth_intents",
 ] as const;
 
 export type PurgeClass = (typeof PURGE_CLASSES)[number];
@@ -130,6 +133,11 @@ export const prismaPurgeStore: PurgeStore = {
               AND NOT EXISTS (SELECT 1 FROM "order_items" oi WHERE oi."quote_id" = q."id")
               AND NOT EXISTS (SELECT 1 FROM "payments" p WHERE p."quote_id" = q."id")
             LIMIT ${limit} FOR UPDATE OF v SKIP LOCKED)`;
+      case "customer_auth_intents":
+        return prisma.$executeRaw`
+          DELETE FROM "customer_auth_intents" WHERE "id" IN (
+            SELECT "id" FROM "customer_auth_intents" WHERE "expires_at" < ${cutoff}
+            LIMIT ${limit} FOR UPDATE SKIP LOCKED)`;
       case "quotes":
         return prisma.$executeRaw`
           DELETE FROM "quotes" WHERE "id" IN (
@@ -230,6 +238,7 @@ export async function runRetentionPurge(opts: RetentionPurgeOptions = {}): Promi
     contactVerifications: c.unbound_contact_verifications.deleted,
     quotes: c.quotes.deleted,
     guestSessions: c.guest_sessions.deleted,
+    authIntents: c.customer_auth_intents.deleted,
     failed: PURGE_CLASSES.filter((k) => c[k].failed).length,
     incomplete: PURGE_CLASSES.filter((k) => !c[k].complete).length,
     outOfTime,

@@ -18,12 +18,13 @@ export async function requireCustomer(nextPath: string) {
   return session;
 }
 
-/** First name when we have one, else the masked phone — never an empty greeting. */
+/** First name when we have one, else the masked phone or email (Group B) — never an empty greeting. */
 export function customerDisplayName(customer: {
   firstName?: string;
   fullName?: string;
-  phoneMasked: string;
+  phoneMasked: string | null;
+  emailMasked?: string;
 }): string {
   const first = customer.firstName?.trim() || customer.fullName?.trim().split(/\s+/)[0];
-  return first || customer.phoneMasked;
+  return first || customer.phoneMasked || customer.emailMasked || "there";
 }

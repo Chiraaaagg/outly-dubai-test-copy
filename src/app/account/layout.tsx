@@ -40,9 +40,15 @@ export default async function AccountLayout({ children }: { children: ReactNode 
       <div className="mb-6 flex flex-wrap items-end justify-between gap-4">
         <div className="min-w-0">
           <h1 className="text-[1.75rem] sm:text-3xl">Hello, {name}</h1>
-          <p className="mt-1 text-sm text-ink-600">
-            <span className="tnum">{customer.phoneMasked}</span>
-            {customer.email ? ` · ${customer.email}` : ""} · with us since {since}
+          <p className="mt-1 text-sm text-ink-600 [overflow-wrap:anywhere]">
+            {[customer.phoneMasked ? <span key="p" className="tnum">{customer.phoneMasked}</span> : null, customer.email ?? null, `with us since ${since}`]
+              .filter(Boolean)
+              .map((part, i) => (
+                <span key={i}>
+                  {i > 0 ? " · " : ""}
+                  {part}
+                </span>
+              ))}
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">

@@ -398,8 +398,8 @@ model AdminSession {
 
 model Customer {
   id                String    @id @db.Uuid
-  /// E.164 — the identity. Verified by OTP before the row exists.
-  phoneE164         String    @unique @map("phone_e164")
+  /// E.164, verified by OTP before it is stored. Null for an email or Google account until a phone is linked (Group B, owner Q9).
+  phoneE164         String?   @unique @map("phone_e164")
   /// Stored lowercased. Optional; never used to sign in.
   email             String?
   fullName          String?   @map("full_name")
@@ -414,12 +414,101 @@ model Customer {
   /// Set by the §05.8 anonymisation (ops action) — the row stays for FK integrity.
   deletedAt         DateTime? @map("deleted_at") @db.Timestamptz(6)
 
-  sessions  CustomerSession[]
-  inquiries Inquiry[]
-  orders    Order[]
-  quotes    Quote[]
+  sessions     CustomerSession[]
+  inquiries    Inquiry[]
+  orders       Order[]
+  quotes       Quote[]
+  identities   CustomerIdentity[]
+  accountLinks OrderAccountLink[]
 
   @@map("customers")
+}
+
+/// Group B: one external identity (the Supabase Auth user id) to one customer. Never keyed on email.
+/// Checks in migration 20261130120000 (provider, method, lower-case email, hash shape).
+model CustomerIdentity {
+  id              String             @id @db.Uuid
+  customerId      String             @map("customer_id") @db.Uuid
+  /// supabase
+  provider        String
+  /// auth.users.id
+  providerSubject String             @map("provider_subject")
+  /// Lower case, as last verified by the identity provider or our own email code.
+  email           String?
+  /// sha256 hex of `email`: rule (a) joins it to order_contact_verifications.contact_hash.
+  emailHash       String?            @map("email_hash")
+  emailVerifiedAt DateTime?          @map("email_verified_at") @db.Timestamptz(6)
+  /// email_otp | google | apple | sms_otp | whatsapp_otp
+  lastMethod      String             @map("last_method")
+  createdAt       DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  lastUsedAt      DateTime           @default(now()) @map("last_used_at") @db.Timestamptz(6)
+  customer        Customer           @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  accountLinks    OrderAccountLink[]
+
+  @@unique([provider, providerSubject], map: "customer_identities_provider_subject_key")
+  @@unique([customerId, provider], map: "customer_identities_customer_provider_key")
+  @@index([emailHash], map: "customer_identities_email_hash_idx")
+  @@map("customer_identities")
+}
+
+/// Group B: the gate for the Supabase Auth hooks. A hook sends a code (or lets a user be created) only for a live,
+/// unconsumed intent our own start route wrote. Hashes only. Purged by retention one day after expiry.
+model CustomerAuthIntent {
+  id          String    @id @db.Uuid
+  /// email | phone
+  channel     String
+  contactHash String    @map("contact_hash")
+  ipHash      String?   @map("ip_hash")
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  expiresAt   DateTime  @map("expires_at") @db.Timestamptz(6)
+  consumedAt  DateTime? @map("consumed_at") @db.Timestamptz(6)
+
+  @@index([expiresAt], map: "customer_auth_intents_expires_idx")
+  @@map("customer_auth_intents")
+}
+
+/// Group B (owner Q10): one automatic attach of a guest order to an account, and its "this was not me" detach.
+/// One active link per order (partial unique index order_account_links_one_active, SQL only).
+model OrderAccountLink {
+  id                     String                    @id @db.Uuid
+  orderId                String                    @map("order_id") @db.Uuid
+  customerId             String                    @map("customer_id") @db.Uuid
+  identityId             String?                   @map("identity_id") @db.Uuid
+  /// verified_email | guest_session | phone_verification | staff
+  rule                   String
+  verificationId         String?                   @map("verification_id") @db.Uuid
+  guestSessionId         String?                   @map("guest_session_id") @db.Uuid
+  notificationId         String?                   @map("notification_id") @db.Uuid
+  attachedAt             DateTime                  @default(now()) @map("attached_at") @db.Timestamptz(6)
+  /// sha256 hex of the "not me" token; the token itself is only in the notice email.
+  disputeTokenHash       String?                   @unique(map: "order_account_links_dispute_token_hash_key") @map("dispute_token_hash")
+  /// The token encrypted (`capability_tokens` ring) until the notice email's outcome is known, so a retry is identical.
+  disputeTokenCiphertext String?                   @map("dispute_token_ciphertext")
+  disputeExpiresAt       DateTime?                 @map("dispute_expires_at") @db.Timestamptz(6)
+  detachedAt             DateTime?                 @map("detached_at") @db.Timestamptz(6)
+  /// not_me | staff | erasure
+  detachReason           String?                   @map("detach_reason")
+  order                  Order                     @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  customer               Customer                  @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  identity               CustomerIdentity?         @relation(fields: [identityId], references: [id], onDelete: SetNull)
+  verification           OrderContactVerification? @relation(fields: [verificationId], references: [id], onDelete: Restrict)
+  guestSession           GuestSession?             @relation(fields: [guestSessionId], references: [id], onDelete: SetNull)
+
+  @@index([customerId], map: "order_account_links_customer_idx")
+  @@index([orderId], map: "order_account_links_order_idx")
+  @@map("order_account_links")
+}
+
+/// Group B (owner Q-B6): daily counts of emails sent outside the notification outbox, for the Resend volume alert.
+model EmailSendCounter {
+  day       DateTime @db.Date
+  /// signin_code | checkout_code | recovery_code
+  kind      String
+  count     Int      @default(0)
+  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  @@id([day, kind], map: "email_send_counters_pkey")
+  @@map("email_send_counters")
 }
 
 /// Opaque bearer session — the token is random, only its SHA-256 is stored. 30-day sliding expiry.
@@ -1619,6 +1708,7 @@ model Order {
   analytics            AnalyticsEvent[]
   quote                Quote?                     @relation("QuoteUsedByOrder")
   verifications        OrderContactVerification[]
+  accountLinks         OrderAccountLink[]
   paymentSaga          PaymentSaga?
   remedies             CustomerRemedy[]
   ledgerEntries        LedgerEntry[]
@@ -1708,12 +1798,13 @@ model OrderItem {
 /// Guest checkout identity (B2). Opaque bearer token; only its SHA-256 is
 /// stored. Not a customer account and never creates one.
 model GuestSession {
-  id        String    @id @db.Uuid
-  tokenHash String    @unique @map("token_hash")
-  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  expiresAt DateTime  @map("expires_at") @db.Timestamptz(6)
-  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(6)
-  quotes    Quote[]
+  id           String             @id @db.Uuid
+  tokenHash    String             @unique @map("token_hash")
+  createdAt    DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  expiresAt    DateTime           @map("expires_at") @db.Timestamptz(6)
+  revokedAt    DateTime?          @map("revoked_at") @db.Timestamptz(6)
+  quotes       Quote[]
+  accountLinks OrderAccountLink[]
 
   @@index([expiresAt], map: "guest_sessions_expires_idx")
   @@map("guest_sessions")
@@ -1760,19 +1851,20 @@ model Quote {
 /// Verifying never creates a customer row. Checks in migration 20261101120000:
 /// channel and method agree; contactHash is sha256 hex.
 model OrderContactVerification {
-  id          String   @id @db.Uuid
-  quoteId     String   @map("quote_id") @db.Uuid
-  orderId     String?  @map("order_id") @db.Uuid
+  id           String             @id @db.Uuid
+  quoteId      String             @map("quote_id") @db.Uuid
+  orderId      String?            @map("order_id") @db.Uuid
   /// phone | email
-  channel     String
+  channel      String
   /// sha256 hex of the normalised contact; the contact itself lives on the order.
-  contactHash String   @map("contact_hash")
+  contactHash  String             @map("contact_hash")
   /// otp_sms | otp_whatsapp | email_code
-  method      String
-  verifiedAt  DateTime @map("verified_at") @db.Timestamptz(6)
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  quote       Quote    @relation(fields: [quoteId], references: [id], onDelete: Restrict)
-  order       Order?   @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  method       String
+  verifiedAt   DateTime           @map("verified_at") @db.Timestamptz(6)
+  createdAt    DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  quote        Quote              @relation(fields: [quoteId], references: [id], onDelete: Restrict)
+  order        Order?             @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  accountLinks OrderAccountLink[]
 
   @@unique([quoteId, channel], map: "ocv_quote_channel_key")
   @@index([orderId], map: "ocv_order_idx")

@@ -1,4 +1,5 @@
 import "server-only";
+import { customerIdentityRepo } from "../repositories/customer-identity.repo";
 import { randomInt } from "node:crypto";
 import { prisma, TX_OPTIONS, type Tx } from "../lib/db";
 import { env } from "../lib/env";
@@ -190,7 +191,7 @@ export type ChallengeDelivery = "sent" | "suppressed" | "unknown" | "failed";
  * notification row, an event or a log. SMS keeps the adapter's own send,
  * which throws on failure. Never throws.
  */
-export async function deliverChallengeCode(input: { challengeId: string; channel: Channel; recipient: string; code: string; ttlSeconds: number }): Promise<ChallengeDelivery> {
+export async function deliverChallengeCode(input: { challengeId: string; channel: Channel; recipient: string; code: string; ttlSeconds: number; purpose?: "checkout" | "recovery" }): Promise<ChallengeDelivery> {
   const { challengeId, channel, recipient, code } = input;
   if (suppressed(channel, recipient)) return "suppressed";
   const ttlMinutes = Math.max(1, Math.round(input.ttlSeconds / 60));
@@ -208,7 +209,11 @@ export async function deliverChallengeCode(input: { challengeId: string; channel
     let outcome = await emailAdapter.send(msg, { idempotencyKey: challengeId });
     // Same key and same body: the provider answers the first request, so this can never be a second email.
     if (outcome?.kind === "unknown") outcome = await emailAdapter.send(msg, { idempotencyKey: challengeId });
-    if (outcome?.kind === "sent") return "sent";
+    if (outcome?.kind === "sent") {
+      // Group B (owner Q-B6): codes go outside the outbox, so the volume alert counts them here. Never throws.
+      await customerIdentityRepo.countEmailSend(input.purpose === "recovery" ? "recovery_code" : "checkout_code");
+      return "sent";
+    }
     if (outcome?.kind === "unknown") {
       log.warn("contact_verification.send_unknown", { challengeId, reason: outcome.reason });
       return "unknown";

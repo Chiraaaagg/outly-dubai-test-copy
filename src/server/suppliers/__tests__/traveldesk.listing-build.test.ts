@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import { pageUnitPrice } from "@/lib/pricing";
 import type { Activity } from "@/lib/types";
 import { meetsFloor, type RuleCostLine } from "../../domain/rule-price";
-import { activityInputSchema, buildActivityContent } from "../../schemas/activity.schema";
-import { assessReadiness, policyTextAgrees, pickupAgrees, unitRestricted } from "../../services/readiness.service";
+import { activityInputSchema, buildActivityContent, MAX_TIME_SLOTS } from "../../schemas/activity.schema";
+import { assessReadiness, policyTextAgrees, pickupAgrees, slotTimesAgree, unitRestricted } from "../../services/readiness.service";
 import { parseClassKey, type CapabilityDimensions } from "../traveldesk/traveldesk.capability";
 import { buildListingDraft, editorLine, lockedFieldsBetween, NON_REFUNDABLE_POLICY, PENDING_TEXT, type BuildContent, type BuildContext } from "../traveldesk/traveldesk.listing-build";
 import { buildListingPlan, type PlannedListing, type PlanOffer, type PlanRules } from "../traveldesk/traveldesk.listing-plan";
@@ -368,4 +368,93 @@ describe("adult age without a child unit (review 110 R110-03)", () => {
     expect([adult.ageMin, adult.label]).toEqual([variantPaxAges(v)!.adult.min, "Adult (12+)"]);
   });
 });
+});
+
+describe("many listed start times (tour 138 shape: invalid:timeSlots:Too big)", () => {
+  const KEY_LISTED = "live.listed_starts_customer_selected.self.external.per_person";
+  const hhmm = (m: number) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+  /** `n` starts `step` minutes apart from `from` (minutes after midnight). */
+  const starts = (n: number, step = 15, from = 480) => Array.from({ length: n }, (_, i) => from + i * step);
+  const listedPlan = (offers: PlanOffer[]) =>
+    buildListingPlan(offers, { rules: RULES, flagsOn: new Set([KEY_LISTED]), content: new Map([[77, { hasDescription: true, photos: 2, faq: 1, itinerary: 1, warnings: 0, schemaVersion: 1 }]]) });
+  const listedOffer = (offerId: number, startMinutes: number[]) => planOffer({ offerId, classKey: KEY_LISTED, isExternal: true, startMinutes });
+  const stores = (ids: number[]) => offersMap(ids, { isExternal: true });
+  const sellable = (slotStartMinutes: number[]) => ({ slotStartMinutes, anyTimeSlots: true, listedStartsSellable: true });
+
+  it("builds and validates a draft with 40 distinct start times, every one kept and in order", () => {
+    const mins = starts(40);
+    const l = listedPlan([listedOffer(1509, mins)]).listings[0];
+    expect(l.kind).toBe("instant");
+    const r = buildListingDraft(l, stores([1509]), CONTENT, CTX);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.input.timeSlots).toEqual(mins.map(hhmm));
+    expect(r.input.timeSlots).toHaveLength(40);
+    expect(activityInputSchema.safeParse(r.input).success).toBe(true);
+    // Readiness: the page times are exactly the offer's stored starts, so the listing stays armable.
+    expect(slotTimesAgree(r.input.timeSlots, sellable(mins))).toBe("ok");
+  });
+
+  it("lists each start once: options sharing 40 starts make one listing, and a repeated start is not repeated on the page", () => {
+    const mins = starts(40);
+    const p = listedPlan([listedOffer(1509, mins), listedOffer(1353, mins)]);
+    expect(p.listings).toHaveLength(1);
+    const r = buildListingDraft(p.listings[0], stores([1509, 1353]), CONTENT, CTX);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.input.timeSlots).toEqual(mins.map(hhmm));
+    expect(slotTimesAgree(r.input.timeSlots, sellable([...mins].reverse()))).toBe("ok");
+
+    // A start repeated in the stored list (two slot ids at one time) is listed once.
+    const repeated = buildListingDraft(listedPlan([listedOffer(1509, [...mins, ...mins.slice(0, 5)])]).listings[0], stores([1509]), CONTENT, CTX);
+    expect(repeated.ok).toBe(true);
+    if (repeated.ok) expect(repeated.input.timeSlots).toEqual(mins.map(hhmm));
+  });
+
+  it("options with different start sets stay separate listings, each with its own times", () => {
+    const a = starts(45);
+    const b = starts(30, 15, 600);
+    const p = listedPlan([listedOffer(1509, a), listedOffer(1353, b)]);
+    expect(p.listings.map((l) => l.startTimes.length).sort((x, y) => x - y)).toEqual([30, 45]);
+    for (const l of p.listings) {
+      const ids = l.options.map((o) => o.offerId);
+      const r = buildListingDraft(l, stores(ids), CONTENT, { ...CTX, siblingCount: 2 });
+      expect(r.ok).toBe(true);
+      if (r.ok) expect(r.input.timeSlots).toEqual(l.startTimes);
+    }
+  });
+
+  it("readiness still refuses a page whose 40 times are not exactly the offer's (never trimmed, never loose)", () => {
+    const mins = starts(40);
+    const page = mins.map(hhmm);
+    expect(slotTimesAgree(page.slice(0, 24), sellable(mins))).toBe("slot_times_mismatch");
+    expect(slotTimesAgree([...page.slice(1), "7:45"], sellable(mins))).toBe("slot_times_mismatch");
+    expect(slotTimesAgree([...page.slice(1), "08:00 pickup"], sellable(mins))).toBe("slot_times_mismatch");
+    expect(slotTimesAgree([...page, "23:59"], sellable(mins))).toBe("slot_times_mismatch");
+  });
+
+  it("caps page times at a full day every 15 minutes (96): 96 builds, 97 is a row error, never a shortened list", () => {
+    expect(MAX_TIME_SLOTS).toBe(96);
+    const day = starts(96, 15, 0);
+    const full = buildListingDraft(listedPlan([listedOffer(1509, day)]).listings[0], stores([1509]), CONTENT, CTX);
+    expect(full.ok).toBe(true);
+    if (full.ok) expect(full.input.timeSlots).toHaveLength(96);
+
+    const over = buildListingDraft(listedPlan([listedOffer(1509, starts(97, 10, 0))]).listings[0], stores([1509]), CONTENT, CTX);
+    // One row error on the time slots field, whatever the validator's wording.
+    expect(over.ok).toBe(false);
+    if (!over.ok) {
+      expect(over.reasons).toHaveLength(1);
+      expect(over.reasons[0].startsWith("invalid:timeSlots:")).toBe(true);
+    }
+  });
+
+  it("the schema keeps the per-time rules: over the cap, blank and over-long entries are still refused", () => {
+    const base = buildListingDraft(listedPlan([listedOffer(1509, starts(40))]).listings[0], stores([1509]), CONTENT, CTX);
+    expect(base.ok).toBe(true);
+    if (!base.ok) return;
+    expect(activityInputSchema.safeParse({ ...base.input, timeSlots: Array.from({ length: 97 }, (_, i) => `slot ${i}`) }).success).toBe(false);
+    expect(activityInputSchema.safeParse({ ...base.input, timeSlots: [...base.input.timeSlots, " "] }).success).toBe(false);
+    expect(activityInputSchema.safeParse({ ...base.input, timeSlots: [...base.input.timeSlots, "x".repeat(81)] }).success).toBe(false);
+  });
 });

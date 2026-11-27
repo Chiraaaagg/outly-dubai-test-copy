@@ -80,3 +80,27 @@ export const deletionRequestSchema = z
     reason: z.string().trim().max(500, "Keep the reason under 500 characters.").optional(),
   })
   .strict();
+
+/* ------------------------------------------------------------ Group B: Supabase sign-in */
+
+/** Email code start. The address is normalised and checked by the service (its error is a closed reason). */
+export const emailStartSchema = z
+  .object({
+    email: z.string().max(320),
+    turnstileToken: z.string().max(2048).optional(),
+  })
+  .strict();
+
+export const emailVerifySchema = z
+  .object({
+    email: z.string().max(320),
+    code: z.string().max(16),
+  })
+  .strict();
+
+/** "This was not me": the token from the notice email's URL fragment. */
+export const accountLinkDisputeSchema = z
+  .object({
+    token: z.string().max(256),
+  })
+  .strict();

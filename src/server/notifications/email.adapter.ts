@@ -43,6 +43,12 @@ export interface EmailSend {
 export interface EmailSendOptions {
   /** The notification row id. Same key + same body = one email at the provider. */
   idempotencyKey: string;
+  /**
+   * A shorter client-side ceiling than EMAIL_TIMEOUT_MS, for a caller that is
+   * itself inside someone else's deadline (the Supabase Send Email hook,
+   * review 103 finding 13). Clamped to 1–10 s. A timeout is still `unknown`.
+   */
+  timeoutMs?: number;
 }
 
 export type EmailFailureReason = "rate_limited" | "rejected" | "auth" | "not_configured" | "invalid_message";
@@ -85,7 +91,7 @@ async function sendViaResend(msg: EmailSend, opts: EmailSendOptions): Promise<Em
   const timer = setTimeout(() => {
     timedOut = true;
     controller.abort();
-  }, EMAIL_TIMEOUT_MS);
+  }, Math.min(EMAIL_TIMEOUT_MS, Math.max(1_000, opts.timeoutMs ?? EMAIL_TIMEOUT_MS)));
   try {
     let res: Response;
     try {

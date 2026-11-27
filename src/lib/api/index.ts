@@ -23,6 +23,7 @@ import type {
 import { bookingReference } from "../utils";
 import * as analytics from "../analytics";
 import { ApiError, assertMockFulfilmentAllowed, currentScenario, mockCall, type MockScenario } from "./client";
+import { isSignInReason, type SignInReason } from "@/lib/customer-auth-options";
 
 /* ---------------------------------------------------------------------------
  * Real transport — the inquiry endpoints are live; everything else is still
@@ -692,16 +693,81 @@ export async function lookupInquiry(
 /** Mirror of the server's `CustomerPublic`. */
 export interface CustomerPublic {
   id: string;
-  phoneE164: string;
+  /** Null for an email or Google account until a phone is linked (Group B). */
+  phoneE164: string | null;
   /** +91 ••••• •3210 */
-  phoneMasked: string;
+  phoneMasked: string | null;
   email?: string;
+  /** j•••@example.com */
+  emailMasked?: string;
   fullName?: string;
   firstName?: string;
   dietary?: Dietary;
   hotel?: string;
   preferredCurrency: "INR" | "AED";
   createdAt: string;
+}
+
+/* ---------------------------------------------------------------------------
+ * Group B: email-code sign-in (Supabase Auth behind our own routes) and the
+ * "this was not me" detach. Errors come back as one closed reason
+ * (src/lib/customer-auth-options.ts); the page owns the words.
+ * ------------------------------------------------------------------------ */
+
+export class SignInError extends Error {
+  constructor(
+    readonly reason: SignInReason,
+    readonly retryAfterSeconds?: number,
+    /** Closed hints on a refusal (Group B re-review 103b): a site-wide limit refused; Google sign-in is on. */
+    readonly hints: { scope?: "site"; alternative?: "google" } = {},
+  ) {
+    super(reason);
+    this.name = "SignInError";
+  }
+}
+
+async function signInPost<T>(path: string, body: unknown): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  let res: Response;
+  try {
+    res = await fetch(path, {
+      method: "POST",
+      headers: { accept: "application/json", "content-type": "application/json" },
+      body: JSON.stringify(body),
+      credentials: "same-origin",
+      cache: "no-store",
+      signal: controller.signal,
+    });
+  } catch {
+    throw new SignInError("UNAVAILABLE");
+  } finally {
+    clearTimeout(timer);
+  }
+  const payload = (await res.json().catch(() => null)) as { error?: { code?: string; details?: { reason?: unknown; retryAfterSeconds?: unknown; scope?: unknown; alternative?: unknown } } } | null;
+  if (res.ok) return payload as T;
+  const d = payload?.error?.details;
+  const retry = typeof d?.retryAfterSeconds === "number" ? d.retryAfterSeconds : undefined;
+  const hints = { ...(d?.scope === "site" ? { scope: "site" as const } : {}), ...(d?.alternative === "google" ? { alternative: "google" as const } : {}) };
+  if (isSignInReason(d?.reason)) throw new SignInError(d.reason, retry, hints);
+  if (res.status === 429 || payload?.error?.code === "RATE_LIMITED") throw new SignInError("RATE_LIMITED", retry);
+  if (payload?.error?.code === "NOT_CONFIGURED") throw new SignInError("NOT_CONFIGURED");
+  throw new SignInError("UNAVAILABLE");
+}
+
+/** POST /api/auth/email/start. The same answer whether or not the address has an account. */
+export function startEmailCode(input: { email: string; turnstileToken?: string }): Promise<{ expiresInSeconds: number; resendAfterSeconds: number }> {
+  return signInPost("/api/auth/email/start", input.turnstileToken ? input : { email: input.email });
+}
+
+/** POST /api/auth/email/verify. On success the server sets the OUTLYY session cookies. */
+export function verifyEmailCode(input: { email: string; code: string }): Promise<{ customer: CustomerPublic; attachedOrders: number }> {
+  return signInPost("/api/auth/email/verify", { email: input.email, code: input.code.replace(/\D/g, "") });
+}
+
+/** POST /api/orders/account-link/dispute. Always `{ ok: true }` unless the request itself fails. */
+export function disputeAccountLink(token: string): Promise<{ ok: true }> {
+  return signInPost("/api/orders/account-link/dispute", { token });
 }
 
 export interface OtpChallenge {

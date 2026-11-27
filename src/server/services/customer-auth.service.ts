@@ -2,8 +2,8 @@ import "server-only";
 import { randomInt } from "node:crypto";
 import type { NextRequest } from "next/server";
 import { prisma, TX_OPTIONS, type Tx } from "../lib/db";
-import { env } from "../lib/env";
-import { Errors } from "../lib/errors";
+import { customerAuthConfigProblems, env, supabaseUrlProblem } from "../lib/env";
+import { AppError, Errors } from "../lib/errors";
 import { log } from "../lib/logger";
 import { uuidv7 } from "../lib/ids";
 import { hashIp, randomToken, safeEqual, sha256Hex } from "../lib/crypto";
@@ -30,6 +30,7 @@ import { hasRealSmsProvider, isWidgetMode, smsAdapter, widgetConfig } from "../s
 import { verifyWidgetToken } from "../sms/msg91-widget";
 import { customerRepo, type CustomerRecord } from "../repositories/customer.repo";
 import type { Currency, Dietary } from "@/lib/types";
+import { hasAnySignInOption, maskEmail, NO_SIGN_IN_OPTIONS, type CustomerAuthOptions } from "@/lib/customer-auth-options";
 
 /**
  * Customer authentication — phone + one-time code (impl/customer-auth-contract.md §1, §3;
@@ -52,9 +53,12 @@ import type { Currency, Dietary } from "@/lib/types";
 
 export interface CustomerPublic {
   id: string;
-  phoneE164: string;
-  phoneMasked: string;
+  /** Null for an email or Google account until a phone is linked (Group B, owner Q9). */
+  phoneE164: string | null;
+  phoneMasked: string | null;
   email?: string;
+  /** `j•••@example.com`, for screens that show the account's contact when there is no phone. */
+  emailMasked?: string;
   fullName?: string;
   firstName?: string;
   dietary?: Dietary;
@@ -82,8 +86,9 @@ export function toCustomerPublic(c: CustomerRecord): CustomerPublic {
   return {
     id: c.id,
     phoneE164: c.phoneE164,
-    phoneMasked: maskPhone(c.phoneE164),
+    phoneMasked: c.phoneE164 ? maskPhone(c.phoneE164) : null,
     email: c.email,
+    emailMasked: c.email ? maskEmail(c.email) : undefined,
     fullName,
     firstName: fullName?.split(/\s+/)[0],
     dietary: c.dietary,
@@ -115,26 +120,50 @@ async function resolveFromToken(token: string | undefined, ctx?: { ipHash?: stri
   return { customer: toCustomerPublic(customer), sessionId: session.id, expiresAt, actor: actorFor(customer.id, ctx) };
 }
 
+/** The closed-account refusal, the same for every sign-in method (plan 92 §6 `ACCOUNT_CLOSED`). */
+export function accountClosedError(): AppError {
+  return new AppError({ status: 401, code: "UNAUTHORIZED", message: "This account has been closed.", recovery: "Contact us if you think this is a mistake.", details: { reason: "ACCOUNT_CLOSED" } });
+}
+
 /**
- * Create (or find) the customer behind a *verified* phone and open a session.
+ * Who signs in, decided inside the session transaction:
+ *  - `{ phoneE164 }`: a phone already proven (our OTP or MSG91's signed
+ *    token); found or created by phone, with the legacy phone linking;
+ *  - `{ resolve }`: any other proven identity (Group B, Supabase Auth): the
+ *    callback finds or creates the customer through `customer_identities`
+ *    and runs the order attach rules, in the same transaction.
+ */
+export type SessionSubject =
+  | { phoneE164: string }
+  | {
+      resolve: (tx: Tx) => Promise<{ customer: CustomerRecord; created: boolean }>;
+      /** Runs after the closed-account check, before the session row; its result comes back as `extra`. */
+      after?: (tx: Tx, customer: CustomerRecord, actor: Actor) => Promise<unknown>;
+      method: string;
+    };
+
+/**
+ * Create (or find) the customer behind a *verified* identity and open a session.
  *
- * Both sign-in paths end here, under the same contract: the phone has already
- * been proven — by our own constant-time comparison in the OTP path, or by
- * MSG91's signed token in the widget path. Nothing below re-checks that, so a
- * caller must never reach this function with a phone the client merely claimed.
+ * Every sign-in path ends here, under the same contract: the identity has
+ * already been proven — by our own constant-time comparison in the OTP path,
+ * by MSG91's signed token in the widget path, or by Supabase Auth (a token we
+ * verified and the user we read back with it). Nothing below re-checks that,
+ * so a caller must never reach this function with an identity the client
+ * merely claimed.
  *
  * `precondition` runs first, inside the transaction. The OTP path uses it to
  * consume the challenge, so a replayed code loses the race here instead of
  * minting a second session.
  */
-async function mintSession(input: {
-  phoneE164: string;
+export async function mintCustomerSession<Extra = unknown>(input: {
+  subject: SessionSubject;
   now: Date;
   sessionDays: number;
   ctx: { ipHash?: string; userAgent?: string };
   precondition?: (tx: Tx) => Promise<void>;
 }) {
-  const { phoneE164, now, ctx } = input;
+  const { subject, now, ctx } = input;
   const token = randomToken(32);
   const expiresAt = sessionExpiresAt(now, input.sessionDays || 30);
   const sessionId = uuidv7();
@@ -142,15 +171,21 @@ async function mintSession(input: {
   const result = await prisma.$transaction(async (tx) => {
     await input.precondition?.(tx);
 
-    const { customer, created } = await customerRepo.findOrCreateByPhone(phoneE164, tx);
-    if (customer.deletedAt) throw Errors.unauthorized("This account has been closed.");
+    const { customer, created } = "phoneE164" in subject ? await customerRepo.findOrCreateByPhone(subject.phoneE164, tx) : await subject.resolve(tx);
+    if (customer.deletedAt) throw accountClosedError();
     const actor = actorFor(customer.id, ctx);
 
-    if (created) await audit(actor, "customer.created", { type: "customer", id: customer.id }, {}, tx);
+    if (created) await audit(actor, "customer.created", { type: "customer", id: customer.id }, "phoneE164" in subject ? {} : { after: { method: subject.method } }, tx);
 
-    const linked = await customerRepo.linkByPhone(customer.id, phoneE164, tx);
-    if (linked.inquiries || linked.orders) {
-      await audit(actor, "customer.linked_by_phone", { type: "customer", id: customer.id }, { after: linked }, tx);
+    let linked = { inquiries: 0, orders: 0 };
+    let extra: unknown = undefined;
+    if ("phoneE164" in subject) {
+      linked = await customerRepo.linkByPhone(customer.id, subject.phoneE164, tx);
+      if (linked.inquiries || linked.orders) {
+        await audit(actor, "customer.linked_by_phone", { type: "customer", id: customer.id }, { after: linked }, tx);
+      }
+    } else if (subject.after) {
+      extra = await subject.after(tx, customer, actor);
     }
 
     await customerRepo.createSession(
@@ -158,20 +193,45 @@ async function mintSession(input: {
       tx,
     );
     await customerRepo.touchLogin(customer.id, now, tx);
-    await audit(actor, "customer.login", { type: "customer_session", id: sessionId }, {}, tx);
+    await audit(actor, "customer.login", { type: "customer_session", id: sessionId }, "phoneE164" in subject ? {} : { after: { method: subject.method } }, tx);
 
-    return { customer: { ...customer, lastLoginAt: now }, linked };
+    return { customer: { ...customer, lastLoginAt: now }, linked, extra: extra as Extra };
   }, TX_OPTIONS);
 
-  return { token, expiresAt, sessionId, customer: result.customer, linked: result.linked };
+  return { token, expiresAt, sessionId, customer: result.customer, linked: result.linked, extra: result.extra };
+}
+
+function mintSession(input: { phoneE164: string; now: Date; sessionDays: number; ctx: { ipHash?: string; userAgent?: string }; precondition?: (tx: Tx) => Promise<void> }) {
+  return mintCustomerSession({ subject: { phoneE164: input.phoneE164 }, now: input.now, sessionDays: input.sessionDays, ctx: input.ctx, precondition: input.precondition });
 }
 
 export const customerAuthService = {
-  /** Is customer sign-in available in this environment? (contract §1) */
+  /** Is the phone sign-in available in this environment? (contract §1) */
   enabled(): boolean {
     const e = env();
     if (e.FEATURE_CUSTOMER_AUTH !== undefined) return e.FEATURE_CUSTOMER_AUTH;
     return e.isNonProduction || hasRealSmsProvider();
+  },
+
+  /**
+   * Which sign-in options actually work here (Group B, plan 92 §6). The
+   * /login page renders exactly these.
+   *  - Email code: the Supabase switch on and every Supabase value present,
+   *    email delivered by Resend in production, and (production) Turnstile.
+   *  - Google: also CUSTOMER_OAUTH_ENABLED and both Google client values.
+   *  - Phone: the existing rule, and only while the Supabase sign-in is off or
+   *    a real SMS route exists (owner Q11: email only for now; phone hidden).
+   */
+  options(): CustomerAuthOptions {
+    const e = env();
+    const supabaseReady = e.CUSTOMER_SUPABASE_AUTH_ENABLED && !customerAuthConfigProblems({ ...e, CUSTOMER_OAUTH_ENABLED: false }).length;
+    const emailCode = supabaseReady;
+    // The same SUPABASE_URL check as the email option (review 103 finding 15): a production URL of the wrong shape hides both.
+    const google = Boolean(e.CUSTOMER_SUPABASE_AUTH_ENABLED && e.CUSTOMER_OAUTH_ENABLED && e.GOOGLE_OAUTH_CLIENT_ID && e.GOOGLE_OAUTH_CLIENT_SECRET && !supabaseUrlProblem(e) && e.SUPABASE_PUBLISHABLE_KEY && e.SUPABASE_AUTH_BEFORE_USER_CREATED_HOOK_SECRET);
+    const phone = customerAuthService.enabled() && (!e.CUSTOMER_SUPABASE_AUTH_ENABLED || (hasRealSmsProvider() && e.FEATURE_CUSTOMER_AUTH !== false));
+    const turnstileSiteKey = emailCode && e.TURNSTILE_SECRET_KEY && e.NEXT_PUBLIC_TURNSTILE_SITE_KEY ? e.NEXT_PUBLIC_TURNSTILE_SITE_KEY : null;
+    const o: CustomerAuthOptions = { emailCode, google, phone, turnstileSiteKey };
+    return hasAnySignInOption(o) ? o : NO_SIGN_IN_OPTIONS;
   },
 
   /* ---------------------------------------------------------------- otp */

@@ -109,16 +109,26 @@ const OTP_CONNECT_SRC = `https://control.msg91.com https://verify.msg91.com http
 const OTP_FRAME_SRC = HCAPTCHA_SRC;
 const OTP_STYLE_SRC = HCAPTCHA_SRC;
 
+/**
+ * Cloudflare Turnstile (Group B; owner Q-B5): the bot check on the email
+ * sign-in. Cloudflare documents exactly two directives for it: the script
+ * (`api.js`) and the challenge iframe, both on challenges.cloudflare.com;
+ * the iframe does its own network calls. `/login` only, and only when the
+ * site key is configured; no other page, and never the admin console.
+ */
+const TURNSTILE_SRC = "https://challenges.cloudflare.com";
+
 /** The Content-Security-Policy value. Pure; exported for tests. */
-export function buildCsp(scriptSrc: string, isProd: boolean, allowAnalytics: boolean, allowOtpWidget: boolean): string {
+export function buildCsp(scriptSrc: string, isProd: boolean, allowAnalytics: boolean, allowOtpWidget: boolean, allowTurnstile = false): string {
+  const frames = [...(allowOtpWidget ? [OTP_FRAME_SRC] : []), ...(allowTurnstile ? [TURNSTILE_SRC] : [])];
   return [
     `default-src 'self'`,
-    `script-src ${scriptSrc}${allowAnalytics ? ` ${GA_SCRIPT_SRC}` : ""}${allowOtpWidget ? ` ${OTP_SCRIPT_SRC}` : ""}`,
+    `script-src ${scriptSrc}${allowAnalytics ? ` ${GA_SCRIPT_SRC}` : ""}${allowOtpWidget ? ` ${OTP_SCRIPT_SRC}` : ""}${allowTurnstile ? ` ${TURNSTILE_SRC}` : ""}`,
     `style-src 'self' 'unsafe-inline'${allowOtpWidget ? ` ${OTP_STYLE_SRC}` : ""}`,
     `img-src 'self' data: blob: https:${allowAnalytics ? ` ${GA_IMG_SRC}` : ""}`,
     `font-src 'self' data:`,
     `connect-src 'self'${allowAnalytics ? ` ${GA_CONNECT_SRC}` : ""}${allowOtpWidget ? ` ${OTP_CONNECT_SRC}` : ""}${isProd ? "" : " ws: wss:"}`,
-    ...(allowOtpWidget ? [`frame-src ${OTP_FRAME_SRC}`] : []),
+    ...(frames.length ? [`frame-src ${frames.join(" ")}`] : []),
     `frame-ancestors 'none'`,
     `base-uri 'self'`,
     `form-action 'self'`,
@@ -199,6 +209,8 @@ export interface EdgePolicyInput {
   analyticsConfigured: boolean;
   /** NEXT_PUBLIC_MSG91_WIDGET_ID is set. */
   otpWidgetConfigured: boolean;
+  /** NEXT_PUBLIC_TURNSTILE_SITE_KEY is set (Group B). Opens the Turnstile origins on `/login` only. */
+  turnstileConfigured?: boolean;
 }
 
 export interface EdgePolicy {
@@ -208,7 +220,7 @@ export interface EdgePolicy {
   headers: Record<string, string>;
 }
 
-export function edgePolicy({ pathname, isProd, nonce, analyticsConfigured, otpWidgetConfigured }: EdgePolicyInput): EdgePolicy {
+export function edgePolicy({ pathname, isProd, nonce, analyticsConfigured, otpWidgetConfigured, turnstileConfigured = false }: EdgePolicyInput): EdgePolicy {
   const isAdmin = pathname.startsWith("/admin");
   const isPrivateCustomer = isPrivateCustomerPath(pathname);
   const scriptSrc = !isProd
@@ -224,7 +236,8 @@ export function edgePolicy({ pathname, isProd, nonce, analyticsConfigured, otpWi
   // the configured sign-in provider. A deploy on the DLT path never opens these
   // origins at all.
   const allowOtpWidget = !isAdmin && otpWidgetConfigured;
-  const csp = buildCsp(scriptSrc, isProd, allowAnalytics, allowOtpWidget);
+  const allowTurnstile = turnstileConfigured && pathname === "/login";
+  const csp = buildCsp(scriptSrc, isProd, allowAnalytics, allowOtpWidget, allowTurnstile);
   const headers = securityHeaders(csp, isProd);
   if (isAdmin) {
     // Admin pages are never indexed or cached — also on the redirects below.
@@ -251,6 +264,7 @@ export async function proxy(req: NextRequest) {
     nonce,
     analyticsConfigured: Boolean(gaMeasurementId()),
     otpWidgetConfigured: Boolean(process.env.NEXT_PUBLIC_MSG91_WIDGET_ID),
+    turnstileConfigured: Boolean(process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY),
   });
 
   // 3. Debug surfaces never ship to production by omission.

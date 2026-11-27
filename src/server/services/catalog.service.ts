@@ -1,4 +1,6 @@
 import "server-only";
+import { cleanSlugOf, TOMBSTONE_MARK } from "../suppliers/traveldesk/clean-address";
+import { tombstoneBase } from "./slug-reservations";
 import type { Prisma } from "@prisma/client";
 import { prisma, TX_OPTIONS } from "../lib/db";
 import type { Actor } from "../lib/actor";
@@ -204,6 +206,21 @@ function assertInstantAllowed(before: ProductWithMappings): void {
 /** Outcome of one bulk item's mode write (doc 30 §3.12). */
 export type BulkModeOutcome = { state: "applied" | "skipped"; outcome: string; effectiveMode: FulfilmentMode | null };
 
+/**
+ * Redirects a move to the clean address left (doc 30 §3.9 follow-up): the old page carries a tombstone, the source
+ * is "<base>-<n>" and the target lives at "<base>". A retire redirect (a different product) never matches.
+ */
+async function moveRedirects(where: Prisma.ProductRedirectWhereInput) {
+  const rows = await prisma.productRedirect.findMany({
+    where: { ...where, oldProduct: { slug: { contains: TOMBSTONE_MARK } } },
+    select: { oldSlug: true, oldProduct: { select: { slug: true } }, targetProduct: { select: { id: true, slug: true, fulfilmentMode: true, tier: true, content: true } } },
+  });
+  return rows.filter((r) => {
+    const base = cleanSlugOf(r.oldSlug);
+    return base !== null && base === tombstoneBase(r.oldProduct.slug) && r.targetProduct.slug === base;
+  });
+}
+
 export const catalogService = {
   /**
    * Inquiry pricing (indicative). Unchanged arithmetic (`computeBreakdown`,
@@ -224,6 +241,12 @@ export const catalogService = {
       prisma.combo.findMany({ where: { slug: { in: slugs }, deletedAt: null, status: "published" }, select: { id: true, slug: true, fulfilmentMode: true, tier: true } }),
     ]);
     const productBySlug = new Map(products.map((p) => [p.slug, p]));
+    // A line holding the old "<base>-<n>" address of a listing moved to its clean address prices as that same listing
+    // (doc 30 §3.9 follow-up). Only a move redirect is followed: a retire redirect points at a different product.
+    const missing = items.filter((i) => i.kind !== "combo" && !productBySlug.has(i.slug)).map((i) => i.slug);
+    if (missing.length) {
+      for (const r of await moveRedirects({ oldSlug: { in: missing }, targetProduct: { deletedAt: null, status: "published" } })) productBySlug.set(r.oldSlug, r.targetProduct);
+    }
     const comboBySlugDb = new Map(combos.map((c) => [c.slug, c]));
 
     const out: PricedItem[] = [];
@@ -340,6 +363,10 @@ export const catalogService = {
     const gate = storefrontGate();
     for (const p of products) out[p.slug] = effectiveModeFrom(p.eligibility, gate);
     for (const c of combos) out[c.slug] = "inquiry";
+    // A cart line on a moved listing's old "<base>-<n>" address is the same listing (priceCartItems follows it too).
+    for (const r of await moveRedirects({ targetProduct: { deletedAt: null, status: "published" } })) {
+      if (out[r.targetProduct.slug] && !out[r.oldSlug]) out[r.oldSlug] = out[r.targetProduct.slug];
+    }
     return out;
   },
 

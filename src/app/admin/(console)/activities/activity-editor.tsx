@@ -4,7 +4,7 @@ import { useActionState, useEffect, useMemo, useState, type ReactNode } from "re
 import { useRouter } from "next/navigation";
 import { Button, ButtonLink } from "@/components/ui/button";
 import { Alert } from "@/components/ui/primitives";
-import { ADDON_CATEGORIES, DIETARY, SUITABILITY, TIERS, type ActivityInput } from "@/server/schemas/activity.schema";
+import { ADDON_CATEGORIES, DIETARY, MAX_TIME_SLOTS, SUITABILITY, TIERS, type ActivityInput } from "@/server/schemas/activity.schema";
 import { saveActivityAction, restoreVersionAction, type ActivityRowResult, type SaveActivityResult } from "../../_actions/activities";
 import { FormField, INPUT_CLASS, Panel, StatusPill, fmtDateTime } from "../../_components/ui";
 
@@ -370,7 +370,7 @@ export function ActivityEditor(props: EditorProps) {
               <Text id="freeCancellationHours" label="Free cancellation until (hours before)" type="number" value={a.freeCancellationHours} error={err("freeCancellationHours")} hint="0 = non-refundable" onChange={(v) => set("freeCancellationHours", Number(v))} />
               <Text id="location" label="Location" required value={a.location} error={err("location")} onChange={(v) => set("location", v)} />
               <Text id="meetingPoint" label="Meeting point" required value={a.meetingPoint} error={err("meetingPoint")} onChange={(v) => set("meetingPoint", v)} />
-              <Area id="timeSlots" label="Time slots (one per line)" value={lines(a.timeSlots)} error={err("timeSlots")} rows={3} onChange={(v) => set("timeSlots", fromLines(v))} />
+              <Area id="timeSlots" label={`Time slots (one per line, up to ${MAX_TIME_SLOTS})`} value={lines(a.timeSlots)} error={err("timeSlots")} rows={Math.min(12, Math.max(3, a.timeSlots.length))} onChange={(v) => set("timeSlots", fromLines(v))} />
               <Area id="pickupZones" label="Pickup zones (one per line)" value={lines(a.pickupZones)} error={err("pickupZones")} rows={3} onChange={(v) => set("pickupZones", fromLines(v))} />
               <Toggle id="pickupIncluded" label="Hotel pickup included" checked={a.pickupIncluded} onChange={(v) => set("pickupIncluded", v)} />
               <Toggle id="isPrivate" label="Private experience" checked={a.isPrivate} onChange={(v) => set("isPrivate", v)} />

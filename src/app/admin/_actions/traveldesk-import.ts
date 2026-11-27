@@ -6,6 +6,7 @@ import { parseWith } from "@/server/lib/http";
 import { authService } from "@/server/services/auth.service";
 import { traveldeskImportService } from "@/server/services/traveldesk-import.service";
 import { traveldeskListingService, type PublishItemResult } from "@/server/services/traveldesk-listing.service";
+import { retireSummary } from "@/server/suppliers/traveldesk/clean-address";
 import { form, runAction, type ActionResult } from "./result";
 
 /**
@@ -97,6 +98,38 @@ export async function restoreReplacedAction(_prev: BatchActionResult | null, fd:
     const input = parseWith(z.object({ linkId: z.uuid(), reason }).strict(), { linkId: form.str(fd, "linkId"), reason: form.str(fd, "reason") ?? "" });
     const r = await traveldeskListingService.restoreReplaced(actor, input.linkId, input.reason);
     revalidatePath(PATH);
-    return { batchId: input.linkId, summary: `${r.oldSlug} restored` };
+    return { batchId: input.linkId, summary: r.redirectOnly ? `${r.oldSlug}: redirect removed; the page stays archived` : `${r.oldSlug} restored` };
+  });
+}
+
+/** Retire the old page of an already published listing (doc 30 §3.9 follow-up): soft delete and redirect, or the redirect only. */
+export async function retireOldPageAction(_prev: BatchActionResult | null, fd: FormData): Promise<BatchActionResult> {
+  return runAction(async () => {
+    const { actor } = await authService.requireCookies("products.publish");
+    const input = parseWith(z.object({ linkId: z.uuid(), oldProductId: z.uuid("Choose the old page"), reason }).strict(), { linkId: form.str(fd, "linkId"), oldProductId: form.str(fd, "oldProductId") ?? "", reason: form.str(fd, "reason") ?? "" });
+    const r = await traveldeskListingService.retireOld(actor, input.linkId, input.oldProductId, input.reason);
+    revalidatePath(PATH);
+    return { batchId: input.linkId, summary: retireSummary(r) };
+  });
+}
+
+/** Move a published "<base>-<n>" listing to "<base>", and the undo (traveldesk-address.ts). */
+export async function moveToCleanAddressAction(_prev: BatchActionResult | null, fd: FormData): Promise<BatchActionResult> {
+  return runAction(async () => {
+    const { actor } = await authService.requireCookies("products.publish");
+    const input = parseWith(z.object({ linkId: z.uuid(), reason }).strict(), { linkId: form.str(fd, "linkId"), reason: form.str(fd, "reason") ?? "" });
+    const r = await traveldeskListingService.moveToCleanAddress(actor, input.linkId, input.reason);
+    revalidatePath(PATH);
+    return { batchId: input.linkId, summary: `Moved to ${r.to}; ${r.from} redirects to it` };
+  });
+}
+
+export async function undoCleanAddressAction(_prev: BatchActionResult | null, fd: FormData): Promise<BatchActionResult> {
+  return runAction(async () => {
+    const { actor } = await authService.requireCookies("products.publish");
+    const input = parseWith(z.object({ linkId: z.uuid(), reason }).strict(), { linkId: form.str(fd, "linkId"), reason: form.str(fd, "reason") ?? "" });
+    const r = await traveldeskListingService.undoCleanAddress(actor, input.linkId, input.reason);
+    revalidatePath(PATH);
+    return { batchId: input.linkId, summary: `Moved back to ${r.to}; ${r.from} redirects to it again` };
   });
 }

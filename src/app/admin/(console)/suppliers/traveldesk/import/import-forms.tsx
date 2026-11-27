@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState, useCallback, useEffect, useId, useRef, useState } from "react";
+import { useActionState, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { Alert } from "@/components/ui/primitives";
@@ -16,14 +16,17 @@ import {
 } from "@/components/ui/shadcn/alert-dialog";
 import { FormCheckbox } from "../../../../_components/select-box";
 import { PublishTable } from "./publish-table";
-import { BATCHES_HEADING_ID, type PublishRow } from "./import-ui";
+import { BATCHES_HEADING_ID, openWhenValid, reportingAction, type PublishRow } from "./import-ui";
 import {
   applyTravelDeskImportAction,
   copyTravelDeskPhotosAction,
   markListingReviewedAction,
+  moveToCleanAddressAction,
   previewTravelDeskImportAction,
   restoreReplacedAction,
+  retireOldPageAction,
   rollbackTravelDeskImportAction,
+  undoCleanAddressAction,
   type BatchActionResult,
   type ImportPreviewResult,
   type ReviewListingResult,
@@ -222,9 +225,9 @@ export function CopyPhotosForm({ batchId }: { batchId: string }) {
   );
 }
 
-export function RestoreReplacedForm({ linkId }: { linkId: string }) {
-  const [result, action, pending] = useActionState<BatchActionResult | null, FormData>(restoreReplacedAction, null);
-  if (result?.ok) return <p role="status" className="text-2xs font-semibold text-[var(--color-success)]">{result.data.summary}.</p>;
+export function RestoreReplacedForm({ linkId, onDone }: { linkId: string; onDone?: (summary: string) => void }) {
+  const [result, action, pending] = useActionState<BatchActionResult | null, FormData>(useReportingAction(restoreReplacedAction, onDone), null);
+  if (result?.ok) return onDone ? null : <p role="status" className="text-2xs font-semibold text-[var(--color-success)]">{result.data.summary}.</p>;
   return (
     <form action={action} className="flex flex-wrap items-end gap-2">
       <input type="hidden" name="linkId" value={linkId} />
@@ -236,6 +239,200 @@ export function RestoreReplacedForm({ linkId }: { linkId: string }) {
         Restore old page
       </Button>
       <div aria-live="polite" className="basis-full">
+        <Outcome result={result} />
+      </div>
+    </form>
+  );
+}
+
+type RowAction = (prev: BatchActionResult | null, fd: FormData) => Promise<BatchActionResult>;
+
+/**
+ * The form's action, reporting a success to the row's outcome region (ReviewActions) from inside the action. The
+ * server action's response carries the refreshed page, which unmounts the submitting form in the same commit, so an
+ * effect in the form would never run (final review, P3-4); the region outlives the forms.
+ */
+function useReportingAction(act: RowAction, onDone: ((summary: string) => void) | undefined): RowAction {
+  return useMemo(() => reportingAction(act, onDone), [act, onDone]);
+}
+
+/**
+ * The address and retire actions of one published row, with one outcome region for all of them (review P3-4).
+ * A success refreshes the page, which swaps the forms (the move form goes, the undo form comes), so the outcome
+ * is announced and focused here, outside them: a status region mounted empty, focused when it gets a message.
+ */
+export function ReviewActions({
+  linkId,
+  title,
+  slug,
+  retireOptions,
+  cleanAddress,
+  movedFrom,
+  canRestore,
+  confirm,
+}: {
+  linkId: string;
+  title: string;
+  slug: string;
+  retireOptions: { productId: string; slug: string; title: string; archived: boolean }[];
+  cleanAddress: string | null;
+  movedFrom: string | null;
+  canRestore: boolean;
+  confirm: boolean;
+}) {
+  const [outcome, setOutcome] = useState<{ text: string; n: number } | null>(null);
+  const region = useRef<HTMLParagraphElement>(null);
+  const done = useCallback((text: string) => setOutcome((o) => ({ text, n: (o?.n ?? 0) + 1 })), []);
+  useEffect(() => {
+    if (outcome) region.current?.focus();
+  }, [outcome]);
+  return (
+    <div className="space-y-2">
+      <p ref={region} tabIndex={-1} role="status" aria-live="polite" aria-atomic="true" className="text-2xs font-semibold text-[var(--color-success)] outline-none focus-visible:outline-2 focus-visible:outline-ink-900 empty:hidden">
+        {outcome ? `${outcome.text}.` : ""}
+      </p>
+      {retireOptions.length > 0 && <RetireOldPageForm linkId={linkId} title={title} options={retireOptions} confirm={confirm} onDone={done} />}
+      {cleanAddress && <CleanAddressForm linkId={linkId} mode="move" from={slug} to={cleanAddress} confirm={confirm} onDone={done} />}
+      {movedFrom && <CleanAddressForm linkId={linkId} mode="undo" from={slug} to={movedFrom} confirm={confirm} onDone={done} />}
+      {canRestore && <RestoreReplacedForm linkId={linkId} onDone={done} />}
+    </div>
+  );
+}
+
+/** A success line that takes focus when it appears, so a keyboard or screen reader user lands on the outcome. */
+function DoneLine({ text }: { text: string }) {
+  const ref = useRef<HTMLParagraphElement>(null);
+  useEffect(() => ref.current?.focus(), []);
+  return (
+    <p ref={ref} tabIndex={-1} role="status" className="text-2xs font-semibold text-[var(--color-success)] outline-none focus-visible:outline-2 focus-visible:outline-ink-900">
+      {text}.
+    </p>
+  );
+}
+
+/**
+ * The submit control of a retire or address form. In production it first opens a confirmation in the shadcn Alert
+ * Dialog on Base UI (the rollback dialog's components, decision 23) whose confirm button submits the form by id;
+ * elsewhere it submits at once. The dialog closes when the action answers.
+ */
+function ConfirmSubmit({ formId, confirm, label, pending, title, description, result }: { formId: string; confirm: boolean; label: string; pending: boolean; title: string; description: string; result: unknown }) {
+  // Open for the result it was opened on: a new answer from the action closes it without an effect.
+  const [openFor, setOpenFor] = useState<{ result: unknown } | null>(null);
+  const open = openFor !== null && openFor.result === result;
+  const setOpen = (next: boolean) => setOpenFor(next ? { result } : null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  if (!confirm) {
+    return (
+      <Button type="submit" size="sm" variant="outline" disabled={pending}>
+        {pending ? "Working…" : label}
+      </Button>
+    );
+  }
+  return (
+    <AlertDialog open={open} onOpenChange={setOpen}>
+      {/* Not a dialog trigger: the confirmation opens only for a form the browser accepts (review P3-3). */}
+      <Button ref={trigger} type="button" size="sm" variant="outline" disabled={pending} onClick={() => openWhenValid(document.getElementById(formId) as HTMLFormElement | null) && setOpen(true)}>
+        {label}…
+      </Button>
+      <AlertDialogContent finalFocus={trigger}>
+        <AlertDialogHeader>
+          <AlertDialogTitle>{title}</AlertDialogTitle>
+          <AlertDialogDescription>{description}</AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel>Cancel</AlertDialogCancel>
+          <Button type="submit" form={formId} size="sm" variant="danger" loading={pending} loadingLabel="Working…">
+            {label}
+          </Button>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
+
+/**
+ * Retire the old page of an already published listing (doc 30 §3.9 follow-up). Nothing is pre-selected; the
+ * service applies the publish path's retire rules and reports a refusal with its reason.
+ */
+export function RetireOldPageForm({ linkId, title, options, confirm = false, onDone }: { linkId: string; title: string; options: { productId: string; slug: string; title: string; archived: boolean }[]; confirm?: boolean; onDone?: (summary: string) => void }) {
+  const [result, action, pending] = useActionState<BatchActionResult | null, FormData>(useReportingAction(retireOldPageAction, onDone), null);
+  const id = useId();
+  if (result?.ok) return onDone ? null : <DoneLine text={result.data.summary} />;
+  const failed = Boolean(result && !result.ok);
+  const invalid = failed ? { "aria-invalid": true, "aria-describedby": `${id}-error` } : {};
+  return (
+    <form id={`${id}-form`} action={action} className="space-y-2" aria-label={`Retire the old page of ${title}`}>
+      <input type="hidden" name="linkId" value={linkId} />
+      <div className="space-y-1">
+        <label htmlFor={`${id}-old`} className="block text-xs font-semibold text-ink-800">
+          Retire old page
+        </label>
+        <select id={`${id}-old`} name="oldProductId" required defaultValue="" {...invalid} className={`${INPUT_CLASS} min-h-9 text-sm`}>
+          <option value="" disabled>
+            Choose the page this one replaces
+          </option>
+          {options.map((o) => (
+            <option key={o.productId} value={o.productId}>
+              {o.title} ({o.slug}
+              {o.archived ? ", already archived: redirect only" : ""})
+            </option>
+          ))}
+        </select>
+      </div>
+      <label htmlFor={`${id}-reason`} className="sr-only">
+        Reason to retire the old page
+      </label>
+      <input id={`${id}-reason`} name="reason" required minLength={8} maxLength={500} placeholder="Reason to retire the old page" {...invalid} className={`${INPUT_CLASS} min-h-9 w-56 text-sm`} />
+      <ConfirmSubmit
+        formId={`${id}-form`}
+        confirm={confirm}
+        label="Retire and redirect"
+        pending={pending}
+        result={result}
+        title={`Retire the old page of ${title}?`}
+        description="A live old page is unpublished and soft-deleted; its address redirects here permanently. An archived page only gets the redirect. Restore old page undoes it."
+      />
+      <div id={`${id}-error`} aria-live="polite">
+        <Outcome result={result} />
+      </div>
+    </form>
+  );
+}
+
+/** Move a published "<base>-<n>" listing to its clean address, or undo that move (traveldesk-address.ts). */
+export function CleanAddressForm({ linkId, mode, from, to, confirm = false, onDone }: { linkId: string; mode: "move" | "undo"; from: string; to: string; confirm?: boolean; onDone?: (summary: string) => void }) {
+  const [result, action, pending] = useActionState<BatchActionResult | null, FormData>(useReportingAction(mode === "move" ? moveToCleanAddressAction : undoCleanAddressAction, onDone), null);
+  const id = useId();
+  if (result?.ok) return onDone ? null : <DoneLine text={result.data.summary} />;
+  const failed = Boolean(result && !result.ok);
+  const label = mode === "move" ? `Move to ${to}` : `Move back to ${to}`;
+  return (
+    <form id={`${id}-form`} action={action} className="flex flex-wrap items-end gap-2" aria-label={`${label} (now ${from})`}>
+      <input type="hidden" name="linkId" value={linkId} />
+      <label htmlFor={`${id}-reason`} className="sr-only">
+        Reason to {mode === "move" ? "move to the clean address" : "undo the address move"}
+      </label>
+      <input
+        id={`${id}-reason`}
+        name="reason"
+        required
+        minLength={8}
+        maxLength={500}
+        placeholder={mode === "move" ? "Reason to move the address" : "Reason to undo the move"}
+        aria-invalid={failed || undefined}
+        aria-describedby={failed ? `${id}-error` : undefined}
+        className={`${INPUT_CLASS} min-h-9 w-56 text-sm`}
+      />
+      <ConfirmSubmit
+        formId={`${id}-form`}
+        confirm={confirm}
+        label={label}
+        pending={pending}
+        result={result}
+        title={`${label}?`}
+        description={`The listing's address changes from /activities/${from} to /activities/${to}; the old address redirects to it permanently. You can move it back.`}
+      />
+      <div id={`${id}-error`} aria-live="polite" className="basis-full">
         <Outcome result={result} />
       </div>
     </form>
@@ -262,7 +459,8 @@ export function ReviewForm({
         <label htmlFor={`replaces-${linkId}`} className="block text-xs font-semibold text-ink-800">
           Replaces old page
         </label>
-        <select id={`replaces-${linkId}`} name="replacesProductId" className={`${INPUT_CLASS} min-h-9 text-sm`} defaultValue={suggestions[0]?.productId ?? ""}>
+        {/* No pre-selection (review INT-08): a page is retired only when a person picks it; the suggestions stay listed. */}
+        <select id={`replaces-${linkId}`} name="replacesProductId" className={`${INPUT_CLASS} min-h-9 text-sm`} defaultValue="">
           <option value="">None (a new page)</option>
           {suggestions.map((s) => (
             <option key={s.productId} value={s.productId}>

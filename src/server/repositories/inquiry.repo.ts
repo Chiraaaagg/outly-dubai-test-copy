@@ -213,9 +213,10 @@ export const inquiryRepo = {
    * re-issued, and the earlier owner's history must not surface in the new
    * owner's account.
    */
-  async listForCustomer(customerId: string, leadPhoneE164: string): Promise<InquiryDetail[]> {
+  async listForCustomer(customerId: string, leadPhoneE164: string | null): Promise<InquiryDetail[]> {
     const rows = await prisma.inquiry.findMany({
-      where: { OR: [{ customerId }, { leadPhone: leadPhoneE164, customerId: null }], status: { not: "spam" } },
+      // An account without a phone (Group B) sees its own inquiries only.
+      where: { ...(leadPhoneE164 ? { OR: [{ customerId }, { leadPhone: leadPhoneE164, customerId: null }] } : { customerId }), status: { not: "spam" } },
       include: detailInclude,
       orderBy: { createdAt: "desc" },
       take: 100,

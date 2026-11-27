@@ -1,9 +1,9 @@
 import type { Metadata } from "next";
 
-/** Client-rendered route — metadata lives in this layout instead of the page. */
+/** Metadata for /login (the page itself is a dynamic server component). */
 export const metadata: Metadata = {
   title: "Sign in",
-  description: "Sign in with a one-time code sent to your WhatsApp number. No password needed.",
+  description: "Sign in to see your OUTLYY bookings: Google or a one-time code by email. No password needed.",
   robots: { index: false, follow: true },
 };
 

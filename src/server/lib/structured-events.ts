@@ -123,6 +123,11 @@ export const STRUCTURED_EVENTS = {
   // Payments job health (B3 recheck N1)
   "payments.tick_out_of_time": ["pass", "visited", "skipped", "consecutive"],
   "payments.tick_starved": ["pass", "consecutive"],
+  // Review 102c D5: the tick's duplicate-payment scan (payments/duplicate-scan.ts).
+  "payments.duplicate_left_for_finance": ["paymentId", "reason"],
+  "payments.duplicate_no_gateway": ["provider", "environment", "count"],
+  "payments.duplicate_scan_full": ["page"],
+  "payments.duplicate_scan_unwired": [],
   // Documents right after a supplier confirm (checkout redesign batch 4, CO-40): best effort, the documents tick is the net.
   "document.after_confirm": ["supplierBookingId", "outcome", "reason", "claimed"],
   // Bitrix24 CRM push (doc 29 §6.4, §6.5; CRM batch C1). Method names, codes, counts and local ids only:
@@ -202,6 +207,7 @@ export const STRUCTURED_EVENTS = {
     "contactVerifications",
     "quotes",
     "guestSessions",
+    "authIntents",
     "failed",
     "incomplete",
     "outOfTime",
@@ -219,6 +225,26 @@ export const STRUCTURED_EVENTS = {
   "supplier.external_past_start": ["supplierBookingId", "pollCount"],
   "supplier.external_failed": ["supplierBookingId", "afterConfirm"],
   "supplier.external_hold_unusable": ["supplierBookingId", "holdMs"],
+  // Group B customer sign-in on Supabase Auth (customer-identity.service.ts, the auth hook routes). Codes, counts and
+  // our own ids only: never an email, a code, a token or provider text.
+  "customer.identity_login": ["sessionId", "method", "attached", "capped", "emailVerified"],
+  "customer.identity_token_refused": ["reason"],
+  "customer.identity_attach_capped": ["customerId"],
+  "customer.identity_attach_skipped": ["reason", "rule"],
+  "customer.identity_phone_link_refused": ["reason"],
+  "customer.identity_email_start_timeout": [],
+  "customer.identity_email_code_requested": [],
+  "customer.identity_email_start_failed": ["reason"],
+  "customer.identity_google_refused": ["reason"],
+  "customer.identity_google_failed": ["reason"],
+  "customer.identity_hook_refused": ["hook", "reason", "actionType", "provider"],
+  "customer.identity_hook_failed": ["hook"],
+  "customer.identity_code_suppressed": ["reason"],
+  "customer.identity_code_failed": ["reason", "httpStatus"],
+  "customer.identity_code_sent": ["outcome", "provider"],
+  "customer.identity_dispute": ["applied"],
+  // A Group B staff-alert read that failed (account-alerts.ts, ops-alert.service.ts; re-review 103b N3). A part code only.
+  "customer.identity_alerts_failed": ["part"],
 } as const satisfies Record<string, readonly string[]>;
 
 export type StructuredEventName = keyof typeof STRUCTURED_EVENTS;

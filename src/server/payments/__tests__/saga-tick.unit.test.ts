@@ -53,7 +53,8 @@ const fakeDb = {
     // `load` and the final state read of `run`: no saga row, so the visit ends at once.
     findUnique: async () => null,
   },
-  payment: { findMany: async () => [] },
+  // The duplicate scan (duplicate-scan.unit.test.ts): no duplicates here.
+  payment: { groupBy: async () => [], findMany: async () => [] },
   // `checked_at` is written once per visited saga, just before it runs: that is where the clock moves.
   $executeRaw: async (_s: TemplateStringsArray, ...values: unknown[]) => {
     state.checked.push(String(values[1]));
@@ -221,18 +222,27 @@ describe("payments tick under the booking tick's cap (checkout redesign batch 4,
   it("the tail (duplicate settles, refund drives) starts nothing once the cap says stop; without it, both run as before", async () => {
     const driven: Array<{ limit: number; stopped: boolean | undefined }> = [];
     const refunds = { driveOpen: async (limit: number, o: { stop?: () => boolean } = {}) => (driven.push({ limit, stopped: o.stop?.() }), 0) };
-    const forProvider = vi.fn(() => null);
-    const original = fakeDb.payment.findMany;
-    fakeDb.payment.findMany = (async () => [{ id: "dup-1", provider: "p" }, { id: "dup-2", provider: "p" }]) as never;
+    // Provider "p" has a gateway; its duplicates' first read finds no row, so each settle ends at once.
+    const forProvider = vi.fn((p: string) => (p === "p" ? { account: () => ({ provider: "p", environment: "test", accountId: "a" }) } : null));
+    const original = { ...fakeDb.payment };
+    const settled: string[] = [];
+    Object.assign(fakeDb.payment, {
+      groupBy: async () => [{ provider: "p", environment: "test", providerAccountId: "a", _count: { _all: 2 }, _max: { createdAt: new Date() } }],
+      findMany: async () => [{ id: "dup-1", provider: "p" }, { id: "dup-2", provider: "p" }],
+      findUnique: async ({ where }: { where: { id: string } }) => (settled.push(where.id), null),
+    });
     try {
       await saga({ refunds, gateways: { forProvider } }).advanceOpen({ stop: () => true });
       expect(forProvider).not.toHaveBeenCalled();
+      expect(settled).toEqual([]);
       expect(driven).toEqual([]);
       await saga({ refunds, gateways: { forProvider } }).advanceOpen();
-      expect(forProvider).toHaveBeenCalledTimes(2);
+      // Once for the provider split (review 102c D5), then once per duplicate, as before.
+      expect(forProvider).toHaveBeenCalledTimes(3);
+      expect(settled).toEqual(["dup-1", "dup-2"]);
       expect(driven).toEqual([{ limit: 50, stopped: undefined }]);
     } finally {
-      fakeDb.payment.findMany = original;
+      fakeDb.payment = original as never;
     }
   });
 });

@@ -16,7 +16,8 @@ import type { Currency, Dietary, Money, PaxCount } from "@/lib/types";
 
 export interface CustomerRecord {
   id: string;
-  phoneE164: string;
+  /** Null for an email or Google account until a phone is linked (Group B). */
+  phoneE164: string | null;
   email?: string;
   fullName?: string;
   dietary?: Dietary;
@@ -186,6 +187,12 @@ export const customerRepo = {
     return { customer: toRecord(created), created: true };
   },
 
+  /** Group B: a customer proven by an identity provider, with no phone (owner Q9). */
+  async createWithoutPhone(input: { email: string | null }, db: Db = prisma): Promise<CustomerRecord> {
+    const created = await db.customer.create({ data: { id: uuidv7(), phoneE164: null, email: input.email } });
+    return toRecord(created);
+  },
+
   async updateProfile(
     id: string,
     patch: {
@@ -301,9 +308,10 @@ export const customerRepo = {
    * stays theirs even if the phone matches (see `linkByPhone`), and the phone
    * match obeys the same instant-order rule (TKT-4). `exportData` reads this.
    */
-  async listOrders(customerId: string, phoneE164: string, db: Db = prisma): Promise<OrderCustomerView[]> {
+  async listOrders(customerId: string, phoneE164: string | null, db: Db = prisma): Promise<OrderCustomerView[]> {
     const rows = await db.order.findMany({
-      where: { OR: [{ customerId }, { leadPhone: phoneE164, customerId: null, ...phoneLinkableOrder(phoneE164) }] },
+      // An account without a phone sees its own orders only (Group B): no phone, no phone match.
+      where: phoneE164 ? { OR: [{ customerId }, { leadPhone: phoneE164, customerId: null, ...phoneLinkableOrder(phoneE164) }] } : { customerId },
       include: orderInclude,
       orderBy: { placedAt: "desc" },
       take: 200,
@@ -313,7 +321,8 @@ export const customerRepo = {
 
   /* --------------------------------------------------------------- consents */
 
-  async listConsents(phoneE164: string, db: Db = prisma): Promise<ConsentView[]> {
+  async listConsents(phoneE164: string | null, db: Db = prisma): Promise<ConsentView[]> {
+    if (!phoneE164) return [];
     const rows = await db.consent.findMany({
       where: { phoneE164 },
       orderBy: { createdAt: "desc" },

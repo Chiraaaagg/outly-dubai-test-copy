@@ -25,6 +25,7 @@ import { appendOnce, lockPayment } from "./ledger";
 import { closeRelease, closeWaitingRemedies, createRefundDriver, isDisputeType, openPendingRefund, openRefund, openRelease, refundableMinor, refundedOutsideOutlyMinor, RefundRefused, type RefundDriver } from "./refunds";
 import { paymentGateways, type GatewayRegistry } from "./registry";
 import { enqueueCrmSyncForOrders } from "../crm/crm.outbox";
+import { DUPLICATE_SCAN_PAGE, duplicatePage, duplicateProviders } from "./duplicate-scan";
 
 /**
  * Payment saga (doc 22 §22.1 item 6, §23 B3; PAY-1 to PAY-6, PAY-13; F1–F5,
@@ -1435,20 +1436,32 @@ export function createPaymentSaga(deps: SagaDeps) {
   /**
    * A second payment on the same provider order (F45): refund it, or void a
    * hold. Never fulfils anything. One automatic refund only: a failed one is
-   * left for finance, never re-sent (F16).
+   * left for finance, never re-sent (F16). A duplicate that can never be
+   * settled automatically is left for finance too, with a `failure_code`, so
+   * the tick's scan stops reading it (review 102c D5, duplicate-scan.ts).
    */
   async function settleDuplicate(gw: PaymentGateway, paymentId: string): Promise<void> {
     const p = await db.payment.findUnique({ where: { id: paymentId } });
     if (!p?.gatewayPaymentId || p.failureCode) return;
     const o = await gw.getPayment(p.gatewayPaymentId);
     if (o.kind !== "ok") throw new InboxRetry("provider_read_unknown");
-    if (bindingMismatch(p, o.payment, gw.account())) {
+    const account = gw.account();
+    const mismatch = bindingMismatch(p, o.payment, account);
+    if (mismatch) {
       log.error("payments.duplicate_binding_mismatch", { paymentId });
+      // Quarantined, as `admit` does for a duplicate mismatched from the start: no automatic money movement (F2).
+      // Not when this deployment's gateway is another account than the row's: that is configuration, and heals.
+      const ownAccount = p.provider === account.provider && p.environment === account.environment && p.providerAccountId === account.accountId;
+      if (ownAccount) await leaveForFinance(p.id, `quarantined_${mismatch}`);
       return;
     }
     await syncPayment(p, o.payment, false);
     const saga = await db.paymentSaga.findUnique({ where: { orderId: p.orderId } });
-    if (!saga) return;
+    if (!saga) {
+      // No item to refund against (checkout always writes payment and saga together).
+      await leaveForFinance(p.id, "duplicate_no_saga");
+      return;
+    }
     const prior = await db.refund.findMany({ where: { paymentId: p.id }, select: { status: true } });
     if (prior.some((r) => r.status === "failed")) {
       await db.payment.updateMany({ where: { id: p.id, failureCode: null }, data: { failureCode: "duplicate_refund_failed" } });
@@ -1479,7 +1492,34 @@ export function createPaymentSaga(deps: SagaDeps) {
     if (o.payment.status === "authorized" && gw.capabilities(p.method ?? "").release === "void") {
       const v = await gw.void(p.gatewayPaymentId, `void:${p.id}`);
       if (v.kind === "ok") await syncPayment(p, v.payment, false);
+      return;
     }
+    if (o.payment.status === "authorized") {
+      // A hold the provider releases by itself: wait for it, as the saga does (F4), until its expiry plus
+      // `AUTO_RELEASE_GRACE_MS`. Still held after that, or with no expiry that can be known, nothing here can release it.
+      if (deps.now().getTime() >= holdReleasedBy(o.payment, p, gw.capabilities(p.method ?? "").authorizationLifetimeMs)) await leaveForFinance(p.id, "duplicate_hold_not_released");
+    }
+  }
+
+  /**
+   * When a duplicate hold the provider releases by itself should be gone: its expiry (the provider's read, else
+   * the row, else authorisation time plus the method's lifetime) plus `AUTO_RELEASE_GRACE_MS`. 0 when unknowable.
+   */
+  function holdReleasedBy(s: GatewayPaymentSnapshot, p: Payment, lifetimeMs: number | null): number {
+    const at = (iso: string | null | undefined, row: Date | null): number | null => {
+      const t = iso ? Date.parse(iso) : Number.NaN;
+      return Number.isNaN(t) ? (row ? row.getTime() : null) : t;
+    };
+    const expiry = at(s.authorizationExpiresAt, p.authorizationExpiresAt);
+    const authorizedAt = at(s.authorizedAt, p.authorizedAt);
+    const by = expiry ?? (authorizedAt !== null && lifetimeMs !== null ? authorizedAt + lifetimeMs : null);
+    return by === null ? 0 : by + AUTO_RELEASE_GRACE_MS;
+  }
+
+  /** Take a duplicate still holding money out of the tick's scan for good: finance decides (review 102c D5). Never overwrites another code. */
+  async function leaveForFinance(paymentId: string, code: string): Promise<void> {
+    const marked = await db.payment.updateMany({ where: { id: paymentId, failureCode: null, status: { in: ["authorized", "captured"] } }, data: { failureCode: code } });
+    if (marked.count === 1) emitEvent("payments.duplicate_left_for_finance", { paymentId, reason: code }, "error");
   }
 
   /** Record a dispute or chargeback: refunds on the payment freeze (refunds.ts) and the saga is flagged. */
@@ -1603,8 +1643,17 @@ export function createPaymentSaga(deps: SagaDeps) {
     const watched = await visit("watch", watch, leastRecentlyChecked, watchLimit, budgetMs);
     await recordTickHealth(cut, visited.size, now, budgetMs);
     const seen = urgent + rest + watched;
-    // Duplicates still holding money: refund or void them (quarantined and failed ones wait for finance).
-    const dups = await db.payment.findMany({ where: { source: "gateway_verified", saga: null, failureCode: null, status: { in: ["authorized", "captured"] }, provider: { not: null } }, take: 50, select: { id: true, provider: true } });
+    // Duplicates still holding money: refund or void them, oldest first (quarantined and failed ones wait for finance).
+    // A provider with no gateway here is left out of the page, so its rows cannot fill it (review 102c D5). Nothing
+    // is read once the cap says stop.
+    let dups: { id: string; provider: string | null }[] = [];
+    if (!opts.stop?.()) {
+      const { served, unserved } = await duplicateProviders((p) => deps.gateways.forProvider(p));
+      for (const u of unserved) emitEvent("payments.duplicate_no_gateway", { provider: u.provider, environment: u.environment, count: u.count }, "warn");
+      dups = served.length ? await duplicatePage(served) : [];
+      // Full: newer duplicates may wait behind this page. The ops-alert sweep emails staff from the same split (duplicate-scan.ts).
+      if (dups.length >= DUPLICATE_SCAN_PAGE) emitEvent("payments.duplicate_scan_full", { page: DUPLICATE_SCAN_PAGE }, "error");
+    }
     for (const d of dups) {
       if (opts.stop?.()) break;
       const gw = deps.gateways.forProvider(d.provider!);

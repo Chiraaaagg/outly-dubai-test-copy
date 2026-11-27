@@ -55,6 +55,8 @@ export const DB_SUITES = [
   "src/server/services/__tests__/traveldesk-dry-run.db.test.ts",
   // Doc 30 N1: the importer, exact links, review, publish with retire and redirect, rollback.
   "src/server/services/__tests__/traveldesk-import.db.test.ts",
+  // Doc 30 §3.9 follow-up: retire the old page after publish, move a "-<n>" listing to its clean address and back.
+  "src/server/services/__tests__/traveldesk-address.db.test.ts",
   // Doc 30 N3: the daily upkeep of imported listings (D17, D18, D19), parity for listings not imported.
   "src/server/services/__tests__/traveldesk-upkeep.db.test.ts",
   // Doc 30 N2: one-person approvals and the owner alert; class proofs in the gate; bulk runs.
@@ -62,6 +64,8 @@ export const DB_SUITES = [
   "src/server/services/__tests__/n2-proofs-bulk.db.test.ts",
   // Group C (doc 93): fiscal numbering, credit notes, refund reconciliation, generated files, payment email.
   "src/server/services/__tests__/group-c-documents.db.test.ts",
+  // Group B: Supabase sign-in, the hook gate, the attach rules, "not me", Google on our own callback.
+  "src/server/services/__tests__/group-b.db.test.ts",
 ];
 
 /**

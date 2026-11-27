@@ -129,7 +129,7 @@ describe("runRetentionPurge", () => {
   });
 
   it("logs one summary line of counts and durations only", async () => {
-    const { store } = fakeStore({ otp_challenges: 1, customer_sessions: 2, admin_sessions: 3, guest_capability_grants: 4, unbound_contact_verifications: 5, quotes: 6, guest_sessions: 7 });
+    const { store } = fakeStore({ otp_challenges: 1, customer_sessions: 2, admin_sessions: 3, guest_capability_grants: 4, unbound_contact_verifications: 5, quotes: 6, guest_sessions: 7, customer_auth_intents: 8 });
     await runRetentionPurge({ store, now: () => T0 });
     const lines = emitted.filter((e) => e.name === "retention.purged");
     expect(lines).toHaveLength(1);
@@ -141,6 +141,7 @@ describe("runRetentionPurge", () => {
       contactVerifications: 5,
       quotes: 6,
       guestSessions: 7,
+      authIntents: 8,
       failed: 0,
       incomplete: 0,
       outOfTime: false,
