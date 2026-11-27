@@ -1,0 +1,103 @@
+{
+  "_comment": "Sanitised contract fixture for capability class live.fixed_slot_single.self.external.per_person (doc 29 Batch 6). Shape of a TravelDesk GET /tours/{id} answer with one LiveBook offer on the external-supplier route (isExternal on the tour, the offer and every slot), one fixed start, direct reporting, a negative minimumAdvancedBooking. Ids, names and every price are synthetic; no supplier rate, code or text.",
+  "id": 9601,
+  "name": "Synthetic external tour 9601",
+  "languageId": 1,
+  "language": "English",
+  "isExternal": true,
+  "cancellationPolicy": [
+    {
+      "hours": 24,
+      "percents": 50
+    },
+    {
+      "hours": 48,
+      "percents": 100
+    }
+  ],
+  "categories": [
+    {
+      "id": 3,
+      "name": null,
+      "url": null,
+      "heroImageId": null,
+      "heroImage": null
+    }
+  ],
+  "notesToAgent": null,
+  "videoUrl": null,
+  "termsAndConditions": "Synthetic terms.",
+  "salesDescription": "Synthetic description.",
+  "faqList": [],
+  "itineraries": [],
+  "photos": [],
+  "offers": [
+    {
+      "id": 96011,
+      "name": "Synthetic external offer, one fixed start, direct reporting",
+      "code": "SYNTH-EXT-96011",
+      "daysOffered": 0,
+      "numberOfHours": 2,
+      "minNumOfPeople": 1,
+      "maxNumOfPeople": 40,
+      "minNumberOfAdult": null,
+      "maxNumberOfAdult": null,
+      "minNumberOfChild": null,
+      "maxNumberOfChild": null,
+      "minNumberOfInfant": null,
+      "maxNumberOfInfant": null,
+      "minimumAdvancedPayment": 0,
+      "privateType": 0,
+      "childrenAllowed": true,
+      "childAge": 12,
+      "infantsAllowed": true,
+      "infantAge": 3,
+      "pricingPeriods": [
+        {
+          "id": 960111,
+          "widgetPricing": null,
+          "dateStart": "2026-01-01T00:00:00",
+          "dateEnd": "2027-12-31T00:00:00",
+          "offerId": 96011,
+          "currency": "AED",
+          "recPricePerAdult": 150,
+          "recPricePerChild": 100,
+          "recPricePerTrip": 0,
+          "pricePerAdult": 100,
+          "pricePerChild": 60,
+          "pricePerTrip": 0,
+          "pricePerAdultUsd": 27.25,
+          "pricePerChildUsd": 16.35,
+          "pricePerTripUsd": 0,
+          "discountPercent": null,
+          "hasDiscount": false,
+          "isBookable": true,
+          "supplierCurrencyCode": null,
+          "conversionRate": 3.67,
+          "vat": 5
+        }
+      ],
+      "isDirectReporting": true,
+      "isAppendTransactionFeeB2b": false,
+      "isDirectCollection": false,
+      "description": null,
+      "timeSlots": [
+        {
+          "id": 960101,
+          "name": "Listed start",
+          "startTime": 1020,
+          "endTime": 1200,
+          "daysOffered": 0,
+          "isAnyTime": false,
+          "isOnRequest": false,
+          "minimumAdvancedBooking": -5,
+          "isExternal": true,
+          "offerId": 96011
+        }
+      ],
+      "bookingType": 1,
+      "isExternal": true,
+      "tripUnit": ""
+    }
+  ]
+}
