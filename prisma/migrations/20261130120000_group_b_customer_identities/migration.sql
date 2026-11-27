@@ -22,7 +22,8 @@
 --      Resend free-tier volume alert sees every email (owner Q-B6). No
 --      contact data.
 --   6. `ops_alerts_entity_kind_check` widened with 'order_account_link',
---      'customer' and 'email_volume'.
+--      'customer' and 'email_volume' (and Group C's 'payment' and
+--      'ledger_entry', the same union as 20261130160000).
 --   7. Hardening (plan 92 §3.3 item 2): EXECUTE on the public trigger
 --      functions revoked from PUBLIC and the Supabase API roles, and default
 --      privileges so future functions created by this role are not
@@ -124,10 +125,13 @@ CREATE TABLE "email_send_counters" (
   CONSTRAINT "email_send_counters_count_check" CHECK ("count" >= 0)
 );
 
--- 6. Ops alert entity kinds (form of migration 20261127160000).
+-- 6. Ops alert entity kinds (form of migration 20261127160000). The list is the union with Group C's
+--    20261130160000_c4_fiscal_attention ('payment', 'ledger_entry'), so whichever of the two reaches a database
+--    last, the other's kinds stay allowed and VALIDATE cannot fail on its rows.
 ALTER TABLE "ops_alerts" DROP CONSTRAINT "ops_alerts_entity_kind_check";
 ALTER TABLE "ops_alerts" ADD CONSTRAINT "ops_alerts_entity_kind_check" CHECK ("entity_kind" IN
-  ('supplier_account', 'payment_saga', 'order_item', 'supplier_booking', 'supplier_document', 'crm_subject', 'privileged_approval', 'bulk_operation_item', 'order_account_link', 'customer', 'email_volume', 'digest')) NOT VALID;
+  ('supplier_account', 'payment_saga', 'order_item', 'supplier_booking', 'supplier_document', 'crm_subject', 'privileged_approval', 'bulk_operation_item',
+   'order_account_link', 'customer', 'email_volume', 'payment', 'ledger_entry', 'digest')) NOT VALID;
 ALTER TABLE "ops_alerts" VALIDATE CONSTRAINT "ops_alerts_entity_kind_check";
 
 -- RLS and no API-role grants on the new tables.

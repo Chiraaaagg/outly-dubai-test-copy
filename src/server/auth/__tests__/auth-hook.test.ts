@@ -52,7 +52,10 @@ describe("Supabase hook signature (Standard Webhooks)", () => {
   });
 
   it("parses the Before User Created body", () => {
-    expect(parseBeforeUserCreatedHook({ user: { email: "guest@example.com", app_metadata: { provider: "google" } } })).toEqual({ email: "guest@example.com", phone: null, provider: "google" });
+    expect(parseBeforeUserCreatedHook({ user: { email: "guest@example.com", app_metadata: { provider: "google" } } })).toEqual({ email: "guest@example.com", phone: null, provider: "google", signupClaim: null });
+    // Our start route's claim, from `user_metadata` (re-review 103b, finding 7); anything else there is ignored.
+    expect(parseBeforeUserCreatedHook({ user: { email: "guest@example.com", app_metadata: { provider: "email" }, user_metadata: { outlyy_signup_claim: "c".repeat(43), full_name: "x" } } })?.signupClaim).toBe("c".repeat(43));
+    expect(parseBeforeUserCreatedHook({ user: { email: "guest@example.com", user_metadata: { outlyy_signup_claim: 7 } } })?.signupClaim).toBeNull();
     expect(parseBeforeUserCreatedHook({})).toBeNull();
   });
 });

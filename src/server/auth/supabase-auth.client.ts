@@ -196,10 +196,18 @@ export function parseUser(data: unknown): SupabaseUser {
   };
 }
 
+/** The `user_metadata` field that carries our start route's signup claim (re-review 103b, finding 7). */
+export const SIGNUP_CLAIM_FIELD = "outlyy_signup_claim";
+
 export const supabaseAuthClient = {
-  /** Starts an email code. Supabase calls our Send Email hook during this request. Uniform `{}` on success. */
-  async sendEmailOtp(email: string): Promise<void> {
-    await call("otp", "/otp", { method: "POST", body: { email, create_user: true } });
+  /**
+   * Starts an email code. Supabase calls our Send Email hook during this request. Uniform `{}` on success.
+   * `signupClaim` (re-review 103b, finding 7) goes in `data`, which Supabase stores as `user_metadata` only
+   * when this call creates the user; our Before User Created hook allows the creation only with it.
+   */
+  async sendEmailOtp(email: string, opts: { signupClaim?: string } = {}): Promise<void> {
+    const body = opts.signupClaim ? { email, create_user: true, data: { [SIGNUP_CLAIM_FIELD]: opts.signupClaim } } : { email, create_user: true };
+    await call("otp", "/otp", { method: "POST", body });
   },
 
   /** Checks an email code. Single use and expiry are Supabase's. */

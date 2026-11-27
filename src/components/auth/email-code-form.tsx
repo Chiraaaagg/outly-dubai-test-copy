@@ -9,6 +9,7 @@ import { SignInError, startEmailCode, verifyEmailCode } from "@/lib/api";
 import { EMAIL_CODE_LENGTH, EMAIL_CODE_TTL_SECONDS, EMAIL_MAX_LENGTH, EMAIL_RESEND_AFTER_SECONDS, maskEmail, normaliseEmail, type SignInReason } from "@/lib/customer-auth-options";
 import { cn } from "@/lib/utils";
 import { TurnstileWidget, type TurnstileHandle } from "./turnstile-widget";
+import { CODE_TIMED_OUT_MESSAGE, codeStepMessage, cookieBlockedMessage, emailStepMessage, EXPIRED_IN_A_ROW_MEANS_NO_COOKIE, minutes } from "./email-code-messages";
 
 /**
  * Email one-time code (Group B, plan 92 §6). Two steps on one card, like the
@@ -20,8 +21,11 @@ import { TurnstileWidget, type TurnstileHandle } from "./turnstile-widget";
  *    resend after 60 s (Supabase's per-address minimum).
  *  - Wrong code: inline error, field cleared and refocused.
  *  - Expired (the 10 minutes ran out on this page): "send a new one", resend at once.
+ *  - Refused by the server as expired (also: this browser lost the start cookie): "can't be used here any more",
+ *    resend at once; twice in a row, or cookies off, says to allow cookies or use Google (re-review 103b).
  *  - Too many tries: field locked until a new code is sent.
- *  - Send rate-limited, send failed, unavailable: one plain line; Google stays on the page.
+ *  - Send rate-limited, send failed, unavailable: one plain line; a long wait reads "later", a site-wide limit
+ *    says so, and Google is offered when it is on (re-review 103b N6).
  *  - Closed account: a plain statement and the support route; no session.
  *  - Not configured: the page drops the option (`onDisabled`).
  *
@@ -43,54 +47,17 @@ export interface EmailFormPreview {
   notice?: string;
 }
 
-function minutes(seconds: number): string {
-  const m = Math.ceil(seconds / 60);
-  return m === 1 ? "1 minute" : `${m} minutes`;
-}
-
-/** Words for each reason, by step. Exported for tests. */
-export function emailStepMessage(reason: SignInReason, retryAfterSeconds?: number): string {
-  switch (reason) {
-    case "EMAIL_INVALID":
-      return "Enter a full email address, like name@example.com.";
-    case "CAPTCHA_FAILED":
-      return "We couldn't confirm you're not a robot. Try again in a moment.";
-    case "RATE_LIMITED":
-      return `Too many codes requested. Try again in ${minutes(Math.max(60, retryAfterSeconds ?? 900))}.`;
-    case "DELIVERY_FAILED":
-      return "We couldn't send the code. Try again in a moment.";
-    case "ACCOUNT_CLOSED":
-      return "This account has been closed.";
-    default:
-      return "Sign-in isn't working right now. Try again in a moment.";
-  }
-}
-
-export function codeStepMessage(reason: SignInReason): string {
-  switch (reason) {
-    case "CODE_INVALID":
-      return "That code didn't work. Check the latest email and try again.";
-    case "CODE_EXPIRED":
-      return "That code has expired. Send a new one.";
-    case "RATE_LIMITED":
-      return "Too many attempts. Wait a few minutes, then request a new code.";
-    case "ACCOUNT_CLOSED":
-      return "This account has been closed.";
-    case "ACCOUNT_CONFLICT":
-      return "This sign-in belongs to another account, so nothing was changed.";
-    default:
-      return "We couldn't check that code. Try again in a moment.";
-  }
-}
-
 export function EmailCodeForm({
   next,
   turnstileSiteKey,
+  googleAvailable = false,
   onDisabled,
   preview,
 }: {
   next: string;
   turnstileSiteKey: string | null;
+  /** Google sign-in is on this page: the cookie-trouble line offers it. */
+  googleAvailable?: boolean;
   onDisabled: () => void;
   /** Development only (src/app/login/page.tsx): open a designed state directly. */
   preview?: EmailFormPreview;
@@ -115,6 +82,8 @@ export function EmailCodeForm({
   const codeRef = useRef<HTMLInputElement>(null);
   const emailRef = useRef<HTMLInputElement>(null);
   const submittedCode = useRef<string | null>(null);
+  /** Server CODE_EXPIRED answers in a row: a browser that drops our start cookie would otherwise loop forever. */
+  const expiredInARow = useRef(0);
 
   useEffect(() => {
     if (resendIn <= 0) return;
@@ -126,7 +95,7 @@ export function EmailCodeForm({
   useEffect(() => {
     if (!expiresAt) return;
     const t = window.setTimeout(() => {
-      setCodeError(codeStepMessage("CODE_EXPIRED"));
+      setCodeError(CODE_TIMED_OUT_MESSAGE);
       setResendIn(0);
     }, Math.max(0, expiresAt - Date.now()));
     return () => window.clearTimeout(t);
@@ -145,6 +114,13 @@ export function EmailCodeForm({
     }
     if (turnstileSiteKey && !token) {
       setEmailError(captchaTrouble ? "The robot check didn't load. Reload the page, or continue with Google." : "One moment: we're checking this browser. Try again in a second.");
+      return false;
+    }
+    // Cookies off: the code could never be checked in this browser, so do not send one (re-review 103b).
+    if (typeof navigator !== "undefined" && navigator.cookieEnabled === false) {
+      const message = cookieBlockedMessage(googleAvailable);
+      if (step === "code") setCodeError(message);
+      else setEmailError(message);
       return false;
     }
     setEmailError(null);
@@ -167,7 +143,7 @@ export function EmailCodeForm({
         onDisabled();
         return false;
       }
-      const message = emailStepMessage(reason, err instanceof SignInError ? err.retryAfterSeconds : undefined);
+      const message = err instanceof SignInError ? emailStepMessage(reason, err.retryAfterSeconds, err.hints) : emailStepMessage(reason);
       if (step === "code") setCodeError(message);
       else setEmailError(message);
       return false;
@@ -197,7 +173,16 @@ export function EmailCodeForm({
         onDisabled();
         return;
       }
-      setCodeError(codeStepMessage(reason));
+      if (reason === "CODE_EXPIRED") {
+        // Nothing more can be done with this code: let a new one be sent at once (re-review 103b). Twice in a row
+        // means this browser is not keeping the start cookie, and a new code would fail the same way.
+        expiredInARow.current += 1;
+        setResendIn(0);
+        setCodeError(expiredInARow.current >= EXPIRED_IN_A_ROW_MEANS_NO_COOKIE ? cookieBlockedMessage(googleAvailable) : codeStepMessage(reason));
+      } else {
+        expiredInARow.current = 0;
+        setCodeError(codeStepMessage(reason));
+      }
       if (reason === "ACCOUNT_CLOSED") setClosed(true);
       if (reason === "RATE_LIMITED") {
         setLocked(true);

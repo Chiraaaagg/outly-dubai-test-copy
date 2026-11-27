@@ -91,13 +91,19 @@ export interface BeforeUserCreatedPayload {
   phone: string | null;
   /** `app_metadata.provider`: `email`, `google`, `phone`, … */
   provider: string | null;
+  /**
+   * `user_metadata.outlyy_signup_claim`: the claim our own start route sent in `/otp` `data` (re-review 103b,
+   * finding 7). A direct `/signup` cannot know it. Read only here, only to gate creation.
+   */
+  signupClaim: string | null;
 }
 
 /** Reads the Before User Created hook body. Null when malformed. */
 export function parseBeforeUserCreatedHook(raw: unknown): BeforeUserCreatedPayload | null {
   if (!raw || typeof raw !== "object") return null;
-  const u = (raw as { user?: { email?: unknown; phone?: unknown; app_metadata?: { provider?: unknown } } }).user;
+  const u = (raw as { user?: { email?: unknown; phone?: unknown; app_metadata?: { provider?: unknown }; user_metadata?: { outlyy_signup_claim?: unknown } } }).user;
   if (!u || typeof u !== "object") return null;
   const s = (v: unknown, max: number) => (typeof v === "string" && v.length > 0 && v.length <= max ? v : null);
-  return { email: s(u.email, 254), phone: s(u.phone, 32), provider: s(u.app_metadata?.provider, 40) };
+  const meta = u.user_metadata && typeof u.user_metadata === "object" ? u.user_metadata : undefined;
+  return { email: s(u.email, 254), phone: s(u.phone, 32), provider: s(u.app_metadata?.provider, 40), signupClaim: s(meta?.outlyy_signup_claim, 128) };
 }

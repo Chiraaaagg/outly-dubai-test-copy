@@ -718,6 +718,8 @@ export class SignInError extends Error {
   constructor(
     readonly reason: SignInReason,
     readonly retryAfterSeconds?: number,
+    /** Closed hints on a refusal (Group B re-review 103b): a site-wide limit refused; Google sign-in is on. */
+    readonly hints: { scope?: "site"; alternative?: "google" } = {},
   ) {
     super(reason);
     this.name = "SignInError";
@@ -742,11 +744,12 @@ async function signInPost<T>(path: string, body: unknown): Promise<T> {
   } finally {
     clearTimeout(timer);
   }
-  const payload = (await res.json().catch(() => null)) as { error?: { code?: string; details?: { reason?: unknown; retryAfterSeconds?: unknown } } } | null;
+  const payload = (await res.json().catch(() => null)) as { error?: { code?: string; details?: { reason?: unknown; retryAfterSeconds?: unknown; scope?: unknown; alternative?: unknown } } } | null;
   if (res.ok) return payload as T;
   const d = payload?.error?.details;
   const retry = typeof d?.retryAfterSeconds === "number" ? d.retryAfterSeconds : undefined;
-  if (isSignInReason(d?.reason)) throw new SignInError(d.reason, retry);
+  const hints = { ...(d?.scope === "site" ? { scope: "site" as const } : {}), ...(d?.alternative === "google" ? { alternative: "google" as const } : {}) };
+  if (isSignInReason(d?.reason)) throw new SignInError(d.reason, retry, hints);
   if (res.status === 429 || payload?.error?.code === "RATE_LIMITED") throw new SignInError("RATE_LIMITED", retry);
   if (payload?.error?.code === "NOT_CONFIGURED") throw new SignInError("NOT_CONFIGURED");
   throw new SignInError("UNAVAILABLE");

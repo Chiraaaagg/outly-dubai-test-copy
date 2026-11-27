@@ -120,7 +120,8 @@ describe.skipIf(!dbEnabled)("Group B: customer sign-in on Supabase Auth (disposa
   beforeAll(async () => {
     assertDisposableDb();
     prisma = await db();
-    fake = await startFakeSupabase();
+    // Supabase also calls our Before User Created hook when `/otp` creates a user (re-review 103b, finding 7).
+    fake = await startFakeSupabase({ beforeUserCreatedHookSecret: BEFORE_SECRET });
 
     // Fake Google token endpoint and keys (loopback).
     const { publicKey, privateKey } = await generateKeyPair("RS256");
@@ -162,6 +163,8 @@ describe.skipIf(!dbEnabled)("Group B: customer sign-in on Supabase Auth (disposa
     };
     // Supabase calls our Send Email hook inside its own /otp, as the hosted service does.
     fake.onSendEmail = async (body, headers) => (await r.hook.POST(apiRequest("/api/auth/hooks/send-email", { rawBody: body, origin: null, headers }))).status;
+    // And our Before User Created hook when it would create a user: every first sign-in below proves our start's claim.
+    fake.onBeforeUserCreated = async (body, headers) => (await r.before.POST(apiRequest("/api/auth/hooks/before-user-created", { rawBody: body, origin: null, headers }))).status;
   });
 
   // The global sign-in limits (30 an hour, the daily code budget) are shared by every test in this file:
@@ -273,27 +276,114 @@ describe.skipIf(!dbEnabled)("Group B: customer sign-in on Supabase Auth (disposa
       expect((await fourth.json()).error.details.reason).toBe("RATE_LIMITED");
     });
 
-    it("daily code budget and per-IP daily limit: RATE_LIMITED once spent (finding 3)", async () => {
-      const { signInCodeDailyBudget } = await import("../customer-identity.service");
+    it("daily code budget, global hour and per-IP day: RATE_LIMITED once spent; a site-wide refusal says so and offers Google (finding 3, re-review 103b N1)", async () => {
+      const svc = await import("../customer-identity.service");
       const { hashIp } = await import("../../lib/crypto");
-      const DAY_MS = 86_400_000;
-      const windowStart = new Date(Math.floor(Date.now() / DAY_MS) * DAY_MS);
-      const expiresAt = new Date(windowStart.getTime() + DAY_MS);
-      // The default plan cap is 100 a day: sign-in codes get 40 of it.
-      expect(signInCodeDailyBudget(100)).toBe(40);
-      await prisma.rateLimitBucket.create({ data: { key: "auth_email_start:global_day", windowStart, count: signInCodeDailyBudget(100), expiresAt } });
-      const spent = await startCode(email("budget"));
-      expect(spent.status).toBe(429);
-      expect((await spent.json()).error.details.reason).toBe("RATE_LIMITED");
-      await prisma.rateLimitBucket.deleteMany({ where: { key: "auth_email_start:global_day" } });
+      // An injected clock: the pre-filled buckets and the route's charges fall in the same windows even if the run
+      // crosses UTC midnight or the top of an hour.
+      const at = new Date();
+      svc.setIdentityClockForTests(() => at);
+      try {
+        const DAY_MS = 86_400_000;
+        const HOUR_MS = 3_600_000;
+        const windowStart = new Date(Math.floor(at.getTime() / DAY_MS) * DAY_MS);
+        const expiresAt = new Date(windowStart.getTime() + DAY_MS);
+        // The default plan cap is 100 a day: sign-in codes get 40 of it.
+        expect(svc.signInCodeDailyBudget(100)).toBe(40);
+        await prisma.rateLimitBucket.create({ data: { key: "auth_email_start:global_day", windowStart, count: svc.signInCodeDailyBudget(100), expiresAt } });
+        const spent = await startCode(email("budget"));
+        expect(spent.status).toBe(429);
+        const spentDetails = (await spent.json()).error.details;
+        expect(spentDetails).toMatchObject({ reason: "RATE_LIMITED", scope: "site", alternative: "google" });
+        // The hourly site-wide charge this refused request took was given back.
+        const hourStart = new Date(Math.floor(at.getTime() / HOUR_MS) * HOUR_MS);
+        expect((await prisma.rateLimitBucket.findUnique({ where: { key_windowStart: { key: "auth_email_start:global", windowStart: hourStart } } }))?.count ?? 0).toBe(0);
+        await prisma.rateLimitBucket.deleteMany({ where: { key: "auth_email_start:global_day" } });
 
-      const addr = ip();
-      await prisma.rateLimitBucket.create({ data: { key: `auth_email_start:ip_day:${hashIp(addr)}`, windowStart, count: 20, expiresAt } });
-      const ipSpent = await startCode(email("ip-day"), { "x-forwarded-for": addr });
-      expect(ipSpent.status).toBe(429);
-      expect((await ipSpent.json()).error.details.reason).toBe("RATE_LIMITED");
-      // Another IP is not affected.
-      expect((await startCode(email("ip-day"))).status).toBe(200);
+        await prisma.rateLimitBucket.create({ data: { key: "auth_email_start:global", windowStart: hourStart, count: 30, expiresAt: new Date(hourStart.getTime() + HOUR_MS) } });
+        const hourSpent = await startCode(email("budget-hour"));
+        expect(hourSpent.status).toBe(429);
+        expect((await hourSpent.json()).error.details).toMatchObject({ reason: "RATE_LIMITED", scope: "site" });
+        await prisma.rateLimitBucket.deleteMany({ where: { key: "auth_email_start:global" } });
+
+        const addr = ip();
+        await prisma.rateLimitBucket.create({ data: { key: `auth_email_start:ip_day:${hashIp(addr)}`, windowStart, count: 20, expiresAt } });
+        const ipSpent = await startCode(email("ip-day"), { "x-forwarded-for": addr });
+        expect(ipSpent.status).toBe(429);
+        const ipDetails = (await ipSpent.json()).error.details;
+        expect(ipDetails.reason).toBe("RATE_LIMITED");
+        expect(ipDetails.scope).toBeUndefined();
+        expect(ipDetails.alternative).toBe("google");
+        // Another IP is not affected.
+        expect((await startCode(email("ip-day"))).status).toBe(200);
+      } finally {
+        svc.setIdentityClockForTests(null);
+      }
+    });
+
+    it("a failed Supabase /otp does not spend the site-wide limits; our own /otp timeout answers as sent (re-review 103b N1, finding 13)", async () => {
+      const svc = await import("../customer-identity.service");
+      const { supabaseAuthClient, SupabaseAuthError } = await import("../../auth/supabase-auth.client");
+      const at = new Date();
+      svc.setIdentityClockForTests(() => at);
+      const count = async (key: string, seconds: number) => {
+        const ms = seconds * 1000;
+        const row = await prisma.rateLimitBucket.findUnique({ where: { key_windowStart: { key, windowStart: new Date(Math.floor(at.getTime() / ms) * ms) } } });
+        return row?.count ?? 0;
+      };
+      try {
+        fake.failNext("/otp", 500, { code: 500, error_code: "unexpected_failure", msg: "x" });
+        expect((await startCode(email("release-fail"))).status).toBe(503);
+        expect(await count("auth_email_start:global", 3600)).toBe(0);
+        expect(await count("auth_email_start:global_day", 86_400)).toBe(0);
+        // The per-address charge stays: failing requests still cannot repeat without bound.
+        expect(await count(`auth_email_start:email:${sha(email("release-fail")).slice(0, 32)}`, 900)).toBe(1);
+
+        expect((await startCode(email("release-ok"))).status).toBe(200);
+        expect(await count("auth_email_start:global", 3600)).toBe(1);
+        expect(await count("auth_email_start:global_day", 86_400)).toBe(1);
+
+        // Our own 5-second ceiling: the hook may have sent the code, so the answer is "sent", the intent is kept,
+        // the start cookie is set and the budget stays charged.
+        svc.setIdentityDepsForTests({
+          client: {
+            ...supabaseAuthClient,
+            sendEmailOtp: async () => {
+              throw new SupabaseAuthError("unavailable", null, null, true);
+            },
+          },
+        });
+        const timedOut = await startCode(email("otp-timeout"));
+        expect(timedOut.status).toBe(200);
+        expect(await timedOut.json()).toEqual({ expiresInSeconds: 600, resendAfterSeconds: 60 });
+        expect(startCookieOf(timedOut)).toBeTruthy();
+        expect(await prisma.customerAuthIntent.count({ where: { contactHash: sha(email("otp-timeout")), consumedAt: null } })).toBe(1);
+        expect(await count("auth_email_start:global_day", 86_400)).toBe(2);
+      } finally {
+        svc.setIdentityDepsForTests(null);
+        svc.setIdentityClockForTests(null);
+      }
+    });
+
+    it("staff alert at 80 % of today's code budget and when it is spent, on a fixed clock (re-review 103b N1)", async () => {
+      const { signInCodeBudgetIncidents } = await import("../account-alerts");
+      const at = new Date("2031-03-04T23:59:30Z");
+      const day = new Date("2031-03-04T00:00:00Z");
+      const where = { key: "auth_email_start:global_day", windowStart: day };
+      await prisma.rateLimitBucket.deleteMany({ where });
+      try {
+        expect(await signInCodeBudgetIncidents(at)).toEqual([]);
+        await prisma.rateLimitBucket.create({ data: { ...where, count: 32, expiresAt: new Date(day.getTime() + 86_400_000) } });
+        expect((await signInCodeBudgetIncidents(at)).map((i) => [i.kind, i.entityKind, i.entityId, i.reason, i.raisedAt.toISOString()])).toEqual([
+          ["signin_code_budget", "email_volume", "signin_budget:2031-03-04", "signin_code_budget_80pct", day.toISOString()],
+        ]);
+        await prisma.rateLimitBucket.updateMany({ where, data: { count: 40 } });
+        expect((await signInCodeBudgetIncidents(at)).map((i) => i.reason)).toEqual(["signin_code_budget_80pct", "signin_code_budget_spent"]);
+        // The next UTC day starts from nothing.
+        expect(await signInCodeBudgetIncidents(new Date("2031-03-05T00:00:01Z"))).toEqual([]);
+      } finally {
+        await prisma.rateLimitBucket.deleteMany({ where });
+      }
     });
 
     it("verify needs this browser's start cookie for that address; attempts are counted per start (finding 8)", async () => {
@@ -320,6 +410,26 @@ describe.skipIf(!dbEnabled)("Group B: customer sign-in on Supabase Auth (disposa
       const ok = await verify(email("cookie-a"), fake.codes.get(email("cookie-a"))!, startCookieOf(again));
       expect(ok.status).toBe(200);
       expect(ok.headers.get("set-cookie")).toMatch(/outlyy_email_start=;/);
+    });
+
+    it("verify attempts per start are not reset by a window edge (re-review 103b N2)", async () => {
+      const svc = await import("../customer-identity.service");
+      const t0 = new Date();
+      svc.setIdentityClockForTests(() => t0);
+      try {
+        const s = await startCode(email("straddle"));
+        const cookie = startCookieOf(s);
+        const code = fake.codes.get(email("straddle"))!;
+        const wrong = code === "000000" ? "000001" : "000000";
+        const verify = (c: string) => r.verify.POST(apiRequest("/api/auth/email/verify", { body: { email: email("straddle"), code: c }, cookie: cookie ?? undefined, headers: { "x-forwarded-for": ip() } }), CTX);
+        for (let i = 0; i < 5; i++) expect((await (await verify(wrong)).json()).error.details.reason).toBe("CODE_INVALID");
+        // Fifteen minutes on: every fixed 15-minute window has turned over, but this start's five tries are spent.
+        const later = new Date(t0.getTime() + 15 * 60_000);
+        svc.setIdentityClockForTests(() => later);
+        expect((await verify(code)).status).toBe(429);
+      } finally {
+        svc.setIdentityClockForTests(null);
+      }
     });
 
     it("a failed Supabase /otp retires our intent (finding 9)", async () => {
@@ -353,11 +463,27 @@ describe.skipIf(!dbEnabled)("Group B: customer sign-in on Supabase Auth (disposa
       expect((await signedHook("before-user-created", u(email("pw"), "email"), BEFORE_SECRET)).status).toBe(403);
       expect((await signedHook("before-user-created", { user: { phone: ["971", "50", "0000000"].join(""), app_metadata: { provider: "phone" } } }, BEFORE_SECRET)).status).toBe(403);
       const { customerIdentityRepo } = await import("../../repositories/customer-identity.repo");
-      await customerIdentityRepo.createIntent({ channel: "email", contactHash: sha(email("allowed")), now: new Date(), ttlMs: 120_000 });
-      expect((await signedHook("before-user-created", u(email("allowed"), "email"), BEFORE_SECRET)).status).toBe(200);
-      expect((await signedHook("before-user-created", u(email("allowed"), "email"), fake.sendEmailHookSecret)).status).toBe(401);
-      // One creation per intent (finding 7): a second creation for the same intent is refused.
+      const { signupClaimFor } = await import("../customer-identity.service");
+      const intentId = await customerIdentityRepo.createIntent({ channel: "email", contactHash: sha(email("allowed")), now: new Date(), ttlMs: 120_000 });
+      const claimed = (address: string, claim?: string) => ({ user: { email: address, app_metadata: { provider: "email" }, user_metadata: claim ? { outlyy_signup_claim: claim } : {} } });
+      // A direct `/signup` for an address with a live intent of ours, but without our start's claim: refused,
+      // whether it arrives before or after our own `/otp` (re-review 103b, finding 7).
       expect((await signedHook("before-user-created", u(email("allowed"), "email"), BEFORE_SECRET)).status).toBe(403);
+      expect((await signedHook("before-user-created", claimed(email("allowed"), signupClaimFor(uuidv7())), BEFORE_SECRET)).status).toBe(403);
+      expect((await signedHook("before-user-created", claimed(email("allowed"), signupClaimFor(intentId)), BEFORE_SECRET)).status).toBe(200);
+      expect((await signedHook("before-user-created", claimed(email("allowed"), signupClaimFor(intentId)), fake.sendEmailHookSecret)).status).toBe(401);
+      // One creation per intent (finding 7): a second creation for the same intent is refused.
+      expect((await signedHook("before-user-created", claimed(email("allowed"), signupClaimFor(intentId)), BEFORE_SECRET)).status).toBe(403);
+    });
+
+    it("our start route sends its signup claim to /otp, and the creation passes our hook (re-review 103b, finding 7)", async () => {
+      const { signupClaimFor } = await import("../customer-identity.service");
+      const res = await startCode(email("claim-sent"));
+      expect(res.status).toBe(200);
+      const intent = await prisma.customerAuthIntent.findFirstOrThrow({ where: { contactHash: sha(email("claim-sent")) }, orderBy: { createdAt: "desc" } });
+      const otp = [...fake.requests].reverse().find((x) => x.path.startsWith("/otp"))!;
+      expect((otp.body as { data?: { outlyy_signup_claim?: string } }).data?.outlyy_signup_claim).toBe(signupClaimFor(intent.id));
+      expect([...fake.users.values()].some((x) => x.email === email("claim-sent"))).toBe(true);
     });
 
     it("hooks answer 404 while the sign-in is off", async () => {
@@ -565,6 +691,55 @@ describe.skipIf(!dbEnabled)("Group B: customer sign-in on Supabase Auth (disposa
       const { accountIncidents } = await import("../account-alerts");
       const incidents = await accountIncidents(new Date(Date.now() - 3_600_000), new Date());
       expect(incidents.some((i) => i.kind === "account_attach_notice_failed" && i.entityId === linkId && i.reason === "attach_notice_missing")).toBe(true);
+    });
+
+    it("the notice row is written before the response; only the send waits (re-review 103b N4)", async () => {
+      const o = await guestOrder("queued-first");
+      const headers = { "x-forwarded-for": ip() };
+      const s = await startCode(email("queued-first"), headers);
+      const v = await r.verify.POST(apiRequest("/api/auth/email/verify", { body: { email: email("queued-first"), code: fake.codes.get(email("queued-first")) }, cookie: startCookieOf(s) ?? undefined, headers }), CTX);
+      expect(v.status).toBe(200);
+      // Not waiting for the deferred send: the queued row and its link to the attach already exist.
+      const link = await prisma.orderAccountLink.findFirstOrThrow({ where: { orderId: o.id } });
+      expect(link.notificationId).toBeTruthy();
+      expect(await prisma.notification.count({ where: { id: link.notificationId!, event: "ACCOUNT_BOOKING_ATTACHED" } })).toBe(1);
+      await (await import("../customer-identity.service")).accountNoticesSettledForTests();
+      expect((await prisma.notification.findUniqueOrThrow({ where: { id: link.notificationId! } })).status).toBe("sent");
+    });
+
+    it("notice alerts: a suppressed notice counts as not sent; failed notices of detached links never hide a new failure (re-review 103b N5, N7)", async () => {
+      const { accountIncidents } = await import("../account-alerts");
+      const holder = await prisma.customer.create({ data: { id: uuidv7(), fullName: `zz-sec-${run}` } });
+      const now = new Date();
+      // More than one page of old failures (the first build read the oldest 100), all on detached links.
+      const filler = await guestOrder("alerts-filler");
+      const old = new Date(now.getTime() - 30 * 60_000);
+      const fillerIds = Array.from({ length: 120 }, () => uuidv7());
+      await prisma.notification.createMany({
+        data: fillerIds.map((id) => ({ id, event: "ACCOUNT_BOOKING_ATTACHED", channel: "email" as const, recipient: email("alerts-filler"), orderId: filler.id, status: "failed" as const, providerError: "definite:x", attempt: 1, createdAt: old, failedAt: old })),
+      });
+      await prisma.orderAccountLink.createMany({ data: fillerIds.map((id) => ({ id: uuidv7(), orderId: filler.id, customerId: holder.id, rule: "staff", detachedAt: old, detachReason: "staff", notificationId: id })) });
+
+      const attachWith = async (label: string, n: { status: "failed" | "suppressed"; providerError?: string; suppressedReason?: string; at: Date }) => {
+        const o = await guestOrder(label);
+        const nid = uuidv7();
+        await prisma.notification.create({
+          data: { id: nid, event: "ACCOUNT_BOOKING_ATTACHED", channel: "email", recipient: email(label), orderId: o.id, status: n.status, providerError: n.providerError ?? null, suppressedReason: n.suppressedReason ?? null, attempt: 1, createdAt: n.at, failedAt: n.status === "failed" ? n.at : null },
+        });
+        const linkId = uuidv7();
+        await prisma.orderAccountLink.create({ data: { id: linkId, orderId: o.id, customerId: holder.id, rule: "guest_session", attachedAt: n.at, notificationId: nid } });
+        return linkId;
+      };
+      const recent = new Date(now.getTime() - 60_000);
+      const failed = await attachWith("alerts-failed", { status: "failed", providerError: "definite:invalid_recipient", at: recent });
+      const optedOut = await attachWith("alerts-opted-out", { status: "suppressed", suppressedReason: "opted_out", at: recent });
+      const allowlisted = await attachWith("alerts-allowlist", { status: "suppressed", suppressedReason: "non_production_allowlist", at: recent });
+
+      const incidents = (await accountIncidents(new Date(now.getTime() - 10 * 60_000), new Date())).filter((i) => i.kind === "account_attach_notice_failed");
+      const ids = incidents.map((i) => i.entityId);
+      expect(ids).toContain(failed);
+      expect(ids).toContain(optedOut);
+      expect(ids).not.toContain(allowlisted);
     });
 
     it('"this was not me": detaches once, alerts staff, uniform answers, never re-attaches', async () => {

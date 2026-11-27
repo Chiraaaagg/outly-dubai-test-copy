@@ -41,12 +41,29 @@ export async function rateLimit(opts: {
   key: string;
   limit: number;
   windowSeconds: number;
+  /** The clock (tests, or one request that charges several limits at the same instant). Defaults to now. */
+  now?: Date;
 }): Promise<RateLimitResult> {
-  const now = new Date();
+  const now = opts.now ?? new Date();
   const windowMs = opts.windowSeconds * 1000;
   const windowStart = new Date(Math.floor(now.getTime() / windowMs) * windowMs);
   const expiresAt = new Date(windowStart.getTime() + windowMs);
+  return countInSpan({ key: opts.key, limit: opts.limit, windowStart, expiresAt, now });
+}
 
+/**
+ * One counter for a span the caller fixes, `[windowStart, expiresAt)`, for a
+ * key that is already unique to one flow (Group B re-review 103b N2: verify
+ * attempts per email start, keyed on the start id and anchored on its issue
+ * time). Unlike `rateLimit`, an epoch-aligned window edge inside the span
+ * cannot reset the count, and the row outlives the flow it limits.
+ */
+export async function rateLimitSpan(opts: { key: string; limit: number; windowStart: Date; expiresAt: Date; now?: Date }): Promise<RateLimitResult> {
+  return countInSpan({ ...opts, now: opts.now ?? new Date() });
+}
+
+async function countInSpan(opts: { key: string; limit: number; windowStart: Date; expiresAt: Date; now: Date }): Promise<RateLimitResult> {
+  const { windowStart, expiresAt, now } = opts;
   try {
     const rows = await prisma.$queryRaw<{ count: number }[]>(Prisma.sql`
       INSERT INTO rate_limit_buckets (bucket_key, window_start, count, expires_at)
@@ -61,13 +78,33 @@ export async function rateLimit(opts: {
 
     // Opportunistic cleanup — no cron needed for a table this small.
     if (Math.random() < 0.02) {
-      void prisma.rateLimitBucket.deleteMany({ where: { expiresAt: { lt: now } } }).catch(() => {});
+      void prisma.rateLimitBucket.deleteMany({ where: { expiresAt: { lt: new Date() } } }).catch(() => {});
     }
 
     return { allowed, remaining: Math.max(0, opts.limit - count), retryAfterSeconds, limit: opts.limit };
   } catch (error) {
     log.error("rate_limit.unavailable", { error, scope: opts.key.split(":")[0] });
     return { allowed: false, remaining: 0, retryAfterSeconds: STORE_RETRY_SECONDS, limit: opts.limit, storeUnavailable: true };
+  }
+}
+
+/**
+ * Gives back one unit charged by `rateLimit` at `chargedAt` for work that did
+ * not happen (Group B re-review 103b N1: a sign-in code whose Supabase `/otp`
+ * failed was not sent, so it does not spend the site-wide code budget). Never
+ * below zero. Best effort: never throws; a failure leaves the charge in place
+ * (stricter, never looser).
+ */
+export async function releaseRateLimit(opts: { key: string; windowSeconds: number; chargedAt: Date }): Promise<void> {
+  const windowMs = opts.windowSeconds * 1000;
+  const windowStart = new Date(Math.floor(opts.chargedAt.getTime() / windowMs) * windowMs);
+  try {
+    await prisma.$executeRaw(Prisma.sql`
+      UPDATE rate_limit_buckets SET count = GREATEST(count - 1, 0)
+      WHERE bucket_key = ${opts.key} AND window_start = ${windowStart}
+    `);
+  } catch (error) {
+    log.warn("rate_limit.release_failed", { error, scope: opts.key.split(":")[0] });
   }
 }
 
@@ -109,7 +146,7 @@ export function enforceMemoryRateLimit(opts: { key: string; limit: number; windo
  * store is down: `closed` (default) throws 503 UNAVAILABLE; `open` falls back
  * to the in-memory counter for the same key and budget.
  */
-export async function enforceRateLimit(opts: { key: string; limit: number; windowSeconds: number; onStoreFailure?: RateLimitFailureMode }) {
+export async function enforceRateLimit(opts: { key: string; limit: number; windowSeconds: number; onStoreFailure?: RateLimitFailureMode; now?: Date }) {
   const { onStoreFailure = "closed", ...limit } = opts;
   const r = await rateLimit(limit);
   if (r.storeUnavailable) {

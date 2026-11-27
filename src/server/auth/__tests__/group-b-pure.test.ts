@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { decideVerifiedEmail, confirmedPhone, emailStartLimits, signInCodeDailyBudget, EMAIL_START_LIMITS, EMAIL_VERIFY_LIMITS } from "../../services/customer-identity.service";
-import { noticeGaveUpAt, volumeCrossings } from "../../services/account-alerts";
+import { decideVerifiedEmail, confirmedPhone, emailStartLimits, signInCodeDailyBudget, signupClaimFor, selectAttachable, ATTACH_CAP, ATTACH_SCAN_LIMIT, EMAIL_START_LIMITS, EMAIL_VERIFY_LIMITS, type AttachCandidate } from "../../services/customer-identity.service";
+import { accountIncidents, noticeGaveUpAt, volumeCrossings } from "../../services/account-alerts";
+import { budgetWindowStart, signInBudgetCrossings } from "../signin-code-budget";
+import { codeStepMessage, cookieBlockedMessage, CODE_TIMED_OUT_MESSAGE, emailStepMessage, waitWords } from "@/components/auth/email-code-messages";
+import { createHash } from "node:crypto";
 import { MAX_ATTEMPTS, RETRY_WINDOW_MS } from "../../services/notification.service";
 import { inquiryNeedsVerification } from "../../services/inquiry.service";
 import { supabaseUrlProblem } from "../../lib/env";
@@ -115,19 +118,22 @@ describe("sign-in code limits (review 103 findings 3 and 8)", () => {
   it("a code request passes per address, per IP hour, per IP day, global hour and the global day budget, in that order", () => {
     const limits = emailStartLimits({ contactHash: "a".repeat(64), ipHash: "b".repeat(32), dailyCap: 100 });
     expect(limits).toEqual([
-      { key: `auth_email_start:email:${"a".repeat(32)}`, max: 3, windowSeconds: 900 },
-      { key: `auth_email_start:ip:${"b".repeat(32)}`, max: 10, windowSeconds: 3600 },
-      { key: `auth_email_start:ip_day:${"b".repeat(32)}`, max: 20, windowSeconds: 86_400 },
-      { key: "auth_email_start:global", max: 30, windowSeconds: 3600 },
-      { key: "auth_email_start:global_day", max: 40, windowSeconds: 86_400 },
+      { key: `auth_email_start:email:${"a".repeat(32)}`, max: 3, windowSeconds: 900, scope: "address" },
+      { key: `auth_email_start:ip:${"b".repeat(32)}`, max: 10, windowSeconds: 3600, scope: "ip" },
+      { key: `auth_email_start:ip_day:${"b".repeat(32)}`, max: 20, windowSeconds: 86_400, scope: "ip" },
+      { key: "auth_email_start:global", max: 30, windowSeconds: 3600, scope: "site" },
+      { key: "auth_email_start:global_day", max: 40, windowSeconds: 86_400, scope: "site" },
     ]);
     expect(emailStartLimits({ contactHash: "a".repeat(64), ipHash: undefined, dailyCap: 100 })[1].key).toBe("auth_email_start:ip:none");
     expect(EMAIL_START_LIMITS.globalHour).toBeLessThanOrEqual(30);
   });
 
-  it("verify attempts: per start cookie, per IP, and per address as the wider backstop", () => {
-    expect(EMAIL_VERIFY_LIMITS).toEqual({ perStart15m: 5, perIp15m: 30, perAddress15m: 30 });
-    expect(EMAIL_VERIFY_LIMITS.perAddress15m).toBeGreaterThan(EMAIL_VERIFY_LIMITS.perStart15m * EMAIL_START_LIMITS.perAddress15m);
+  it("verify attempts: per start (its whole life), per IP, and per address as a backstop of 15 to 20 (re-review 103b N2)", () => {
+    expect(EMAIL_VERIFY_LIMITS).toEqual({ perStart: 5, perIp15m: 30, perAddress15m: 20 });
+    expect(EMAIL_VERIFY_LIMITS.perAddress15m).toBeGreaterThanOrEqual(15);
+    expect(EMAIL_VERIFY_LIMITS.perAddress15m).toBeLessThanOrEqual(20);
+    // The owner's own three starts in a window still fit under the backstop.
+    expect(EMAIL_VERIFY_LIMITS.perAddress15m).toBeGreaterThanOrEqual(EMAIL_VERIFY_LIMITS.perStart * EMAIL_START_LIMITS.perAddress15m);
   });
 });
 
@@ -150,6 +156,12 @@ describe("attach notice gave up (review 103 finding 5)", () => {
     expect(noticeGaveUpAt(row({ status: "sent" }), now)).toBeNull();
     expect(noticeGaveUpAt(row({ providerError: "definite:link_detached" }), now)).toBeNull();
   });
+  it("a suppressed notice was never sent: given up at once, except the non-production allowlist (re-review 103b N5)", () => {
+    const createdAt = new Date(now.getTime() - 120_000);
+    expect(noticeGaveUpAt(row({ status: "suppressed", suppressedReason: "opted_out", createdAt, failedAt: null }), now)).toEqual(createdAt);
+    expect(noticeGaveUpAt(row({ status: "suppressed", suppressedReason: "unsupported_channel", createdAt, failedAt: null }), now)).toEqual(createdAt);
+    expect(noticeGaveUpAt(row({ status: "suppressed", suppressedReason: "non_production_allowlist", createdAt, failedAt: null }), now)).toBeNull();
+  });
 });
 
 describe("verified inquiries need a verified phone (review 103 finding 6)", () => {
@@ -171,5 +183,115 @@ describe("SUPABASE_URL shape, shared by the email and Google options (review 103
     expect(supabaseUrlProblem({ SUPABASE_URL: "http://127.0.0.1:54321", isProduction: false })).toBeNull();
     expect(supabaseUrlProblem({ SUPABASE_URL: "http://127.0.0.1:54321", isProduction: true })).toMatch(/supabase\.co/);
     expect(supabaseUrlProblem({ SUPABASE_URL: "https://example-project.supabase.co", isProduction: true })).toBeNull();
+  });
+});
+
+describe("sign-in code budget alert (re-review 103b N1)", () => {
+  // An injected clock: nothing here depends on the real time of day, so a run across UTC midnight cannot flake.
+  const now = new Date("2031-03-04T23:59:30Z");
+  it("raises at 80 % of the budget and again when it is spent, both at the start of that UTC day", () => {
+    const day = new Date("2031-03-04T00:00:00Z");
+    expect(budgetWindowStart(now)).toEqual(day);
+    expect(signInBudgetCrossings(31, 40, now)).toEqual([]);
+    expect(signInBudgetCrossings(32, 40, now)).toEqual([{ reason: "signin_code_budget_80pct", raisedAt: day, count: 32, budget: 40 }]);
+    expect(signInBudgetCrossings(40, 40, now).map((c) => c.reason)).toEqual(["signin_code_budget_80pct", "signin_code_budget_spent"]);
+    expect(signInBudgetCrossings(55, 40, now).map((c) => c.reason)).toEqual(["signin_code_budget_80pct", "signin_code_budget_spent"]);
+    expect(signInBudgetCrossings(0, 40, now)).toEqual([]);
+    // A paid plan: 1200 codes a day, the alert at 960.
+    expect(signInBudgetCrossings(959, signInCodeDailyBudget(3000), now)).toEqual([]);
+    expect(signInBudgetCrossings(960, signInCodeDailyBudget(3000), now)).toHaveLength(1);
+  });
+  it("the next UTC day is a new window", () => {
+    expect(budgetWindowStart(new Date("2031-03-05T00:00:00Z"))).toEqual(new Date("2031-03-05T00:00:00Z"));
+  });
+});
+
+describe("email code form words (re-review 103b N6 and the cookie case)", () => {
+  it("caps the stated wait: an hour or less in minutes, anything longer reads later", () => {
+    expect(waitWords(900)).toBe("in 15 minutes");
+    expect(waitWords(3600)).toBe("in 60 minutes");
+    expect(waitWords(3601)).toBe("later");
+    expect(waitWords(86_400)).toBe("later");
+    expect(emailStepMessage("RATE_LIMITED", 82_800)).not.toMatch(/\d+ minutes/);
+  });
+  it("a site-wide refusal does not blame the customer, and offers Google only when it is on", () => {
+    expect(emailStepMessage("RATE_LIMITED", 82_800, { scope: "site", alternative: "google" })).toBe("We can't send more email codes right now. Try again later, or continue with Google.");
+    expect(emailStepMessage("RATE_LIMITED", 82_800, { scope: "site" })).toBe("We can't send more email codes right now. Try again later.");
+    expect(emailStepMessage("RATE_LIMITED", 900, { alternative: "google" })).toBe("Too many codes requested. Try again in 15 minutes, or continue with Google.");
+    expect(emailStepMessage("RATE_LIMITED", 900)).toBe("Too many codes requested. Try again in 15 minutes.");
+  });
+  it("a server CODE_EXPIRED covers another browser or a lost cookie; the page's own timer says expired", () => {
+    expect(codeStepMessage("CODE_EXPIRED")).toBe("That code can't be used here any more. Send a new one.");
+    expect(CODE_TIMED_OUT_MESSAGE).toBe("That code has expired. Send a new one.");
+  });
+  it("blocked cookies: says what will work instead of another code that fails the same way", () => {
+    expect(cookieBlockedMessage(true)).toMatch(/Allow cookies for this site.*or continue with Google\.$/);
+    expect(cookieBlockedMessage(false)).not.toMatch(/Google/);
+  });
+});
+
+describe("signup claim (re-review 103b, finding 7)", () => {
+  it("is fixed per intent, differs between intents and never contains the intent id", () => {
+    const a = "0190f7a2-0000-7000-8000-0000000a0001";
+    const b = "0190f7a2-0000-7000-8000-0000000a0002";
+    expect(signupClaimFor(a)).toBe(signupClaimFor(a));
+    expect(signupClaimFor(a)).not.toBe(signupClaimFor(b));
+    expect(signupClaimFor(a)).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(signupClaimFor(a)).not.toContain(a);
+  });
+});
+
+describe("attach cap counts the orders that pass the per-order checks (review 103 finding 12)", () => {
+  const sha = (v: string) => createHash("sha256").update(v).digest("hex");
+  const gs = "0190f7a2-0000-7000-8000-0000000000aa";
+  const order = (n: number, opts: { lead: string; verified: string; session?: string | null }): AttachCandidate => ({
+    id: `0190f7a2-0000-7000-8000-${String(n).padStart(12, "0")}`,
+    reference: `OUT-${100000 + n}`,
+    leadEmail: opts.lead,
+    quote: { ownerKind: "guest", guestSessionId: opts.session === undefined ? gs : opts.session },
+    verifications: [{ id: `v-${n}`, contactHash: sha(opts.verified) }],
+  });
+  const ctx = { verifiedEmail: "signer@example.com", guestSessionId: gs, grantOrderIds: [] as string[] };
+
+  it("25 loose matches in this browser whose email was not the one proven do not block the one that qualifies", () => {
+    const loose = Array.from({ length: 25 }, (_, i) => order(i, { lead: `buyer${i}@example.com`, verified: "someone-else@example.com" }));
+    const good = order(99, { lead: "buyer99@example.com", verified: "buyer99@example.com" });
+    const r = selectAttachable([...loose, good], ctx);
+    expect(r.capped).toBe(false);
+    expect(r.chosen.map((c) => [c.order.id, c.rule, c.recipient])).toEqual([[good.id, "guest_session", "buyer99@example.com"]]);
+  });
+
+  it("rule (a) wins over rule (b) for the same order; more than 20 qualifying orders attach none", () => {
+    const own = order(1, { lead: "signer@example.com", verified: "signer@example.com", session: null });
+    expect(selectAttachable([own], ctx).chosen[0]).toMatchObject({ rule: "verified_email", recipient: "signer@example.com" });
+    const many = Array.from({ length: ATTACH_CAP + 1 }, (_, i) => order(i, { lead: `b${i}@example.com`, verified: `b${i}@example.com` }));
+    expect(selectAttachable(many, ctx)).toEqual({ chosen: [], capped: true });
+    expect(selectAttachable(many.slice(0, ATTACH_CAP), ctx).chosen).toHaveLength(ATTACH_CAP);
+  });
+
+  it("more candidates than the scan limit is itself unusual volume: none attached", () => {
+    const loose = Array.from({ length: ATTACH_SCAN_LIMIT + 1 }, (_, i) => order(i, { lead: `x${i}@example.com`, verified: "nobody@example.com" }));
+    expect(selectAttachable(loose, ctx)).toEqual({ chosen: [], capped: true });
+  });
+
+  it("another session, or no browser link at all, never attaches by rule (b)", () => {
+    const other = order(5, { lead: "b5@example.com", verified: "b5@example.com", session: "0190f7a2-0000-7000-8000-0000000000bb" });
+    expect(selectAttachable([other], ctx).chosen).toEqual([]);
+    expect(selectAttachable([order(6, { lead: "b6@example.com", verified: "b6@example.com" })], { ...ctx, guestSessionId: null }).chosen).toEqual([]);
+  });
+});
+
+describe("account alerts survive a failing part (re-review 103b N3)", () => {
+  it("a notice query that throws loses only the notice alerts; the cap alert still comes through", async () => {
+    const createdAt = new Date("2031-03-04T10:00:00Z");
+    const fake = {
+      orderAccountLink: { findMany: async () => [] },
+      auditLog: { findMany: async () => [{ entityType: "customer_attach_cap", entityId: "0190f7a2-0000-7000-8000-0000000000cc", createdAt }] },
+      $queryRaw: async () => {
+        throw new Error("relation does not exist");
+      },
+    } as unknown as Parameters<typeof accountIncidents>[3];
+    const out = await accountIncidents(new Date("2031-03-04T00:00:00Z"), new Date("2031-03-04T12:00:00Z"), 100, fake);
+    expect(out.map((i) => [i.kind, i.entityId])).toEqual([["account_attach_capped", "0190f7a2-0000-7000-8000-0000000000cc"]]);
   });
 });

@@ -38,6 +38,12 @@ describe("Supabase Auth client contract", () => {
     expect(r.headers.authorization).toBeUndefined();
   });
 
+  it("POST /otp with our signup claim: sent as data (user_metadata on creation) (re-review 103b, finding 7)", async () => {
+    const claim = "c".repeat(43);
+    await supabaseAuthClient.sendEmailOtp("jo@example.com", { signupClaim: claim });
+    expect(last("/otp").body).toEqual({ email: "jo@example.com", create_user: true, data: { outlyy_signup_claim: claim } });
+  });
+
   it("POST /verify: type email, email, token; returns a session whose access token verifies against the JWKS", async () => {
     await supabaseAuthClient.sendEmailOtp("ana@example.com");
     const code = fake.codes.get("ana@example.com")!;

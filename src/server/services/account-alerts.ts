@@ -4,6 +4,8 @@ import { env } from "../lib/env";
 import type { OpsIncident } from "./ops-alert.service";
 import { MAX_ATTEMPTS, RETRY_WINDOW_MS } from "./notification.service";
 import { ACCOUNT_LINK_NOTICE_EVENT } from "../notifications/auth-templates";
+import { emitEvent } from "../lib/structured-events";
+import { budgetWindowStart, SIGNIN_CODE_BUDGET_BUCKET, signInBudgetCrossings, signInCodeDailyBudget } from "../auth/signin-code-budget";
 
 /**
  * Group B staff alerts, read from committed state by the ops sweep
@@ -24,7 +26,9 @@ import { ACCOUNT_LINK_NOTICE_EVENT } from "../notifications/auth-templates";
  *    be sent: its outbox row failed for good (definite failure, attempts or
  *    retry window spent, or flagged for a human), or no row was written
  *    within NOTICE_MISSING_AFTER_MS of the attach. The notice is the buyer's
- *    only control on an automatic attach, so staff check it by hand.
+ *    only control on an automatic attach, so staff check it by hand. A
+ *    notice that ended `suppressed` (opted out, unsupported) counts as not
+ *    sent, except the non-production allowlist (re-review 103b N5).
  *    Entity `order_account_link:<link id>`.
  *  - `email_volume_high` (owner Q-B6, Resend free tier): emails sent today
  *    (UTC) or this calendar month reached EMAIL_VOLUME_ALERT_PERCENT of the
@@ -32,6 +36,15 @@ import { ACCOUNT_LINK_NOTICE_EVENT } from "../notifications/auth-templates";
  *    it (`email_send_counters`). Entity `email_volume:day:<date>` or
  *    `email_volume:month:<yyyy-mm>`, raised at the start of the day on which
  *    the threshold was crossed, so it alerts once per window.
+ *  - `signin_code_budget` (re-review 103b N1): today's sign-in code budget
+ *    (40 % of EMAIL_DAILY_SEND_CAP, the limiter bucket of the email start
+ *    route) reached 80 % (`signin_code_budget_80pct`) or is spent
+ *    (`signin_code_budget_spent`: email codes are refused until UTC midnight;
+ *    Google still works). Entity `email_volume:signin_budget:<date>`, raised
+ *    at the start of that UTC day, so each alerts once a day.
+ *
+ * Each part reads on its own: a failing query loses only its own incidents,
+ * never the others', and emits `customer.identity_alerts_failed`.
  */
 
 type Db = Tx | typeof prisma;
@@ -47,8 +60,13 @@ export const NOTICE_MISSING_AFTER_MS = 15 * 60_000;
  * once flagged for a human. `definite:link_detached` is not a failure to
  * report: the order was detached before the notice went out.
  */
-export function noticeGaveUpAt(row: { status: string; providerError: string | null; attempt: number; createdAt: Date; failedAt: Date | null; attentionRequiredAt: Date | null }, now: Date): Date | null {
+export function noticeGaveUpAt(
+  row: { status: string; providerError: string | null; suppressedReason?: string | null; attempt: number; createdAt: Date; failedAt: Date | null; attentionRequiredAt: Date | null },
+  now: Date,
+): Date | null {
   if (row.status === "unknown") return row.attentionRequiredAt;
+  // Suppressed is final and nothing was sent (re-review 103b N5). The non-production allowlist is a test setup, not a buyer left untold.
+  if (row.status === "suppressed") return row.suppressedReason === "non_production_allowlist" ? null : row.createdAt;
   if (row.status !== "failed") return null;
   if (row.providerError === "definite:link_detached") return null;
   const at = row.failedAt ?? row.createdAt;
@@ -57,48 +75,68 @@ export function noticeGaveUpAt(row: { status: string; providerError: string | nu
   return windowEnd.getTime() <= now.getTime() ? new Date(Math.max(windowEnd.getTime(), at.getTime())) : null;
 }
 
+/** Rows read per page by the notice check, and the most pages one sweep reads (re-review 103b N7). */
+const NOTICE_PAGE = 500;
+const NOTICE_MAX_PAGES = 40;
+
+interface NoticeRow {
+  id: string;
+  status: string;
+  provider_error: string | null;
+  suppressed_reason: string | null;
+  attempt: number;
+  created_at: Date;
+  failed_at: Date | null;
+  attention_required_at: Date | null;
+  link_id: string;
+  order_id: string;
+  reference: string;
+}
+
 /** `account_attach_notice_failed` incidents raised in (since, now]. */
 async function noticeIncidents(since: Date, now: Date, limit: number, db: Db): Promise<OpsIncident[]> {
   const out: OpsIncident[] = [];
-  const incident = (link: { id: string; orderId: string; order: { reference: string } }, raisedAt: Date, reason: string): OpsIncident => ({
+  const incident = (link: { id: string; orderId: string; reference: string }, raisedAt: Date, reason: string): OpsIncident => ({
     kind: "account_attach_notice_failed",
     entityKind: "order_account_link",
     entityId: link.id,
     reason,
     raisedAt,
     orderId: link.orderId,
-    orderReference: link.order.reference,
+    orderReference: link.reference,
     bookingId: null,
     supplierBookingRef: null,
-    adminPath: `/admin/bookings/${encodeURIComponent(link.order.reference)}`,
+    adminPath: `/admin/bookings/${encodeURIComponent(link.reference)}`,
   });
   const inWindow = (d: Date | null): d is Date => Boolean(d && d.getTime() > since.getTime() && d.getTime() <= now.getTime());
 
-  // A row can give up up to RETRY_WINDOW_MS after it was created.
-  const rows = await db.notification.findMany({
-    where: {
-      event: ACCOUNT_LINK_NOTICE_EVENT,
-      createdAt: { gt: new Date(since.getTime() - RETRY_WINDOW_MS - 3_600_000) },
-      OR: [{ status: "failed" }, { status: "unknown", attentionRequiredAt: { not: null } }],
-    },
-    select: { id: true, status: true, providerError: true, attempt: true, createdAt: true, failedAt: true, attentionRequiredAt: true },
-    orderBy: { createdAt: "asc" },
-    take: limit,
-  });
-  const gaveUp = new Map<string, Date>();
-  for (const r of rows) {
-    const at = noticeGaveUpAt(r, now);
-    if (inWindow(at)) gaveUp.set(r.id, at);
-  }
-  if (gaveUp.size) {
-    const links = await db.orderAccountLink.findMany({
-      where: { notificationId: { in: [...gaveUp.keys()] }, detachedAt: null },
-      select: { id: true, orderId: true, notificationId: true, order: { select: { reference: true } } },
-    });
-    for (const l of links) out.push(incident(l, gaveUp.get(l.notificationId!)!, "attach_notice_failed"));
+  // Only notices of links that are still attached, every page of them (re-review 103b N7): rows of detached links
+  // cannot crowd out a new definite failure. A row can give up up to RETRY_WINDOW_MS after it was created.
+  const lookback = new Date(since.getTime() - RETRY_WINDOW_MS - 3_600_000);
+  for (let page = 0; page < NOTICE_MAX_PAGES; page++) {
+    const rows = await db.$queryRaw<NoticeRow[]>`
+      SELECT n.id::text AS id, n.status::text AS status, n.provider_error, n.suppressed_reason, n.attempt,
+             n.created_at, n.failed_at, n.attention_required_at, l.id::text AS link_id, l.order_id::text AS order_id, o.reference
+      FROM order_account_links l
+      JOIN notifications n ON n.id = l.notification_id
+      JOIN orders o ON o.id = l.order_id
+      WHERE l.detached_at IS NULL AND n.event = ${ACCOUNT_LINK_NOTICE_EVENT} AND n.created_at > ${lookback}
+        AND (n.status = 'failed'
+          OR (n.status = 'unknown' AND n.attention_required_at IS NOT NULL)
+          OR (n.status = 'suppressed' AND n.suppressed_reason IS DISTINCT FROM 'non_production_allowlist'))
+      ORDER BY n.created_at, n.id
+      LIMIT ${NOTICE_PAGE} OFFSET ${page * NOTICE_PAGE}`;
+    for (const r of rows) {
+      const at = noticeGaveUpAt(
+        { status: r.status, providerError: r.provider_error, suppressedReason: r.suppressed_reason, attempt: Number(r.attempt), createdAt: new Date(r.created_at), failedAt: r.failed_at ? new Date(r.failed_at) : null, attentionRequiredAt: r.attention_required_at ? new Date(r.attention_required_at) : null },
+        now,
+      );
+      if (inWindow(at)) out.push(incident({ id: r.link_id, orderId: r.order_id, reference: r.reference }, at, "attach_notice_failed"));
+    }
+    if (rows.length < NOTICE_PAGE) break;
   }
 
-  // No outbox row at all: the deferred send never ran (or failed before writing it).
+  // No outbox row at all: it could not be written in the sign-in request (the row is queued before the response).
   const missing = await db.orderAccountLink.findMany({
     where: {
       notificationId: null,
@@ -107,58 +145,71 @@ async function noticeIncidents(since: Date, now: Date, limit: number, db: Db): P
       attachedAt: { gt: new Date(since.getTime() - NOTICE_MISSING_AFTER_MS), lte: new Date(now.getTime() - NOTICE_MISSING_AFTER_MS) },
     },
     select: { id: true, orderId: true, attachedAt: true, order: { select: { reference: true } } },
-    orderBy: { attachedAt: "asc" },
+    orderBy: { attachedAt: "desc" },
     take: limit,
   });
-  for (const l of missing) out.push(incident(l, new Date(l.attachedAt.getTime() + NOTICE_MISSING_AFTER_MS), "attach_notice_missing"));
+  for (const l of missing) out.push(incident({ id: l.id, orderId: l.orderId, reference: l.order.reference }, new Date(l.attachedAt.getTime() + NOTICE_MISSING_AFTER_MS), "attach_notice_missing"));
   return out;
 }
 
+/** One part of the account alerts, read on its own: a failure loses only that part and is logged (re-review 103b N3). */
+async function part(name: "disputed" | "audit" | "notices" | "volume" | "signin_budget", read: () => Promise<OpsIncident[]>): Promise<OpsIncident[]> {
+  try {
+    return await read();
+  } catch {
+    emitEvent("customer.identity_alerts_failed", { part: name }, "error");
+    return [];
+  }
+}
+
 export async function accountIncidents(since: Date, now: Date, limit = 100, db: Db = prisma): Promise<OpsIncident[]> {
-  const out: OpsIncident[] = [];
-  const disputed = await db.orderAccountLink.findMany({
-    where: { detachReason: "not_me", detachedAt: { gt: since, lte: now } },
-    select: { id: true, orderId: true, detachedAt: true, order: { select: { reference: true } } },
-    orderBy: { detachedAt: "asc" },
-    take: limit,
-  });
-  for (const d of disputed) {
-    out.push({
-      kind: "account_attach_disputed",
-      entityKind: "order_account_link",
-      entityId: d.id,
-      reason: "attach_disputed",
-      raisedAt: d.detachedAt!,
-      orderId: d.orderId,
-      orderReference: d.order.reference,
-      bookingId: null,
-      supplierBookingRef: null,
-      adminPath: `/admin/bookings/${encodeURIComponent(d.order.reference)}`,
+  const disputed = await part("disputed", async () => {
+    const rows = await db.orderAccountLink.findMany({
+      where: { detachReason: "not_me", detachedAt: { gt: since, lte: now } },
+      select: { id: true, orderId: true, detachedAt: true, order: { select: { reference: true } } },
+      orderBy: { detachedAt: "asc" },
+      take: limit,
     });
-  }
-  const rows = await db.auditLog.findMany({
-    where: { entityType: { in: ["customer_attach_cap", "customer_supabase_user"] }, createdAt: { gt: since, lte: now } },
-    select: { entityType: true, entityId: true, createdAt: true },
-    orderBy: { createdAt: "asc" },
-    take: limit,
+    return rows.map(
+      (d): OpsIncident => ({
+        kind: "account_attach_disputed",
+        entityKind: "order_account_link",
+        entityId: d.id,
+        reason: "attach_disputed",
+        raisedAt: d.detachedAt!,
+        orderId: d.orderId,
+        orderReference: d.order.reference,
+        bookingId: null,
+        supplierBookingRef: null,
+        adminPath: `/admin/bookings/${encodeURIComponent(d.order.reference)}`,
+      }),
+    );
   });
-  out.push(...(await noticeIncidents(since, now, limit, db)));
-  for (const r of rows) {
-    const capped = r.entityType === "customer_attach_cap";
-    out.push({
-      kind: capped ? "account_attach_capped" : "supabase_user_delete_due",
-      entityKind: "customer",
-      entityId: r.entityId,
-      reason: capped ? "attach_capped" : "supabase_user_delete_due",
-      raisedAt: r.createdAt,
-      orderId: null,
-      orderReference: null,
-      bookingId: null,
-      supplierBookingRef: null,
-      adminPath: "/admin",
+  const audited = await part("audit", async () => {
+    const rows = await db.auditLog.findMany({
+      where: { entityType: { in: ["customer_attach_cap", "customer_supabase_user"] }, createdAt: { gt: since, lte: now } },
+      select: { entityType: true, entityId: true, createdAt: true },
+      orderBy: { createdAt: "asc" },
+      take: limit,
     });
-  }
-  return out;
+    return rows.map((r): OpsIncident => {
+      const capped = r.entityType === "customer_attach_cap";
+      return {
+        kind: capped ? "account_attach_capped" : "supabase_user_delete_due",
+        entityKind: "customer",
+        entityId: r.entityId,
+        reason: capped ? "attach_capped" : "supabase_user_delete_due",
+        raisedAt: r.createdAt,
+        orderId: null,
+        orderReference: null,
+        bookingId: null,
+        supplierBookingRef: null,
+        adminPath: "/admin",
+      };
+    });
+  });
+  const notices = await part("notices", () => noticeIncidents(since, now, limit, db));
+  return [...disputed, ...notices, ...audited];
 }
 
 const dayStart = (d: Date) => new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
@@ -221,4 +272,30 @@ export async function emailVolumeIncidents(now: Date, db: Db = prisma): Promise<
     supplierBookingRef: null,
     adminPath: "/admin",
   }));
+}
+
+/**
+ * `signin_code_budget` incidents for today (re-review 103b N1), read from the
+ * email start route's own limiter bucket for the UTC day that holds `now`.
+ * Never throws: a read failure loses only this alert and is logged.
+ */
+export async function signInCodeBudgetIncidents(now: Date, db: Db = prisma): Promise<OpsIncident[]> {
+  return part("signin_budget", async () => {
+    const row = await db.rateLimitBucket.findUnique({ where: { key_windowStart: { key: SIGNIN_CODE_BUDGET_BUCKET, windowStart: budgetWindowStart(now) } }, select: { count: true } });
+    const budget = signInCodeDailyBudget(env().EMAIL_DAILY_SEND_CAP);
+    return signInBudgetCrossings(row?.count ?? 0, budget, now).map(
+      (c): OpsIncident => ({
+        kind: "signin_code_budget",
+        entityKind: "email_volume",
+        entityId: `signin_budget:${isoDay(c.raisedAt)}`,
+        reason: c.reason,
+        raisedAt: c.raisedAt,
+        orderId: null,
+        orderReference: null,
+        bookingId: null,
+        supplierBookingRef: null,
+        adminPath: "/admin",
+      }),
+    );
+  });
 }

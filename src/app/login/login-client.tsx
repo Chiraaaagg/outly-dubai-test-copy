@@ -76,7 +76,7 @@ export function LoginClient({ options, next, notice, inAppBrowser, preview }: { 
 
   const googleFirst = google && !inAppBrowser;
   const googleButton = google ? <GoogleButton next={next} /> : null;
-  const emailForm = emailOn ? <EmailCodeForm next={next} turnstileSiteKey={options.turnstileSiteKey} onDisabled={() => setEmailOn(false)} preview={preview} /> : null;
+  const emailForm = emailOn ? <EmailCodeForm next={next} turnstileSiteKey={options.turnstileSiteKey} googleAvailable={google} onDisabled={() => setEmailOn(false)} preview={preview} /> : null;
   const lead = (text: string) => <p className="mb-3 text-sm font-semibold text-ink-700">{text}</p>;
 
   return (

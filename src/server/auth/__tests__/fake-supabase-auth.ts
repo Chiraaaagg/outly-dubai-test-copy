@@ -53,7 +53,14 @@ export interface FakeSupabase {
   foreignKey: CryptoKey;
   /** The hook the fake calls during /otp. Return the HTTP status the hook answered. */
   onSendEmail: ((body: string, headers: Record<string, string>) => Promise<number>) | null;
+  /**
+   * The Before User Created hook the fake calls when `/otp` would create a user (signed with
+   * `beforeUserCreatedHookSecret`), with `user_metadata` = the `/otp` `data`. A non-2xx answer refuses the
+   * creation and `/otp` answers 403 `hook_rejected`-style, as assumed for the hosted service (to confirm at staging).
+   */
+  onBeforeUserCreated: ((body: string, headers: Record<string, string>) => Promise<number>) | null;
   sendEmailHookSecret: string;
+  beforeUserCreatedHookSecret: string;
   close: () => Promise<void>;
 }
 
@@ -73,7 +80,7 @@ function send(res: ServerResponse, status: number, body?: unknown) {
   res.end(JSON.stringify(body));
 }
 
-export async function startFakeSupabase(opts: { sendEmailHookSecret?: string } = {}): Promise<FakeSupabase> {
+export async function startFakeSupabase(opts: { sendEmailHookSecret?: string; beforeUserCreatedHookSecret?: string } = {}): Promise<FakeSupabase> {
   const { publicKey, privateKey } = await generateKeyPair("ES256");
   const foreign = await generateKeyPair("ES256");
   const jwk: JWK = { ...(await exportJWK(publicKey)), kid: "fake-es256-1", alg: "ES256", use: "sig" };
@@ -84,6 +91,7 @@ export async function startFakeSupabase(opts: { sendEmailHookSecret?: string } =
   const forced = new Map<string, { status: number; body: unknown }>();
   const tokens = new Map<string, string>(); // token → user id
   const sendEmailHookSecret = opts.sendEmailHookSecret ?? `v1,whsec_${randomBytes(32).toString("base64")}`;
+  const beforeUserCreatedHookSecret = opts.beforeUserCreatedHookSecret ?? `v1,whsec_${randomBytes(32).toString("base64")}`;
   let url = "";
 
   const fake: FakeSupabase = {
@@ -105,7 +113,9 @@ export async function startFakeSupabase(opts: { sendEmailHookSecret?: string } =
     },
     foreignKey: foreign.privateKey,
     onSendEmail: null,
+    onBeforeUserCreated: null,
     sendEmailHookSecret,
+    beforeUserCreatedHookSecret,
     close: () => new Promise<void>((r) => server.close(() => r())),
   };
 
@@ -148,6 +158,15 @@ export async function startFakeSupabase(opts: { sendEmailHookSecret?: string } =
     if (req.method === "POST" && path === "/otp") {
       const email = String(b.email ?? "").toLowerCase();
       if (!email.includes("@")) return send(res, 400, { code: 400, error_code: "email_address_invalid", msg: "invalid" });
+      if (!byEmail.has(email) && fake.onBeforeUserCreated) {
+        const meta = b.data && typeof b.data === "object" ? b.data : {};
+        const hookBody = JSON.stringify({ metadata: { name: "before-user-created" }, user: { email, app_metadata: { provider: "email" }, user_metadata: meta } });
+        const id = `msg_${randomBytes(8).toString("hex")}`;
+        const ts = String(Math.floor(Date.now() / 1000));
+        const key = hookSecretKey(beforeUserCreatedHookSecret)!;
+        const status = await fake.onBeforeUserCreated(hookBody, { "webhook-id": id, "webhook-timestamp": ts, "webhook-signature": `v1,${signHookPayload(key, id, ts, hookBody)}` });
+        if (status < 200 || status >= 300) return send(res, 403, { code: 403, error_code: "hook_rejected", msg: "Sign-up is not available this way." });
+      }
       const user = userFor(email, "email", { email, email_verified: false, sub: "" });
       const code = String(randomInt(0, 1_000_000)).padStart(6, "0");
       codes.set(email, code);

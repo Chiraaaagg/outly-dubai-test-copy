@@ -118,6 +118,12 @@ export interface DispatchInput {
 /** Row states a dispatch can end in. `queued`: the outcome could not be recorded; the sweep resolves it. */
 export type OutboxOutcome = "sent" | "failed" | "unknown" | "suppressed" | "queued";
 
+/** An attach notice row written in the sign-in request; its send runs after the response (re-review 103b N4). */
+export interface QueuedAccountLinkNotice {
+  row: Notification;
+  claimUntil: Date;
+}
+
 export interface DispatchResult {
   id: string;
   /** Coarse status kept for existing callers: `unknown` and `queued` read as `failed` with an `error` code. */
@@ -688,6 +694,46 @@ function recipientHashesOrNull(recipient: string): string[] | null {
   }
 }
 
+/**
+ * Step 1 of the attach notice (re-review 103b N4): writes the queued outbox
+ * row and links it to the attach, inside the sign-in request, before the
+ * response. Once the row exists, a send that never runs (the function was
+ * stopped after the response) is still sent by the outbox sweep when the
+ * row's claim lapses. Never throws: null when the row could not be written
+ * (the link then has no row and raises `attach_notice_missing` for staff).
+ */
+async function queueAccountLinkNotice(input: { linkId: string; orderId: string; recipient: string }): Promise<QueuedAccountLinkNotice | { duplicate: DispatchResult } | null> {
+  try {
+    const now = new Date();
+    const hashes = recipientHashesOrNull(input.recipient);
+    const [dedupKey = null, ...olderKeys] = hashes
+      ? dedupKeysFor({ event: `${ACCOUNT_LINK_NOTICE_EVENT}:email:${input.linkId}`, orderId: input.orderId, inquiryId: null, resendOf: null }, hashes)
+      : [];
+    const id = uuidv7();
+    const inserted = await insertQueued(
+      { id, event: ACCOUNT_LINK_NOTICE_EVENT, channel: "email", recipient: input.recipient, orderId: input.orderId, payload: { kind: "account_link_notice", linkId: input.linkId }, dedupKey },
+      now,
+      olderKeys,
+    );
+    if ("duplicate" in inserted) return { duplicate: resultOf(inserted.duplicate.id, rowOutcome(inserted.duplicate), { duplicate: true }) };
+    await prisma.orderAccountLink.updateMany({ where: { id: input.linkId, notificationId: null }, data: { notificationId: inserted.row.id } });
+    return { row: inserted.row, claimUntil: inserted.claimUntil };
+  } catch {
+    emitEvent("notification.failed", { event: ACCOUNT_LINK_NOTICE_EVENT, channel: "email", reason: "dispatch_failed" }, "error");
+    return null;
+  }
+}
+
+/** Step 2 of the attach notice: the send of a queued row, deferred until after the response. Never throws. */
+async function sendQueuedAccountLinkNotice(queued: QueuedAccountLinkNotice): Promise<DispatchResult | null> {
+  try {
+    return await attemptAndRecord(queued.row, new Date(), queued.claimUntil);
+  } catch {
+    emitEvent("notification.failed", { event: ACCOUNT_LINK_NOTICE_EVENT, channel: "email", reason: "dispatch_failed" }, "error");
+    return null;
+  }
+}
+
 export const notificationService = {
   async dispatch(input: DispatchInput): Promise<DispatchResult> {
     const now = new Date();
@@ -738,28 +784,17 @@ export const notificationService = {
    * verified email, through the outbox (one row per link; a second call for
    * the same link is a duplicate and sends nothing). Never throws: a failed
    * notice leaves the attach in place and the row for the retry sweep.
+   * The same as `queueAccountLinkNotice` then `sendQueuedAccountLinkNotice`.
    */
   async sendAccountLinkNotice(input: { linkId: string; orderId: string; recipient: string }): Promise<DispatchResult | null> {
-    try {
-      const now = new Date();
-      const hashes = recipientHashesOrNull(input.recipient);
-      const [dedupKey = null, ...olderKeys] = hashes
-        ? dedupKeysFor({ event: `${ACCOUNT_LINK_NOTICE_EVENT}:email:${input.linkId}`, orderId: input.orderId, inquiryId: null, resendOf: null }, hashes)
-        : [];
-      const id = uuidv7();
-      const inserted = await insertQueued(
-        { id, event: ACCOUNT_LINK_NOTICE_EVENT, channel: "email", recipient: input.recipient, orderId: input.orderId, payload: { kind: "account_link_notice", linkId: input.linkId }, dedupKey },
-        now,
-        olderKeys,
-      );
-      if ("duplicate" in inserted) return resultOf(inserted.duplicate.id, rowOutcome(inserted.duplicate), { duplicate: true });
-      await prisma.orderAccountLink.updateMany({ where: { id: input.linkId, notificationId: null }, data: { notificationId: inserted.row.id } });
-      return await attemptAndRecord(inserted.row, now, inserted.claimUntil);
-    } catch {
-      emitEvent("notification.failed", { event: ACCOUNT_LINK_NOTICE_EVENT, channel: "email", reason: "dispatch_failed" }, "error");
-      return null;
-    }
+    const queued = await queueAccountLinkNotice(input);
+    if (!queued) return null;
+    if ("duplicate" in queued) return queued.duplicate;
+    return sendQueuedAccountLinkNotice(queued);
   },
+
+  queueAccountLinkNotice,
+  sendQueuedAccountLinkNotice,
 
   /* -------------------------------------------------- inquiry triggers */
 

@@ -14,7 +14,7 @@ import { AUTH_PAUSE_MS, BREAKER_THRESHOLD, breakerPauseMs } from "../crm/crm.wor
 import { crmReturnIncidents } from "../crm/crm.return.alerts";
 import { ownerAlertIncidents } from "./owner-alert";
 import { bulkDisarmIncidents } from "./bulk-guard";
-import { accountIncidents, emailVolumeIncidents } from "./account-alerts";
+import { accountIncidents, emailVolumeIncidents, signInCodeBudgetIncidents } from "./account-alerts";
 
 /**
  * Ops alert emails for instant-path incidents (doc 22 §32.24: alerts by
@@ -145,7 +145,9 @@ export type OpsIncidentKind =
   /** Group B (owner Q-B3): an erased account's Supabase Auth user must be deleted by hand. */
   | "supabase_user_delete_due"
   /** Group B (owner Q-B6): email volume reached the alert share of the Resend plan's daily or monthly cap. */
-  | "email_volume_high";
+  | "email_volume_high"
+  /** Group B (re-review 103b N1): today's sign-in code budget reached 80 % or is spent (account-alerts.ts). */
+  | "signin_code_budget";
 /**
  * `crm_subject` needs migration 20261122140000 (ops_alerts_entity_kind_check). Its entity id is `inquiry:<id>`
  * or `order:<id>`, or `portal:<environment>` for the CRM worker's own pause (C2b, no new entity kind).
@@ -191,6 +193,7 @@ export const OPS_INCIDENT_TITLES: Record<OpsIncidentKind, string> = {
   account_attach_notice_failed: "Booking added to an account, but its notice email was not sent",
   supabase_user_delete_due: "Erased account: delete its Supabase Auth user by hand",
   email_volume_high: "Email volume near the Resend plan cap",
+  signin_code_budget: "Email sign-in codes: today's budget is nearly or fully spent (Google sign-in still works)",
 };
 
 /** The stored row payload: what the email says plus its idempotency scope. */
@@ -279,6 +282,12 @@ export function bookingReason(b: { state: string; errorCode: string | null; atte
 
 /** Doc 29 Batch 6: a failed external charge still unrefunded this long after the rejection raises an alert (within the 24 h funds window). */
 export const EXTERNAL_REFUND_ALERT_AFTER_MS = 3 * 3_600_000;
+
+/** A Group B alert read failed: no incident from it, and a log line instead of silence (re-review 103b N3). */
+function groupBReadFailed(part: "account" | "volume" | "signin_budget"): OpsIncident[] {
+  emitEvent("customer.identity_alerts_failed", { part }, "error");
+  return [];
+}
 
 export async function collectOpsIncidents(since: Date, now: Date, limit = COLLECT_LIMIT): Promise<OpsIncident[]> {
   const out: OpsIncident[] = [];
@@ -487,9 +496,11 @@ export async function collectOpsIncidents(since: Date, now: Date, limit = COLLEC
   // Doc 30 N2 review N2-04: needs migration 20261127160000 (entity kind `bulk_operation_item`).
   out.push(...(await bulkDisarmIncidents(since, now, limit)));
   // Group B: needs migration 20261130120000 (entity kinds `order_account_link`, `customer`, `email_volume`).
-  // A read failure here (tables not yet migrated) yields no incident, never a failed sweep.
-  out.push(...(await accountIncidents(since, now, limit).catch(() => [])));
-  out.push(...(await emailVolumeIncidents(now).catch(() => [])));
+  // A read failure here (tables not yet migrated) yields no incident, never a failed sweep; each part of
+  // `accountIncidents` reads on its own and logs its own failure (re-review 103b N3).
+  out.push(...(await accountIncidents(since, now, limit).catch(() => groupBReadFailed("account"))));
+  out.push(...(await emailVolumeIncidents(now).catch(() => groupBReadFailed("volume"))));
+  out.push(...(await signInCodeBudgetIncidents(now).catch(() => groupBReadFailed("signin_budget"))));
   return out;
 }
 

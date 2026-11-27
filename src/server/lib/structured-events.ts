@@ -224,6 +224,8 @@ export const STRUCTURED_EVENTS = {
   "customer.identity_code_failed": ["reason", "httpStatus"],
   "customer.identity_code_sent": ["outcome", "provider"],
   "customer.identity_dispute": ["applied"],
+  // A Group B staff-alert read that failed (account-alerts.ts, ops-alert.service.ts; re-review 103b N3). A part code only.
+  "customer.identity_alerts_failed": ["part"],
 } as const satisfies Record<string, readonly string[]>;
 
 export type StructuredEventName = keyof typeof STRUCTURED_EVENTS;
