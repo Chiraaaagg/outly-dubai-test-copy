@@ -17,7 +17,7 @@ interface DupRow {
 const state = {
   dups: [] as DupRow[],
   groupBys: 0,
-  findManyArgs: [] as { where: Record<string, unknown>; orderBy: unknown; take: number }[],
+  findManyArgs: [] as { where: { AND: [unknown, { OR: unknown[] }] }; orderBy: unknown; take: number }[],
   settled: [] as string[],
 };
 
@@ -33,11 +33,12 @@ const fakeDb = {
       state.groupBys += 1;
       const by = new Map<string, DupRow[]>();
       for (const d of state.dups) by.set(d.provider, [...(by.get(d.provider) ?? []), d]);
-      return [...by].map(([provider, r]) => ({ provider, _count: { _all: r.length }, _max: { createdAt: new Date(Math.max(...r.map((d) => d.createdAt.getTime()))) } }));
+      return [...by].map(([provider, r]) => ({ provider, environment: "test", providerAccountId: ACCOUNT, _count: { _all: r.length }, _max: { createdAt: new Date(Math.max(...r.map((d) => d.createdAt.getTime()))) } }));
     },
-    findMany: async (args: { where: { provider: { in: string[] } }; orderBy: unknown; take: number }) => {
+    findMany: async (args: { where: { AND: [unknown, { OR: { provider: string }[] }] }; orderBy: unknown; take: number }) => {
       state.findManyArgs.push(args as never);
-      return state.dups.filter((d) => args.where.provider.in.includes(d.provider)).slice(0, args.take);
+      const providers = args.where.AND[1].OR.map((a) => a.provider);
+      return state.dups.filter((d) => providers.includes(d.provider)).slice(0, args.take);
     },
     // settleDuplicate's first read: no row, so it stops at once (its own cases run in the db suite).
     findUnique: async ({ where }: { where: { id: string } }) => {
@@ -55,7 +56,9 @@ const { createPaymentSaga } = await import("../saga");
 const { DUPLICATE_SCAN_PAGE, duplicateScanIncident, duplicateScanIncidents } = await import("../duplicate-scan");
 
 const SERVED = "fake-aed-card";
-const gateways = { forProvider: (p: string) => (p === SERVED ? ({ account: () => ({ provider: SERVED }) } as never) : null), forRail: () => null } as never;
+const ACCOUNT = "fake-account-1";
+const forProvider = (p: string) => (p === SERVED ? { account: () => ({ provider: SERVED, environment: "test", accountId: ACCOUNT }) } : null);
+const gateways = { forProvider, forRail: () => null } as never;
 
 function saga() {
   return createPaymentSaga({
@@ -104,7 +107,7 @@ describe("payments tick: duplicate scan (review 102c D5)", () => {
     // More rows of the unserved provider than a page: before the fix they filled it on every tick.
     state.dups = [...rows("zz-retired", DUPLICATE_SCAN_PAGE + 10), ...rows(SERVED, 2)];
     await saga().advanceOpen();
-    expect(state.findManyArgs[0]!.where.provider).toEqual({ in: [SERVED] });
+    expect(state.findManyArgs[0]!.where.AND[1].OR).toEqual([{ provider: SERVED, environment: "test", providerAccountId: ACCOUNT }]);
     expect(state.settled).toEqual([`${SERVED}-0000`, `${SERVED}-0001`]);
     expect(events("payments.duplicate_no_gateway")).toEqual([expect.objectContaining({ level: "warn", provider: "zz-retired", count: DUPLICATE_SCAN_PAGE + 10 })]);
     expect(events("payments.duplicate_scan_full")).toEqual([]);
@@ -140,7 +143,6 @@ describe("payments tick: duplicate scan (review 102c D5)", () => {
 describe("duplicate scan ops alerts (review 102c D5)", () => {
   const now = new Date("2030-01-10T08:00:00Z");
   const since = new Date(now.getTime() - 72 * 3_600_000);
-  const forProvider = (p: string) => p === SERVED;
 
   it("raised when the newest row arrived today, else at the start of the UTC day, never in the future", () => {
     const today = duplicateScanIncident("duplicate_scan_full", new Date("2030-01-10T07:00:00Z"), now);
@@ -155,6 +157,13 @@ describe("duplicate scan ops alerts (review 102c D5)", () => {
     expect(await duplicateScanIncidents(since, now, forProvider)).toEqual([]);
     state.dups = rows(SERVED, DUPLICATE_SCAN_PAGE);
     expect((await duplicateScanIncidents(since, now, forProvider)).map((i) => i.kind)).toEqual(["duplicate_scan_full"]);
+  });
+
+  it("a process without the composition root raises nothing (every provider would look unserved) and says so", async () => {
+    state.dups = rows("zz-retired", 3);
+    expect(await duplicateScanIncidents(since, now)).toEqual([]);
+    expect(state.groupBys).toBe(0);
+    expect(events("payments.duplicate_scan_unwired")).toHaveLength(1);
   });
 
   it("no gateway: any held row of an unserved provider is raised, apart from the full page", async () => {

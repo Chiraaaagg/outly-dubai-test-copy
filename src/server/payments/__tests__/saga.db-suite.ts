@@ -1138,7 +1138,8 @@ describe.skipIf(!dbEnabled)("B3 payment saga (disposable database)", () => {
       const dup = await unsettledDuplicate(x, c, pid);
       // The provider's read now differs from the row (found at settle time, not at admit).
       x.inr.payments.get(pid)!.amountMinor = 229_999n;
-      // A row of another account than this deployment's gateway: configuration, which can heal, so never marked.
+      // A row of another account than this deployment's gateway: configuration, which can heal, so never marked;
+      // it is left out of the page (never read) and reported like a provider with no gateway.
       const other = c.gw.pay(c.providerOrderId);
       const drift = await unsettledDuplicate(x, c, other, { providerAccountId: "fake-account-other" });
       await x.saga.advanceOpen();
@@ -1148,7 +1149,7 @@ describe.skipIf(!dbEnabled)("B3 payment saga (disposable database)", () => {
       expect(reads).toBe(1);
       await x.saga.advanceOpen();
       expect(readsOf(x, pid)).toBe(reads);
-      expect(readsOf(x, other)).toBe(2);
+      expect(readsOf(x, other)).toBe(0);
       expect(await prisma.refund.count({ where: { paymentId: { in: [dup, drift] } } })).toBe(0);
       expect(x.inr.callsOf("refund").filter((a) => a[0] === pid || a[0] === other)).toEqual([]);
     });
@@ -1245,7 +1246,7 @@ describe.skipIf(!dbEnabled)("B3 payment saga (disposable database)", () => {
       written.push(...unreadable.map((r) => r.id));
 
       const { duplicateScanIncidents } = await import("../duplicate-scan");
-      const servedHere = (p: string) => p === x.inr.provider || p === x.aed.provider;
+      const servedHere = (p: string) => (p === x.inr.provider ? x.inr : p === x.aed.provider ? x.aed : null);
       const kinds = async () => {
         const now = new Date();
         return (await duplicateScanIncidents(new Date(now.getTime() - 72 * 3_600_000), now, servedHere)).map((i) => [i.kind, i.entityKind, i.entityId]);

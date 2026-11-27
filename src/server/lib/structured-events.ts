@@ -111,8 +111,9 @@ export const STRUCTURED_EVENTS = {
   "payments.tick_starved": ["pass", "consecutive"],
   // Review 102c D5: the tick's duplicate-payment scan (payments/duplicate-scan.ts).
   "payments.duplicate_left_for_finance": ["paymentId", "reason"],
-  "payments.duplicate_no_gateway": ["provider", "count"],
+  "payments.duplicate_no_gateway": ["provider", "environment", "count"],
   "payments.duplicate_scan_full": ["page"],
+  "payments.duplicate_scan_unwired": [],
   // Documents right after a supplier confirm (checkout redesign batch 4, CO-40): best effort, the documents tick is the net.
   "document.after_confirm": ["supplierBookingId", "outcome", "reason", "claimed"],
   // Bitrix24 CRM push (doc 29 §6.4, §6.5; CRM batch C1). Method names, codes, counts and local ids only:

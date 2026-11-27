@@ -223,11 +223,11 @@ describe("payments tick under the booking tick's cap (checkout redesign batch 4,
     const driven: Array<{ limit: number; stopped: boolean | undefined }> = [];
     const refunds = { driveOpen: async (limit: number, o: { stop?: () => boolean } = {}) => (driven.push({ limit, stopped: o.stop?.() }), 0) };
     // Provider "p" has a gateway; its duplicates' first read finds no row, so each settle ends at once.
-    const forProvider = vi.fn((p: string) => (p === "p" ? {} : null));
+    const forProvider = vi.fn((p: string) => (p === "p" ? { account: () => ({ provider: "p", environment: "test", accountId: "a" }) } : null));
     const original = { ...fakeDb.payment };
     const settled: string[] = [];
     Object.assign(fakeDb.payment, {
-      groupBy: async () => [{ provider: "p", _count: { _all: 2 }, _max: { createdAt: new Date() } }],
+      groupBy: async () => [{ provider: "p", environment: "test", providerAccountId: "a", _count: { _all: 2 }, _max: { createdAt: new Date() } }],
       findMany: async () => [{ id: "dup-1", provider: "p" }, { id: "dup-2", provider: "p" }],
       findUnique: async ({ where }: { where: { id: string } }) => (settled.push(where.id), null),
     });

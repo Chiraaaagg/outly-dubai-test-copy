@@ -1506,10 +1506,14 @@ export function createPaymentSaga(deps: SagaDeps) {
    * the row, else authorisation time plus the method's lifetime) plus `AUTO_RELEASE_GRACE_MS`. 0 when unknowable.
    */
   function holdReleasedBy(s: GatewayPaymentSnapshot, p: Payment, lifetimeMs: number | null): number {
-    const expiry = s.authorizationExpiresAt ? Date.parse(s.authorizationExpiresAt) : p.authorizationExpiresAt ? p.authorizationExpiresAt.getTime() : null;
-    const authorizedAt = s.authorizedAt ? Date.parse(s.authorizedAt) : p.authorizedAt ? p.authorizedAt.getTime() : null;
+    const at = (iso: string | null | undefined, row: Date | null): number | null => {
+      const t = iso ? Date.parse(iso) : Number.NaN;
+      return Number.isNaN(t) ? (row ? row.getTime() : null) : t;
+    };
+    const expiry = at(s.authorizationExpiresAt, p.authorizationExpiresAt);
+    const authorizedAt = at(s.authorizedAt, p.authorizedAt);
     const by = expiry ?? (authorizedAt !== null && lifetimeMs !== null ? authorizedAt + lifetimeMs : null);
-    return by === null || Number.isNaN(by) ? 0 : by + AUTO_RELEASE_GRACE_MS;
+    return by === null ? 0 : by + AUTO_RELEASE_GRACE_MS;
   }
 
   /** Take a duplicate still holding money out of the tick's scan for good: finance decides (review 102c D5). Never overwrites another code. */
@@ -1645,7 +1649,7 @@ export function createPaymentSaga(deps: SagaDeps) {
     let dups: { id: string; provider: string | null }[] = [];
     if (!opts.stop?.()) {
       const { served, unserved } = await duplicateProviders((p) => deps.gateways.forProvider(p));
-      for (const u of unserved) emitEvent("payments.duplicate_no_gateway", { provider: u.provider, count: u.count }, "warn");
+      for (const u of unserved) emitEvent("payments.duplicate_no_gateway", { provider: u.provider, environment: u.environment, count: u.count }, "warn");
       dups = served.length ? await duplicatePage(served) : [];
       // Full: newer duplicates may wait behind this page. The ops-alert sweep emails staff from the same split (duplicate-scan.ts).
       if (dups.length >= DUPLICATE_SCAN_PAGE) emitEvent("payments.duplicate_scan_full", { page: DUPLICATE_SCAN_PAGE }, "error");

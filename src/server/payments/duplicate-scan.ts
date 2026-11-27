@@ -2,7 +2,8 @@ import "server-only";
 import type { Prisma } from "@prisma/client";
 import { prisma } from "../lib/db";
 import type { OpsIncident, OpsIncidentKind } from "../services/ops-alert.service";
-import { paymentGateways } from "./registry";
+import { emitEvent } from "../lib/structured-events";
+import { paymentGateways, paymentGatewaysWired } from "./registry";
 
 /**
  * The duplicate-payment scan of the payments tick (saga.ts `advanceOpen`,
@@ -27,8 +28,9 @@ import { paymentGateways } from "./registry";
  *    (the provider's, or authorisation time plus the method's lifetime), or
  *    with no expiry that can be known;
  *  - `duplicate_refund_failed` (unchanged): the one automatic refund failed.
- * A provider with no configured gateway is not marked either: the rows must
- * be refunded once the gateway is back. They are left out of the page (so
+ * A provider with no configured gateway is not marked either, nor a row of
+ * another environment or account than the gateway's: the rows must be
+ * refunded once the configuration is back. They are left out of the page (so
  * they cannot fill it) and reported.
  *
  * Reporting: the tick logs `payments.duplicate_scan_full` (error) when its
@@ -52,24 +54,42 @@ export const DUPLICATE_SCAN_WHERE: Prisma.PaymentWhereInput = {
 /** Oldest first, so the page is the same rows in the same order on every tick until they settle. */
 export const DUPLICATE_SCAN_ORDER: Prisma.PaymentOrderByWithRelationInput[] = [{ createdAt: "asc" }, { id: "asc" }];
 
-type ForProvider = (provider: string) => unknown;
+/** The gateway this deployment has for a provider, if any (the registry's `forProvider`). */
+type ForProvider = (provider: string) => { account(): { provider: string; environment: string; accountId: string } } | null;
 
-/** The providers that have scan rows, split by whether this deployment has a gateway for them. */
-export async function duplicateProviders(forProvider: ForProvider): Promise<{ served: string[]; unserved: { provider: string; count: number; newest: Date | null }[] }> {
-  const served: string[] = [];
-  const unserved: { provider: string; count: number; newest: Date | null }[] = [];
-  const groups = await prisma.payment.groupBy({ by: ["provider"], where: DUPLICATE_SCAN_WHERE, _count: { _all: true }, _max: { createdAt: true } });
+/** One provider account the scan can settle: this deployment's gateway is that very account. */
+export interface ServedAccount {
+  provider: string;
+  environment: string;
+  accountId: string;
+}
+
+/**
+ * The provider accounts that have scan rows, split by whether this deployment's gateway is that account.
+ * Rows of a provider with no gateway, or of another environment or account id than the gateway's (a
+ * configuration state, which `settleDuplicate` never marks), are left out of the page and reported.
+ */
+export async function duplicateProviders(forProvider: ForProvider): Promise<{ served: ServedAccount[]; unserved: { provider: string; environment: string | null; count: number; newest: Date | null }[] }> {
+  const served: ServedAccount[] = [];
+  const unserved: { provider: string; environment: string | null; count: number; newest: Date | null }[] = [];
+  const groups = await prisma.payment.groupBy({ by: ["provider", "environment", "providerAccountId"], where: DUPLICATE_SCAN_WHERE, _count: { _all: true }, _max: { createdAt: true } });
   for (const g of groups) {
     if (!g.provider) continue;
-    if (forProvider(g.provider)) served.push(g.provider);
-    else unserved.push({ provider: g.provider, count: g._count?._all ?? 0, newest: g._max?.createdAt ?? null });
+    const a = forProvider(g.provider)?.account();
+    if (a && a.provider === g.provider && a.environment === g.environment && a.accountId === g.providerAccountId) served.push({ provider: a.provider, environment: a.environment, accountId: a.accountId });
+    else unserved.push({ provider: g.provider, environment: g.environment, count: g._count._all, newest: g._max.createdAt });
   }
   return { served, unserved };
 }
 
-/** The scan's page: oldest first, served providers only. */
-export function duplicatePage(served: string[]): Promise<{ id: string; provider: string | null; createdAt: Date }[]> {
-  return prisma.payment.findMany({ where: { ...DUPLICATE_SCAN_WHERE, provider: { in: served } }, orderBy: DUPLICATE_SCAN_ORDER, take: DUPLICATE_SCAN_PAGE, select: { id: true, provider: true, createdAt: true } });
+/** The scan's page: oldest first, served provider accounts only. */
+export function duplicatePage(served: ServedAccount[]): Promise<{ id: string; provider: string | null; createdAt: Date }[]> {
+  return prisma.payment.findMany({
+    where: { AND: [DUPLICATE_SCAN_WHERE, { OR: served.map((a) => ({ provider: a.provider, environment: a.environment, providerAccountId: a.accountId })) }] },
+    orderBy: DUPLICATE_SCAN_ORDER,
+    take: DUPLICATE_SCAN_PAGE,
+    select: { id: true, provider: true, createdAt: true },
+  });
 }
 
 /** Entity of both alerts (no new entity kind, so no migration). */
@@ -103,11 +123,19 @@ export function duplicateScanIncident(kind: Extract<OpsIncidentKind, "duplicate_
  *  - `duplicate_scan_full`: the tick's page (served providers) is full, so a
  *    newer duplicate may wait behind it;
  *  - `duplicate_no_gateway`: duplicates of a provider this deployment has no
- *    gateway for are held and not refunded.
+ *    gateway for (or of another account of it) are held and not refunded.
+ * Needs `src/server/wiring.ts` in the process (the inquiry-sweep route
+ * imports it); without it nothing is raised and
+ * `payments.duplicate_scan_unwired` is logged.
  */
-export async function duplicateScanIncidents(since: Date, now: Date, forProvider: ForProvider = (p) => paymentGateways.forProvider(p)): Promise<OpsIncident[]> {
+export async function duplicateScanIncidents(since: Date, now: Date, forProvider?: ForProvider): Promise<OpsIncident[]> {
+  // Without the composition root every provider would look unserved: say so instead of raising false alerts.
+  if (!forProvider && !paymentGatewaysWired()) {
+    emitEvent("payments.duplicate_scan_unwired", {}, "warn");
+    return [];
+  }
   const out: OpsIncident[] = [];
-  const { served, unserved } = await duplicateProviders(forProvider);
+  const { served, unserved } = await duplicateProviders(forProvider ?? ((p) => paymentGateways.forProvider(p)));
   if (served.length) {
     const page = await duplicatePage(served);
     if (page.length >= DUPLICATE_SCAN_PAGE) out.push(duplicateScanIncident("duplicate_scan_full", new Date(Math.max(...page.map((p) => p.createdAt.getTime()))), now));
