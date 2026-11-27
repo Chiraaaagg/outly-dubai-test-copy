@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomBytes, randomInt, randomUUID } from "node:crypto";
-import { exportJWK, generateKeyPair, SignJWT, type JWK, type KeyLike } from "jose";
+import { exportJWK, generateKeyPair, SignJWT, type CryptoKey, type JWK } from "jose";
 import { signHookPayload, hookSecretKey } from "../auth-hook";
 
 /**
@@ -48,9 +48,9 @@ export interface FakeSupabase {
   /** Force the next answer of a path (`/otp`, `/verify`, `/token`, `/user`) to this status and body. */
   failNext: (path: string, status: number, body: unknown) => void;
   /** Mint an access token for a user (or a forged one with other claims). */
-  token: (userId: string, overrides?: Record<string, unknown>, key?: KeyLike) => Promise<string>;
+  token: (userId: string, overrides?: Record<string, unknown>, key?: CryptoKey) => Promise<string>;
   /** A key that is not in the JWKS. */
-  foreignKey: KeyLike;
+  foreignKey: CryptoKey;
   /** The hook the fake calls during /otp. Return the HTTP status the hook answered. */
   onSendEmail: ((body: string, headers: Record<string, string>) => Promise<number>) | null;
   sendEmailHookSecret: string;

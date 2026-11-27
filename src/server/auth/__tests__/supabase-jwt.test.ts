@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT, UnsecuredJWT } from "jose";
+import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT, UnsecuredJWT, type CryptoKey } from "jose";
 import { verifySupabaseAccessToken } from "../supabase-jwt";
 
 const baseUrl = "https://example-project.supabase.co";
@@ -8,7 +8,7 @@ async function setup() {
   const { publicKey, privateKey } = await generateKeyPair("ES256");
   const other = await generateKeyPair("ES256");
   const keys = createLocalJWKSet({ keys: [{ ...(await exportJWK(publicKey)), kid: "k1", alg: "ES256" }] });
-  const sign = (claims: Record<string, unknown> = {}, opts: { kid?: string; key?: CryptoKey | import("jose").KeyLike; iss?: string; exp?: string } = {}) =>
+  const sign = (claims: Record<string, unknown> = {}, opts: { kid?: string; key?: CryptoKey; iss?: string; exp?: string } = {}) =>
     new SignJWT({ aud: "authenticated", ...claims })
       .setProtectedHeader({ alg: "ES256", kid: opts.kid ?? "k1" })
       .setIssuer(opts.iss ?? `${baseUrl}/auth/v1`)

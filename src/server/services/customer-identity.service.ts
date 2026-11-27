@@ -11,7 +11,7 @@ import { customerActor, type Actor } from "../lib/actor";
 import { safeNext } from "@/lib/safe-next";
 import { EMAIL_CODE_TTL_SECONDS, EMAIL_RESEND_AFTER_SECONDS, normaliseEmail, type SignInReason } from "@/lib/customer-auth-options";
 import { normalisePhone } from "../domain/phone";
-import { accessCookieGrants } from "./capability.service";
+import { accessCookieGrants, checkoutGrantsEnabled } from "./capability.service";
 import { customerAuthService, mintCustomerSession, toCustomerPublic, type CustomerPublic } from "./customer-auth.service";
 import { notificationService } from "./notification.service";
 import { customerRepo, type CustomerRecord } from "../repositories/customer.repo";
@@ -24,6 +24,8 @@ import { renderSignInCode } from "../notifications/auth-templates";
 import { emailAdapter } from "../notifications/email.adapter";
 import { isRecipientAllowed } from "../notifications/allowlist";
 import type { OAuthCookieValue } from "../lib/oauth-cookie";
+import { decodeEmailStartCookie, newEmailStartCookie, type EmailStartCookieValue } from "../lib/email-start-cookie";
+import { defer } from "../lib/defer";
 import type { SendEmailHookPayload, BeforeUserCreatedPayload } from "../auth/auth-hook";
 import { SIGN_IN_EMAIL_ACTIONS } from "../auth/auth-hook";
 import type { JWTVerifyGetKey } from "jose";
@@ -42,10 +44,13 @@ import type { JWTVerifyGetKey } from "jose";
  *  3. in one transaction (`mintCustomerSession`): the customer is found by
  *     `customer_identities` (never by an email lookup in `customers`), or an
  *     existing phone account is linked when Supabase confirms the same phone
- *     (Q9), or a phone-less customer is created; a closed account is refused;
+ *     on a `phone` identity and we started that phone sign-in (Q9; only while
+ *     CUSTOMER_PHONE_LINK_ENABLED is on, review 103 finding 4), or a
+ *     phone-less customer is created; a closed account is refused;
  *     the attach rules run (`attachGuestOrders`); the OUTLYY session row is
  *     written;
- *  4. after commit, one notice email per attached order.
+ *  4. after commit and after the response (`defer`), one notice email per
+ *     attached order.
  *
  * The attach rules (owner Q10), the only way a guest order joins an account:
  *  (a) the account's email was verified by this sign-in (our email code for
@@ -66,15 +71,66 @@ export const ATTACH_CAP = 20;
 export const DISPUTE_TTL_MS = 30 * 24 * 3600_000;
 /** Intents live just long enough for Supabase to call the hook during our own `/otp` request. */
 export const INTENT_TTL_MS = 2 * 60_000;
+/** Resend ceiling inside the Send Email hook. */
+export const SEND_EMAIL_HOOK_RESEND_TIMEOUT_MS = 3_000;
 
 const NO_IP_BUCKET = "none";
 const WINDOW_15M = 900;
 const WINDOW_1H = 3600;
+const WINDOW_1D = 86_400;
+
+/**
+ * Sign-in code budget (review 103 finding 3). The Resend plan's daily cap is
+ * shared with booking confirmations, ticket emails and the attach notices,
+ * so sign-in codes may use at most this share of EMAIL_DAILY_SEND_CAP per
+ * UTC day. Every limit below is a Postgres counter that fails closed.
+ */
+export const SIGNIN_CODE_DAILY_SHARE_PERCENT = 40;
+export const EMAIL_START_LIMITS = {
+  perAddress15m: 3,
+  perIpHour: 10,
+  perIpDay: 20,
+  /** Much lower than the 300 an hour of the first build while on the Resend free tier. */
+  globalHour: 30,
+} as const;
+/** Verify attempts: per start cookie (finding 8), per IP, and per address as the wider backstop. */
+export const EMAIL_VERIFY_LIMITS = { perStart15m: 5, perIp15m: 30, perAddress15m: 30 } as const;
+/** A Supabase-confirmed phone links an existing account only for a phone sign-in we started this recently (finding 4). */
+export const PHONE_LINK_INTENT_WINDOW_MS = EMAIL_CODE_TTL_SECONDS * 1000;
+
+/** Sign-in codes allowed per UTC day for a plan cap: 40 % of it, at least one. Pure. */
+export function signInCodeDailyBudget(dailyCap: number): number {
+  const cap = Number.isFinite(dailyCap) ? Math.max(0, Math.floor(dailyCap)) : 0;
+  return Math.max(1, Math.floor((cap * SIGNIN_CODE_DAILY_SHARE_PERCENT) / 100));
+}
+
+/**
+ * The limits a code request passes, in order (pure, exported for tests).
+ * The daily windows are aligned to UTC midnight (the limiter's windows start
+ * at multiples of their length since the epoch), the same day as
+ * `email_send_counters`.
+ */
+export function emailStartLimits(input: { contactHash: string; ipHash: string | undefined; dailyCap: number }): { key: string; max: number; windowSeconds: number }[] {
+  const ip = input.ipHash ?? NO_IP_BUCKET;
+  return [
+    { key: `auth_email_start:email:${input.contactHash.slice(0, 32)}`, max: EMAIL_START_LIMITS.perAddress15m, windowSeconds: WINDOW_15M },
+    { key: `auth_email_start:ip:${ip}`, max: EMAIL_START_LIMITS.perIpHour, windowSeconds: WINDOW_1H },
+    { key: `auth_email_start:ip_day:${ip}`, max: EMAIL_START_LIMITS.perIpDay, windowSeconds: WINDOW_1D },
+    { key: "auth_email_start:global", max: EMAIL_START_LIMITS.globalHour, windowSeconds: WINDOW_1H },
+    { key: "auth_email_start:global_day", max: signInCodeDailyBudget(input.dailyCap), windowSeconds: WINDOW_1D },
+  ];
+}
 
 /* ------------------------------------------------------------ test seams */
 
 let client: SupabaseAuthClient = supabaseAuthClient;
 let jwtKeys: JWTVerifyGetKey | undefined;
+let lastNotices: Promise<void> = Promise.resolve();
+
+/** Test seam: resolves when the attach notices of the latest sign-in have been dispatched (they run after the response). */
+export function accountNoticesSettledForTests(): Promise<void> {
+  return lastNotices;
+}
 
 /** Test seam: a fake Auth client and local JWKS. `null` restores the real ones. */
 export function setIdentityDepsForTests(deps: { client?: SupabaseAuthClient; keys?: JWTVerifyGetKey } | null) {
@@ -155,9 +211,15 @@ export function decideVerifiedEmail(user: SupabaseUser, proof: { method: "email_
   return google ? email : null;
 }
 
-/** A phone Supabase confirmed, as E.164, or null. Only used to link an existing phone account (Q9). */
+/**
+ * A phone Supabase confirmed on a `phone` identity of this user, as E.164,
+ * or null. Only used to link an existing phone account (Q9), and only while
+ * CUSTOMER_PHONE_LINK_ENABLED is on (review 103 finding 4): a phone set on
+ * an email or Google user through `PUT /user` has no `phone` identity.
+ */
 export function confirmedPhone(user: SupabaseUser): string | null {
   if (!user.phone || !user.phoneConfirmedAt) return null;
+  if (!user.identities.some((i) => i.provider === "phone")) return null;
   const raw = user.phone.startsWith("+") ? user.phone : `+${user.phone}`;
   const p = normalisePhone(raw);
   return p.valid ? p.e164 : null;
@@ -180,6 +242,8 @@ export interface AttachResult {
 
 /** The browser's live checkout grants, from the signed access cookie, re-read now. */
 async function checkoutGrantOrders(tx: Tx, accessCookie: string | undefined, now: Date): Promise<string[]> {
+  // The checkout-grant release switch applies here as in `liveAccess` (review 103 finding 11).
+  if (!checkoutGrantsEnabled()) return [];
   const ids = accessCookieGrants(accessCookie, now)
     .filter((g) => g.checkout)
     .map((g) => g.grantId);
@@ -209,7 +273,9 @@ export async function attachGuestOrders(
   if (!rules.length) return { attached: [], capped: false };
 
   const candidates = await tx.order.findMany({
-    where: { customerId: null, accountLinks: { none: { detachReason: "not_me" } }, OR: rules },
+    // Never an order once disputed, and never one that still has an open link (a manual change could leave
+    // `customer_id` NULL with a live link; creating a second would abort the whole sign-in; finding 12).
+    where: { customerId: null, accountLinks: { none: { OR: [{ detachReason: "not_me" }, { detachedAt: null }] } }, OR: rules },
     select: {
       id: true,
       reference: true,
@@ -223,9 +289,12 @@ export async function attachGuestOrders(
   if (!candidates.length) return { attached: [], capped: false };
 
   if (candidates.length > ATTACH_CAP) {
-    // Unusual volume is a signal, not a convenience: attach none and tell staff (ops-alert `account_attach_capped`).
-    await audit(input.actor, "customer.order_attach_capped", { type: "customer_attach_cap", id: customer.id }, { after: { candidates: `>${ATTACH_CAP}` } }, tx);
-    emitEvent("customer_identity.attach_capped", { customerId: customer.id }, "warn");
+    // Unusual volume is a signal, not a convenience: attach none and tell staff (ops-alert `account_attach_capped`),
+    // once per customer per UTC day, not on every later sign-in (finding 12).
+    const dayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    const already = await tx.auditLog.count({ where: { entityType: "customer_attach_cap", entityId: customer.id, createdAt: { gte: dayStart } } });
+    if (!already) await audit(input.actor, "customer.order_attach_capped", { type: "customer_attach_cap", id: customer.id }, { after: { candidates: `>${ATTACH_CAP}` } }, tx);
+    emitEvent("customer.identity_attach_capped", { customerId: customer.id }, "warn");
     return { attached: [], capped: true };
   }
 
@@ -254,18 +323,26 @@ export async function attachGuestOrders(
     }
     if (!rule || !recipient) continue;
 
-    // Only an order nobody holds moves; a racing sign-in for the same order loses here.
-    const moved = await tx.order.updateMany({ where: { id: o.id, customerId: null }, data: { customerId: customer.id } });
-    if (moved.count !== 1) continue;
-
     const token = randomToken(32);
     let ciphertext: string | null = null;
     try {
       ciphertext = encryptFor("capability_tokens", token);
     } catch {
-      // No key ring here: the notice cannot carry a working link and fails definitely; the attach and the audit stand.
       ciphertext = null;
     }
+    if (!ciphertext && rule === "guest_session") {
+      // Rule (b) attaches to whoever signs in on this browser, and the notice with its "not me" link is the
+      // buyer's only control. Without the key ring that link cannot be sent, so the order stays a guest
+      // order (review 103 finding 5). Rule (a) is the buyer's own verified address: it still attaches, and
+      // its failed notice raises `account_attach_notice_failed` for staff.
+      emitEvent("customer.identity_attach_skipped", { reason: "token_unavailable", rule }, "warn");
+      continue;
+    }
+
+    // Only an order nobody holds moves; a racing sign-in for the same order loses here.
+    const moved = await tx.order.updateMany({ where: { id: o.id, customerId: null }, data: { customerId: customer.id } });
+    if (moved.count !== 1) continue;
+
     const linkId = uuidv7();
     await tx.orderAccountLink.create({
       data: {
@@ -323,7 +400,7 @@ export async function completeSignIn(input: TailInput): Promise<SignInOutcome> {
     user = await client.getUser(accessToken);
     if (user.id !== sub) throw new SupabaseJwtError();
   } catch (err) {
-    emitEvent("customer_identity.token_refused", { reason: err instanceof SupabaseAuthError ? err.kind : "jwt" }, "warn");
+    emitEvent("customer.identity_token_refused", { reason: err instanceof SupabaseAuthError ? err.kind : "jwt" }, "warn");
     throw signInError("UNAVAILABLE");
   } finally {
     // The Supabase session has done its job: revoke its refresh token now, whatever happens next.
@@ -331,7 +408,8 @@ export async function completeSignIn(input: TailInput): Promise<SignInOutcome> {
   }
 
   const verifiedEmail = decideVerifiedEmail(user, input.proof);
-  const phone = confirmedPhone(user);
+  // Q9 phone linking is off until the Send SMS hook batch (review 103 finding 4).
+  const phone = env().CUSTOMER_PHONE_LINK_ENABLED ? confirmedPhone(user) : null;
   const method: SignInMethod = input.proof.method;
   const now = new Date();
   const ipHash = hashIp(input.ip);
@@ -353,11 +431,16 @@ export async function completeSignIn(input: TailInput): Promise<SignInOutcome> {
         let customer: CustomerRecord | null = null;
         let created = false;
         if (phone) {
-          // Q9: an existing phone account is linked only on Supabase's own phone confirmation.
+          // Q9: an existing phone account is linked only on Supabase's own confirmation of a `phone` identity,
+          // and only for a phone sign-in our own start route began (an intent of ours for that number).
           const existing = await tx.customer.findUnique({ where: { phoneE164: phone } });
           if (existing) {
-            if (await customerIdentityRepo.findByCustomer(existing.id, tx)) throw signInError("ACCOUNT_CONFLICT");
-            customer = toRecordLike(existing);
+            const ours = await customerIdentityRepo.hasRecentIntent("phone", sha256Hex(phone), new Date(now.getTime() - PHONE_LINK_INTENT_WINDOW_MS), tx);
+            if (!ours) emitEvent("customer.identity_phone_link_refused", { reason: "no_intent" }, "warn");
+            else {
+              if (await customerIdentityRepo.findByCustomer(existing.id, tx)) throw signInError("ACCOUNT_CONFLICT");
+              customer = toRecordLike(existing);
+            }
           }
         }
         if (!customer) {
@@ -379,10 +462,24 @@ export async function completeSignIn(input: TailInput): Promise<SignInOutcome> {
   });
 
   const attach = minted.extra ?? { attached: [], capped: false };
-  // After commit: one notice per attach. A failed send never undoes the attach (the sweep retries the row).
-  for (const a of attach.attached) await notificationService.sendAccountLinkNotice({ linkId: a.linkId, orderId: a.orderId, recipient: a.recipient });
+  // After commit, after the response (finding 5): one notice per attach, so up to 20 sends cannot time out the
+  // request after the session and the attach are committed but before the cookie is set. A failed send never
+  // undoes the attach: the outbox sweep retries the row, and a notice that fails for good, or whose row was
+  // never written, raises `account_attach_notice_failed` for staff (account-alerts.ts).
+  if (attach.attached.length) {
+    const list = attach.attached;
+    lastNotices = new Promise<void>((resolve) =>
+      defer("account_link_notices", async () => {
+        try {
+          for (const a of list) await notificationService.sendAccountLinkNotice({ linkId: a.linkId, orderId: a.orderId, recipient: a.recipient });
+        } finally {
+          resolve();
+        }
+      }),
+    );
+  }
 
-  emitEvent("customer_identity.login", { sessionId: minted.sessionId, method, attached: attach.attached.length, capped: attach.capped, emailVerified: Boolean(verifiedEmail) });
+  emitEvent("customer.identity_login", { sessionId: minted.sessionId, method, attached: attach.attached.length, capped: attach.capped, emailVerified: Boolean(verifiedEmail) });
   const customer = minted.customer.email || !verifiedEmail ? minted.customer : { ...minted.customer, email: verifiedEmail };
   return { token: minted.token, expiresAt: minted.expiresAt, customer: toCustomerPublic(customer), attachedOrders: attach.attached.length };
 }
@@ -422,7 +519,7 @@ export const customerIdentityService = {
    * Send Email hook within the same request. Uniform answer whether or not
    * the address has an account.
    */
-  async startEmailCode(input: { email: unknown; turnstileToken?: unknown; ip?: string }): Promise<{ expiresInSeconds: number; resendAfterSeconds: number }> {
+  async startEmailCode(input: { email: unknown; turnstileToken?: unknown; ip?: string }): Promise<{ expiresInSeconds: number; resendAfterSeconds: number; startCookie: EmailStartCookieValue }> {
     if (!supabaseEnabled()) throw signInError("NOT_CONFIGURED");
     const email = normaliseEmail(input.email);
     if (!email) throw signInError("EMAIL_INVALID");
@@ -436,32 +533,47 @@ export const customerIdentityService = {
 
     const contactHash = sha256Hex(email);
     const ipHash = hashIp(input.ip);
-    await limit(`auth_email_start:email:${contactHash.slice(0, 32)}`, 3, WINDOW_15M);
-    await limit(`auth_email_start:ip:${ipHash ?? NO_IP_BUCKET}`, 10, WINDOW_1H);
-    await limit("auth_email_start:global", 300, WINDOW_1H);
+    for (const l of emailStartLimits({ contactHash, ipHash, dailyCap: env().EMAIL_DAILY_SEND_CAP })) await limit(l.key, l.max, l.windowSeconds);
 
-    await customerIdentityRepo.createIntent({ channel: "email", contactHash, ipHash, now: new Date(), ttlMs: INTENT_TTL_MS });
+    const now = new Date();
+    const intentId = await customerIdentityRepo.createIntent({ channel: "email", contactHash, ipHash, now, ttlMs: INTENT_TTL_MS });
+    const answer = { expiresInSeconds: EMAIL_CODE_TTL_SECONDS, resendAfterSeconds: EMAIL_RESEND_AFTER_SECONDS, startCookie: newEmailStartCookie(contactHash, now) };
     try {
       await client.sendEmailOtp(email);
     } catch (err) {
-      emitEvent("customer_identity.email_start_failed", { reason: err instanceof SupabaseAuthError ? err.kind : "error" }, "warn");
+      if (err instanceof SupabaseAuthError && err.timedOut) {
+        // Our own 5-second ceiling, not Supabase's answer: the hook may well have sent the code (finding 13).
+        // Answer as sent ("check your inbox"); the customer can ask again after the resend wait.
+        emitEvent("customer.identity_email_start_timeout", {}, "warn");
+        return answer;
+      }
+      // Nothing will use this intent now: retire it so a direct call to Supabase cannot spend it (finding 9).
+      await customerIdentityRepo.retireIntent(intentId, new Date()).catch(() => {});
+      emitEvent("customer.identity_email_start_failed", { reason: err instanceof SupabaseAuthError ? err.kind : "error" }, "warn");
       throw fromSupabase(err, "send");
     }
-    emitEvent("customer_identity.email_code_requested", {});
-    return { expiresInSeconds: EMAIL_CODE_TTL_SECONDS, resendAfterSeconds: EMAIL_RESEND_AFTER_SECONDS };
+    emitEvent("customer.identity_email_code_requested", {});
+    return answer;
   },
 
   /** POST /api/auth/email/verify. Single use and expiry are Supabase's; ours are the attempt limits. */
-  async verifyEmailCode(input: { email: unknown; code: unknown; ip?: string; userAgent?: string; guestSessionId: string | null; accessCookie: string | undefined }): Promise<SignInOutcome> {
+  async verifyEmailCode(input: { email: unknown; code: unknown; startCookie: string | undefined; ip?: string; userAgent?: string; guestSessionId: string | null; accessCookie: string | undefined }): Promise<SignInOutcome> {
     if (!supabaseEnabled()) throw signInError("NOT_CONFIGURED");
     const email = normaliseEmail(input.email);
     if (!email) throw signInError("EMAIL_INVALID");
     const code = typeof input.code === "string" ? input.code.replace(/\s+/g, "") : "";
     if (!/^\d{6}$/.test(code)) throw signInError("CODE_INVALID");
 
+    const addressHash = sha256Hex(email).slice(0, 32);
+    // Only the browser that asked for this address's code may try it (finding 8): without the signed start
+    // cookie for this address the code is treated as expired, and nothing is counted against the address.
+    const started = decodeEmailStartCookie(input.startCookie);
+    if (!started || started.addressHash !== addressHash) throw signInError("CODE_EXPIRED");
+
     const ipHash = hashIp(input.ip);
-    await limit(`auth_email_verify:ip:${ipHash ?? NO_IP_BUCKET}`, 30, WINDOW_15M);
-    await limit(`auth_email_verify:email:${sha256Hex(email).slice(0, 32)}`, 10, WINDOW_15M);
+    await limit(`auth_email_verify:ip:${ipHash ?? NO_IP_BUCKET}`, EMAIL_VERIFY_LIMITS.perIp15m, WINDOW_15M);
+    await limit(`auth_email_verify:start:${started.id}`, EMAIL_VERIFY_LIMITS.perStart15m, WINDOW_15M);
+    await limit(`auth_email_verify:email:${addressHash}`, EMAIL_VERIFY_LIMITS.perAddress15m, WINDOW_15M);
 
     let session: SupabaseSession;
     try {
@@ -500,7 +612,7 @@ export const customerIdentityService = {
     if (error) return { ok: false, notice: error === "access_denied" ? "google_cancelled" : "google_failed" };
     const c = input.cookie;
     if (!c || !code || !state || code.length > 2048 || state !== c.state) {
-      emitEvent("customer_identity.google_refused", { reason: !c ? "no_cookie" : "state" }, "warn");
+      emitEvent("customer.identity_google_refused", { reason: !c ? "no_cookie" : "state" }, "warn");
       return { ok: false, notice: "google_failed" };
     }
     try {
@@ -513,7 +625,7 @@ export const customerIdentityService = {
       return { ok: true, next: c.next, outcome };
     } catch (err) {
       const reason = err instanceof GoogleOAuthError ? err.reason : err instanceof SupabaseAuthError ? `supabase_${err.kind}` : (reasonOf(err) ?? "error");
-      emitEvent("customer_identity.google_failed", { reason }, "warn");
+      emitEvent("customer.identity_google_failed", { reason }, "warn");
       if (reasonOf(err) === "ACCOUNT_CLOSED") return { ok: false, notice: "account_closed" };
       return { ok: false, notice: "google_failed" };
     }
@@ -529,7 +641,7 @@ export const customerIdentityService = {
    */
   async handleSendEmailHook(payload: SendEmailHookPayload, webhookId: string): Promise<"sent" | "suppressed" | "refused" | "failed"> {
     if (!SIGN_IN_EMAIL_ACTIONS.includes(payload.actionType)) {
-      emitEvent("customer_identity.hook_refused", { hook: "send_email", reason: "action_type", actionType: payload.actionType }, "warn");
+      emitEvent("customer.identity_hook_refused", { hook: "send_email", reason: "action_type", actionType: payload.actionType }, "warn");
       return "refused";
     }
     const email = normaliseEmail(payload.email);
@@ -537,31 +649,32 @@ export const customerIdentityService = {
     // Replay of the same delivery: refused before any intent is touched.
     const claim = await rateLimit({ key: `auth_hook:send_email:${sha256Hex(webhookId).slice(0, 32)}`, limit: 1, windowSeconds: 900 });
     if (!claim.allowed) {
-      emitEvent("customer_identity.hook_refused", { hook: "send_email", reason: claim.storeUnavailable ? "store_unavailable" : "replay" }, "warn");
+      emitEvent("customer.identity_hook_refused", { hook: "send_email", reason: claim.storeUnavailable ? "store_unavailable" : "replay" }, "warn");
       return "refused";
     }
     const now = new Date();
     const intent = await customerIdentityRepo.consumeIntent("email", sha256Hex(email), now);
     if (!intent) {
-      emitEvent("customer_identity.hook_refused", { hook: "send_email", reason: "no_intent" }, "warn");
+      emitEvent("customer.identity_hook_refused", { hook: "send_email", reason: "no_intent" }, "warn");
       return "refused";
     }
     const e = env();
     if (e.isNonProduction && emailAdapter.provider() !== "log" && !isRecipientAllowed(email, e.recipientAllowlist)) {
-      emitEvent("customer_identity.code_suppressed", { reason: "non_production_allowlist" });
+      emitEvent("customer.identity_code_suppressed", { reason: "non_production_allowlist" });
       return "suppressed";
     }
     const msg = renderSignInCode({ code: payload.token, ttlMinutes: EMAIL_CODE_TTL_SECONDS / 60, supportEmail: e.NEXT_PUBLIC_SUPPORT_EMAIL ?? e.EMAIL_REPLY_TO });
     const idempotencyKey = `signin-${sha256Hex(webhookId).slice(0, 40)}`;
     const out = { to: email, subject: msg.subject!, html: msg.html!, text: msg.text };
-    let outcome = await emailAdapter.send(out, { idempotencyKey });
-    if (outcome.kind === "unknown") outcome = await emailAdapter.send(out, { idempotencyKey });
+    // One attempt with a 3-second ceiling: this runs inside Supabase's hook timeout and our own 5-second `/otp`
+    // call (finding 13). `unknown` (timeout) counts as sent: Resend may have it, and the customer can ask again.
+    const outcome = await emailAdapter.send(out, { idempotencyKey, timeoutMs: SEND_EMAIL_HOOK_RESEND_TIMEOUT_MS });
     if (outcome.kind === "failed") {
-      emitEvent("customer_identity.code_failed", { reason: outcome.reason, httpStatus: outcome.httpStatus }, "warn");
+      emitEvent("customer.identity_code_failed", { reason: outcome.reason, httpStatus: outcome.httpStatus }, "warn");
       return "failed";
     }
     await customerIdentityRepo.countEmailSend("signin_code", now);
-    emitEvent("customer_identity.code_sent", { outcome: outcome.kind, provider: emailAdapter.provider() });
+    emitEvent("customer.identity_code_sent", { outcome: outcome.kind, provider: emailAdapter.provider() });
     return "sent";
   },
 
@@ -575,9 +688,17 @@ export const customerIdentityService = {
     if (payload.provider === "google" && payload.email) return "allow";
     if (payload.provider === "email" || (!payload.provider && payload.email)) {
       const email = normaliseEmail(payload.email);
-      if (email && (await customerIdentityRepo.hasLiveIntent("email", sha256Hex(email), new Date()))) return "allow";
+      const intentId = email ? await customerIdentityRepo.findLiveIntent("email", sha256Hex(email), new Date()) : null;
+      if (intentId) {
+        // One creation per intent (review 103 finding 7): a direct Supabase `/signup` racing our own start for the
+        // same address cannot use the same intent a second time. The claim fails closed when the store is down.
+        const claim = await rateLimit({ key: `auth_hook:before_create:${intentId}`, limit: 1, windowSeconds: 900 });
+        if (claim.allowed) return "allow";
+        emitEvent("customer.identity_hook_refused", { hook: "before_user_created", reason: claim.storeUnavailable ? "store_unavailable" : "claimed", provider: payload.provider ?? "none" }, "warn");
+        return "reject";
+      }
     }
-    emitEvent("customer_identity.hook_refused", { hook: "before_user_created", reason: "no_intent", provider: payload.provider ?? "none" }, "warn");
+    emitEvent("customer.identity_hook_refused", { hook: "before_user_created", reason: "no_intent", provider: payload.provider ?? "none" }, "warn");
     return "reject";
   },
 
@@ -608,6 +729,6 @@ export const customerIdentityService = {
       await audit(actor, "customer.order_detached", { type: "order", id: link.orderId }, { before: { customerId: link.customerId }, after: { reason: "not_me", linkId: link.id, rule: link.rule, cleared: cleared.count === 1 } }, tx);
       return true;
     });
-    emitEvent("customer_identity.dispute", { applied: done });
+    emitEvent("customer.identity_dispute", { applied: done });
   },
 };

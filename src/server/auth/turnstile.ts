@@ -6,8 +6,10 @@ import { env } from "../lib/env";
  *
  * The /login widget produces a single-use token; the email-code start route
  * sends it here with our secret before any intent is written or any code is
- * requested. `success` must be true, the `action` must be ours and, in
- * production, the `hostname` must be the site's. Anything else, including a
+ * requested. `success` must be true, the `action` must be exactly ours
+ * (present and equal) and, in production, the `hostname` must be the
+ * NEXT_PUBLIC_SITE_URL host exactly (an alias such as `www.` must redirect to
+ * it before /login is reached). Anything else, including a
  * Cloudflare outage, refuses the send (fail closed): Google sign-in stays
  * available on the same page.
  *
@@ -56,7 +58,8 @@ export async function verifyTurnstile(token: unknown, remoteIp: string | undefin
     }
     const data = (await res.json().catch(() => null)) as { success?: unknown; action?: unknown; hostname?: unknown } | null;
     if (!data || data.success !== true) return "refused";
-    if (data.action !== undefined && data.action !== TURNSTILE_ACTION) return "refused";
+    // Exactly our action (review 103 finding 10): a token from a widget without it, or with another, is refused.
+    if (data.action !== TURNSTILE_ACTION) return "refused";
     if (e.isProduction) {
       const host = new URL(e.NEXT_PUBLIC_SITE_URL).hostname;
       if (data.hostname !== host) return "refused";

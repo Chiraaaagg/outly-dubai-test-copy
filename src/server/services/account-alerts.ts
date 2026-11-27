@@ -2,6 +2,8 @@ import "server-only";
 import { prisma, type Tx } from "../lib/db";
 import { env } from "../lib/env";
 import type { OpsIncident } from "./ops-alert.service";
+import { MAX_ATTEMPTS, RETRY_WINDOW_MS } from "./notification.service";
+import { ACCOUNT_LINK_NOTICE_EVENT } from "../notifications/auth-templates";
 
 /**
  * Group B staff alerts, read from committed state by the ops sweep
@@ -17,6 +19,13 @@ import type { OpsIncident } from "./ops-alert.service";
  *  - `supabase_user_delete_due`: an erased account had a Supabase Auth user,
  *    which staff delete by hand in the Supabase dashboard (owner Q-B3).
  *    Entity `customer:<customer id>`; the user id is in the audit row.
+ *  - `account_attach_notice_failed` (review 103 finding 5): the "booking
+ *    added to an account" notice of a link that is still attached will not
+ *    be sent: its outbox row failed for good (definite failure, attempts or
+ *    retry window spent, or flagged for a human), or no row was written
+ *    within NOTICE_MISSING_AFTER_MS of the attach. The notice is the buyer's
+ *    only control on an automatic attach, so staff check it by hand.
+ *    Entity `order_account_link:<link id>`.
  *  - `email_volume_high` (owner Q-B6, Resend free tier): emails sent today
  *    (UTC) or this calendar month reached EMAIL_VOLUME_ALERT_PERCENT of the
  *    plan's cap. Counts the notification outbox plus the codes sent outside
@@ -26,6 +35,84 @@ import type { OpsIncident } from "./ops-alert.service";
  */
 
 type Db = Tx | typeof prisma;
+
+/** A link whose notice row was never written (the deferred send did not run) is reported after this long. */
+export const NOTICE_MISSING_AFTER_MS = 15 * 60_000;
+
+/**
+ * When the outbox will not send this notice row any more, or null while it
+ * still might (pure, exported for tests). Mirrors `retryFailed`: a `failed`
+ * row is retried unless its error is `definite:`, its attempts reached
+ * MAX_ATTEMPTS or it is older than RETRY_WINDOW_MS; an `unknown` row is final
+ * once flagged for a human. `definite:link_detached` is not a failure to
+ * report: the order was detached before the notice went out.
+ */
+export function noticeGaveUpAt(row: { status: string; providerError: string | null; attempt: number; createdAt: Date; failedAt: Date | null; attentionRequiredAt: Date | null }, now: Date): Date | null {
+  if (row.status === "unknown") return row.attentionRequiredAt;
+  if (row.status !== "failed") return null;
+  if (row.providerError === "definite:link_detached") return null;
+  const at = row.failedAt ?? row.createdAt;
+  if (row.providerError?.startsWith("definite:") || row.attempt >= MAX_ATTEMPTS) return at;
+  const windowEnd = new Date(row.createdAt.getTime() + RETRY_WINDOW_MS);
+  return windowEnd.getTime() <= now.getTime() ? new Date(Math.max(windowEnd.getTime(), at.getTime())) : null;
+}
+
+/** `account_attach_notice_failed` incidents raised in (since, now]. */
+async function noticeIncidents(since: Date, now: Date, limit: number, db: Db): Promise<OpsIncident[]> {
+  const out: OpsIncident[] = [];
+  const incident = (link: { id: string; orderId: string; order: { reference: string } }, raisedAt: Date, reason: string): OpsIncident => ({
+    kind: "account_attach_notice_failed",
+    entityKind: "order_account_link",
+    entityId: link.id,
+    reason,
+    raisedAt,
+    orderId: link.orderId,
+    orderReference: link.order.reference,
+    bookingId: null,
+    supplierBookingRef: null,
+    adminPath: `/admin/bookings/${encodeURIComponent(link.order.reference)}`,
+  });
+  const inWindow = (d: Date | null): d is Date => Boolean(d && d.getTime() > since.getTime() && d.getTime() <= now.getTime());
+
+  // A row can give up up to RETRY_WINDOW_MS after it was created.
+  const rows = await db.notification.findMany({
+    where: {
+      event: ACCOUNT_LINK_NOTICE_EVENT,
+      createdAt: { gt: new Date(since.getTime() - RETRY_WINDOW_MS - 3_600_000) },
+      OR: [{ status: "failed" }, { status: "unknown", attentionRequiredAt: { not: null } }],
+    },
+    select: { id: true, status: true, providerError: true, attempt: true, createdAt: true, failedAt: true, attentionRequiredAt: true },
+    orderBy: { createdAt: "asc" },
+    take: limit,
+  });
+  const gaveUp = new Map<string, Date>();
+  for (const r of rows) {
+    const at = noticeGaveUpAt(r, now);
+    if (inWindow(at)) gaveUp.set(r.id, at);
+  }
+  if (gaveUp.size) {
+    const links = await db.orderAccountLink.findMany({
+      where: { notificationId: { in: [...gaveUp.keys()] }, detachedAt: null },
+      select: { id: true, orderId: true, notificationId: true, order: { select: { reference: true } } },
+    });
+    for (const l of links) out.push(incident(l, gaveUp.get(l.notificationId!)!, "attach_notice_failed"));
+  }
+
+  // No outbox row at all: the deferred send never ran (or failed before writing it).
+  const missing = await db.orderAccountLink.findMany({
+    where: {
+      notificationId: null,
+      detachedAt: null,
+      rule: { in: ["verified_email", "guest_session"] },
+      attachedAt: { gt: new Date(since.getTime() - NOTICE_MISSING_AFTER_MS), lte: new Date(now.getTime() - NOTICE_MISSING_AFTER_MS) },
+    },
+    select: { id: true, orderId: true, attachedAt: true, order: { select: { reference: true } } },
+    orderBy: { attachedAt: "asc" },
+    take: limit,
+  });
+  for (const l of missing) out.push(incident(l, new Date(l.attachedAt.getTime() + NOTICE_MISSING_AFTER_MS), "attach_notice_missing"));
+  return out;
+}
 
 export async function accountIncidents(since: Date, now: Date, limit = 100, db: Db = prisma): Promise<OpsIncident[]> {
   const out: OpsIncident[] = [];
@@ -55,6 +142,7 @@ export async function accountIncidents(since: Date, now: Date, limit = 100, db: 
     orderBy: { createdAt: "asc" },
     take: limit,
   });
+  out.push(...(await noticeIncidents(since, now, limit, db)));
   for (const r of rows) {
     const capped = r.entityType === "customer_attach_cap";
     out.push({

@@ -32,7 +32,7 @@ export async function POST(req: NextRequest) {
     body,
   });
   if (!verdict.ok) {
-    emitEvent("customer_identity.hook_refused", { hook: "before_user_created", reason: verdict.reason }, "warn");
+    emitEvent("customer.identity_hook_refused", { hook: "before_user_created", reason: verdict.reason }, "warn");
     return hookError(401, "invalid signature");
   }
   let raw: unknown;

@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { inquiryService } from "@/server/services/inquiry.service";
+import { inquiryNeedsVerification, inquiryService } from "@/server/services/inquiry.service";
 import { customerAuthService } from "@/server/services/customer-auth.service";
 import { assertSameOrigin, clientIp, handle, json, parseJson, userAgent } from "@/server/lib/http";
 import { Errors } from "@/server/lib/errors";
@@ -20,7 +20,8 @@ export const dynamic = "force-dynamic";
  *
  *   off  anyone may submit. A signed-in visitor still gets their inquiry
  *        linked to their account, because the session is read either way.
- *   on   a caller without a session gets VERIFICATION_REQUIRED (401), and the
+ *   on   a caller without a session, or whose session has no verified phone
+ *        (an email or Google sign-in), gets VERIFICATION_REQUIRED (401), and the
  *        form answers that by opening the code step inline and resubmitting
  *        the same payload. It never navigates to /login, which would lose a
  *        filled-in form and read as a signup wall.
@@ -41,7 +42,8 @@ export const POST = handle(async (req: NextRequest) => {
   // Read the session regardless: an inquiry from someone already signed in is
   // linked to their account whether or not verification is being enforced.
   const session = await customerAuthService.resolveRequest(req);
-  if (!session && env().FEATURE_VERIFIED_INQUIRIES) throw Errors.verificationRequired();
+  // A session without a verified phone (email or Google sign-in) does not count as verified here.
+  if (inquiryNeedsVerification(env().FEATURE_VERIFIED_INQUIRIES, session?.customer)) throw Errors.verificationRequired();
 
   const result = await inquiryService.create(body, {
     ip: clientIp(req),

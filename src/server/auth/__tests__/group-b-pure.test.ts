@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { decideVerifiedEmail, confirmedPhone } from "../../services/customer-identity.service";
-import { volumeCrossings } from "../../services/account-alerts";
+import { decideVerifiedEmail, confirmedPhone, emailStartLimits, signInCodeDailyBudget, EMAIL_START_LIMITS, EMAIL_VERIFY_LIMITS } from "../../services/customer-identity.service";
+import { noticeGaveUpAt, volumeCrossings } from "../../services/account-alerts";
+import { MAX_ATTEMPTS, RETRY_WINDOW_MS } from "../../services/notification.service";
+import { inquiryNeedsVerification } from "../../services/inquiry.service";
+import { supabaseUrlProblem } from "../../lib/env";
 import { notMeLink, renderAccountLinkNotice, renderSignInCode } from "../../notifications/auth-templates";
 import { maskEmail, normaliseEmail, parseLoginNotice, hasAnySignInOption } from "@/lib/customer-auth-options";
 import { buildCsp, edgePolicy } from "@/proxy";
@@ -28,9 +31,13 @@ describe("verified email decision (plan 92 §1.4 step 3)", () => {
     expect(decideVerifiedEmail(user({ email: "j.o+trip@example.com" }), { method: "email_otp", email: "jo@example.com" })).toBeNull();
   });
 
-  it("a phone counts only when Supabase confirmed it", () => {
-    expect(confirmedPhone(user({ phone: ["971", "50", "1234567"].join(""), phoneConfirmedAt: null }))).toBeNull();
-    expect(confirmedPhone(user({ phone: ["971", "50", "1234567"].join(""), phoneConfirmedAt: "2026-11-27T00:00:00Z" }))).toBe(`+${["971", "50", "1234567"].join("")}`);
+  it("a phone counts only when Supabase confirmed it on a phone identity (finding 4)", () => {
+    const digits = ["971", "50", "1234567"].join("");
+    const phoneIdentity = { provider: "phone", identityData: { email: null, emailVerified: false, sub: "p" } };
+    expect(confirmedPhone(user({ phone: digits, phoneConfirmedAt: null, identities: [phoneIdentity] }))).toBeNull();
+    // Set through `PUT /user` on an email user: confirmed, but no phone identity.
+    expect(confirmedPhone(user({ phone: digits, phoneConfirmedAt: "2026-11-27T00:00:00Z", identities: [{ ...phoneIdentity, provider: "email" }] }))).toBeNull();
+    expect(confirmedPhone(user({ phone: digits, phoneConfirmedAt: "2026-11-27T00:00:00Z", identities: [phoneIdentity] }))).toBe(`+${digits}`);
   });
 });
 
@@ -93,5 +100,76 @@ describe("CSP: Turnstile on /login only", () => {
     for (const pathname of ["/", "/account", "/admin/login", "/booking/not-me", "/login/x"]) expect(edgePolicy({ ...base, pathname, turnstileConfigured: true }).csp).not.toContain("cloudflare");
     expect(edgePolicy({ ...base, pathname: "/login", turnstileConfigured: false }).csp).not.toContain("cloudflare");
     expect(edgePolicy({ ...base, pathname: "/login" }).csp).toBe(buildCsp("'self' 'unsafe-inline'", true, false, false));
+  });
+});
+
+describe("sign-in code limits (review 103 findings 3 and 8)", () => {
+  it("the daily code budget is 40 % of the plan cap, at least one", () => {
+    expect(signInCodeDailyBudget(100)).toBe(40);
+    expect(signInCodeDailyBudget(3000)).toBe(1200);
+    expect(signInCodeDailyBudget(1)).toBe(1);
+    expect(signInCodeDailyBudget(0)).toBe(1);
+    expect(signInCodeDailyBudget(Number.NaN)).toBe(1);
+  });
+
+  it("a code request passes per address, per IP hour, per IP day, global hour and the global day budget, in that order", () => {
+    const limits = emailStartLimits({ contactHash: "a".repeat(64), ipHash: "b".repeat(32), dailyCap: 100 });
+    expect(limits).toEqual([
+      { key: `auth_email_start:email:${"a".repeat(32)}`, max: 3, windowSeconds: 900 },
+      { key: `auth_email_start:ip:${"b".repeat(32)}`, max: 10, windowSeconds: 3600 },
+      { key: `auth_email_start:ip_day:${"b".repeat(32)}`, max: 20, windowSeconds: 86_400 },
+      { key: "auth_email_start:global", max: 30, windowSeconds: 3600 },
+      { key: "auth_email_start:global_day", max: 40, windowSeconds: 86_400 },
+    ]);
+    expect(emailStartLimits({ contactHash: "a".repeat(64), ipHash: undefined, dailyCap: 100 })[1].key).toBe("auth_email_start:ip:none");
+    expect(EMAIL_START_LIMITS.globalHour).toBeLessThanOrEqual(30);
+  });
+
+  it("verify attempts: per start cookie, per IP, and per address as the wider backstop", () => {
+    expect(EMAIL_VERIFY_LIMITS).toEqual({ perStart15m: 5, perIp15m: 30, perAddress15m: 30 });
+    expect(EMAIL_VERIFY_LIMITS.perAddress15m).toBeGreaterThan(EMAIL_VERIFY_LIMITS.perStart15m * EMAIL_START_LIMITS.perAddress15m);
+  });
+});
+
+describe("attach notice gave up (review 103 finding 5)", () => {
+  const now = new Date("2026-11-27T12:00:00Z");
+  const row = (over: Partial<Parameters<typeof noticeGaveUpAt>[0]> = {}) => ({ status: "failed", providerError: "retryable:http_500", attempt: 1, createdAt: new Date(now.getTime() - 3_600_000), failedAt: new Date(now.getTime() - 60_000), attentionRequiredAt: null, ...over });
+  it("a retryable failure under the attempts and inside the window is still pending", () => {
+    expect(noticeGaveUpAt(row(), now)).toBeNull();
+  });
+  it("a definite failure, spent attempts, a spent window or a flagged unknown row has given up", () => {
+    expect(noticeGaveUpAt(row({ providerError: "definite:token_unavailable" }), now)).toEqual(new Date(now.getTime() - 60_000));
+    expect(noticeGaveUpAt(row({ attempt: MAX_ATTEMPTS }), now)).toEqual(new Date(now.getTime() - 60_000));
+    const old = new Date(now.getTime() - RETRY_WINDOW_MS - 60_000);
+    expect(noticeGaveUpAt(row({ createdAt: old, failedAt: old }), now)).toEqual(new Date(old.getTime() + RETRY_WINDOW_MS));
+    const flagged = new Date(now.getTime() - 5_000);
+    expect(noticeGaveUpAt(row({ status: "unknown", attentionRequiredAt: flagged }), now)).toEqual(flagged);
+    expect(noticeGaveUpAt(row({ status: "unknown" }), now)).toBeNull();
+  });
+  it("a sent row, or a notice dropped because the order was already detached, is not a failure", () => {
+    expect(noticeGaveUpAt(row({ status: "sent" }), now)).toBeNull();
+    expect(noticeGaveUpAt(row({ providerError: "definite:link_detached" }), now)).toBeNull();
+  });
+});
+
+describe("verified inquiries need a verified phone (review 103 finding 6)", () => {
+  it("with the flag on, no session and a phone-less session both need verification", () => {
+    const phone = `+${["971", "50", "1234567"].join("")}`;
+    expect(inquiryNeedsVerification(true, null)).toBe(true);
+    expect(inquiryNeedsVerification(true, { phoneE164: null })).toBe(true);
+    expect(inquiryNeedsVerification(true, { phoneE164: phone })).toBe(false);
+  });
+  it("with the flag off or unset, nobody does", () => {
+    expect(inquiryNeedsVerification(false, null)).toBe(false);
+    expect(inquiryNeedsVerification(undefined, { phoneE164: null })).toBe(false);
+  });
+});
+
+describe("SUPABASE_URL shape, shared by the email and Google options (review 103 finding 15)", () => {
+  it("is required, and must be a supabase.co project URL in production", () => {
+    expect(supabaseUrlProblem({ SUPABASE_URL: undefined, isProduction: false })).toMatch(/missing/);
+    expect(supabaseUrlProblem({ SUPABASE_URL: "http://127.0.0.1:54321", isProduction: false })).toBeNull();
+    expect(supabaseUrlProblem({ SUPABASE_URL: "http://127.0.0.1:54321", isProduction: true })).toMatch(/supabase\.co/);
+    expect(supabaseUrlProblem({ SUPABASE_URL: "https://example-project.supabase.co", isProduction: true })).toBeNull();
   });
 });

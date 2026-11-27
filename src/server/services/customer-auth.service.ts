@@ -2,7 +2,7 @@ import "server-only";
 import { randomInt } from "node:crypto";
 import type { NextRequest } from "next/server";
 import { prisma, TX_OPTIONS, type Tx } from "../lib/db";
-import { customerAuthConfigProblems, env } from "../lib/env";
+import { customerAuthConfigProblems, env, supabaseUrlProblem } from "../lib/env";
 import { AppError, Errors } from "../lib/errors";
 import { log } from "../lib/logger";
 import { uuidv7 } from "../lib/ids";
@@ -226,7 +226,8 @@ export const customerAuthService = {
     const e = env();
     const supabaseReady = e.CUSTOMER_SUPABASE_AUTH_ENABLED && !customerAuthConfigProblems({ ...e, CUSTOMER_OAUTH_ENABLED: false }).length;
     const emailCode = supabaseReady;
-    const google = Boolean(e.CUSTOMER_SUPABASE_AUTH_ENABLED && e.CUSTOMER_OAUTH_ENABLED && e.GOOGLE_OAUTH_CLIENT_ID && e.GOOGLE_OAUTH_CLIENT_SECRET && e.SUPABASE_URL && e.SUPABASE_PUBLISHABLE_KEY && e.SUPABASE_AUTH_BEFORE_USER_CREATED_HOOK_SECRET);
+    // The same SUPABASE_URL check as the email option (review 103 finding 15): a production URL of the wrong shape hides both.
+    const google = Boolean(e.CUSTOMER_SUPABASE_AUTH_ENABLED && e.CUSTOMER_OAUTH_ENABLED && e.GOOGLE_OAUTH_CLIENT_ID && e.GOOGLE_OAUTH_CLIENT_SECRET && !supabaseUrlProblem(e) && e.SUPABASE_PUBLISHABLE_KEY && e.SUPABASE_AUTH_BEFORE_USER_CREATED_HOOK_SECRET);
     const phone = customerAuthService.enabled() && (!e.CUSTOMER_SUPABASE_AUTH_ENABLED || (hasRealSmsProvider() && e.FEATURE_CUSTOMER_AUTH !== false));
     const turnstileSiteKey = emailCode && e.TURNSTILE_SECRET_KEY && e.NEXT_PUBLIC_TURNSTILE_SITE_KEY ? e.NEXT_PUBLIC_TURNSTILE_SITE_KEY : null;
     const o: CustomerAuthOptions = { emailCode, google, phone, turnstileSiteKey };

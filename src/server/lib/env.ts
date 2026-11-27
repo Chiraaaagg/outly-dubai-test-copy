@@ -122,6 +122,14 @@ const schema = z.object({
    * configured and tested.
    */
   CUSTOMER_OAUTH_ENABLED: strictBool("CUSTOMER_OAUTH_ENABLED"),
+  /**
+   * Links a Supabase sign-in to an existing phone-only account when Supabase
+   * confirmed the same phone (owner Q9). Off until the Send SMS hook batch
+   * ships (review 103 finding 4): even when on, it needs a `phone` identity on
+   * the Supabase user and a phone sign-in our own start route began in the
+   * last 10 minutes. Only "true" turns it on; default off everywhere.
+   */
+  CUSTOMER_PHONE_LINK_ENABLED: strictBool("CUSTOMER_PHONE_LINK_ENABLED"),
   /** `https://<project>.supabase.co`: the Auth base URL and the JWT issuer host. Server only. */
   SUPABASE_URL: optionalStr,
   /** The project's publishable key (public by design), sent as `apikey` on Auth calls. Server only all the same. */
@@ -530,8 +538,8 @@ export function assertBootEnv(): string[] {
  */
 export function customerAuthConfigProblems(e: Env): string[] {
   const problems: string[] = [];
-  if (!e.SUPABASE_URL) problems.push("SUPABASE_URL missing");
-  else if (!/^https:\/\/[a-z0-9-]+\.supabase\.co$/.test(e.SUPABASE_URL) && e.isProduction) problems.push("SUPABASE_URL must be https://<project>.supabase.co in production");
+  const url = supabaseUrlProblem(e);
+  if (url) problems.push(url);
   if (!e.SUPABASE_PUBLISHABLE_KEY) problems.push("SUPABASE_PUBLISHABLE_KEY missing");
   if (!e.SUPABASE_AUTH_SEND_EMAIL_HOOK_SECRET) problems.push("SUPABASE_AUTH_SEND_EMAIL_HOOK_SECRET missing — no sign-in code can be sent");
   if (!e.SUPABASE_AUTH_BEFORE_USER_CREATED_HOOK_SECRET) problems.push("SUPABASE_AUTH_BEFORE_USER_CREATED_HOOK_SECRET missing");
@@ -539,6 +547,16 @@ export function customerAuthConfigProblems(e: Env): string[] {
   if (e.isProduction && !(e.TURNSTILE_SECRET_KEY && e.NEXT_PUBLIC_TURNSTILE_SITE_KEY)) problems.push("Turnstile keys missing — the email code option stays hidden in production (owner Q-B5)");
   if (e.CUSTOMER_OAUTH_ENABLED && !(e.GOOGLE_OAUTH_CLIENT_ID && e.GOOGLE_OAUTH_CLIENT_SECRET)) problems.push("CUSTOMER_OAUTH_ENABLED without GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET — Google stays hidden");
   return problems;
+}
+
+/**
+ * SUPABASE_URL missing, or not `https://<project>.supabase.co` in production.
+ * Shared by the email and the Google options (review 103 finding 15).
+ */
+export function supabaseUrlProblem(e: Pick<Env, "SUPABASE_URL" | "isProduction">): string | null {
+  if (!e.SUPABASE_URL) return "SUPABASE_URL missing";
+  if (!/^https:\/\/[a-z0-9-]+\.supabase\.co$/.test(e.SUPABASE_URL) && e.isProduction) return "SUPABASE_URL must be https://<project>.supabase.co in production";
+  return null;
 }
 
 /** Test/seed helper. */

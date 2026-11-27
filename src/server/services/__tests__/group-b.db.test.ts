@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createHash, randomBytes } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from "jose";
@@ -43,22 +43,42 @@ let r: Routes;
 
 const email = (label: string) => `zz-sec-${run}-${label}@outlyy.test`;
 
+/** The signed start cookie (`name=value`) a start answer set, or null (review 103 finding 8). */
+function startCookieOf(res: Response): string | null {
+  const m = /((?:__Host-)?outlyy_email_start=[^;]+)/.exec(res.headers.get("set-cookie") ?? "");
+  return m ? m[1] : null;
+}
+
+const joinCookies = (...c: (string | null | undefined)[]) => c.filter(Boolean).join("; ") || undefined;
+
+async function startCode(address: string, headers: Record<string, string> = { "x-forwarded-for": ip() }) {
+  return r.start.POST(apiRequest("/api/auth/email/start", { body: { email: address }, headers }), CTX);
+}
+
 async function signIn(address: string, opts: { cookie?: string; code?: string } = {}) {
   const headers = { "x-forwarded-for": ip() };
-  const s = await r.start.POST(apiRequest("/api/auth/email/start", { body: { email: address }, headers }), CTX);
+  const s = await startCode(address, headers);
   if (s.status !== 200) return { status: s.status, body: await s.json(), cookie: null as string | null };
   const code = opts.code ?? fake.codes.get(address.toLowerCase())!;
-  const v = await r.verify.POST(apiRequest("/api/auth/email/verify", { body: { email: address, code }, cookie: opts.cookie, headers }), CTX);
+  const v = await r.verify.POST(apiRequest("/api/auth/email/verify", { body: { email: address, code }, cookie: joinCookies(opts.cookie, startCookieOf(s)), headers }), CTX);
+  // The attach notices run after the response (finding 5); wait for them so the checks below see their rows.
+  await (await import("../customer-identity.service")).accountNoticesSettledForTests();
   const setCookie = v.headers.get("set-cookie") ?? "";
   const m = /outlyy_customer_session=([^;]+)/.exec(setCookie);
   return { status: v.status, body: await v.json(), cookie: m ? `outlyy_customer_session=${m[1]}` : null };
 }
 
-/** A guest session with a known token, and its cookie. */
+/**
+ * A guest session with a known token, and its cookie. A negative `expiresInMs`
+ * makes a session that was created two hours earlier and has already expired
+ * (`gs_expiry_check` requires expires_at > created_at).
+ */
 async function guestSession(expiresInMs = 3_600_000) {
   const token = randomBytes(32).toString("base64url");
   const id = uuidv7();
-  await prisma.guestSession.create({ data: { id, tokenHash: sha(token), expiresAt: new Date(Date.now() + expiresInMs) } });
+  const expiresAt = new Date(Date.now() + expiresInMs);
+  const createdAt = new Date(Math.min(Date.now(), expiresAt.getTime() - 2 * 3_600_000));
+  await prisma.guestSession.create({ data: { id, tokenHash: sha(token), createdAt, expiresAt } });
   return { id, cookie: `outlyy_guest_session=${token}` };
 }
 
@@ -142,6 +162,12 @@ describe.skipIf(!dbEnabled)("Group B: customer sign-in on Supabase Auth (disposa
     };
     // Supabase calls our Send Email hook inside its own /otp, as the hosted service does.
     fake.onSendEmail = async (body, headers) => (await r.hook.POST(apiRequest("/api/auth/hooks/send-email", { rawBody: body, origin: null, headers }))).status;
+  });
+
+  // The global sign-in limits (30 an hour, the daily code budget) are shared by every test in this file:
+  // each test starts from empty global buckets so the suite is not limited by its own earlier tests.
+  beforeEach(async () => {
+    await prisma.rateLimitBucket.deleteMany({ where: { key: { startsWith: "auth_email_start:global" } } });
   });
 
   afterAll(async () => {
@@ -247,6 +273,63 @@ describe.skipIf(!dbEnabled)("Group B: customer sign-in on Supabase Auth (disposa
       expect((await fourth.json()).error.details.reason).toBe("RATE_LIMITED");
     });
 
+    it("daily code budget and per-IP daily limit: RATE_LIMITED once spent (finding 3)", async () => {
+      const { signInCodeDailyBudget } = await import("../customer-identity.service");
+      const { hashIp } = await import("../../lib/crypto");
+      const DAY_MS = 86_400_000;
+      const windowStart = new Date(Math.floor(Date.now() / DAY_MS) * DAY_MS);
+      const expiresAt = new Date(windowStart.getTime() + DAY_MS);
+      // The default plan cap is 100 a day: sign-in codes get 40 of it.
+      expect(signInCodeDailyBudget(100)).toBe(40);
+      await prisma.rateLimitBucket.create({ data: { key: "auth_email_start:global_day", windowStart, count: signInCodeDailyBudget(100), expiresAt } });
+      const spent = await startCode(email("budget"));
+      expect(spent.status).toBe(429);
+      expect((await spent.json()).error.details.reason).toBe("RATE_LIMITED");
+      await prisma.rateLimitBucket.deleteMany({ where: { key: "auth_email_start:global_day" } });
+
+      const addr = ip();
+      await prisma.rateLimitBucket.create({ data: { key: `auth_email_start:ip_day:${hashIp(addr)}`, windowStart, count: 20, expiresAt } });
+      const ipSpent = await startCode(email("ip-day"), { "x-forwarded-for": addr });
+      expect(ipSpent.status).toBe(429);
+      expect((await ipSpent.json()).error.details.reason).toBe("RATE_LIMITED");
+      // Another IP is not affected.
+      expect((await startCode(email("ip-day"))).status).toBe(200);
+    });
+
+    it("verify needs this browser's start cookie for that address; attempts are counted per start (finding 8)", async () => {
+      const a = await startCode(email("cookie-a"));
+      const b = await startCode(email("cookie-b"));
+      const cookieA = startCookieOf(a)!;
+      expect(cookieA).toBeTruthy();
+      expect(a.headers.get("set-cookie")).toMatch(/HttpOnly/i);
+      const verify = (address: string, code: string, cookie?: string | null) =>
+        r.verify.POST(apiRequest("/api/auth/email/verify", { body: { email: address, code }, cookie: cookie ?? undefined, headers: { "x-forwarded-for": ip() } }), CTX);
+      const codeA = fake.codes.get(email("cookie-a"))!;
+      const none = await verify(email("cookie-a"), codeA);
+      expect((await none.json()).error.details.reason).toBe("CODE_EXPIRED");
+      const other = await verify(email("cookie-a"), codeA, startCookieOf(b));
+      expect((await other.json()).error.details.reason).toBe("CODE_EXPIRED");
+      // Nothing above reached Supabase or spent the code.
+      expect(fake.codes.get(email("cookie-a"))).toBe(codeA);
+      const wrong = codeA === "000000" ? "000001" : "000000";
+      for (let i = 0; i < 5; i++) expect((await (await verify(email("cookie-a"), wrong, cookieA)).json()).error.details.reason).toBe("CODE_INVALID");
+      const sixth = await verify(email("cookie-a"), codeA, cookieA);
+      expect(sixth.status).toBe(429);
+      // A fresh start in the owner's browser still works: the address itself is not locked out.
+      const again = await startCode(email("cookie-a"));
+      const ok = await verify(email("cookie-a"), fake.codes.get(email("cookie-a"))!, startCookieOf(again));
+      expect(ok.status).toBe(200);
+      expect(ok.headers.get("set-cookie")).toMatch(/outlyy_email_start=;/);
+    });
+
+    it("a failed Supabase /otp retires our intent (finding 9)", async () => {
+      fake.failNext("/otp", 500, { code: 500, error_code: "unexpected_failure", msg: "x" });
+      const res = await startCode(email("otp-fails"));
+      expect(res.status).toBe(503);
+      expect((await res.json()).error.details.reason).toBe("DELIVERY_FAILED");
+      expect(await prisma.customerAuthIntent.count({ where: { contactHash: sha(email("otp-fails")), consumedAt: null } })).toBe(0);
+    });
+
     it("the hook sends nothing without our intent, refuses a replay, a bad signature and other action types", async () => {
       const body = (address: string, action = "magiclink") => ({ user: { id: uuidv7(), email: address }, email_data: { token: "123456", email_action_type: action } });
       expect((await signedHook("send-email", body(email("no-intent")), fake.sendEmailHookSecret)).status).toBe(403);
@@ -273,6 +356,8 @@ describe.skipIf(!dbEnabled)("Group B: customer sign-in on Supabase Auth (disposa
       await customerIdentityRepo.createIntent({ channel: "email", contactHash: sha(email("allowed")), now: new Date(), ttlMs: 120_000 });
       expect((await signedHook("before-user-created", u(email("allowed"), "email"), BEFORE_SECRET)).status).toBe(200);
       expect((await signedHook("before-user-created", u(email("allowed"), "email"), fake.sendEmailHookSecret)).status).toBe(401);
+      // One creation per intent (finding 7): a second creation for the same intent is refused.
+      expect((await signedHook("before-user-created", u(email("allowed"), "email"), BEFORE_SECRET)).status).toBe(403);
     });
 
     it("hooks answer 404 while the sign-in is off", async () => {
@@ -295,27 +380,49 @@ describe.skipIf(!dbEnabled)("Group B: customer sign-in on Supabase Auth (disposa
       expect(res.cookie).toBeNull();
     });
 
-    it("an existing phone account is linked only when Supabase confirmed that phone (Q9)", async () => {
+    it("an existing phone account is never linked while CUSTOMER_PHONE_LINK_ENABLED is off (finding 4)", async () => {
       const phone = syntheticPhone(run, 2);
       const existing = await prisma.customer.create({ data: { id: uuidv7(), phoneE164: phone, fullName: `zz-sec-${run}` } });
-      // First sign-in creates the Supabase user; give it a confirmed phone, then sign in on a fresh identity.
-      await r.start.POST(apiRequest("/api/auth/email/start", { body: { email: email("phone") }, headers: { "x-forwarded-for": ip() } }), CTX);
+      // First start creates the Supabase user; give it a confirmed phone and a phone identity, then sign in.
+      await startCode(email("phone"));
       const user = [...fake.users.values()].find((u) => u.email === email("phone"))!;
       user.phone = phone.slice(1);
       user.phoneConfirmedAt = new Date().toISOString();
+      user.identities.push({ provider: "phone", identity_data: { phone: phone.slice(1) } });
+      const { customerIdentityRepo } = await import("../../repositories/customer-identity.repo");
+      await customerIdentityRepo.createIntent({ channel: "phone", contactHash: sha(phone), now: new Date(), ttlMs: 120_000 });
       const res = await signIn(email("phone"));
       expect(res.status).toBe(200);
-      expect(await identityCustomer(email("phone"))).toBe(existing.id);
+      expect(await identityCustomer(email("phone"))).not.toBe(existing.id);
+    });
 
-      // An unconfirmed phone links nothing.
-      const phone2 = syntheticPhone(run, 3);
-      const other = await prisma.customer.create({ data: { id: uuidv7(), phoneE164: phone2, fullName: `zz-sec-${run}` } });
-      await r.start.POST(apiRequest("/api/auth/email/start", { body: { email: email("phone2") }, headers: { "x-forwarded-for": ip() } }), CTX);
-      const u2 = [...fake.users.values()].find((u) => u.email === email("phone2"))!;
-      u2.phone = phone2.slice(1);
-      u2.phoneConfirmedAt = null;
-      await signIn(email("phone2"));
-      expect(await identityCustomer(email("phone2"))).not.toBe(other.id);
+    it("with the switch on, a phone links only on a Supabase phone identity plus our own phone intent (Q9, finding 4)", async () => {
+      vi.stubEnv("CUSTOMER_PHONE_LINK_ENABLED", "true");
+      resetEnvCache();
+      try {
+        const { customerIdentityRepo } = await import("../../repositories/customer-identity.repo");
+        const setUp = async (label: string, n: number, opts: { identity: boolean; confirmed: boolean; intent: boolean }) => {
+          const phone = syntheticPhone(run, n);
+          const existing = await prisma.customer.create({ data: { id: uuidv7(), phoneE164: phone, fullName: `zz-sec-${run}` } });
+          await startCode(email(label));
+          const u = [...fake.users.values()].find((x) => x.email === email(label))!;
+          // A phone set through `PUT /user` on an email user, without a phone identity, is the attack shape.
+          u.phone = phone.slice(1);
+          u.phoneConfirmedAt = opts.confirmed ? new Date().toISOString() : null;
+          if (opts.identity) u.identities.push({ provider: "phone", identity_data: { phone: phone.slice(1) } });
+          if (opts.intent) await customerIdentityRepo.createIntent({ channel: "phone", contactHash: sha(phone), now: new Date(), ttlMs: 120_000 });
+          const res = await signIn(email(label));
+          expect(res.status).toBe(200);
+          return { existing, linked: (await identityCustomer(email(label))) === existing.id };
+        };
+        expect((await setUp("phone-ok", 3, { identity: true, confirmed: true, intent: true })).linked).toBe(true);
+        expect((await setUp("phone-no-identity", 4, { identity: false, confirmed: true, intent: true })).linked).toBe(false);
+        expect((await setUp("phone-no-intent", 5, { identity: true, confirmed: true, intent: false })).linked).toBe(false);
+        expect((await setUp("phone-unconfirmed", 6, { identity: true, confirmed: false, intent: true })).linked).toBe(false);
+      } finally {
+        vi.stubEnv("CUSTOMER_PHONE_LINK_ENABLED", "");
+        resetEnvCache();
+      }
     });
 
     it("a customer session never passes staff authentication", async () => {
@@ -387,9 +494,11 @@ describe.skipIf(!dbEnabled)("Group B: customer sign-in on Supabase Auth (disposa
     it("two sign-ins racing for the same order: one link, one owner", async () => {
       const gs = await guestSession();
       const o = await guestOrder("race", { guestSessionId: gs.id });
-      for (const l of ["race-1", "race-2"]) await r.start.POST(apiRequest("/api/auth/email/start", { body: { email: email(l) }, headers: { "x-forwarded-for": ip() } }), CTX);
-      const go = (l: string) => r.verify.POST(apiRequest("/api/auth/email/verify", { body: { email: email(l), code: fake.codes.get(email(l)) }, cookie: gs.cookie, headers: { "x-forwarded-for": ip() } }), CTX);
+      const starts = new Map<string, string | null>();
+      for (const l of ["race-1", "race-2"]) starts.set(l, startCookieOf(await startCode(email(l))));
+      const go = (l: string) => r.verify.POST(apiRequest("/api/auth/email/verify", { body: { email: email(l), code: fake.codes.get(email(l)) }, cookie: joinCookies(gs.cookie, starts.get(l)), headers: { "x-forwarded-for": ip() } }), CTX);
       await Promise.all([go("race-1"), go("race-2")]);
+      await (await import("../customer-identity.service")).accountNoticesSettledForTests();
       expect(await prisma.orderAccountLink.count({ where: { orderId: o.id, detachedAt: null } })).toBe(1);
       const owner = await customerOf(o.id);
       expect([await identityCustomer(email("race-1")), await identityCustomer(email("race-2"))]).toContain(owner);
@@ -405,6 +514,57 @@ describe.skipIf(!dbEnabled)("Group B: customer sign-in on Supabase Auth (disposa
       const { accountIncidents } = await import("../account-alerts");
       const incidents = await accountIncidents(new Date(Date.now() - 3_600_000), new Date());
       expect(incidents.some((i) => i.kind === "account_attach_capped" && i.entityId === cid)).toBe(true);
+      // A later sign-in the same day records the cap once, not again (finding 12).
+      await signIn(email("cap"));
+      expect(await prisma.auditLog.count({ where: { entityType: "customer_attach_cap", entityId: cid } })).toBe(1);
+    });
+
+    it("an order with an open link is never a candidate, and the sign-in still succeeds (finding 12)", async () => {
+      const o = await guestOrder("open-link");
+      const holder = await prisma.customer.create({ data: { id: uuidv7(), fullName: `zz-sec-${run}` } });
+      await prisma.orderAccountLink.create({ data: { id: uuidv7(), orderId: o.id, customerId: holder.id, rule: "staff" } });
+      const res = await signIn(email("open-link"));
+      expect(res.status).toBe(200);
+      expect(res.body.attachedOrders).toBe(0);
+      expect(await customerOf(o.id)).toBeNull();
+      expect(await prisma.orderAccountLink.count({ where: { orderId: o.id, detachedAt: null } })).toBe(1);
+    });
+
+    it("without the capability key ring: rule (b) does not attach; rule (a) attaches and its failed notice alerts staff (finding 5)", async () => {
+      const { setKeyRingsForTests } = await import("../../lib/crypto");
+      const since = new Date(Date.now() - 60_000);
+      setKeyRingsForTests({ capability_tokens: null });
+      try {
+        const gs = await guestSession();
+        const b = await guestOrder("nokey-b", { guestSessionId: gs.id });
+        const resB = await signIn(email("nokey-b-other-person"), { cookie: gs.cookie });
+        expect(resB.status).toBe(200);
+        expect(resB.body.attachedOrders).toBe(0);
+        expect(await customerOf(b.id)).toBeNull();
+
+        const a = await guestOrder("nokey-a");
+        const resA = await signIn(email("nokey-a"));
+        expect(resA.body.attachedOrders).toBe(1);
+        const link = await prisma.orderAccountLink.findFirstOrThrow({ where: { orderId: a.id } });
+        const n = await prisma.notification.findFirstOrThrow({ where: { orderId: a.id, event: "ACCOUNT_BOOKING_ATTACHED" } });
+        expect(n.status).toBe("failed");
+        const { accountIncidents } = await import("../account-alerts");
+        const incidents = await accountIncidents(since, new Date());
+        expect(incidents.some((i) => i.kind === "account_attach_notice_failed" && i.entityId === link.id && i.reason === "attach_notice_failed" && i.orderReference === a.reference)).toBe(true);
+      } finally {
+        setKeyRingsForTests(null);
+      }
+    });
+
+    it("an attach whose notice row was never written alerts staff after 15 minutes (finding 5)", async () => {
+      const o = await guestOrder("notice-missing");
+      const holder = await prisma.customer.create({ data: { id: uuidv7(), fullName: `zz-sec-${run}` } });
+      await prisma.order.update({ where: { id: o.id }, data: { customerId: holder.id } });
+      const linkId = uuidv7();
+      await prisma.orderAccountLink.create({ data: { id: linkId, orderId: o.id, customerId: holder.id, rule: "guest_session", attachedAt: new Date(Date.now() - 20 * 60_000) } });
+      const { accountIncidents } = await import("../account-alerts");
+      const incidents = await accountIncidents(new Date(Date.now() - 3_600_000), new Date());
+      expect(incidents.some((i) => i.kind === "account_attach_notice_failed" && i.entityId === linkId && i.reason === "attach_notice_missing")).toBe(true);
     });
 
     it('"this was not me": detaches once, alerts staff, uniform answers, never re-attaches', async () => {

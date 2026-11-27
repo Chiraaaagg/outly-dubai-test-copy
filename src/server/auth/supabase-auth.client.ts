@@ -48,12 +48,15 @@ export class SupabaseAuthError extends Error {
   readonly httpStatus: number | null;
   /** Supabase's `error_code` when it sent one: a short identifier, kept for the closed mapping and tests, never shown. */
   readonly errorCode: string | null;
-  constructor(kind: SupabaseAuthErrorKind, httpStatus: number | null, errorCode: string | null) {
+  /** True when our own timeout aborted the call: Supabase may still have done the work (for `/otp`, sent the code). */
+  readonly timedOut: boolean;
+  constructor(kind: SupabaseAuthErrorKind, httpStatus: number | null, errorCode: string | null, timedOut = false) {
     super(`supabase_auth:${kind}`);
     this.name = "SupabaseAuthError";
     this.kind = kind;
     this.httpStatus = httpStatus;
     this.errorCode = errorCode;
+    this.timedOut = timedOut;
   }
 }
 
@@ -115,7 +118,11 @@ async function call(op: Parameters<typeof classifySupabaseError>[0], path: strin
   const cfg = supabaseAuthConfig();
   if (!cfg) throw new SupabaseAuthError("not_configured", null, null);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), SUPABASE_AUTH_TIMEOUT_MS);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, SUPABASE_AUTH_TIMEOUT_MS);
   let res: Response;
   try {
     res = await fetch(`${cfg.baseUrl}/auth/v1${path}`, {
@@ -133,7 +140,7 @@ async function call(op: Parameters<typeof classifySupabaseError>[0], path: strin
       cache: "no-store",
     });
   } catch {
-    throw new SupabaseAuthError("unavailable", null, null);
+    throw new SupabaseAuthError("unavailable", null, null, timedOut);
   } finally {
     clearTimeout(timer);
   }

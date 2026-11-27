@@ -90,9 +90,25 @@ export const customerIdentityRepo = {
     return id;
   },
 
-  /** True when a live, unconsumed intent exists (Before User Created hook). Reads only. */
-  async hasLiveIntent(channel: "email" | "phone", contactHash: string, now: Date, db: Db = prisma): Promise<boolean> {
-    const row = await db.customerAuthIntent.findFirst({ where: { channel, contactHash, consumedAt: null, expiresAt: { gt: now } }, select: { id: true } });
+  /** The newest live, unconsumed intent's id, or null (Before User Created hook). Reads only. */
+  async findLiveIntent(channel: "email" | "phone", contactHash: string, now: Date, db: Db = prisma): Promise<string | null> {
+    const row = await db.customerAuthIntent.findFirst({ where: { channel, contactHash, consumedAt: null, expiresAt: { gt: now } }, orderBy: { createdAt: "desc" }, select: { id: true } });
+    return row?.id ?? null;
+  },
+
+  /** Retires one intent that will not be used (Supabase `/otp` failed; review 103 finding 9). */
+  async retireIntent(id: string, now: Date, db: Db = prisma): Promise<void> {
+    await db.customerAuthIntent.updateMany({ where: { id, consumedAt: null }, data: { consumedAt: now } });
+  },
+
+  /**
+   * True when our own start route wrote an intent for this contact at or
+   * after `since`, consumed or not. Used only by the phone-account link
+   * (review 103 finding 4): a phone Supabase confirmed counts only for a
+   * phone sign-in that OUTLYY itself started.
+   */
+  async hasRecentIntent(channel: "email" | "phone", contactHash: string, since: Date, db: Db = prisma): Promise<boolean> {
+    const row = await db.customerAuthIntent.findFirst({ where: { channel, contactHash, createdAt: { gte: since } }, select: { id: true } });
     return Boolean(row);
   },
 

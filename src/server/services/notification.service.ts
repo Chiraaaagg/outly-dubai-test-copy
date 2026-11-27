@@ -141,9 +141,9 @@ type Outcome =
 const TICKETS_READY: TicketNotificationEvent = "TICKETS_READY";
 
 /** Attempts per row for retryable failures and for ambiguous (`unknown`, stale `queued`) rows. */
-const MAX_ATTEMPTS = 4;
+export const MAX_ATTEMPTS = 4;
 /** Retryable failures are retried for this long after the row was created. */
-const RETRY_WINDOW_MS = 24 * 3600_000;
+export const RETRY_WINDOW_MS = 24 * 3600_000;
 /**
  * Ambiguous rows are re-sent under the same idempotency key only while the
  * provider still remembers it. Resend keeps keys 24 hours; we stop 30

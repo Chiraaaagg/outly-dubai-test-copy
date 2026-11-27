@@ -35,7 +35,7 @@ export async function POST(req: NextRequest) {
     body,
   });
   if (!verdict.ok) {
-    emitEvent("customer_identity.hook_refused", { hook: "send_email", reason: verdict.reason }, "warn");
+    emitEvent("customer.identity_hook_refused", { hook: "send_email", reason: verdict.reason }, "warn");
     return hookError(401, "invalid signature");
   }
   let raw: unknown;
@@ -51,7 +51,7 @@ export async function POST(req: NextRequest) {
     if (result === "sent" || result === "suppressed") return NextResponse.json({}, { headers: { "cache-control": "no-store" } });
     return result === "failed" ? hookError(503, "delivery failed") : hookError(403, "not allowed");
   } catch {
-    emitEvent("customer_identity.hook_failed", { hook: "send_email" }, "error");
+    emitEvent("customer.identity_hook_failed", { hook: "send_email" }, "error");
     return hookError(503, "delivery failed");
   }
 }

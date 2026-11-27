@@ -219,6 +219,17 @@ export function manualPaymentFor(input: {
   return { amountMinor: entered.amountMinor, currency: entered.currency, varianceReason: reason.slice(0, 500) };
 }
 
+/**
+ * `FEATURE_VERIFIED_INQUIRIES` means "this phone was proven". Only a session
+ * that carries a verified phone passes: an email or Google account without a
+ * phone (Group B) is unverified for this purpose (review 103 finding 6), so
+ * the form opens its code step as it does for a visitor without a session.
+ * Pure; the route calls it.
+ */
+export function inquiryNeedsVerification(flagOn: boolean | undefined, customer: { phoneE164: string | null } | null | undefined): boolean {
+  return flagOn === true && !customer?.phoneE164;
+}
+
 export const inquiryService = {
   /* ================================================================ create */
 

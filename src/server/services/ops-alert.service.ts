@@ -140,6 +140,8 @@ export type OpsIncidentKind =
   | "account_attach_disputed"
   /** Group B: one sign-in matched more than 20 guest orders; none were attached. */
   | "account_attach_capped"
+  /** Group B (review 103 finding 5): the notice of an automatic attach will not be sent; staff tell the buyer. */
+  | "account_attach_notice_failed"
   /** Group B (owner Q-B3): an erased account's Supabase Auth user must be deleted by hand. */
   | "supabase_user_delete_due"
   /** Group B (owner Q-B6): email volume reached the alert share of the Resend plan's daily or monthly cap. */
@@ -186,6 +188,7 @@ export const OPS_INCIDENT_TITLES: Record<OpsIncidentKind, string> = {
   bulk_item_disarmed: "Bulk free-cancellation run left an armed listing on inquiry",
   account_attach_disputed: "Customer said a booking added to an account was not theirs: booking detached",
   account_attach_capped: "One sign-in matched more than 20 guest bookings: none attached",
+  account_attach_notice_failed: "Booking added to an account, but its notice email was not sent",
   supabase_user_delete_due: "Erased account: delete its Supabase Auth user by hand",
   email_volume_high: "Email volume near the Resend plan cap",
 };
