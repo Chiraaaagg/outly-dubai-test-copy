@@ -300,14 +300,23 @@ describe.skipIf(!dbEnabled)("Group B: customer sign-in on Supabase Auth (disposa
         expect((await prisma.rateLimitBucket.findUnique({ where: { key_windowStart: { key: "auth_email_start:global", windowStart: hourStart } } }))?.count ?? 0).toBe(0);
         await prisma.rateLimitBucket.deleteMany({ where: { key: "auth_email_start:global_day" } });
 
-        await prisma.rateLimitBucket.create({ data: { key: "auth_email_start:global", windowStart: hourStart, count: 30, expiresAt: new Date(hourStart.getTime() + HOUR_MS) } });
+        // The refused request above left this hour's row at count 0 (charges are given back, not deleted): set it, do not insert.
+        await prisma.rateLimitBucket.upsert({
+          where: { key_windowStart: { key: "auth_email_start:global", windowStart: hourStart } },
+          create: { key: "auth_email_start:global", windowStart: hourStart, count: 30, expiresAt: new Date(hourStart.getTime() + HOUR_MS) },
+          update: { count: 30 },
+        });
         const hourSpent = await startCode(email("budget-hour"));
         expect(hourSpent.status).toBe(429);
         expect((await hourSpent.json()).error.details).toMatchObject({ reason: "RATE_LIMITED", scope: "site" });
         await prisma.rateLimitBucket.deleteMany({ where: { key: "auth_email_start:global" } });
 
         const addr = ip();
-        await prisma.rateLimitBucket.create({ data: { key: `auth_email_start:ip_day:${hashIp(addr)}`, windowStart, count: 20, expiresAt } });
+        await prisma.rateLimitBucket.upsert({
+          where: { key_windowStart: { key: `auth_email_start:ip_day:${hashIp(addr)}`, windowStart } },
+          create: { key: `auth_email_start:ip_day:${hashIp(addr)}`, windowStart, count: 20, expiresAt },
+          update: { count: 20 },
+        });
         const ipSpent = await startCode(email("ip-day"), { "x-forwarded-for": addr });
         expect(ipSpent.status).toBe(429);
         const ipDetails = (await ipSpent.json()).error.details;
