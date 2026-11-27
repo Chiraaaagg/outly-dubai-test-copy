@@ -287,6 +287,18 @@ async function draftCreditNote(db: Tx | typeof prisma, entry: { id: string; paym
 
 /* ------------------------------------------------------------ issue */
 
+/** Was this payment's capture booked before the invoice series' cut-off (re-review N9)? */
+async function refundOfCaptureBeforeCutOff(db: Tx | typeof prisma, legalEntity: string, environment: FiscalEnvironment, paymentId: string): Promise<boolean> {
+  const [row] = await db.$queryRaw<{ is_before: boolean }[]>`
+    SELECT EXISTS (
+      SELECT 1 FROM ledger_entries c JOIN fiscal_series fs
+        ON fs.legal_entity = ${legalEntity} AND fs.environment = ${environment} AND fs.doc_type = 'tax_invoice'
+      WHERE c.payment_id = ${paymentId}::uuid AND c.book = 'customer_money' AND c.kind = 'capture'
+        AND fs.issue_from IS NOT NULL AND c.occurred_at < fs.issue_from
+    ) AS is_before`;
+  return row?.is_before === true;
+}
+
 export interface IssueDeps {
   now: Date;
   legalEntity: string;
@@ -336,6 +348,9 @@ export async function issueForLedgerEntry(ledgerEntryId: string, deps: IssueDeps
         FOR UPDATE`;
       if (!series) throw new Blocked("series_missing");
       if (series.issue_from && entry.occurredAt < series.issue_from) throw new Blocked("before_issue_from");
+      // Re-review N9: a refund of a capture booked before the INVOICE series' cut-off has no invoice by design, so no
+      // credit note either (silent, no alert). Whether such refunds need any document is the accountant's call (A12).
+      if (docType === "tax_credit_note" && (await refundOfCaptureBeforeCutOff(tx, deps.legalEntity, environment, paymentId))) throw new Blocked("before_issue_from");
       // Under the series lock: a concurrent issuer of the same entry has committed by now if it won.
       const won = await tx.fiscalDocument.findUnique({ where: { ledgerEntryId }, select: { id: true, displayNumber: true } });
       if (won) return { kind: "exists" as const, ...won };
@@ -449,6 +464,12 @@ export async function issueDue(opts: { now: Date; e?: Env; max?: number; scan?: 
           WHERE fs.legal_entity = ${deps.legalEntity} AND fs.environment = split_part(l.evidence_ref, ':', 2)
             AND fs.doc_type = (CASE WHEN l.kind = 'capture' THEN 'tax_invoice' ELSE 'tax_credit_note' END)
             AND fs.issue_from IS NOT NULL AND l.occurred_at < fs.issue_from)
+        -- Re-review N9: nor a refund of a capture booked before the invoice series' cut-off (it has no invoice).
+        AND NOT (l.kind = 'refund' AND EXISTS (
+          SELECT 1 FROM ledger_entries c JOIN fiscal_series fs
+            ON fs.legal_entity = ${deps.legalEntity} AND fs.environment = split_part(c.evidence_ref, ':', 2) AND fs.doc_type = 'tax_invoice'
+          WHERE c.payment_id = l.payment_id AND c.book = 'customer_money' AND c.kind = 'capture'
+            AND fs.issue_from IS NOT NULL AND c.occurred_at < fs.issue_from))
         -- Finding 6: a blocked entry waits FISCAL_BLOCKED_RECHECK_MS before it is looked at again.
         AND NOT EXISTS (
           SELECT 1 FROM fiscal_attention a

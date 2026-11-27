@@ -10,9 +10,9 @@ import { sha256Of, validatePdf } from "../documents/pdf";
 import { storageEnvironment } from "../documents/store";
 import { renderFiscalPdf } from "../documents/generated/fiscal/render";
 import { isFiscalSnapshot, type FiscalSnapshot } from "../documents/generated/fiscal/snapshot";
-import { assertDecoderReady, createZxingDecoder, DecoderUnavailableError, type CodeDecoder } from "../documents/generated/entry/code-decoder";
+import { assertDecoderReady, createZxingDecoder, DecoderUnavailableError, decoderWorks, type CodeDecoder } from "../documents/generated/entry/code-decoder";
 import { GUARD_RELEASING_STATES } from "../suppliers/booking-port";
-import { generateEntryDocument, plainEntryLayout, type EntryView } from "../documents/generated/entry/entry-pdf";
+import { generateEntryDocument, isWalkTimeout, plainEntryLayout, type EntryView } from "../documents/generated/entry/entry-pdf";
 import { DOCUMENT_LIMITS } from "./document.service";
 import { paxLabel } from "./order-status.service";
 import { siteConfig } from "@/lib/site-config";
@@ -76,6 +76,22 @@ async function retryOrFail(row: Pick<GeneratedDocument, "id" | "attempts">, reas
   }
   await prisma.generatedDocument.updateMany({ where: { id: row.id, status: "pending" }, data: { reasonCode: reason, lockedUntil: null, nextAttemptAt: new Date(now.getTime() + backoffMs(attempts)), updatedAt: now } });
   return "retry";
+}
+
+/**
+ * A row whose attempts already reached the limit when it comes up again: its last attempt never returned (the
+ * function was killed, or a file hung it). It is failed here instead of being claimed again, so it can never loop
+ * (re-review N6). Answers whether this call failed it.
+ */
+async function failExhausted(row: Pick<GeneratedDocument, "id" | "attempts">, now: Date): Promise<boolean> {
+  const n = await prisma.generatedDocument.updateMany({
+    where: { id: row.id, status: "pending", attempts: row.attempts, OR: [{ lockedUntil: null }, { lockedUntil: { lt: now } }] },
+    data: { status: "failed", reasonCode: "fault_timeout", lockedUntil: null, updatedAt: now },
+  });
+  if (n.count !== 1) return false;
+  emitEvent("document.generated_failed", { generatedDocumentId: row.id, reason: "fault_timeout" }, "error");
+  await raiseFiscalFileAttention(row.id, "fault_timeout", now);
+  return true;
 }
 
 /** A fiscal file failed for good: one open `fiscal_attention` row on its ledger entry, alerted by the ops sweep. */
@@ -160,6 +176,10 @@ export async function drawPendingFiscal(opts: { store: DocumentStore | null; now
     });
     for (const row of rows) {
       if (opts.deadline !== undefined && Date.now() + 3_000 > opts.deadline) break;
+      if (row.attempts >= MAX_ATTEMPTS) {
+        if (await failExhausted(row, opts.now)) summary.failed++;
+        continue;
+      }
       if (!(await claim(row, opts.now))) continue;
       try {
         const drawn = await drawFiscal(row);
@@ -294,6 +314,8 @@ export async function generatePendingEntries(opts: {
   decoder?: () => CodeDecoder;
   /** Test seam: the reader readiness check (default: load the zxing reader). */
   decoderReady?: () => Promise<void>;
+  /** Test seam: the known-good decode after a reader fault (default: `decoderWorks`). */
+  decoderWorks?: () => Promise<boolean>;
   /** Limits the run (tests on a shared database). */
   sourceDocumentIds?: readonly string[];
   /** The job's shared deadline (epoch ms, finding 10): no file is started without `ENTRY_UNIT_MS` left. */
@@ -333,6 +355,9 @@ export async function generatePendingEntries(opts: {
         AND s.order_item_id IS NOT NULL AND s.order_id IS NOT NULL AND s.sha256 IS NOT NULL
         AND b.state::text NOT IN (${RELEASED_STATES})
         AND NOT EXISTS (SELECT 1 FROM generated_documents g WHERE g.source_document_id = s.id AND g.status IN ('pending', 'valid', 'failed'))
+        -- One live entry file per item (index generated_documents_one_live_entry): a second source of the same item waits,
+        -- it never takes a place in the run and fails on the index every tick (re-review N8).
+        AND NOT EXISTS (SELECT 1 FROM generated_documents g2 WHERE g2.order_item_id = s.order_item_id AND g2.kind IN ('entry_pdf', 'cover_page') AND g2.status IN ('pending', 'valid'))
         ${scope}
       ORDER BY s.validated_at ASC NULLS LAST, s.id ASC
       LIMIT ${opts.max - due.length}`;
@@ -349,6 +374,11 @@ export async function generatePendingEntries(opts: {
     // `attempts` as before this attempt's claim (the retry/fail arithmetic of `retryOrFail`).
     const claimed: Pick<GeneratedDocument, "id" | "attempts">[] = [];
     for (const r of due) {
+      // Re-review N6: a row whose last attempt never returned (killed or hung) is failed, not claimed again.
+      if (r.attempts >= ENTRY_MAX_ATTEMPTS) {
+        if (await failExhausted(r, opts.now)) summary.failed++;
+        continue;
+      }
       if (await claim(r, opts.now, ["entry_pdf", "cover_page"])) claimed.push({ id: r.id, attempts: r.attempts });
     }
     for (const s of fresh) {
@@ -376,25 +406,34 @@ export async function generatePendingEntries(opts: {
         throw err;
       }
     }
+    // Claims not started give their attempts back (deadline, or a reader that is down).
+    const release = async (rows: readonly Pick<GeneratedDocument, "id" | "attempts">[]) => {
+      for (const left of rows) await prisma.generatedDocument.updateMany({ where: { id: left.id, status: "pending" }, data: { attempts: left.attempts, lockedUntil: null } });
+    };
     for (const [i, row] of claimed.entries()) {
       if (opts.deadline !== undefined && Date.now() + ENTRY_UNIT_MS > opts.deadline) {
-        // Out of time: release the claims not started, giving their attempts back.
-        for (const left of claimed.slice(i)) {
-          await prisma.generatedDocument.updateMany({ where: { id: left.id, status: "pending" }, data: { attempts: left.attempts, lockedUntil: null } });
-        }
+        await release(claimed.slice(i));
         break;
       }
       try {
         await generateEntryFor(row, opts.store, opts.now, opts.decoder ?? createZxingDecoder, summary);
       } catch (err) {
         if (err instanceof DecoderUnavailableError) {
-          // Not this file's fault: give the attempt back and stop the run.
-          await prisma.generatedDocument.updateMany({ where: { id: row.id, status: "pending" }, data: { attempts: { decrement: 1 }, lockedUntil: null, nextAttemptAt: new Date(opts.now.getTime() + 5 * 60_000), reasonCode: "decoder_unavailable" } });
+          // Re-review N7: is the reader itself down, or does only this file break it? A known-good decode decides.
+          if (await (opts.decoderWorks ?? decoderWorks)()) {
+            (await retryOrFail(row, `${ENTRY_FAULT_PREFIX}decoder`, opts.now, ENTRY_MAX_ATTEMPTS)) === "failed" ? summary.failed++ : summary.retried++;
+            continue;
+          }
+          // The reader is down: not this file's fault. Give every attempt of this run back and stop.
+          await prisma.generatedDocument.updateMany({ where: { id: row.id, status: "pending" }, data: { attempts: row.attempts, lockedUntil: null, nextAttemptAt: new Date(opts.now.getTime() + 5 * 60_000), reasonCode: "decoder_unavailable" } });
+          await release(claimed.slice(i + 1));
           emitEvent("document.generated_decoder_unavailable", { reason: err.reason }, "error");
           summary.retried++;
           break;
         }
-        (await retryOrFail(row, `${ENTRY_FAULT_PREFIX}generate_error`, opts.now, ENTRY_MAX_ATTEMPTS)) === "failed" ? summary.failed++ : summary.retried++;
+        // Re-review N10: a walk that ran out of time is retried like any fault, never a final decision.
+        const reason = isWalkTimeout(err) ? `${ENTRY_FAULT_PREFIX}walk_timeout` : `${ENTRY_FAULT_PREFIX}generate_error`;
+        (await retryOrFail(row, reason, opts.now, ENTRY_MAX_ATTEMPTS)) === "failed" ? summary.failed++ : summary.retried++;
       }
     }
   } catch {
@@ -446,9 +485,10 @@ async function generateEntryFor(row: Pick<GeneratedDocument, "id" | "attempts">,
     }
   } catch (err) {
     await store.delete(key).catch(() => {});
-    // The item already has a live file of this kind (one-live-row index): this one is not needed.
+    // The item already has a live file of this kind (one-live-row index): this one is not needed. Closed as a decision
+    // (failed), so the source is not picked again every tick (re-review N8).
     if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
-      await prisma.generatedDocument.updateMany({ where: { id: row.id, status: "pending" }, data: { status: "superseded", reasonCode: "duplicate_live", lockedUntil: null } });
+      await prisma.generatedDocument.updateMany({ where: { id: row.id, status: "pending" }, data: { status: "failed", reasonCode: "duplicate_live", lockedUntil: null, updatedAt: now } });
       return;
     }
     throw err;

@@ -191,6 +191,11 @@ export async function verifyEntryPdf(sourceCodes: readonly LocatedCode[], output
   return { ok: true };
 }
 
+/** A walk that hit its wall-clock limit (load-dependent: a retryable fault, not a decision). */
+export function isWalkTimeout(e: unknown): e is WalkLimitError {
+  return e instanceof WalkLimitError && e.reason === "walk_timeout";
+}
+
 export type EntryOutcome =
   | { kind: "entry_pdf"; bytes: Uint8Array; codes: number }
   | { kind: "cover_page"; bytes: Uint8Array; reason: "no_code_found" }
@@ -226,7 +231,9 @@ export async function generateEntryDocument(
   try {
     located = await locateCodes(source, decoder);
   } catch (e) {
-    if (e instanceof DecoderUnavailableError) throw e;
+    // A reader fault or a walk that ran out of time says nothing final about the file: thrown, so the job retries it
+    // up to its attempt limit (re-review N10). Other limits (size, complexity, filters) are a decision on the file.
+    if (e instanceof DecoderUnavailableError || isWalkTimeout(e)) throw e;
     return { kind: "none", reason: e instanceof WalkLimitError ? e.reason : "locate_error" };
   }
   if (!located.codes.length) {
@@ -247,7 +254,7 @@ export async function generateEntryDocument(
   }
   if (!built.ok) return { kind: "none", reason: built.reason };
   const verified = await verifyEntryPdf(located.codes, built.bytes, decoder, { maxBytes: opts.maxBytes }).catch((e: unknown) => {
-    if (e instanceof DecoderUnavailableError) throw e;
+    if (e instanceof DecoderUnavailableError || isWalkTimeout(e)) throw e;
     return { ok: false as const, reason: "verify_error" };
   });
   if (!verified.ok) return { kind: "none", reason: verified.reason };

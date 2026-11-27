@@ -28,6 +28,12 @@ const CN_PREFIX = `TEST-Z${RUN.toUpperCase()}C-`;
 const NOW = new Date("2027-02-14T10:05:00.000Z");
 /** Synthetic phone, built at run time (the public CI copy is scanned for phone-like literals). */
 const PHONE = ["+91", "0000", "000000"].join("");
+/**
+ * A ticket code row's ciphertext in the shape `supplier_ticket_codes_ciphertext_check` requires
+ * (`v2.ticket_codes.<key id>.<a>.<b>.<c>`, key id = `code_key_id`). Never decrypted here: the entry step only counts
+ * the rows (units issued).
+ */
+const PLACEHOLDER_CIPHERTEXT = ["v2", "ticket_codes", "zz", "AAAA", "BBBB", "CCCC"].join(".");
 /** Synthetic recipients only (example.invalid never delivers). */
 const MAIL_DOMAIN = "@example.invalid";
 
@@ -40,6 +46,8 @@ let notifications: typeof import("../notification.service");
 let storeMod: typeof import("../../documents/store");
 let productId: string;
 let priorCategory: string | null;
+let unclassifiedProductId: string;
+let unclassifiedPrior: string | null;
 let supplierId: string;
 const savedEnv = { ...process.env };
 const sent: { key: string; msg: EmailSend }[] = [];
@@ -87,7 +95,8 @@ async function paidOrder(opts: { grosses?: bigint[]; environment?: "test" | "pro
       data: {
         id,
         orderId: order.id,
-        productId: opts.withProduct === false ? null : productId,
+        // `order_item_has_product` needs a product: "without a VAT category" is a second product left unclassified.
+        productId: opts.withProduct === false ? unclassifiedProductId : productId,
         titleSnapshot: `Specimen Activity ${i + 1}`,
         tierSnapshot: "A",
         slugSnapshot: `zz-c-${RUN}-${k}-${i}`,
@@ -165,7 +174,7 @@ async function entrySource(store: MemoryDocumentStore, o: Awaited<ReturnType<typ
   });
   const codesDoc = await prisma.supplierDocument.create({ data: { id: uuidv7(), supplierBookingId: booking.id, orderId: o.orderId, orderItemId: o.items[0], kind: "ticket_codes", version: 1, status: "valid", source: "confirm_response", validatedAt: NOW } });
   for (let i = 0; i < units; i++) {
-    await prisma.supplierTicketCode.create({ data: { id: uuidv7(), documentId: codesDoc.id, supplierBookingId: booking.id, unitIndex: i, ticketFor: "adult", codeCiphertext: "v2:zz:placeholder", codeKeyId: "zz", codeHash: randomBytes(32).toString("hex") } });
+    await prisma.supplierTicketCode.create({ data: { id: uuidv7(), documentId: codesDoc.id, supplierBookingId: booking.id, unitIndex: i, ticketFor: "adult", codeCiphertext: PLACEHOLDER_CIPHERTEXT, codeKeyId: "zz", codeHash: randomBytes(32).toString("hex") } });
   }
   const pdf = await syntheticSupplierPdf({ layout: Array.from({ length: units }, () => 1) });
   const key = `test/${randomBytes(16).toString("hex")}`;
@@ -180,6 +189,55 @@ async function entrySource(store: MemoryDocumentStore, o: Awaited<ReturnType<typ
 class FailingReadStore extends MemoryDocumentStore {
   override async get(): Promise<Uint8Array | null> {
     throw new Error("injected read fault");
+  }
+}
+
+/**
+ * Removes every row this run created, child first, scoped to this run's ids (fix round 2: later suites count order
+ * items with a charged amount, and the payments tick treats a captured payment with no saga as a duplicate to
+ * refund, so leftovers broke `b2-migration` and CR-B3-8).
+ *
+ * `ledger_entries` and `fiscal_documents` are append-only by trigger, and every order, payment, item and refund of
+ * this run is referenced by them, so the delete runs in one transaction with `session_replication_role = replica`
+ * (user triggers off for this transaction only). That needs the disposable CI database's superuser, which the guard
+ * at the top of the suite has already proved is a disposable database. Where it is not allowed, the mutable rows are
+ * still removed and the attention rows closed, and a warning names what was left.
+ */
+async function cleanupRun(): Promise<void> {
+  assertDisposableDb();
+  const orderIds = (await prisma.order.findMany({ where: { leadName: { startsWith: `zz-c-${RUN}` } }, select: { id: true } })).map((o) => o.id);
+  const guestIds = (await prisma.guest.findMany({ where: { fullName: { startsWith: `zz-c-${RUN}` } }, select: { id: true } })).map((g) => g.id);
+  const entities = [ENTITY, `zz_d_${RUN}`];
+  const bookingIds = (await prisma.supplierBooking.findMany({ where: { OR: [{ orderId: { in: orderIds } }, { supplierId }] }, select: { id: true } })).map((b) => b.id);
+  try {
+    await prisma.$transaction(async (tx) => {
+      await tx.$executeRawUnsafe("SET LOCAL session_replication_role = replica");
+      await tx.$executeRaw`DELETE FROM notifications WHERE order_id = ANY(${orderIds}::uuid[])`;
+      await tx.$executeRaw`DELETE FROM fiscal_attention WHERE order_id = ANY(${orderIds}::uuid[])`;
+      await tx.$executeRaw`DELETE FROM generated_documents WHERE order_id = ANY(${orderIds}::uuid[])`;
+      await tx.$executeRaw`DELETE FROM fiscal_document_parties WHERE fiscal_document_id IN (SELECT id FROM fiscal_documents WHERE order_id = ANY(${orderIds}::uuid[]))`;
+      await tx.$executeRaw`DELETE FROM fiscal_documents WHERE order_id = ANY(${orderIds}::uuid[]) AND refers_to_id IS NOT NULL`;
+      await tx.$executeRaw`DELETE FROM fiscal_documents WHERE order_id = ANY(${orderIds}::uuid[])`;
+      await tx.$executeRaw`DELETE FROM fiscal_series WHERE legal_entity = ANY(${entities}::text[])`;
+      await tx.$executeRaw`DELETE FROM supplier_ticket_codes WHERE supplier_booking_id = ANY(${bookingIds}::uuid[])`;
+      await tx.$executeRaw`DELETE FROM supplier_documents WHERE supplier_booking_id = ANY(${bookingIds}::uuid[])`;
+      await tx.$executeRaw`DELETE FROM supplier_booking_events WHERE supplier_booking_id = ANY(${bookingIds}::uuid[])`;
+      await tx.$executeRaw`DELETE FROM supplier_bookings WHERE id = ANY(${bookingIds}::uuid[])`;
+      await tx.$executeRaw`DELETE FROM refunds WHERE payment_id IN (SELECT id FROM payments WHERE order_id = ANY(${orderIds}::uuid[]))`;
+      await tx.$executeRaw`DELETE FROM ledger_entries WHERE order_id = ANY(${orderIds}::uuid[])`;
+      await tx.$executeRaw`DELETE FROM payments WHERE order_id = ANY(${orderIds}::uuid[])`;
+      await tx.$executeRaw`DELETE FROM order_items WHERE order_id = ANY(${orderIds}::uuid[])`;
+      await tx.$executeRaw`DELETE FROM orders WHERE id = ANY(${orderIds}::uuid[])`;
+      await tx.$executeRaw`DELETE FROM guests WHERE id = ANY(${guestIds}::uuid[])`;
+      await tx.$executeRaw`DELETE FROM suppliers WHERE id = ${supplierId}::uuid`;
+    });
+  } catch (err) {
+    // No superuser here: remove what is mutable, close the attention rows (raised at the fixed 2027 NOW, so resolved
+    // after it: `fiscal_attention_times_check`, review 102 finding 2), and say what stays.
+    console.warn(`group-c cleanup: append-only rows kept (${err instanceof Error ? err.message.slice(0, 120) : "error"})`);
+    await prisma.notification.deleteMany({ where: { orderId: { in: orderIds } } });
+    await prisma.fiscalAttention.updateMany({ where: { resolvedAt: null, orderId: { in: orderIds } }, data: { resolvedAt: new Date(NOW.getTime() + 7 * 86_400_000) } });
+    await prisma.supplierTicketCode.deleteMany({ where: { supplierBookingId: { in: bookingIds } } });
   }
 }
 
@@ -211,6 +269,10 @@ describe("Group C documents (disposable database)", () => {
     productId = product.id;
     priorCategory = product.vatCategory;
     await prisma.product.update({ where: { id: productId }, data: { vatCategory: "standard" } });
+    const other = await prisma.product.findFirstOrThrow({ where: { id: { not: productId }, deletedAt: null }, orderBy: { slug: "desc" }, select: { id: true, vatCategory: true } });
+    unclassifiedProductId = other.id;
+    unclassifiedPrior = other.vatCategory;
+    await prisma.product.update({ where: { id: unclassifiedProductId }, data: { vatCategory: null } });
     await prisma.fiscalSeries.createMany({
       data: [
         { id: uuidv7(), legalEntity: ENTITY, environment: "test", docType: "tax_invoice", prefix: PREFIX, nextNumber: 1n },
@@ -228,10 +290,8 @@ describe("Group C documents (disposable database)", () => {
     resetEnvCache();
     if (!prisma) return;
     await prisma.product.update({ where: { id: productId }, data: { vatCategory: priorCategory } });
-    // Leave nothing open that the ops alert sweep of another suite could pick up.
-    // Rows were raised at the fixed NOW (2027); `fiscal_attention_times_check` needs resolved_at >= raised_at, so the
-    // real clock (2026) cannot be used here (review 102 finding 2): resolve a day after the latest test time.
-    await prisma.fiscalAttention.updateMany({ where: { resolvedAt: null, orderId: { in: (await prisma.order.findMany({ where: { leadName: { startsWith: `zz-c-${RUN}` } }, select: { id: true } })).map((o) => o.id) } }, data: { resolvedAt: new Date(NOW.getTime() + 7 * 86_400_000) } });
+    if (unclassifiedProductId) await prisma.product.update({ where: { id: unclassifiedProductId }, data: { vatCategory: unclassifiedPrior } });
+    await cleanupRun();
     await prisma.$disconnect();
   });
 
@@ -295,7 +355,7 @@ describe("Group C documents (disposable database)", () => {
     expect(await fiscal.issueForLedgerEntry(o.ledgerId, deps({ productionAllowed: true, seller: realSeller, vatRuleConfirmed: true, layoutProductionReady: true }))).toEqual({ kind: "blocked", reason: "series_missing" });
     expect(await prisma.fiscalDocument.count({ where: { ledgerEntryId: o.ledgerId } })).toBe(0);
     const open = await prisma.fiscalAttention.findMany({ where: { entityId: o.ledgerId, resolvedAt: null } });
-    expect(open.map((a) => a.reason).sort()).toEqual(["environment_mismatch", "layout_pending", "series_missing", "seller_unconfigured", "vat_rule_unconfirmed"]);
+    expect(open.map((a) => a.reason).sort()).toEqual(["environment_mismatch", "layout_pending", "seller_unconfigured", "series_missing", "vat_rule_unconfirmed"]);
     // The migration seeds no production series.
     expect(await prisma.fiscalSeries.count({ where: { environment: "production" } })).toBe(0);
     // Finding 6: a production series cannot exist without its cut-off.
@@ -404,6 +464,12 @@ describe("Group C documents (disposable database)", () => {
     expect(await fiscal.issueForLedgerEntry(o.ledgerId, deps({ legalEntity: entity }))).toEqual({ kind: "blocked", reason: "before_issue_from" });
     expect(await prisma.fiscalAttention.count({ where: { entityId: o.ledgerId, resolvedAt: null } })).toBe(0);
     expect(await prisma.fiscalDocument.count({ where: { ledgerEntryId: o.ledgerId } })).toBe(0);
+    // Re-review N9: a refund (after the cut-off) of that pre-cut-off capture has no invoice, so no credit note: silent.
+    await prisma.fiscalSeries.create({ data: { id: uuidv7(), legalEntity: entity, environment: "test", docType: "tax_credit_note", prefix: `TEST-ZD${RUN.toUpperCase()}C-`, nextNumber: 1n } });
+    const refund = await settledRefund(o, 0, 1000n);
+    expect(await fiscal.issueDue({ now: new Date(NOW.getTime() + 2 * 3600_000), e: on, ledgerEntryIds: [refund.ledgerId], deps: { seller } })).toMatchObject({ scanned: 0 });
+    expect(await fiscal.issueForLedgerEntry(refund.ledgerId, deps({ legalEntity: entity }))).toEqual({ kind: "blocked", reason: "before_issue_from" });
+    expect(await prisma.fiscalAttention.count({ where: { entityId: refund.ledgerId, resolvedAt: null } })).toBe(0);
   });
 
   it("a blocked entry is looked at again only after the back-off, so it never hogs the scan (finding 6)", async () => {
@@ -417,9 +483,11 @@ describe("Group C documents (disposable database)", () => {
   /* -------------------------------------------------------------- reconciliation */
 
   it("reconciliation: a refunded total with no refunds row raises one staff alert, cleared once the rows match", async () => {
-    const o = await paidOrder({ grosses: [5000n] });
-    // A dashboard refund: the provider's total moved, no refunds row (saga.ts syncPayment).
-    await prisma.payment.update({ where: { id: o.paymentId }, data: { refundedMinor: 5000n, status: "refunded" } });
+    // Captured 100.00; a dashboard refund of 50.00 moves the provider's total with no refunds row (saga.ts syncPayment).
+    // The capture leaves room for staff to record that refund afterwards: the database cap counts the provider total
+    // AND every non-failed row (migration 20261101140000), so a row equal to the whole capture could never be added.
+    const o = await paidOrder({ grosses: [10000n] });
+    await prisma.payment.update({ where: { id: o.paymentId }, data: { refundedMinor: 5000n, status: "partially_refunded" } });
     const r1 = await fiscal.reconcileRefunds(NOW, { paymentIds: [o.paymentId] });
     expect(r1).toMatchObject({ checked: 1, raised: 1 });
     await fiscal.reconcileRefunds(new Date(NOW.getTime() + 60_000), { paymentIds: [o.paymentId] });
@@ -559,7 +627,7 @@ describe("Group C documents (disposable database)", () => {
     // Two issued units (TKT-1 rows; the ciphertext is a placeholder, never read here).
     const codesDoc = await prisma.supplierDocument.create({ data: { id: uuidv7(), supplierBookingId: booking.id, orderId: o.orderId, orderItemId: o.items[0], kind: "ticket_codes", version: 1, status: "valid", source: "confirm_response", validatedAt: NOW } });
     for (const i of [0, 1]) {
-      await prisma.supplierTicketCode.create({ data: { id: uuidv7(), documentId: codesDoc.id, supplierBookingId: booking.id, unitIndex: i, ticketFor: "adult", codeCiphertext: "v2:zz:placeholder", codeKeyId: "zz", codeHash: randomBytes(32).toString("hex") } });
+      await prisma.supplierTicketCode.create({ data: { id: uuidv7(), documentId: codesDoc.id, supplierBookingId: booking.id, unitIndex: i, ticketFor: "adult", codeCiphertext: PLACEHOLDER_CIPHERTEXT, codeKeyId: "zz", codeHash: randomBytes(32).toString("hex") } });
     }
     const pdf = await syntheticSupplierPdf({ layout: [1, 1] });
     const key = `test/${randomBytes(16).toString("hex")}`;
@@ -666,6 +734,67 @@ describe("Group C documents (disposable database)", () => {
     }
   }, 120_000);
 
+  it("a row whose last attempt never returned is failed, not claimed again for ever (re-review N6)", async () => {
+    const store = new MemoryDocumentStore();
+    storeMod.setDocumentStoreForTests(store);
+    // Fiscal: a pending file at the attempt limit with an expired lock (the function was killed mid-draw).
+    const o = await paidOrder();
+    const r = await fiscal.issueForLedgerEntry(o.ledgerId, deps());
+    const fid = (r as { id: string }).id;
+    const pending = await prisma.generatedDocument.findFirstOrThrow({ where: { fiscalDocumentId: fid, status: "pending" } });
+    await prisma.generatedDocument.update({ where: { id: pending.id }, data: { attempts: 5, lockedUntil: new Date(NOW.getTime() - 60_000) } });
+    const on = envWith({ FISCAL_DOCUMENTS_ENABLED: true, BRANDED_ENTRY_PDF_ENABLED: true });
+    expect(await generated.drawPendingFiscal({ store, now: NOW, max: 5, e: on, fiscalDocumentIds: [fid] })).toMatchObject({ failed: 1, drawn: 0 });
+    expect(await prisma.generatedDocument.findUniqueOrThrow({ where: { id: pending.id } })).toMatchObject({ status: "failed", reasonCode: "fault_timeout" });
+    expect((await prisma.fiscalAttention.findMany({ where: { entityId: o.ledgerId, resolvedAt: null } })).map((a) => a.reason)).toEqual(["fiscal_file_failed"]);
+    // Entry: the same for a claimed row at the limit.
+    const e2 = await paidOrder({ grosses: [5000n] });
+    const { src } = await entrySource(store, e2);
+    await prisma.generatedDocument.create({
+      data: { id: uuidv7(), kind: "entry_pdf", orderId: e2.orderId, orderItemId: e2.items[0], sourceDocumentId: src.id, sourceSha256: src.sha256, templateVersion: 1, status: "pending", attempts: generated.ENTRY_MAX_ATTEMPTS, lockedUntil: new Date(NOW.getTime() - 60_000) },
+    });
+    expect(await generated.generatePendingEntries({ store, now: NOW, max: 3, e: on, sourceDocumentIds: [src.id], decoderReady: async () => {} })).toMatchObject({ failed: 1, drawn: 0 });
+    expect(await prisma.generatedDocument.findFirstOrThrow({ where: { sourceDocumentId: src.id } })).toMatchObject({ status: "failed", reasonCode: "fault_timeout" });
+  }, 120_000);
+
+  it("a file that faults the reader while the reader still works is the file's fault: retried, then failed (re-review N7)", async () => {
+    const store = new MemoryDocumentStore();
+    storeMod.setDocumentStoreForTests(store);
+    const o = await paidOrder({ grosses: [5000n] });
+    const { src } = await entrySource(store, o);
+    const on = envWith({ BRANDED_ENTRY_PDF_ENABLED: true });
+    const { DecoderUnavailableError } = await import("../../documents/generated/entry/code-decoder");
+    const faulting = () => ({
+      async decode(): Promise<never> {
+        throw new DecoderUnavailableError("read_failed");
+      },
+    });
+    const run = (t: Date, works: boolean) => generated.generatePendingEntries({ store, now: t, max: 3, e: on, sourceDocumentIds: [src.id], decoderReady: async () => {}, decoder: faulting, decoderWorks: async () => works });
+    // Reader down (the known-good decode fails too): the attempt is given back, nothing is failed.
+    expect(await run(NOW, false)).toMatchObject({ failed: 0, retried: 1 });
+    expect(await prisma.generatedDocument.findFirstOrThrow({ where: { sourceDocumentId: src.id } })).toMatchObject({ status: "pending", attempts: 0, reasonCode: "decoder_unavailable" });
+    // Reader fine, this file faults it every time: counted, failed for good on the third attempt.
+    for (const minutes of [6, 9, 14]) await run(new Date(NOW.getTime() + minutes * 60_000), true);
+    expect(await prisma.generatedDocument.findFirstOrThrow({ where: { sourceDocumentId: src.id } })).toMatchObject({ status: "failed", reasonCode: "fault_decoder", attempts: 3 });
+  }, 120_000);
+
+  it("a second source of an item that already has a live entry file waits and never takes a place in the run (re-review N8)", async () => {
+    const store = new MemoryDocumentStore();
+    storeMod.setDocumentStoreForTests(store);
+    const o = await paidOrder({ grosses: [5000n] });
+    const { booking, src } = await entrySource(store, o);
+    const on = envWith({ BRANDED_ENTRY_PDF_ENABLED: true, BRANDED_ENTRY_PDF_KINDS: ["tickets_pdf", "voucher_pdf"] });
+    expect(await generated.generatePendingEntries({ store, now: NOW, max: 3, e: on, sourceDocumentIds: [src.id] })).toMatchObject({ drawn: 1 });
+    const pdf = await syntheticSupplierPdf({ layout: [1, 1] });
+    const key = `test/${randomBytes(16).toString("hex")}`;
+    await store.put(key, pdf, "application/pdf");
+    const voucher = await prisma.supplierDocument.create({
+      data: { id: uuidv7(), supplierBookingId: booking.id, orderId: o.orderId, orderItemId: o.items[0], kind: "voucher_pdf", version: 1, status: "valid", source: "pdf_download", storageKey: key, contentType: "application/pdf", byteSize: pdf.byteLength, sha256: sha256Of(pdf), validatedAt: NOW },
+    });
+    expect(await generated.generatePendingEntries({ store, now: NOW, max: 3, e: on, sourceDocumentIds: [voucher.id] })).toMatchObject({ drawn: 0, cover: 0, none: 0, failed: 0 });
+    expect(await prisma.generatedDocument.count({ where: { sourceDocumentId: voucher.id } })).toBe(0);
+  }, 120_000);
+
   /* -------------------------------------------------------------- payment email */
 
   it("payment email: once per order, ids-only row, no link, no attachment while the fiscal switch is off", async () => {
@@ -740,17 +869,26 @@ describe("Group C documents (disposable database)", () => {
     const r = await fiscal.issueForLedgerEntry(o.ledgerId, deps());
     const fid = (r as { id: string }).id;
     const later = new Date(NOW.getTime() + 2 * 60_000);
-    // Switch off: nothing.
+    // Fiscal switch off: nothing.
     expect(await notifications.notificationService.sweepInvoiceIssued(later, 5, { orderIds: [o.orderId] })).toMatchObject({ skipped: "switch_off" });
     process.env.FISCAL_DOCUMENTS_ENABLED = "true";
     resetEnvCache();
     try {
       await generated.drawPendingFiscal({ store, now: NOW, max: 5, fiscalDocumentIds: [fid] });
       sent.length = 0;
+      // Re-review N5: the fiscal switch alone never starts customer email; the payment email switch gates it too.
+      process.env.PAYMENT_RECEIVED_EMAIL_ENABLED = "false";
+      resetEnvCache();
+      expect(await notifications.notificationService.sweepInvoiceIssued(later, 5, { orderIds: [o.orderId] })).toMatchObject({ skipped: "switch_off" });
+      process.env.PAYMENT_RECEIVED_EMAIL_ENABLED = "true";
+      resetEnvCache();
+      // The window is on the capture time: a day and more after the capture, nothing.
+      expect(await notifications.notificationService.sweepInvoiceIssued(new Date(NOW.getTime() + notifications.INVOICE_ISSUED_WINDOW_MS + 60_000), 5, { orderIds: [o.orderId] })).toMatchObject({ scanned: 0 });
       expect(await notifications.notificationService.sweepInvoiceIssued(later, 5, { orderIds: [o.orderId] })).toMatchObject({ scanned: 1, sent: 1 });
       expect(sent).toHaveLength(1);
       expect(sent[0].msg.subject).toContain((r as { displayNumber: string }).displayNumber);
       expect(sent[0].msg.text).toContain("This email is not your entry ticket.");
+      expect(sent[0].msg.text).not.toContain("separate email");
       expect(sent[0].msg.html).not.toMatch(/<a\s/i);
       expect(sent[0].msg.attachments?.[0].filename).toBe(`OUTLYY-tax-invoice-${(r as { displayNumber: string }).displayNumber}.pdf`);
       // Once per invoice.

@@ -705,9 +705,10 @@ export function renderPaymentReceived(ctx: PaymentReceivedContext): Rendered {
  * owner answer O8 "attach"). The invoice is numbered and drawn by the
  * documents job after the capture, so the payment email usually goes before
  * it exists; this email then carries the file. Sent once per invoice, only
- * while FISCAL_DOCUMENTS_ENABLED is on and the file is valid, and never when
- * the payment email already carried the same file. No link (O7), not an
- * entry ticket, rendered at send time from ids.
+ * while FISCAL_DOCUMENTS_ENABLED and PAYMENT_RECEIVED_EMAIL_ENABLED are on and
+ * the file is valid, never when the payment email already carried the same
+ * file, never for a cancelled or refunding order. No link (O7), not an entry
+ * ticket, rendered at send time from ids.
  */
 export const INVOICE_EVENTS = ["INVOICE_ISSUED"] as const;
 export type InvoiceNotificationEvent = (typeof INVOICE_EVENTS)[number];
@@ -722,12 +723,12 @@ export interface InvoiceIssuedContext {
 export function renderInvoiceIssued(ctx: InvoiceIssuedContext): Rendered {
   const greeting = ctx.firstName ? `Hi ${ctx.firstName},` : "Hi,";
   const attached = `Your tax invoice / receipt ${ctx.displayNumber} for booking ${ctx.orderReference} is attached.`;
+  // No "tickets come in a separate email" line (re-review N5): by the time the invoice exists they may have come already.
   const notTicket = "This email is not your entry ticket.";
-  const followUp = "Your voucher or tickets come in a separate email once the operator confirms.";
-  const text = [`${greeting} ${attached}`, `${notTicket} ${followUp}`, "There is nothing to pay.", "If you did not make this booking, reply to this email and we will look into it."].join("\n\n");
+  const text = [`${greeting} ${attached}`, notTicket, "There is nothing to pay.", "If you did not make this booking, reply to this email and we will look into it."].join("\n\n");
   const html =
     p(`${escapeHtml(greeting)} ${escapeHtml(attached)}`) +
-    p(`<strong>${escapeHtml(notTicket)}</strong> ${escapeHtml(followUp)}`) +
+    p(`<strong>${escapeHtml(notTicket)}</strong>`) +
     p("There is nothing to pay.") +
     p("If you did not make this booking, reply to this email and we will look into it.");
   const shellCtx = { supportEmail: ctx.supportEmail } as TemplateContext;

@@ -149,7 +149,7 @@ export const PAYMENT_RECEIVED_WINDOW_MS = 30 * 60_000;
 
 /** Group C (review 102 finding 14, O8): the follow-up email that carries the combined invoice once it exists. */
 const INVOICE_ISSUED: InvoiceNotificationEvent = "INVOICE_ISSUED";
-/** Invoices issued longer ago than this are never mailed by the sweep (first switch-on, a long job outage). */
+/** Invoices of captures booked longer ago than this are never mailed by the sweep (first switch-on, a long job outage; re-review N5). */
 export const INVOICE_ISSUED_WINDOW_MS = 24 * 3600_000;
 /** Order states in which the money is still held for the booking: the payment email is sent only in these (finding 9). */
 const PAYMENT_EMAIL_ORDER_STATES = ["paid", "supplier_pending", "confirmed", "partially_confirmed", "completed"] as const;
@@ -461,9 +461,15 @@ async function preparePaymentMessage(ref: PaymentMessageRef): Promise<Prepared> 
  */
 async function prepareInvoiceMessage(ref: InvoiceMessageRef): Promise<Prepared> {
   const e = env();
-  if (!e.FISCAL_DOCUMENTS_ENABLED) return { ok: false, outcome: { status: "suppressed", reason: "switch_off" } };
+  // Both switches (re-review N5): the fiscal switch alone never starts customer email.
+  if (!e.FISCAL_DOCUMENTS_ENABLED || !e.PAYMENT_RECEIVED_EMAIL_ENABLED) return { ok: false, outcome: { status: "suppressed", reason: "switch_off" } };
   const order = await prisma.order.findUnique({ where: { id: ref.orderId }, select: { reference: true, leadName: true } });
   if (!order) return { ok: false, outcome: { status: "failed", retryable: false, code: "order_missing" } };
+  // Not for an order that is cancelled or being refunded (re-review N5), checked again at send time.
+  const invoiceDoc = await prisma.fiscalDocument.findUnique({ where: { id: ref.fiscalDocumentId }, select: { paymentId: true, orderId: true } });
+  if (!invoiceDoc || invoiceDoc.orderId !== ref.orderId || !(await paymentEmailStillRight(ref.orderId, invoiceDoc.paymentId))) {
+    return { ok: false, outcome: { status: "failed", retryable: false, code: "order_refunding" } };
+  }
   const { readServableGenerated } = await import("./generated-document.read");
   const file = await readServableGenerated(ref.generatedDocumentId);
   if (file.kind !== "ok" || file.document.orderId !== ref.orderId || file.document.kind !== "tax_invoice" || !file.document.displayNumber) {
@@ -1047,10 +1053,12 @@ export const notificationService = {
 
   /**
    * The documents-job step for the follow-up invoice email (finding 14; O8):
-   * every valid combined invoice file issued in the last
-   * `INVOICE_ISSUED_WINDOW_MS` that no payment email carried and that has no
-   * invoice email yet gets one, to the order's lead email. Only while
-   * FISCAL_DOCUMENTS_ENABLED is on. At most `max`, no send started after
+   * every valid combined invoice file whose CAPTURE was booked in the last
+   * `INVOICE_ISSUED_WINDOW_MS` (re-review N5: not the numbering time, so a
+   * first switch-on never mails old payments), that no payment email carried,
+   * whose order still holds the money (not cancelled or refunding), and that
+   * has no invoice email yet gets one, to the order's lead email. Only while
+   * FISCAL_DOCUMENTS_ENABLED and PAYMENT_RECEIVED_EMAIL_ENABLED are both on. At most `max`, no send started after
    * `budget.startBy`. Never throws.
    */
   async sweepInvoiceIssued(
@@ -1060,18 +1068,20 @@ export const notificationService = {
     budget: { startBy?: number } = {},
   ): Promise<{ skipped?: "switch_off"; scanned: number; sent: number; failed: number }> {
     const summary = { scanned: 0, sent: 0, failed: 0 };
-    if (!env().FISCAL_DOCUMENTS_ENABLED) return { ...summary, skipped: "switch_off" };
+    const e = env();
+    if (!e.FISCAL_DOCUMENTS_ENABLED || !e.PAYMENT_RECEIVED_EMAIL_ENABLED) return { ...summary, skipped: "switch_off" };
     const only = scope.orderIds
       ? Prisma.sql`AND f.order_id IN (${Prisma.join(scope.orderIds.length ? scope.orderIds.map((id) => Prisma.sql`${id}::uuid`) : [Prisma.sql`NULL::uuid`])})`
       : Prisma.empty;
     try {
       const since = new Date(now.getTime() - INVOICE_ISSUED_WINDOW_MS);
-      const rows = await prisma.$queryRaw<{ order_id: string; fiscal_document_id: string; generated_document_id: string; lead_email: string | null }[]>`
-        SELECT f.order_id, f.id AS fiscal_document_id, g.id AS generated_document_id, o.lead_email
+      const rows = await prisma.$queryRaw<{ order_id: string; payment_id: string; fiscal_document_id: string; generated_document_id: string; lead_email: string | null }[]>`
+        SELECT f.order_id, f.payment_id, f.id AS fiscal_document_id, g.id AS generated_document_id, o.lead_email
         FROM fiscal_documents f
         JOIN generated_documents g ON g.fiscal_document_id = f.id AND g.status = 'valid'
         JOIN orders o ON o.id = f.order_id
-        WHERE f.doc_type = 'tax_invoice' AND f.issued_at >= ${since} AND f.issued_at <= ${now}
+        JOIN ledger_entries l ON l.id = f.ledger_entry_id
+        WHERE f.doc_type = 'tax_invoice' AND l.occurred_at >= ${since} AND l.occurred_at <= ${now}
           AND NOT EXISTS (SELECT 1 FROM notifications n WHERE n.order_id = f.order_id AND n.event = ${INVOICE_ISSUED} AND n.payload->>'fiscalDocumentId' = f.id::text)
           AND NOT EXISTS (
             SELECT 1 FROM notifications n JOIN generated_documents g2 ON g2.id::text = n.payload->>'attachGeneratedDocumentId'
@@ -1084,6 +1094,7 @@ export const notificationService = {
         if (budget.startBy !== undefined && Date.now() >= budget.startBy) break;
         const recipient = r.lead_email?.trim();
         if (!recipient) continue;
+        if (!(await paymentEmailStillRight(r.order_id, r.payment_id))) continue;
         summary.scanned++;
         try {
           const out = await sendInvoiceMessage({ ref: { kind: "invoice_message", orderId: r.order_id, fiscalDocumentId: r.fiscal_document_id, generatedDocumentId: r.generated_document_id }, recipient }, now);

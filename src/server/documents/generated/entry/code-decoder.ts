@@ -108,6 +108,25 @@ export async function assertDecoderReady(): Promise<void> {
   await loadReader();
 }
 
+/**
+ * Known-good decode (re-review N7): a fresh reader (re-loaded after a fault)
+ * reads a blank white image and must answer "no code" without throwing. True
+ * means the reader works, so a fault on one file is that file's fault; false
+ * means the reader itself is down.
+ */
+export async function decoderWorks(): Promise<boolean> {
+  try {
+    const z = await loadReader();
+    const side = 64;
+    const data = new Uint8ClampedArray(side * side * 4).fill(255);
+    await z.readBarcodes({ width: side, height: side, data, colorSpace: "srgb" } as unknown as ImageData, { formats: [...ACCEPTED_CODE_FORMATS], maxNumberOfSymbols: 1 });
+    return true;
+  } catch {
+    reader = null;
+    return false;
+  }
+}
+
 /** A decoder whose digests are comparable only with each other (one fresh key per instance). */
 export function createZxingDecoder(): CodeDecoder {
   const key = randomBytes(32);
@@ -122,6 +141,8 @@ export function createZxingDecoder(): CodeDecoder {
           formats: [...ACCEPTED_CODE_FORMATS],
         });
       } catch {
+        // A WebAssembly abort can leave the module unusable: drop it, so the next call loads a fresh one (re-review N7).
+        reader = null;
         throw new DecoderUnavailableError("read_failed");
       }
       return results

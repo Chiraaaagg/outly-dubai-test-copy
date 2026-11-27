@@ -49,8 +49,15 @@ export interface ImageDraw {
 const IDENTITY: Matrix = [1, 0, 0, 1, 0, 0];
 const MAX_DEPTH = 8;
 
-/** Whole-document limits of one walk (review finding 12). */
-export const WALK_LIMITS = Object.freeze({
+/** Whole-document limits of one walk (review finding 12). Plain numbers, so a caller (a test) may pass other values. */
+export interface WalkLimits {
+  maxOps: number;
+  maxFormVisits: number;
+  maxInflatedBytes: number;
+  maxMs: number;
+}
+
+export const WALK_LIMITS: Readonly<WalkLimits> = Object.freeze({
   /** Operators across every content stream and form visit of the document. */
   maxOps: 1_000_000,
   /** Form XObject entries across the document (a form drawn N times counts N). */
@@ -75,7 +82,7 @@ export class WalkBudget {
   inflatedBytes = 0;
   readonly deadline: number;
   readonly decoded = new Map<PDFObject, Uint8Array>();
-  constructor(readonly limits: typeof WALK_LIMITS = WALK_LIMITS, now: number = Date.now()) {
+  constructor(readonly limits: Readonly<WalkLimits> = WALK_LIMITS, now: number = Date.now()) {
     this.deadline = now + limits.maxMs;
   }
   op(): void {
@@ -302,6 +309,8 @@ function streamBytes(ctx: PDFContext, s: PDFObject | undefined, budget: WalkBudg
   if (s instanceof PDFRawStream) {
     const filters = filterNames(ctx, s.dict);
     const parms = resolve(ctx, s.dict.get(PDFName.of("DecodeParms")));
+    // DecodeParms as an array (one entry per filter) is allowed by the format; refused rather than misread (re-review N11).
+    if (parms instanceof PDFArray) throw new WalkLimitError("content_filter_unsupported");
     const predictor = parms instanceof PDFDict ? resolve(ctx, parms.get(PDFName.of("Predictor"))) : undefined;
     if (!filters || filters.length > 1 || (filters.length === 1 && filters[0] !== "FlateDecode" && filters[0] !== "Fl")) throw new WalkLimitError("content_filter_unsupported");
     if (predictor instanceof PDFNumber && predictor.asNumber() > 1) throw new WalkLimitError("content_filter_unsupported");

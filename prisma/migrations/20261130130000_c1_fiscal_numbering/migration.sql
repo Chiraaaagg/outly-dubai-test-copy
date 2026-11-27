@@ -159,6 +159,18 @@ BEGIN
   RETURN NEW;
 END $$;
 
+-- A trigger function is never called directly: no EXECUTE for PUBLIC or the API roles (re-review N3, as Group B does).
+REVOKE EXECUTE ON FUNCTION outly_fiscal_series_guard() FROM PUBLIC;
+DO $$
+DECLARE r text;
+BEGIN
+  FOREACH r IN ARRAY ARRAY['anon', 'authenticated'] LOOP
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
+      EXECUTE format('REVOKE EXECUTE ON FUNCTION outly_fiscal_series_guard() FROM %I', r);
+    END IF;
+  END LOOP;
+END $$;
+
 CREATE TRIGGER fiscal_series_guard BEFORE UPDATE OR DELETE ON "fiscal_series"
   FOR EACH ROW EXECUTE FUNCTION outly_fiscal_series_guard();
 CREATE TRIGGER fiscal_series_no_truncate BEFORE TRUNCATE ON "fiscal_series"

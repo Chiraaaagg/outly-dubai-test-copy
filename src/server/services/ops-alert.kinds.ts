@@ -17,6 +17,10 @@ export const OPS_ENTITY_KINDS = [
   "crm_subject",
   "privileged_approval",
   "bulk_operation_item",
+  /** Group B (impl/postpay-b migration 20261130120000; re-review N12): listed here now so the merge cannot drop them. */
+  "order_account_link",
+  "customer",
+  "email_volume",
   /** Group C: needs migration 20261130160000 (ops_alerts_entity_kind_check). */
   "payment",
   "ledger_entry",
