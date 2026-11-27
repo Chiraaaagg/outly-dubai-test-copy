@@ -1,0 +1,79 @@
+{
+  "_comment": "Sanitised contract fixture for capability class live.fixed_slot_choice.self.internal.per_person (doc 29 Batch 1a). Shape of a TravelDesk GET /tours/{id} answer with one LiveBook offer that has two fixed starts and direct reporting. Ids, names and every price are synthetic; no supplier rate, code or text.",
+  "id": 9001,
+  "name": "Synthetic evening cruise with two sailings",
+  "languageId": 1,
+  "language": "English",
+  "isExternal": false,
+  "cancellationPolicy": [
+    { "hours": 24, "percents": 50 },
+    { "hours": 48, "percents": 100 }
+  ],
+  "categories": [{ "id": 3, "name": null, "url": null, "heroImageId": null, "heroImage": null }],
+  "notesToAgent": null,
+  "videoUrl": null,
+  "termsAndConditions": "Synthetic terms.",
+  "salesDescription": "Synthetic description.",
+  "faqList": [],
+  "itineraries": [],
+  "photos": [],
+  "offers": [
+    {
+      "id": 90011,
+      "name": "Synthetic cruise, early or late sailing, direct reporting",
+      "code": "SYNTH-CHOICE",
+      "daysOffered": 0,
+      "numberOfHours": 2,
+      "minNumOfPeople": 1,
+      "maxNumOfPeople": 40,
+      "minNumberOfAdult": null,
+      "maxNumberOfAdult": null,
+      "minNumberOfChild": null,
+      "maxNumberOfChild": null,
+      "minNumberOfInfant": null,
+      "maxNumberOfInfant": null,
+      "minimumAdvancedPayment": 0,
+      "privateType": 0,
+      "childrenAllowed": true,
+      "childAge": 12,
+      "infantsAllowed": true,
+      "infantAge": 3,
+      "pricingPeriods": [
+        {
+          "id": 900111,
+          "widgetPricing": null,
+          "dateStart": "2026-01-01T00:00:00",
+          "dateEnd": "2027-12-31T00:00:00",
+          "offerId": 90011,
+          "currency": "AED",
+          "recPricePerAdult": 150,
+          "recPricePerChild": 100,
+          "recPricePerTrip": 0,
+          "pricePerAdult": 100,
+          "pricePerChild": 60,
+          "pricePerTrip": 0,
+          "pricePerAdultUsd": 27.25,
+          "pricePerChildUsd": 16.35,
+          "pricePerTripUsd": 0,
+          "discountPercent": null,
+          "hasDiscount": false,
+          "isBookable": true,
+          "supplierCurrencyCode": null,
+          "conversionRate": 3.67,
+          "vat": 5
+        }
+      ],
+      "isDirectReporting": true,
+      "isAppendTransactionFeeB2b": false,
+      "isDirectCollection": false,
+      "description": null,
+      "timeSlots": [
+        { "id": 901, "name": "Early sailing", "startTime": 1140, "endTime": 1260, "daysOffered": 0, "isAnyTime": false, "isOnRequest": false, "offerId": 90011, "minimumAdvancedBooking": 12, "isExternal": false },
+        { "id": 902, "name": "Late sailing", "startTime": 1290, "endTime": 1410, "daysOffered": 0, "isAnyTime": false, "isOnRequest": false, "offerId": 90011, "minimumAdvancedBooking": 12, "isExternal": false, "numberOfUnits": 1 }
+      ],
+      "bookingType": 1,
+      "isExternal": false,
+      "tripUnit": ""
+    }
+  ]
+}
