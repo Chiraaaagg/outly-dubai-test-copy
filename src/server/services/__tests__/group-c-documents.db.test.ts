@@ -17,8 +17,9 @@ import { syntheticSupplierPdf } from "../../documents/generated/specimen/synthet
  * a SYNTHETIC supplier PDF, and the payment email.
  *
  * Every run uses its own legal entity key and series, so numbers start at 1
- * and nothing mixes with other suites. Fiscal rows are append-only by design
- * and stay; every scan is scoped to this run's ids. Synthetic values only.
+ * and nothing mixes with other suites. Every scan is scoped to this run's ids,
+ * and `afterAll` removes every row of the run (`cleanupRun`), the append-only
+ * fiscal and ledger rows included. Synthetic values only.
  */
 
 const RUN = randomBytes(4).toString("hex");
@@ -197,47 +198,52 @@ class FailingReadStore extends MemoryDocumentStore {
  * items with a charged amount, and the payments tick treats a captured payment with no saga as a duplicate to
  * refund, so leftovers broke `b2-migration` and CR-B3-8).
  *
- * `ledger_entries` and `fiscal_documents` are append-only by trigger, and every order, payment, item and refund of
- * this run is referenced by them, so the delete runs in one transaction with `session_replication_role = replica`
- * (user triggers off for this transaction only). That needs the disposable CI database's superuser, which the guard
- * at the top of the suite has already proved is a disposable database. Where it is not allowed, the mutable rows are
- * still removed and the attention rows closed, and a warning names what was left.
+ * Fix round 3 (re-review D6–D8): foreign keys stay ON for every delete except the append-only tables
+ * (`fiscal_documents`, `fiscal_series`, `ledger_entries`, `supplier_booking_events`), whose own triggers refuse any
+ * delete; only those statements run under `session_replication_role = replica` (user triggers off, this transaction
+ * only), and the role is set back to `origin` right after, so a forgotten child table fails the cleanup loudly instead
+ * of being orphaned. That needs the disposable CI database's superuser (the guard at the top of the suite proved it
+ * is a disposable database). The transaction gets `TX_OPTIONS`, so a slow database does not time it out. If the
+ * cleanup cannot run, it THROWS: leftovers would break later suites, and the cause must be named here.
  */
 async function cleanupRun(): Promise<void> {
   assertDisposableDb();
+  const { TX_OPTIONS } = await import("../../lib/db");
   const orderIds = (await prisma.order.findMany({ where: { leadName: { startsWith: `zz-c-${RUN}` } }, select: { id: true } })).map((o) => o.id);
   const guestIds = (await prisma.guest.findMany({ where: { fullName: { startsWith: `zz-c-${RUN}` } }, select: { id: true } })).map((g) => g.id);
   const entities = [ENTITY, `zz_d_${RUN}`];
-  const bookingIds = (await prisma.supplierBooking.findMany({ where: { OR: [{ orderId: { in: orderIds } }, { supplierId }] }, select: { id: true } })).map((b) => b.id);
+  // D7: the supplier branch only when this run's supplier exists (an undefined id would match every booking).
+  const bookingWhere = supplierId ? { OR: [{ orderId: { in: orderIds } }, { supplierId }] } : { orderId: { in: orderIds } };
+  const bookingIds = (await prisma.supplierBooking.findMany({ where: bookingWhere, select: { id: true } })).map((b) => b.id);
   try {
     await prisma.$transaction(async (tx) => {
-      await tx.$executeRawUnsafe("SET LOCAL session_replication_role = replica");
+      // 1. Children of the append-only rows, foreign keys on.
       await tx.$executeRaw`DELETE FROM notifications WHERE order_id = ANY(${orderIds}::uuid[])`;
       await tx.$executeRaw`DELETE FROM fiscal_attention WHERE order_id = ANY(${orderIds}::uuid[])`;
       await tx.$executeRaw`DELETE FROM generated_documents WHERE order_id = ANY(${orderIds}::uuid[])`;
       await tx.$executeRaw`DELETE FROM fiscal_document_parties WHERE fiscal_document_id IN (SELECT id FROM fiscal_documents WHERE order_id = ANY(${orderIds}::uuid[]))`;
+      // 2. The append-only rows only, with user triggers off.
+      await tx.$executeRawUnsafe("SET LOCAL session_replication_role = replica");
       await tx.$executeRaw`DELETE FROM fiscal_documents WHERE order_id = ANY(${orderIds}::uuid[]) AND refers_to_id IS NOT NULL`;
       await tx.$executeRaw`DELETE FROM fiscal_documents WHERE order_id = ANY(${orderIds}::uuid[])`;
       await tx.$executeRaw`DELETE FROM fiscal_series WHERE legal_entity = ANY(${entities}::text[])`;
+      await tx.$executeRaw`DELETE FROM ledger_entries WHERE order_id = ANY(${orderIds}::uuid[])`;
+      await tx.$executeRaw`DELETE FROM supplier_booking_events WHERE supplier_booking_id = ANY(${bookingIds}::uuid[])`;
+      // 3. Everything else, foreign keys on again.
+      await tx.$executeRawUnsafe("SET LOCAL session_replication_role = origin");
       await tx.$executeRaw`DELETE FROM supplier_ticket_codes WHERE supplier_booking_id = ANY(${bookingIds}::uuid[])`;
       await tx.$executeRaw`DELETE FROM supplier_documents WHERE supplier_booking_id = ANY(${bookingIds}::uuid[])`;
-      await tx.$executeRaw`DELETE FROM supplier_booking_events WHERE supplier_booking_id = ANY(${bookingIds}::uuid[])`;
       await tx.$executeRaw`DELETE FROM supplier_bookings WHERE id = ANY(${bookingIds}::uuid[])`;
       await tx.$executeRaw`DELETE FROM refunds WHERE payment_id IN (SELECT id FROM payments WHERE order_id = ANY(${orderIds}::uuid[]))`;
-      await tx.$executeRaw`DELETE FROM ledger_entries WHERE order_id = ANY(${orderIds}::uuid[])`;
       await tx.$executeRaw`DELETE FROM payments WHERE order_id = ANY(${orderIds}::uuid[])`;
       await tx.$executeRaw`DELETE FROM order_items WHERE order_id = ANY(${orderIds}::uuid[])`;
       await tx.$executeRaw`DELETE FROM orders WHERE id = ANY(${orderIds}::uuid[])`;
       await tx.$executeRaw`DELETE FROM guests WHERE id = ANY(${guestIds}::uuid[])`;
-      await tx.$executeRaw`DELETE FROM suppliers WHERE id = ${supplierId}::uuid`;
-    });
+      if (supplierId) await tx.$executeRaw`DELETE FROM suppliers WHERE id = ${supplierId}::uuid`;
+    }, TX_OPTIONS);
   } catch (err) {
-    // No superuser here: remove what is mutable, close the attention rows (raised at the fixed 2027 NOW, so resolved
-    // after it: `fiscal_attention_times_check`, review 102 finding 2), and say what stays.
-    console.warn(`group-c cleanup: append-only rows kept (${err instanceof Error ? err.message.slice(0, 120) : "error"})`);
-    await prisma.notification.deleteMany({ where: { orderId: { in: orderIds } } });
-    await prisma.fiscalAttention.updateMany({ where: { resolvedAt: null, orderId: { in: orderIds } }, data: { resolvedAt: new Date(NOW.getTime() + 7 * 86_400_000) } });
-    await prisma.supplierTicketCode.deleteMany({ where: { supplierBookingId: { in: bookingIds } } });
+    // D8: never a silent partial cleanup.
+    throw new Error(`group-c cleanup failed, rows of run ${RUN} are left in the shared database: ${err instanceof Error ? err.message.slice(0, 300) : String(err)}`);
   }
 }
 
@@ -795,6 +801,27 @@ describe("Group C documents (disposable database)", () => {
     expect(await prisma.generatedDocument.count({ where: { sourceDocumentId: voucher.id } })).toBe(0);
   }, 120_000);
 
+  it("each entry file is claimed just before it is processed: a file that never returns holds only its own claim (re-review D1)", async () => {
+    const store = new MemoryDocumentStore();
+    storeMod.setDocumentStoreForTests(store);
+    const a = await entrySource(store, await paidOrder({ grosses: [5000n] }));
+    const b = await entrySource(store, await paidOrder({ grosses: [5000n] }));
+    // A is older, so it is processed first.
+    await prisma.supplierDocument.update({ where: { id: a.src.id }, data: { validatedAt: new Date(NOW.getTime() - 60_000) } });
+    const rowsOfBWhenAIsRead: number[] = [];
+    // The read of A's file stands for the moment a hang or a kill would strike: B must not be claimed yet.
+    class WatchingStore extends MemoryDocumentStore {
+      override async get(key: string, opts: { maxBytes: number }): Promise<Uint8Array | null> {
+        if (key === a.src.storageKey) rowsOfBWhenAIsRead.push(await prisma.generatedDocument.count({ where: { sourceDocumentId: b.src.id } }));
+        return store.get(key, opts);
+      }
+    }
+    const on = envWith({ BRANDED_ENTRY_PDF_ENABLED: true });
+    const out = await generated.generatePendingEntries({ store: new WatchingStore(), now: NOW, max: 3, e: on, sourceDocumentIds: [a.src.id, b.src.id], decoderReady: async () => {} });
+    expect(rowsOfBWhenAIsRead).toEqual([0]);
+    expect(out).toMatchObject({ drawn: 2 });
+  }, 120_000);
+
   /* -------------------------------------------------------------- payment email */
 
   it("payment email: once per order, ids-only row, no link, no attachment while the fiscal switch is off", async () => {
@@ -899,6 +926,36 @@ describe("Group C documents (disposable database)", () => {
       resetEnvCache();
     }
   });
+
+  it("invoice emails: orders that must be skipped never hold the run's places (re-review D2)", async () => {
+    const store = new MemoryDocumentStore();
+    storeMod.setDocumentStoreForTests(store);
+    process.env.FISCAL_DOCUMENTS_ENABLED = "true";
+    resetEnvCache();
+    try {
+      const orders: Awaited<ReturnType<typeof paidOrder>>[] = [];
+      // Five that must be skipped (oldest first), then one that must be mailed.
+      for (let i = 0; i < 6; i++) orders.push(await paidOrder({ grosses: [5000n], email: i === 0 ? null : undefined }));
+      for (const o of orders) {
+        const r = await fiscal.issueForLedgerEntry(o.ledgerId, deps());
+        await generated.drawPendingFiscal({ store, now: NOW, max: 5, fiscalDocumentIds: [(r as { id: string }).id] });
+      }
+      const [, cancelled, refunding, refunded, endedOrder, good] = orders;
+      await prisma.order.update({ where: { id: cancelled.orderId }, data: { status: "cancelled" } });
+      await prisma.refund.create({ data: { id: uuidv7(), paymentId: refunding.paymentId, orderItemId: refunding.items[0], provider: "stripe", providerRefundId: `re_d2a_${RUN}`, idempotencyKey: `zc-d2a-${RUN}`, amountMinor: 5000n, currency: "AED", status: "requested", reason: "supplier_failed" } });
+      await prisma.payment.update({ where: { id: refunded.paymentId }, data: { refundedMinor: 1000n, status: "partially_refunded" } });
+      await prisma.order.update({ where: { id: endedOrder.orderId }, data: { status: "refunded" } });
+      sent.length = 0;
+      const out = await notifications.notificationService.sweepInvoiceIssued(new Date(NOW.getTime() + 2 * 60_000), 1, { orderIds: orders.map((o) => o.orderId) });
+      // With one place per run, the only order selected is the one that can be mailed.
+      expect(out).toMatchObject({ scanned: 1, sent: 1 });
+      expect(sent).toHaveLength(1);
+      expect((await prisma.notification.findMany({ where: { orderId: { in: orders.map((o) => o.orderId) }, event: "INVOICE_ISSUED" } })).map((n) => n.orderId)).toEqual([good.orderId]);
+    } finally {
+      delete process.env.FISCAL_DOCUMENTS_ENABLED;
+      resetEnvCache();
+    }
+  }, 120_000);
 
   it("payment email kill switch: off writes and sends nothing, and a row already written is not sent (PAYMENT_RECEIVED_EMAIL_ENABLED)", async () => {
     const o = await paidOrder();

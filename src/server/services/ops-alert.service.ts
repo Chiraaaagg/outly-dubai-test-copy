@@ -517,6 +517,9 @@ export async function entryFileIncidents(since: Date, now: Date, limit = COLLECT
       AND s.storage_key IS NOT NULL AND s.order_item_id IS NOT NULL
       AND s.validated_at >= ${waitedSince} AND s.validated_at <= ${waitedUntil}
       AND NOT EXISTS (SELECT 1 FROM generated_documents g WHERE g.source_document_id = s.id AND g.status IN ('valid', 'failed'))
+      -- Re-review D3: a second source of an item that already has a live entry file waits by design; not an incident.
+      AND NOT EXISTS (SELECT 1 FROM generated_documents g2 WHERE g2.order_item_id = s.order_item_id AND g2.source_document_id <> s.id
+        AND g2.kind IN ('entry_pdf', 'cover_page') AND g2.status IN ('pending', 'valid'))
     ORDER BY s.validated_at DESC LIMIT ${limit}`;
   return [
     ...failed.map((r) => ({

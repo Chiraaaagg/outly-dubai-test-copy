@@ -456,8 +456,9 @@ async function preparePaymentMessage(ref: PaymentMessageRef): Promise<Prepared> 
 }
 
 /**
- * The follow-up invoice email (finding 14), rendered at send time from ids. Needs the fiscal switch on and the named
- * file valid and checked; otherwise it fails retryably (a later attempt may find the switch back on or the file re-drawn).
+ * The follow-up invoice email (finding 14), rendered at send time from ids. Suppressed while either switch is off;
+ * fails definitely when the invoice is missing or not this order's (`invoice_missing`) or the order no longer holds the
+ * money (`order_refunding`); fails retryably when the named file cannot be read and checked (it may be re-drawn).
  */
 async function prepareInvoiceMessage(ref: InvoiceMessageRef): Promise<Prepared> {
   const e = env();
@@ -467,9 +468,9 @@ async function prepareInvoiceMessage(ref: InvoiceMessageRef): Promise<Prepared> 
   if (!order) return { ok: false, outcome: { status: "failed", retryable: false, code: "order_missing" } };
   // Not for an order that is cancelled or being refunded (re-review N5), checked again at send time.
   const invoiceDoc = await prisma.fiscalDocument.findUnique({ where: { id: ref.fiscalDocumentId }, select: { paymentId: true, orderId: true } });
-  if (!invoiceDoc || invoiceDoc.orderId !== ref.orderId || !(await paymentEmailStillRight(ref.orderId, invoiceDoc.paymentId))) {
-    return { ok: false, outcome: { status: "failed", retryable: false, code: "order_refunding" } };
-  }
+  // Re-review D9: a missing or foreign invoice is its own code, not "refunding".
+  if (!invoiceDoc || invoiceDoc.orderId !== ref.orderId) return { ok: false, outcome: { status: "failed", retryable: false, code: "invoice_missing" } };
+  if (!(await paymentEmailStillRight(ref.orderId, invoiceDoc.paymentId))) return { ok: false, outcome: { status: "failed", retryable: false, code: "order_refunding" } };
   const { readServableGenerated } = await import("./generated-document.read");
   const file = await readServableGenerated(ref.generatedDocumentId);
   if (file.kind !== "ok" || file.document.orderId !== ref.orderId || file.document.kind !== "tax_invoice" || !file.document.displayNumber) {
@@ -1080,21 +1081,28 @@ export const notificationService = {
         FROM fiscal_documents f
         JOIN generated_documents g ON g.fiscal_document_id = f.id AND g.status = 'valid'
         JOIN orders o ON o.id = f.order_id
+        JOIN payments p ON p.id = f.payment_id
         JOIN ledger_entries l ON l.id = f.ledger_entry_id
         WHERE f.doc_type = 'tax_invoice' AND l.occurred_at >= ${since} AND l.occurred_at <= ${now}
+          -- Re-review D2: the skip conditions are part of the selection, so skipped orders never hold the run's places.
+          -- Same test as paymentEmailStillRight (kept at send time): a lead email, a paid order, nothing refunded or refunding.
+          AND NULLIF(btrim(o.lead_email), '') IS NOT NULL
+          AND o.status::text IN (${Prisma.join([...PAYMENT_EMAIL_ORDER_STATES])})
+          AND p.order_id = f.order_id AND p.captured_minor > 0 AND p.refunded_minor = 0
+          AND NOT EXISTS (SELECT 1 FROM refunds r WHERE r.payment_id = f.payment_id AND r.status <> 'failed')
+          AND NOT EXISTS (SELECT 1 FROM customer_remedies cr WHERE cr.order_id = f.order_id AND cr.kind = 'refund' AND cr.status IN ('pending', 'in_progress', 'completed'))
           AND NOT EXISTS (SELECT 1 FROM notifications n WHERE n.order_id = f.order_id AND n.event = ${INVOICE_ISSUED} AND n.payload->>'fiscalDocumentId' = f.id::text)
           AND NOT EXISTS (
             SELECT 1 FROM notifications n JOIN generated_documents g2 ON g2.id::text = n.payload->>'attachGeneratedDocumentId'
             WHERE n.order_id = f.order_id AND n.event = ${PAYMENT_RECEIVED} AND n.status::text NOT IN ('failed', 'suppressed') AND g2.fiscal_document_id = f.id)
           ${only}
-        ORDER BY f.issued_at ASC
+        ORDER BY f.issued_at ASC, f.id ASC
         LIMIT ${max}`;
       for (const r of rows) {
         // No send starts after `startBy` (the caller leaves one send's worst case after it, finding 10).
         if (budget.startBy !== undefined && Date.now() >= budget.startBy) break;
         const recipient = r.lead_email?.trim();
         if (!recipient) continue;
-        if (!(await paymentEmailStillRight(r.order_id, r.payment_id))) continue;
         summary.scanned++;
         try {
           const out = await sendInvoiceMessage({ ref: { kind: "invoice_message", orderId: r.order_id, fiscalDocumentId: r.fiscal_document_id, generatedDocumentId: r.generated_document_id }, recipient }, now);

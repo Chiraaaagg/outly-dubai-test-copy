@@ -371,49 +371,49 @@ export async function generatePendingEntries(opts: {
       return { ...summary, skipped: "decoder_unavailable" };
     }
 
-    // `attempts` as before this attempt's claim (the retry/fail arithmetic of `retryOrFail`).
-    const claimed: Pick<GeneratedDocument, "id" | "attempts">[] = [];
-    for (const r of due) {
-      // Re-review N6: a row whose last attempt never returned (killed or hung) is failed, not claimed again.
-      if (r.attempts >= ENTRY_MAX_ATTEMPTS) {
-        if (await failExhausted(r, opts.now)) summary.failed++;
-        continue;
-      }
-      if (await claim(r, opts.now, ["entry_pdf", "cover_page"])) claimed.push({ id: r.id, attempts: r.attempts });
-    }
-    for (const s of fresh) {
-      const id = uuidv7();
-      try {
-        await prisma.generatedDocument.create({
-          data: {
-            id,
-            kind: "entry_pdf",
-            orderId: s.order_id,
-            orderItemId: s.order_item_id,
-            sourceDocumentId: s.id,
-            sourceSha256: s.sha256,
-            version: s.next_version,
-            templateVersion: plainEntryLayout.templateVersion,
-            status: "pending",
-            attempts: 1,
-            lockedUntil: new Date(opts.now.getTime() + CLAIM_MS),
-          },
-        });
-        claimed.push({ id, attempts: 0 });
-      } catch (err) {
-        // A concurrent run claimed this source (or the item has another live entry file): leave it.
-        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") continue;
-        throw err;
-      }
-    }
-    // Claims not started give their attempts back (deadline, or a reader that is down).
-    const release = async (rows: readonly Pick<GeneratedDocument, "id" | "attempts">[]) => {
-      for (const left of rows) await prisma.generatedDocument.updateMany({ where: { id: left.id, status: "pending" }, data: { attempts: left.attempts, lockedUntil: null } });
-    };
-    for (const [i, row] of claimed.entries()) {
-      if (opts.deadline !== undefined && Date.now() + ENTRY_UNIT_MS > opts.deadline) {
-        await release(claimed.slice(i));
-        break;
+    // Fix round 3 (re-review D1): each row is claimed (a retry) or created (a new source) immediately before its file
+    // is processed, never all at the start. A file that hangs or gets the function killed then holds only its own
+    // claim; the files behind it were never touched and come up again untouched. `attempts` below is the count before
+    // this attempt's claim (the retry/fail arithmetic of `retryOrFail`).
+    const work: ({ kind: "due"; r: (typeof due)[number] } | { kind: "fresh"; s: (typeof fresh)[number] })[] = [
+      ...due.map((r) => ({ kind: "due" as const, r })),
+      ...fresh.map((x) => ({ kind: "fresh" as const, s: x })),
+    ];
+    for (const w of work) {
+      if (opts.deadline !== undefined && Date.now() + ENTRY_UNIT_MS > opts.deadline) break;
+      let row: Pick<GeneratedDocument, "id" | "attempts">;
+      if (w.kind === "due") {
+        // Re-review N6: a row whose last attempt never returned (killed or hung) is failed, not claimed again.
+        if (w.r.attempts >= ENTRY_MAX_ATTEMPTS) {
+          if (await failExhausted(w.r, opts.now)) summary.failed++;
+          continue;
+        }
+        if (!(await claim(w.r, opts.now, ["entry_pdf", "cover_page"]))) continue;
+        row = { id: w.r.id, attempts: w.r.attempts };
+      } else {
+        const id = uuidv7();
+        try {
+          await prisma.generatedDocument.create({
+            data: {
+              id,
+              kind: "entry_pdf",
+              orderId: w.s.order_id,
+              orderItemId: w.s.order_item_id,
+              sourceDocumentId: w.s.id,
+              sourceSha256: w.s.sha256,
+              version: w.s.next_version,
+              templateVersion: plainEntryLayout.templateVersion,
+              status: "pending",
+              attempts: 1,
+              lockedUntil: new Date(opts.now.getTime() + CLAIM_MS),
+            },
+          });
+        } catch (err) {
+          // A concurrent run claimed this source (or the item has another live entry file): leave it.
+          if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") continue;
+          throw err;
+        }
+        row = { id, attempts: 0 };
       }
       try {
         await generateEntryFor(row, opts.store, opts.now, opts.decoder ?? createZxingDecoder, summary);
@@ -424,9 +424,8 @@ export async function generatePendingEntries(opts: {
             (await retryOrFail(row, `${ENTRY_FAULT_PREFIX}decoder`, opts.now, ENTRY_MAX_ATTEMPTS)) === "failed" ? summary.failed++ : summary.retried++;
             continue;
           }
-          // The reader is down: not this file's fault. Give every attempt of this run back and stop.
+          // The reader is down: not this file's fault. Give its attempt back and stop (nothing else is claimed).
           await prisma.generatedDocument.updateMany({ where: { id: row.id, status: "pending" }, data: { attempts: row.attempts, lockedUntil: null, nextAttemptAt: new Date(opts.now.getTime() + 5 * 60_000), reasonCode: "decoder_unavailable" } });
-          await release(claimed.slice(i + 1));
           emitEvent("document.generated_decoder_unavailable", { reason: err.reason }, "error");
           summary.retried++;
           break;
