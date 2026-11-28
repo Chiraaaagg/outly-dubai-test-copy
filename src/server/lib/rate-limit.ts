@@ -105,6 +105,23 @@ export async function readRateLimitSpan(opts: { key: string; windowStart: Date }
 }
 
 /**
+ * True when a span counter of this key started after `since` (a sliding
+ * check: one row per marked event, `windowStart` = the event's time, written
+ * with `rateLimitSpan`). Group B review 109 N3: the pilot refusal answers
+ * Supabase's own 60-second per-address limit the same way a real send does.
+ * `"unavailable"` when the store cannot be read: the caller fails closed.
+ */
+export async function spanStartedSince(opts: { key: string; since: Date }): Promise<boolean | "unavailable"> {
+  try {
+    const row = await prisma.rateLimitBucket.findFirst({ where: { key: opts.key, windowStart: { gt: opts.since } }, select: { count: true } });
+    return Boolean(row);
+  } catch (error) {
+    log.error("rate_limit.unavailable", { error, scope: opts.key.split(":")[0] });
+    return "unavailable";
+  }
+}
+
+/**
  * Gives back one unit charged by `rateLimit` at `chargedAt` for work that did
  * not happen (Group B re-review 103b N1: a sign-in code whose Supabase `/otp`
  * failed was not sent, so it does not spend the site-wide code budget). Never

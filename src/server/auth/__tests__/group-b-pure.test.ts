@@ -323,13 +323,15 @@ describe("which failed /otp gives the site-wide code charges back (re-review 103
 });
 
 describe("/login description names only the options the page shows", () => {
-  it("Google and the email code only when on; neutral words otherwise", () => {
-    expect(loginDescription({ google: true, emailCode: true })).toBe("Sign in to see your OUTLYY bookings: Google or a one-time code by email. No password needed.");
-    expect(loginDescription({ google: true, emailCode: false })).not.toMatch(/email/i);
-    expect(loginDescription({ google: false, emailCode: true })).not.toMatch(/google/i);
-    const neutral = loginDescription({ google: false, emailCode: false });
-    expect(neutral).not.toMatch(/google|email/i);
-    expect(neutral).toMatch(/one-time code/);
+  it("Google and the email code only when on; neutral words otherwise; no promise when nothing is on (review 109 N9)", () => {
+    expect(loginDescription({ google: true, emailCode: true, phone: false })).toBe("Sign in to see your OUTLYY bookings: Google or a one-time code by email. No password needed.");
+    expect(loginDescription({ google: true, emailCode: false, phone: false })).not.toMatch(/email/i);
+    expect(loginDescription({ google: false, emailCode: true, phone: false })).not.toMatch(/google/i);
+    const phoneOnly = loginDescription({ google: false, emailCode: false, phone: true });
+    expect(phoneOnly).not.toMatch(/google|email/i);
+    expect(phoneOnly).toMatch(/one-time code/);
+    const none = loginDescription({ google: false, emailCode: false, phone: false });
+    expect(none).not.toMatch(/google|email|code|sign in/i);
   });
 });
 

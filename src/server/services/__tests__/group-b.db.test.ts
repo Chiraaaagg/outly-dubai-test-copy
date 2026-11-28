@@ -539,6 +539,10 @@ describe.skipIf(!dbEnabled)("Group B: customer sign-in on Supabase Auth (disposa
       await prisma.rateLimitBucket.deleteMany({ where: bucket });
       const errors = vi.spyOn(log, "error");
       svc.setIdentityClockForTests(() => at);
+      // Review 109 N2: Supabase reports our hook's refusal as a plain 500, as hosted may; the charge is still given back.
+      const refusal = fake.beforeUserCreatedRefusal;
+      fake.beforeUserCreatedRefusal = { status: 500, body: { code: 500, error_code: "unexpected_failure", msg: "x" } };
+      const dayBucket = { key: "auth_email_start:global_day", windowStart: day };
       // Supabase drops our `/otp` `data`: the hook is handed a new user without the claim.
       svc.setIdentityDepsForTests({ client: { ...supabaseAuthClient, sendEmailOtp: (address: string) => supabaseAuthClient.sendEmailOtp(address) } });
       try {
@@ -550,6 +554,8 @@ describe.skipIf(!dbEnabled)("Group B: customer sign-in on Supabase Auth (disposa
         expect([...fake.users.values()].some((u) => u.email === address)).toBe(false);
         const intent = await prisma.customerAuthIntent.findFirstOrThrow({ where: { contactHash: sha(address) }, orderBy: { createdAt: "desc" } });
         expect(await markerCount(intent.id)).toBe(1);
+        // Nothing was sent: our own marker gives the site-wide budget back although the code is a plain 500 (N2).
+        expect((await prisma.rateLimitBucket.findUnique({ where: { key_windowStart: dayBucket } }))?.count ?? 0).toBe(0);
         expect(errors).toHaveBeenCalledWith("customer.identity_signup_claim_missing", expect.anything());
         const incidents = await signupClaimIncidents(at);
         expect(incidents.map((i) => [i.kind, i.entityKind, i.entityId, i.reason, i.raisedAt.toISOString()])).toEqual([
@@ -560,6 +566,7 @@ describe.skipIf(!dbEnabled)("Group B: customer sign-in on Supabase Auth (disposa
         expect((await prisma.rateLimitBucket.findUniqueOrThrow({ where: { key_windowStart: bucket } })).count).toBe(2);
         expect(await signupClaimIncidents(at)).toHaveLength(1);
       } finally {
+        fake.beforeUserCreatedRefusal = refusal;
         errors.mockRestore();
         svc.setIdentityDepsForTests(null);
         svc.setIdentityClockForTests(null);
@@ -1071,6 +1078,21 @@ describe.skipIf(!dbEnabled)("Group B: customer sign-in on Supabase Auth (disposa
         expect(await ok.json()).toEqual(refusedBody);
         expect(fake.codes.get(owner().toLowerCase())).toBeTruthy();
         expect(await dayCount()).toBe(1);
+
+        // Review 109 N3: a second start inside 60 seconds answers alike. The listed address meets Supabase's own
+        // per-address limit (forced here: the fake has none); the outside address meets ours.
+        fake.failNext("/otp", 429, { code: 429, error_code: "over_email_send_rate_limit", msg: "x" });
+        const ownerAgain = await startCode(owner());
+        const strangerAgain = await startCode(stranger);
+        expect(ownerAgain.status).toBe(429);
+        expect(strangerAgain.status).toBe(429);
+        const shape = (b: { error: { code: string; message: string; details: unknown } }) => ({ code: b.error.code, message: b.error.message, details: b.error.details });
+        expect(shape(await strangerAgain.json())).toEqual(shape(await ownerAgain.json()));
+        expect(await dayCount()).toBe(1);
+        // Sixty seconds on, the outside address gets the "sent" answer again.
+        const later = new Date(at.getTime() + 61_000);
+        svc.setIdentityClockForTests(() => later);
+        expect((await startCode(stranger)).status).toBe(200);
       } finally {
         svc.setIdentityClockForTests(null);
       }
@@ -1093,7 +1115,8 @@ describe.skipIf(!dbEnabled)("Group B: customer sign-in on Supabase Auth (disposa
       google.nextIdToken = await google.sign({ sub: `g-${run}-stranger`, email: stranger, email_verified: true, nonce: a.loc.searchParams.get("nonce") });
       const tokenCalls = fake.requests.filter((x) => x.path.startsWith("/token")).length;
       const refused = await callback(a);
-      expect(refused.headers.get("location")).toMatch(/\/login\?e=not_configured$/);
+      // A failed round trip keeps `pilot=1` while the pilot is set (review 109 N5).
+      expect(refused.headers.get("location")).toMatch(/\/login\?e=not_configured&pilot=1$/);
       expect(refused.headers.get("set-cookie") ?? "").not.toMatch(/outlyy_customer_session=[^;]/);
       // Refused before Supabase was asked to sign the Google user in, and before our tail: nothing created or linked.
       expect(fake.requests.filter((x) => x.path.startsWith("/token")).length).toBe(tokenCalls);
@@ -1104,6 +1127,21 @@ describe.skipIf(!dbEnabled)("Group B: customer sign-in on Supabase Auth (disposa
       const ok = await callback(b);
       expect(new URL(ok.headers.get("location")!).pathname).toBe("/account/bookings");
       expect(ok.headers.get("set-cookie")).toMatch(/outlyy_customer_session=/);
+      const cancelled = await r.gCallback.GET(apiRequest("/api/auth/google/callback?error=access_denied", { origin: null }), CTX);
+      expect(cancelled.headers.get("location")).toMatch(/\/login\?e=google_cancelled&pilot=1$/);
+    });
+
+    it("Before User Created refuses every address outside the list, Google included (review 109 N4)", async () => {
+      const googleUser = (address: string) => ({ user: { email: address, app_metadata: { provider: "google" } } });
+      expect((await signedHook("before-user-created", googleUser(exampleEmail("pilot-hook-stranger")), BEFORE_SECRET)).status).toBe(403);
+      expect((await signedHook("before-user-created", googleUser(owner().toUpperCase()), BEFORE_SECRET)).status).toBe(200);
+      // An email creation outside the list is refused even with a live intent and its own claim.
+      const { customerIdentityRepo } = await import("../../repositories/customer-identity.repo");
+      const { signupClaimFor } = await import("../customer-identity.service");
+      const outside = exampleEmail("pilot-hook-email");
+      const intentId = await customerIdentityRepo.createIntent({ channel: "email", contactHash: sha(outside), now: new Date(), ttlMs: 120_000 });
+      const claimed = { user: { email: outside, app_metadata: { provider: "email" }, user_metadata: { outlyy_signup_claim: signupClaimFor(intentId) } } };
+      expect((await signedHook("before-user-created", claimed, BEFORE_SECRET)).status).toBe(403);
     });
   });
 

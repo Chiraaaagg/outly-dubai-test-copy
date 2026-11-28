@@ -6,7 +6,7 @@ import { AppError, isAppError } from "../lib/errors";
 import { uuidv7 } from "../lib/ids";
 import { emitEvent } from "../lib/structured-events";
 import { encryptFor, hashIp, randomToken, sha256Hex } from "../lib/crypto";
-import { enforceRateLimit, rateLimit, rateLimitSpan, readRateLimitSpan, releaseRateLimit } from "../lib/rate-limit";
+import { enforceRateLimit, rateLimit, rateLimitSpan, readRateLimitSpan, releaseRateLimit, spanStartedSince } from "../lib/rate-limit";
 import { audit } from "../lib/audit";
 import { customerActor, type Actor } from "../lib/actor";
 import { safeNext } from "@/lib/safe-next";
@@ -672,6 +672,16 @@ export const customerIdentityService = {
       // same answer as a sent code, so the answer says nothing about the list. No intent, no Supabase call; the
       // per-address and per-IP charges stay as for any request, the site-wide ones are given back (nothing sent).
       await releaseSiteCharges(charged, now);
+      // Review 109 N3: Supabase refuses a second code for one address within 60 seconds of the last one it sent.
+      // The same limit here, sliding from the last "sent" answer, so a second start inside 60 seconds answers 429
+      // alike for a listed and an outside address (the answer our real path gives for Supabase's 429). Fails closed.
+      // Accepted residual: an outside address answers without the Supabase and Resend round trip (timing).
+      const gapKey = `auth_email_start:pilot_gap:${contactHash.slice(0, 32)}`;
+      const recent = await spanStartedSince({ key: gapKey, since: new Date(now.getTime() - EMAIL_RESEND_AFTER_SECONDS * 1000) });
+      if (recent === "unavailable") throw signInError("UNAVAILABLE");
+      if (recent) throw signInError("RATE_LIMITED", EMAIL_RESEND_AFTER_SECONDS);
+      const mark = await rateLimitSpan({ key: gapKey, limit: 1, windowStart: now, expiresAt: new Date(now.getTime() + EMAIL_RESEND_AFTER_SECONDS * 1000), now });
+      if (mark.storeUnavailable) throw signInError("UNAVAILABLE");
       emitEvent("customer.identity_pilot_refused", { method: "email_otp" }, "warn");
       return answer;
     }
@@ -690,14 +700,18 @@ export const customerIdentityService = {
       }
       // Nothing will use this intent now: retire it so a direct call to Supabase cannot spend it (finding 9).
       await customerIdentityRepo.retireIntent(intentId, new Date()).catch(() => {});
-      // Only when Supabase's answer proves no code went out are the site-wide hourly limit and daily budget given
-      // back (re-review 103b N1, 103c D3); a hook timeout or a 5xx may come after our hook sent the code. The
-      // per-address and per-IP charges always stay, so failing requests still cannot be repeated without bound.
-      if (otpSentNothing(err)) await releaseSiteCharges(charged, now);
-      emitEvent("customer.identity_email_start_failed", { reason: err instanceof SupabaseAuthError ? err.kind : "error" }, "warn");
       // Re-review 103c D1: did our Before User Created hook refuse this very start for a missing signup claim? Then
-      // Supabase did not pass our `/otp` `data` on, and every new address is refused: tell staff, loudly.
-      if ((await readRateLimitSpan({ key: claimMissingMarkerKey(intentId), windowStart: CLAIM_MISSING_MARKER_START })) > 0) {
+      // Supabase did not pass our `/otp` `data` on, and every new address is refused.
+      const claimMissing = (await readRateLimitSpan({ key: claimMissingMarkerKey(intentId), windowStart: CLAIM_MISSING_MARKER_START })) > 0;
+      // Only when no code went out are the site-wide hourly limit and daily budget given back (re-review 103b N1,
+      // 103c D3): Supabase's answer proves it (`otpSentNothing`), or our own hook refused this start's creation
+      // (review 109 N2: hosted Supabase may report a hook refusal as a plain 500, which the code alone cannot tell
+      // from a 5xx after a send; our marker can). A hook timeout or another 5xx may come after our hook sent the
+      // code: the charge stays. The per-address and per-IP charges always stay.
+      if (otpSentNothing(err) || claimMissing) await releaseSiteCharges(charged, now);
+      emitEvent("customer.identity_email_start_failed", { reason: err instanceof SupabaseAuthError ? err.kind : "error" }, "warn");
+      // Tell staff, loudly (D1).
+      if (claimMissing) {
         emitEvent("customer.identity_signup_claim_missing", {}, "error");
         await rateLimit({ key: SIGNUP_CLAIM_MISSING_BUCKET, limit: SIGNUP_CLAIM_MISSING_COUNT_LIMIT, windowSeconds: SIGNUP_CLAIM_MISSING_WINDOW_SECONDS, now });
       }
@@ -859,10 +873,19 @@ export const customerIdentityService = {
    * CUSTOMER_SIGNUP_CLAIM_RELAXED on, the claim is not compared, but a live
    * (unconsumed) intent of ours from the last two minutes is still required
    * and its single creation is still spent.
+   *
+   * During the owner-only pilot (CUSTOMER_AUTH_PILOT_EMAILS) any address
+   * outside the list is refused first, for every provider (review 109 N4).
    */
   async handleBeforeUserCreatedHook(payload: BeforeUserCreatedPayload): Promise<"allow" | "reject"> {
-    if (payload.provider === "google" && payload.email) return "allow";
     const provider = payload.provider ?? "none";
+    // Owner-only pilot (review 109 N4): while the list is set, Supabase creates no user for an address outside it,
+    // whatever the provider: Google through a direct `id_token` sign-in included, not only through our routes.
+    if (!pilotAllowsEmail(payload.email)) {
+      emitEvent("customer.identity_hook_refused", { hook: "before_user_created", reason: "pilot", provider }, "warn");
+      return "reject";
+    }
+    if (payload.provider === "google" && payload.email) return "allow";
     if (payload.provider === "email" || (!payload.provider && payload.email)) {
       const email = normaliseEmail(payload.email);
       const now = new Date();

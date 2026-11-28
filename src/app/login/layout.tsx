@@ -7,7 +7,7 @@ import type { Metadata } from "next";
  */
 export const metadata: Metadata = {
   title: "Sign in",
-  description: "Sign in to see your OUTLYY bookings with a one-time code. No password needed.",
+  description: "See your OUTLYY bookings in one place, or find a booking by its reference.",
   robots: { index: false, follow: true },
 };
 
