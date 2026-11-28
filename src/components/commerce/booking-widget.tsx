@@ -12,8 +12,8 @@ import { WhatsAppButton } from "./whatsapp";
 import { ConfirmFirstNote, IndicativePriceNote, ResponsePromise } from "./inquiry-ui";
 import { track } from "@/lib/analytics";
 import { ctaFor } from "@/lib/cta";
-import { computeBreakdown, guestOptionSwitch, guestRowsFor, toCartItem, variantById } from "@/lib/pricing";
-import { guestAgesNotice, guestRowAges, paxForAges } from "@/lib/pax-ages";
+import { computeBreakdown, guestOptionSwitch, guestRowsFor, restoreLineGuests, toCartItem, variantById, type LineRestoreReason } from "@/lib/pricing";
+import { guestLimitNotice, guestRowAges, guestRowLimits, paxForAges } from "@/lib/pax-ages";
 import { fetchStartTimes, type StartTimesAnswer } from "@/lib/api/start-times";
 import { dateOnlyStartView } from "@/lib/start-time-retry";
 import { startMark } from "@/lib/perf-mark";
@@ -50,7 +50,9 @@ import { EMPTY_PAX, TICKET_NON_REFUNDABLE_STATEMENT, cancellationPolicyBeforeQuo
  * the offer: no Seniors row without a senior price (owner decision 5).
  * `retimeItemId` (from checkout's "Choose another time") restores that cart
  * line, says its time is gone and moves focus to the times; the new choice
- * replaces the line.
+ * replaces the line. With `restoreReason` "guests" (checkout's "Change
+ * guests", guest picker fix D1) it keeps the line's time instead, drops the
+ * guests its option cannot book, says so and moves focus to the guests.
  */
 export function BookingWidget({
   activity,
@@ -58,6 +60,7 @@ export function BookingWidget({
   compact,
   initialDate,
   retimeItemId,
+  restoreReason = "time",
 }: {
   activity: Activity;
   className?: string;
@@ -65,6 +68,8 @@ export function BookingWidget({
   initialDate?: string;
   /** A cart line whose start time the quote refused (`retimeHrefFor`, src/lib/start-time-retry.ts). */
   retimeItemId?: string;
+  /** Why that line was sent back (`parseRestoreReason`): its start time, or its guests (`guestsHrefFor`). */
+  restoreReason?: LineRestoreReason;
 }) {
   const router = useRouter();
   const { currency, addToCart, removeFromCart, cart, toast } = useApp();
@@ -86,6 +91,8 @@ export function BookingWidget({
   const [timeNotice, setTimeNotice] = useState<string | null>(null);
   const timesRef = useRef<HTMLDivElement>(null);
   const [focusTimes, setFocusTimes] = useState(false);
+  const guestsRef = useRef<HTMLDivElement>(null);
+  const [focusGuests, setFocusGuests] = useState(false);
   const timesUid = useId();
   const timeLabelId = `${timesUid}-label`;
   const timeNoticeId = `${timesUid}-notice`;
@@ -105,21 +112,31 @@ export function BookingWidget({
       setAgesVariant(retimeItem.variantId);
     }
     // Guest picker fix: a line saved before its option's closed rows were enforced may hold children or infants the
-    // option cannot book. Those are dropped here and said in words, never silently.
-    const restoredVariant = variantById(activity, retimeItem.variantId ?? variantId);
-    setPax(paxForAges(retimeItem.pax, guestRowAges(restoredVariant)));
-    setAgeNotice(guestAgesNotice(restoredVariant, restoredVariant, retimeItem.pax));
+    // option cannot book. Those are dropped here and said in words, never silently (`restoreLineGuests`).
+    const restoredGuests = restoreLineGuests(activity, retimeItem, restoreReason, variantId);
+    setPax(restoredGuests.pax);
+    setAgeNotice(restoredGuests.notice);
     setAddOnIds(retimeItem.addOnIds);
-    setTime(undefined);
-    // Neutral: the quote also refuses a start with fewer seats than the party, not only a sold-out one.
-    setTimeNotice(`The ${retimeItem.time} start can't be booked for your group on ${formatDateKey(retimeItem.date)}. Choose another time.`);
-    setFocusTimes(true);
+    if (restoreReason === "guests") {
+      // Sent back for its guests (D1): the time was not refused, so it is kept.
+      setTime(retimeItem.time);
+      setTimeNotice(null);
+    } else {
+      setTime(undefined);
+      // Neutral: the quote also refuses a start with fewer seats than the party, not only a sold-out one.
+      setTimeNotice(`The ${retimeItem.time} start can't be booked for your group on ${formatDateKey(retimeItem.date)}. Choose another time.`);
+    }
+    // D6: with a guest notice to read, focus goes to the guests, not past them to the times.
+    if (restoredGuests.focus === "guests") setFocusGuests(true);
+    else setFocusTimes(true);
   }
 
   // Guest rows follow the offer (owner decision 5): no Seniors row without a senior price.
   const guestRows = guestRowsFor(activity, variantId);
-  // Ages follow the selected option (doc 30 N4, D22): its own child and infant ages, else the page's.
-  const guestAges = guestRowAges(variantById(activity, variantId));
+  // Ages follow the selected option (doc 30 N4, D22): its own child and infant ages, else the page's. On an instant
+  // listing its typed units decide which rows it books and how many (guest picker fix; inquiry keeps its rows, D2).
+  const guestAges = guestRowAges(variantById(activity, variantId), activity.fulfilmentMode);
+  const guestLimits = guestRowLimits(variantById(activity, variantId), activity.fulfilmentMode);
   // Review 102 N4-02, N4-06: switching option says when the ages behind a count already set change, or a row closes;
   // a closed row's count is dropped from the party itself, so switching back never brings it back unseen.
   const sw = guestOptionSwitch(activity, agesVariant, variantId, pax);
@@ -129,6 +146,9 @@ export function BookingWidget({
     if (sw.pax !== pax) setPax(sw.pax);
   }
   const shownPax: PaxCount = paxForAges(guestRows.includes("senior") || pax.senior === 0 ? pax : { ...pax, senior: 0 }, guestAges);
+  // D3: more guests of a type than the option's unit takes (after an option switch or a restored line); the quote would refuse it.
+  const limitNotice = guestLimitNotice(shownPax, guestLimits);
+  const guestNotice = [ageNotice, limitNotice].filter(Boolean).join(" ") || null;
 
   // Listed start times for the date (Batch 2). Inquiry products never ask: their times are preferences.
   const readKey = !inquiryMode && activity.productId && variantId ? `${activity.productId}|${variantId}|${date}` : null;
@@ -150,7 +170,8 @@ export function BookingWidget({
         status: dateOnlyAnswer.status,
         pickup: activity.pickupIncluded,
         date,
-        retime: retimeItem ? { date: retimeItem.date, time: retimeItem.time } : null,
+        // Only a line sent back for its time had that start refused.
+        retime: retimeItem && restoreReason === "time" ? { date: retimeItem.date, time: retimeItem.time } : null,
       })
     : null;
   const dateOnlyStart = dateOnlyAnswer && dateOnlyView && !dateOnlyView.blocked ? (dateOnlyAnswer.startsAt ?? undefined) : undefined;
@@ -194,6 +215,17 @@ export function BookingWidget({
     setFocusTimes(false);
   }, [focusTimes, startTimes.status]);
 
+  useEffect(() => {
+    // The guests to change, or a notice about them (D1, D6): onto the guest group, which reads its label and notice.
+    if (!focusGuests) return;
+    const el = guestsRef.current;
+    if (el) {
+      el.scrollIntoView({ block: "center" });
+      el.focus({ preventScroll: true });
+    }
+    setFocusGuests(false);
+  }, [focusGuests]);
+
   const breakdown = computeBreakdown(activity, shownPax, variantId, addOnIds);
   const variant = variantById(activity, variantId);
 
@@ -208,6 +240,11 @@ export function BookingWidget({
     if (!chosenTime && (pickerTimes || pickerLoading || (retimeItem && !dateOnlyAnswer))) {
       setTimeNotice("Choose a start time first.");
       setFocusTimes(true);
+      return;
+    }
+    // More guests of a type than the option takes: the notice says so above the rows; lower the number first.
+    if (limitNotice) {
+      setFocusGuests(true);
       return;
     }
     setSubmitting(true);
@@ -507,7 +544,9 @@ export function BookingWidget({
             }}
             rows={guestRows}
             ages={guestAges}
-            notice={ageNotice}
+            limits={guestLimits}
+            notice={guestNotice}
+            focusRef={guestsRef}
           />
         </div>
 

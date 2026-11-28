@@ -57,7 +57,7 @@ import {
 import { fetchOrderStatus } from "@/lib/api/order-status";
 import { resumePayment } from "@/lib/resume-payment";
 import { inquiryHref, inquiryReasonForQuote, inquiryReasonText, type InquiryReason } from "@/lib/inquiry-handoff";
-import { retimeHrefFor, reviewTime } from "@/lib/start-time-retry";
+import { guestsHrefFor, retimeHrefFor, reviewTime } from "@/lib/start-time-retry";
 import { PickupHotelFields, usePickupHotelLists } from "@/components/checkout/pickup-hotel-fields";
 import {
   CART_HOTEL_FIELD,
@@ -325,6 +325,8 @@ export default function CheckoutPage() {
   const [inquiryReason, setInquiryReason] = useState<InquiryReason | null>(null);
   /** Doc 29 Batch 2: when only a line's start time was refused, the way back to choose another (`retimeHrefFor`). */
   const [retimeHref, setRetimeHref] = useState<string | null>(null);
+  /** Guest picker fix (D1): when only a line's guests were refused, the way back to change them (`guestsHrefFor`). */
+  const [guestsHref, setGuestsHref] = useState<string | null>(null);
   // Back from Stripe (CO-06): the order this tab handed over for this cart. `moved_on`: it has a payment or has ended.
   const [leftPayment, setLeftPayment] = useState<{ reference: string; state: LeftPaymentState | "moved_on" } | null>(null);
   const leftPaymentRef = useRef<HTMLDivElement>(null);
@@ -502,6 +504,7 @@ export default function CheckoutPage() {
     const lines = quoteLinesFor(cart, activities);
     if (!lines) {
       setRetimeHref(null);
+      setGuestsHref(null);
       setInquiryReason("unavailable");
       return null;
     }
@@ -518,6 +521,7 @@ export default function CheckoutPage() {
         // Nothing is charged and the cart is kept; the page says why and offers the inquiry (CO-07),
         // or, when only a start time was refused, another time first (Batch 2).
         setRetimeHref(retimeHrefFor(r.lines, cart, activities));
+        setGuestsHref(guestsHrefFor(r.lines, cart));
         setInquiryReason(inquiryReasonForQuote(r.lines.map((l) => l.reason)));
         refusedPickup.current = refusedPickupHotels(r.lines, cart, pickupItems).byList;
         setQuoteState("idle");
@@ -525,6 +529,7 @@ export default function CheckoutPage() {
       }
       setInquiryReason(null);
       setRetimeHref(null);
+      setGuestsHref(null);
       setQuote(r);
       setQuoteState("ready");
       return r;
@@ -694,6 +699,7 @@ export default function CheckoutPage() {
           // Nothing was charged; the cart is kept, and the page says so before offering the inquiry (CO-07).
           setPayment("idle");
           setRetimeHref(null);
+          setGuestsHref(null);
           setInquiryReason("unavailable");
         }
         return;
@@ -704,6 +710,7 @@ export default function CheckoutPage() {
       if (!payPage) {
         setPayment("idle");
         setRetimeHref(null);
+        setGuestsHref(null);
         setInquiryReason("unavailable");
         return;
       }
@@ -1033,7 +1040,12 @@ export default function CheckoutPage() {
                       Choose another time
                     </ButtonLink>
                   )}
-                  <ButtonLink href={inquiryHref(inquiryReason)} size="sm" variant={retimeHref ? "outline" : undefined}>
+                  {guestsHref && (
+                    <ButtonLink href={guestsHref} size="sm">
+                      Change guests
+                    </ButtonLink>
+                  )}
+                  <ButtonLink href={inquiryHref(inquiryReason)} size="sm" variant={retimeHref || guestsHref ? "outline" : undefined}>
                     Send it to our team
                   </ButtonLink>
                   {/* The operator refused the hotel (doc 29 §3.5 Pickup): back to the hotel choice, focus on it. */}
@@ -1053,6 +1065,7 @@ export default function CheckoutPage() {
                           if (cartHotel?.hotelId && !stillOffered) setCartHotel(null);
                         }
                         setRetimeHref(null);
+                        setGuestsHref(null);
                         setInquiryReason(null);
                         editDetails();
                       }}

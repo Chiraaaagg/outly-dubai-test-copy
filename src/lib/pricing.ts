@@ -58,14 +58,39 @@ export { PAGE_PAX_AGES } from "./pax-ages";
  * sets both together (re-review R1): nothing to announce.
  */
 export function guestOptionSwitch(
-  activity: Pick<PricedActivity, "variants">,
+  activity: Pick<PricedActivity, "variants" | "fulfilmentMode">,
   fromVariantId: string | undefined,
   toVariantId: string | undefined,
   pax: PaxCount,
 ): { notice: string | null; pax: PaxCount } | null {
   if (fromVariantId === toVariantId) return null;
   const to = variantById(activity, toVariantId);
-  return { notice: guestAgesNotice(variantById(activity, fromVariantId), to, pax), pax: paxForAges(pax, guestRowAges(to)) };
+  const mode = activity.fulfilmentMode;
+  return { notice: guestAgesNotice(variantById(activity, fromVariantId), to, pax, mode), pax: paxForAges(pax, guestRowAges(to, mode)) };
+}
+
+/** Why checkout sent a cart line back to its activity page: its start time (doc 29 Batch 2) or its guests (guest picker fix, D1). */
+export type LineRestoreReason = "time" | "guests";
+
+/**
+ * The guest picker's step when the booking widget restores a cart line sent
+ * back from checkout (guest picker fix, D1, D6). The line's guests with
+ * every row its option cannot book dropped, what the guest is told about
+ * the dropped ones (null when none), and where focus goes: the guests when
+ * they were sent back for their guests or a notice is shown, else the start
+ * times. A line restored on its own option is not an option switch, so no
+ * band wording (re-review R1).
+ */
+export function restoreLineGuests(
+  activity: Pick<PricedActivity, "variants" | "fulfilmentMode">,
+  item: Pick<CartItem, "pax" | "variantId">,
+  reason: LineRestoreReason,
+  currentVariantId?: string,
+): { pax: PaxCount; notice: string | null; focus: "guests" | "times" } {
+  const variant = variantById(activity, item.variantId ?? currentVariantId);
+  const mode = activity.fulfilmentMode;
+  const notice = guestAgesNotice(variant, variant, item.pax, mode);
+  return { pax: paxForAges(item.pax, guestRowAges(variant, mode)), notice, focus: reason === "guests" || notice ? "guests" : "times" };
 }
 
 /** The guest rows the picker can show, in display order. */
@@ -186,7 +211,7 @@ export function toCartItem(
 ): CartItem {
   const variant = variantById(activity, opts.variantId);
   // A row the option cannot book never reaches the cart (guest picker fix): the quote would refuse it (`unknown_unit`).
-  const pax = paxForAges(opts.pax, guestRowAges(variant));
+  const pax = paxForAges(opts.pax, guestRowAges(variant, activity.fulfilmentMode));
   const breakdown = computeBreakdown(activity, pax, opts.variantId, opts.addOnIds ?? []);
   return {
     id: `${activity.slug}-${opts.date}-${opts.time}-${variant?.id ?? "std"}`,

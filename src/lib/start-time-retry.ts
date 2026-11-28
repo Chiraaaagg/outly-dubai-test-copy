@@ -1,3 +1,4 @@
+import type { LineRestoreReason } from "./pricing";
 import type { Activity, CartItem } from "./types";
 
 /**
@@ -48,6 +49,36 @@ export function retimeHrefFor(
   if (!activity || (activity.timeSlots.length < 2 && !dateOnlyStart)) return null;
   const q = new URLSearchParams({ date: item.date, retime: item.id });
   return `/activities/${encodeURIComponent(item.slug)}?${q.toString()}#book`;
+}
+
+/**
+ * Refusals the guests can fix on the activity page (guest picker fix, D1): a
+ * guest type the option has no unit for (`unknown_unit`), or a number its
+ * units do not take (`unit_rule_failed`).
+ */
+export const GUEST_REASONS: readonly string[] = ["unknown_unit", "unit_rule_failed"];
+
+/**
+ * The "Change guests" link for a refused quote, or null when changing the
+ * guests cannot fix it: any refused line for another reason, or more than
+ * one refused line. Like "Choose another time" it restores the cart line on
+ * its activity page (`retime`, the line id), marked `change=guests`: the
+ * widget keeps the line's time, drops the guests its option cannot book,
+ * says so and moves focus to the guests. Continuing replaces the line.
+ */
+export function guestsHrefFor(refused: readonly { index: number; reason: string }[], cart: readonly CartItem[]): string | null {
+  if (refused.length === 0 || refused.some((l) => !GUEST_REASONS.includes(l.reason))) return null;
+  const indexes = new Set(refused.map((l) => l.index));
+  if (indexes.size !== 1) return null;
+  const item = cart[[...indexes][0]];
+  if (!item || item.kind !== "activity" || !parseRetimeId(item.id)) return null;
+  const q = new URLSearchParams({ date: item.date, retime: item.id, change: "guests" });
+  return `/activities/${encodeURIComponent(item.slug)}?${q.toString()}#book`;
+}
+
+/** Why a restored line was sent back (`change` in the activity page URL); anything but "guests" is the start time. */
+export function parseRestoreReason(raw: string | null | undefined): LineRestoreReason {
+  return raw === "guests" ? "guests" : "time";
 }
 
 /**
