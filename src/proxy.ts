@@ -1,0 +1,330 @@
+import { NextResponse, type NextRequest } from "next/server";
+import { jwtVerify } from "jose";
+import { CURRENCY_COOKIE, currencyForCountry, isDisplayCurrency } from "@/lib/currency";
+import { isPrivateCustomerPath } from "@/lib/customer-status";
+import { gaMeasurementId } from "@/lib/ga-config";
+
+/**
+ * Request proxy (Next 16 name for middleware) — the edge of the app (§04.2).
+ *
+ *  1. Security headers on EVERY response (§13.8), including the early
+ *     redirects/rewrites below. CSP:
+ *       - /admin/** is force-dynamic, so it gets a per-request nonce with
+ *         'strict-dynamic'. The CSP is also set on the *request* headers —
+ *         that is how Next.js learns the nonce and stamps its own inline
+ *         scripts with it (Next docs → "Content Security Policy → Nonces").
+ *       - The storefront is statically prerendered (x-nextjs-prerender), so a
+ *         nonce can never reach its inline bootstrap scripts; a nonce policy
+ *         there would block hydration on every page. It keeps 'unsafe-inline'
+ *         for scripts (no eval in production). Accepted deviation from §13.8,
+ *         recorded in docs/backend/impl/security.md. The storefront does render
+ *         staff-edited catalogue text from the database, so 'unsafe-inline' is
+ *         not a backstop: every inline sink must encode its data itself (JSON-LD
+ *         goes through serializeJsonLd). Options for removing 'unsafe-inline'
+ *         are in docs/security/csp-storefront-plan.md.
+ *       - Development keeps eval for the toolchain.
+ *  2. /admin/** — cheap gate: redirect to /admin/login without a valid
+ *     session JWT. Real authorisation happens server-side in the admin layout
+ *     and every service call; this only saves a render for logged-out hits.
+ *  3. /design-system blocked in production unless FEATURE_DESIGN_SYSTEM_PAGE (§01 R3).
+ *  4. Maintenance mode flag → /maintenance for the storefront only.
+ *  5. Display currency — resolve the visitor's country from the edge geo
+ *     header and stamp `outlyy_ccy` once. This is the only place geo is read;
+ *     nothing downstream sniffs the browser language or the timezone, both of
+ *     which are wrong for anyone travelling, on a VPN, or using an
+ *     English-US phone in Dubai.
+ *  6. Private customer routes (PRIVATE_CUSTOMER_ROUTE_PREFIXES: /t, /booking,
+ *     /manage-booking, /voucher and their APIs) are never cached, never
+ *     indexed and never leak their URL in a Referer, and their CSP has no
+ *     analytics origins (PRV-4, TKT-5). This applies to API routes as well:
+ *     Next sends a header set here in place of the same header from a route
+ *     handler, so the proxy must agree with the handlers' TICKET_HEADERS.
+ *
+ * No database access here. Nothing PII-bearing is logged.
+ */
+
+const SESSION_COOKIE = "outlyy_admin_session";
+const PENDING_COOKIE = "outlyy_admin_pending";
+
+/**
+ * Google Analytics 4 origins, exactly as Google documents them for a CSP
+ * ("Google Analytics 4 (Google Analytics)" in
+ * https://developers.google.com/tag-platform/security/guides/csp):
+ *
+ *   script-src   https://*.googletagmanager.com
+ *   img-src      https://*.google-analytics.com https://*.googletagmanager.com
+ *   connect-src  https://*.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com
+ *
+ * gtag.js is served from www.googletagmanager.com and sends its hits to
+ * region hosts such as `region1.google-analytics.com` and, for GA4,
+ * `region1.analytics.google.com`. That last family was missing (D4, doc 29
+ * Batch 1c), so collection was blocked by the CSP and failed silently, which
+ * is the hardest kind of analytics bug to notice. Google's extra hosts for
+ * Google Signals and ads features (`*.g.doubleclick.net`, `*.google.com`,
+ * `*.google.<TLD>`) are deliberately NOT added: neither is enabled here,
+ * and they would open far more than collection needs. `img-src` already
+ * allows any https image; the GA hosts are named there too so the policy
+ * stays correct if that is ever narrowed.
+ *
+ * Storefront only, and only when a measurement id is configured
+ * (`gaMeasurementId()`, src/lib/ga-config.ts). Private customer pages and
+ * the admin console never get them: the admin console keeps its nonce +
+ * 'strict-dynamic' policy with nothing added, because no third-party script
+ * belongs on a screen showing customer PII.
+ */
+const GA_SCRIPT_SRC = "https://*.googletagmanager.com";
+const GA_IMG_SRC = "https://*.google-analytics.com https://*.googletagmanager.com";
+const GA_CONNECT_SRC = "https://*.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com";
+
+/**
+ * MSG91 OTP widget origins (src/lib/msg91-widget.ts).
+ *
+ * The provider script is published on two hosts and we fall back from the
+ * first to the second, so both have to be allowed or the fallback is pointless
+ * — a network that blocks one would otherwise hit a CSP wall on the other.
+ * `control.msg91.com` is where the widget posts the code for verification.
+ *
+ * Storefront only, and only when the widget is the configured provider. The
+ * admin console keeps its nonce + 'strict-dynamic' policy untouched, for the
+ * same reason analytics is kept off it: no third-party script belongs on a
+ * screen showing customer PII.
+ */
+/**
+ * hCaptcha, not reCAPTCHA.
+ *
+ * MSG91's documentation calls this "Google re-Captcha" throughout. It is not:
+ * the widget renders an `<h-captcha>` element and loads `js.hcaptcha.com`.
+ * Allowing the Google origins the docs imply leaves the real script blocked,
+ * `isCaptchaVerified()` stuck at false, and every send refused — which is the
+ * failure this constant exists to prevent recurring.
+ *
+ * All four directives are needed. The script is only the first hop: the
+ * challenge lives in an iframe (`frame-src`), hCaptcha injects its own
+ * stylesheet (`style-src`, which otherwise allows no external host), and the
+ * verdict is posted back over XHR (`connect-src`).
+ */
+const HCAPTCHA_SRC = "https://hcaptcha.com https://*.hcaptcha.com";
+const OTP_SCRIPT_SRC = `https://verify.msg91.com https://verify.phone91.com ${HCAPTCHA_SRC}`;
+const OTP_CONNECT_SRC = `https://control.msg91.com https://verify.msg91.com https://verify.phone91.com ${HCAPTCHA_SRC}`;
+const OTP_FRAME_SRC = HCAPTCHA_SRC;
+const OTP_STYLE_SRC = HCAPTCHA_SRC;
+
+/**
+ * Cloudflare Turnstile (Group B; owner Q-B5): the bot check on the email
+ * sign-in. Cloudflare documents exactly two directives for it: the script
+ * (`api.js`) and the challenge iframe, both on challenges.cloudflare.com;
+ * the iframe does its own network calls. `/login` only, and only when the
+ * site key is configured; no other page, and never the admin console.
+ */
+const TURNSTILE_SRC = "https://challenges.cloudflare.com";
+
+/** The Content-Security-Policy value. Pure; exported for tests. */
+export function buildCsp(scriptSrc: string, isProd: boolean, allowAnalytics: boolean, allowOtpWidget: boolean, allowTurnstile = false): string {
+  const frames = [...(allowOtpWidget ? [OTP_FRAME_SRC] : []), ...(allowTurnstile ? [TURNSTILE_SRC] : [])];
+  return [
+    `default-src 'self'`,
+    `script-src ${scriptSrc}${allowAnalytics ? ` ${GA_SCRIPT_SRC}` : ""}${allowOtpWidget ? ` ${OTP_SCRIPT_SRC}` : ""}${allowTurnstile ? ` ${TURNSTILE_SRC}` : ""}`,
+    `style-src 'self' 'unsafe-inline'${allowOtpWidget ? ` ${OTP_STYLE_SRC}` : ""}`,
+    `img-src 'self' data: blob: https:${allowAnalytics ? ` ${GA_IMG_SRC}` : ""}`,
+    `font-src 'self' data:`,
+    `connect-src 'self'${allowAnalytics ? ` ${GA_CONNECT_SRC}` : ""}${allowOtpWidget ? ` ${OTP_CONNECT_SRC}` : ""}${isProd ? "" : " ws: wss:"}`,
+    ...(frames.length ? [`frame-src ${frames.join(" ")}`] : []),
+    `frame-ancestors 'none'`,
+    `base-uri 'self'`,
+    `form-action 'self'`,
+    `object-src 'none'`,
+    `upgrade-insecure-requests`,
+  ].join("; ");
+}
+
+function securityHeaders(csp: string, isProd: boolean): Record<string, string> {
+  const headers: Record<string, string> = {
+    "Content-Security-Policy": csp,
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "X-Frame-Options": "DENY",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+    "Cross-Origin-Opener-Policy": "same-origin",
+  };
+  if (isProd) headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains; preload";
+  return headers;
+}
+
+/**
+ * Country from the platform's edge geo header.
+ *
+ * Vercel sets `x-vercel-ip-country` on every request; Cloudflare sets
+ * `cf-ipcountry`; `x-country` covers a generic proxy in front. All three are
+ * set by infrastructure, not by the client, so they cannot be spoofed by the
+ * browser — unlike Accept-Language or Intl timezone, which the brief rules out
+ * and which this replaces.
+ *
+ * Returns null when no header is present (local development, an unknown
+ * platform, or a request the edge could not locate). The caller then falls
+ * back to DEFAULT_CURRENCY (AED).
+ */
+function geoCountry(req: NextRequest): string | null {
+  const raw =
+    req.headers.get("x-vercel-ip-country") ??
+    req.headers.get("cf-ipcountry") ??
+    req.headers.get("x-country");
+  const code = raw?.trim().toUpperCase();
+  // "XX" and "T1" are the platforms' own "unknown"/Tor placeholders.
+  if (!code || code.length !== 2 || code === "XX" || code === "T1") return null;
+  return code;
+}
+
+function withHeaders<T extends NextResponse>(res: T, headers: Record<string, string>): T {
+  for (const [k, v] of Object.entries(headers)) res.headers.set(k, v);
+  return res;
+}
+
+async function hasValidSession(req: NextRequest): Promise<boolean> {
+  const token = req.cookies.get(SESSION_COOKIE)?.value;
+  const secret = process.env.AUTH_JWT_SECRET;
+  if (!token || !secret) return false;
+  try {
+    // Pin the algorithm to what the signer uses (src/server/lib/session.ts), so
+    // the accepted set never depends on jose's defaults for the key type.
+    await jwtVerify(token, new TextEncoder().encode(secret), {
+      issuer: "outlyy-admin",
+      audience: "session",
+      algorithms: ["HS256"],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Headers for one response, from its path and the deploy's configuration.
+ * Pure (no request, no clock, no env reads), so it is unit-tested directly.
+ */
+export interface EdgePolicyInput {
+  pathname: string;
+  isProd: boolean;
+  nonce: string;
+  /** A GA4 measurement id is configured (`gaMeasurementId()`: NEXT_PUBLIC_GA_MEASUREMENT_ID, or the deprecated NEXT_PUBLIC_GA4_MEASUREMENT_ID). */
+  analyticsConfigured: boolean;
+  /** NEXT_PUBLIC_MSG91_WIDGET_ID is set. */
+  otpWidgetConfigured: boolean;
+  /** NEXT_PUBLIC_TURNSTILE_SITE_KEY is set (Group B). Opens the Turnstile origins on `/login` only. */
+  turnstileConfigured?: boolean;
+}
+
+export interface EdgePolicy {
+  isAdmin: boolean;
+  isPrivateCustomer: boolean;
+  csp: string;
+  headers: Record<string, string>;
+}
+
+export function edgePolicy({ pathname, isProd, nonce, analyticsConfigured, otpWidgetConfigured, turnstileConfigured = false }: EdgePolicyInput): EdgePolicy {
+  const isAdmin = pathname.startsWith("/admin");
+  const isPrivateCustomer = isPrivateCustomerPath(pathname);
+  const scriptSrc = !isProd
+    ? `'self' 'unsafe-inline' 'unsafe-eval'`
+    : isAdmin
+      ? `'self' 'nonce-${nonce}' 'strict-dynamic'`
+      : `'self' 'unsafe-inline'`;
+  // Analytics origins are allowed on the storefront only, and only when a
+  // measurement id is configured — an unconfigured deploy keeps the tighter
+  // policy. Private customer pages never load the tag, so they never allow it.
+  const allowAnalytics = !isAdmin && !isPrivateCustomer && analyticsConfigured;
+  // Same rule for the OTP widget: storefront only, and only when it is actually
+  // the configured sign-in provider. A deploy on the DLT path never opens these
+  // origins at all.
+  const allowOtpWidget = !isAdmin && otpWidgetConfigured;
+  const allowTurnstile = turnstileConfigured && pathname === "/login";
+  const csp = buildCsp(scriptSrc, isProd, allowAnalytics, allowOtpWidget, allowTurnstile);
+  const headers = securityHeaders(csp, isProd);
+  if (isAdmin) {
+    // Admin pages are never indexed or cached — also on the redirects below.
+    headers["X-Robots-Tag"] = "noindex, nofollow";
+    headers["Cache-Control"] = "no-store";
+  }
+  if (isPrivateCustomer) {
+    // One customer's order: not stored by any cache, not indexed, and the URL
+    // (a reference, or the /t landing) is not sent on to the next site.
+    headers["Cache-Control"] = "private, no-store";
+    headers["Referrer-Policy"] = "no-referrer";
+    headers["X-Robots-Tag"] = "noindex, nofollow";
+  }
+  return { isAdmin, isPrivateCustomer, csp, headers };
+}
+
+export async function proxy(req: NextRequest) {
+  const { pathname } = req.nextUrl;
+  const isProd = process.env.APP_ENV === "production" || process.env.NODE_ENV === "production";
+  const nonce = btoa(crypto.randomUUID());
+  const { isAdmin, csp, headers } = edgePolicy({
+    pathname,
+    isProd,
+    nonce,
+    analyticsConfigured: Boolean(gaMeasurementId()),
+    otpWidgetConfigured: Boolean(process.env.NEXT_PUBLIC_MSG91_WIDGET_ID),
+    turnstileConfigured: Boolean(process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY),
+  });
+
+  // 3. Debug surfaces never ship to production by omission.
+  if (pathname.startsWith("/design-system") && process.env.APP_ENV === "production" && process.env.FEATURE_DESIGN_SYSTEM_PAGE !== "true") {
+    return withHeaders(NextResponse.rewrite(new URL("/not-found", req.url), { status: 404 }), headers);
+  }
+
+  // 4. Maintenance mode — storefront only; admin and API stay reachable.
+  if (
+    process.env.FEATURE_MAINTENANCE_MODE === "true" &&
+    !isAdmin &&
+    !pathname.startsWith("/api") &&
+    !pathname.startsWith("/maintenance") &&
+    !pathname.startsWith("/_next")
+  ) {
+    return withHeaders(NextResponse.rewrite(new URL("/maintenance", req.url), { status: 503 }), headers);
+  }
+
+  // 2. Admin gate.
+  if (isAdmin) {
+    const isAuthRoute = pathname === "/admin/login" || pathname === "/admin/verify" || pathname === "/admin/enrol";
+    const ok = await hasValidSession(req);
+    if (!ok && !isAuthRoute) {
+      const hasPending = Boolean(req.cookies.get(PENDING_COOKIE)?.value);
+      const url = new URL(hasPending ? "/admin/verify" : "/admin/login", req.url);
+      if (!hasPending) url.searchParams.set("next", pathname);
+      return withHeaders(NextResponse.redirect(url), headers);
+    }
+    if (ok && pathname === "/admin/login") {
+      return withHeaders(NextResponse.redirect(new URL("/admin", req.url)), headers);
+    }
+  }
+
+  const requestHeaders = new Headers(req.headers);
+  requestHeaders.set("x-nonce", nonce);
+  if (isAdmin) requestHeaders.set("Content-Security-Policy", csp);
+
+  // 5. Display currency. Written once and then left alone, so a visitor who
+  // picks a currency by hand keeps it — including an Indian traveller sitting
+  // in a Dubai hotel. Dynamic pages read it through cookies(); static pages
+  // read it in the pre-paint script (see CURRENCY_BOOTSTRAP_SCRIPT).
+  const existing = req.cookies.get(CURRENCY_COOKIE)?.value;
+  // Pages only: API responses (private documents among them) never set this cookie.
+  const currency = isDisplayCurrency(existing) || pathname.startsWith("/api") ? null : currencyForCountry(geoCountry(req));
+  if (currency) requestHeaders.set("x-outlyy-currency", currency);
+
+  const res = NextResponse.next({ request: { headers: requestHeaders } });
+  if (currency) {
+    res.cookies.set(CURRENCY_COOKIE, currency, {
+      path: "/",
+      maxAge: 365 * 24 * 60 * 60,
+      sameSite: "lax",
+      httpOnly: false, // the pre-paint script and the switcher both read it
+      secure: isProd,
+    });
+  }
+  return withHeaders(res, headers);
+}
+
+export const config = {
+  // Everything except static assets. API routes get headers too.
+  matcher: ["/((?!_next/static|_next/image|favicon.ico|icon.svg|robots.txt|sitemap.xml|manifest.webmanifest).*)"],
+};
