@@ -394,6 +394,95 @@ test.describe("/checkout with several instant items", () => {
     await expect(page.locator("#phone")).toHaveValue("9000000017");
   });
 
+  test.describe("back to a filled /checkout after a paid return (review 116 D3, 116b N5)", () => {
+    const PAID_REF = "OUT-123455";
+    const paidStatus = (route: Route) =>
+      json(route, 200, {
+        reference: PAID_REF,
+        state: "confirmed",
+        tone: "success",
+        headline: "Your synthetic activity is booked.",
+        nextStep: "Your voucher is ready.",
+        rail: "self_serve",
+        currency: "AED",
+        totalMinor: "44000",
+        placedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        steps: {
+          payment: { status: "done", label: "Payment received", at: null },
+          booking: { status: "done", label: "Booked with the operator", at: null },
+          tickets: { status: "done", label: "Voucher ready", at: null },
+          refund: null,
+        },
+        deadlines: { refundUntilUtc: null, remedyAtUtc: null, remedyKind: null },
+        items: [],
+        pollAfterMs: null,
+      });
+
+    /**
+     * What the status page leaves once it has the payment (CO-19): the hand-off and hint spent and, when the cart was
+     * the paid one, the cart emptied and the "recently paid" marker kept. Then Back restores /checkout from the
+     * back-forward cache (simulated: headless Chromium may not cache under automation).
+     */
+    async function paidElsewhereThenRestore(page: Page, cartPaid: boolean): Promise<void> {
+      await page.evaluate(
+        ([cartKey, ref, paid]) => {
+          sessionStorage.removeItem("outlyy.paymentHandoff");
+          sessionStorage.removeItem("outlyy.orderRef");
+          if (paid) {
+            localStorage.setItem(cartKey, "[]");
+            sessionStorage.setItem("outlyy.recentlyPaid", JSON.stringify({ reference: ref, paidAt: Date.now() }));
+          }
+          window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+        },
+        [CART_KEY, PAID_REF, cartPaid] as const,
+      );
+    }
+
+    test("a filled /checkout restored after its cart was paid shows the booking, not the stale cart", async ({ page }) => {
+      await routeCatalog(page, 1);
+      await page.route("**/api/orders/*/status", paidStatus);
+      await plantCart(page, instantCart(1));
+      await page.goto("/checkout");
+      await expect(page.getByRole("heading", { level: 1, name: "Your details" })).toBeVisible();
+      await page.waitForLoadState("networkidle");
+
+      await paidElsewhereThenRestore(page, true);
+      await expect(page.getByRole("heading", { level: 1, name: `Your booking ${PAID_REF} is confirmed` })).toBeVisible();
+      await expect(page.getByRole("heading", { level: 1, name: "Your details" })).toHaveCount(0);
+      await expect(page.getByRole("heading", { level: 1 })).toHaveCount(1);
+      await expect(page.getByRole("link", { name: "View booking" })).toHaveAttribute("href", `/booking/${PAID_REF}`);
+    });
+
+    test("restored while still opening the payment page: idle again with no hand-off left, then the booking once the cart is paid", async ({ page }) => {
+      test.skip(!DEV, "Needs the fake gateway's hosted page, which only development builds open.");
+      await routeCatalog(page, 1);
+      await routePaymentSide(page);
+      // The hosted page answers 204, so the browser stays on /checkout, frozen in "opening the payment page", as Back restores it.
+      await page.route(`${HOSTED}/**`, (route) => route.fulfill({ status: 204, body: "" }));
+      await page.route("**/api/orders/*/status", paidStatus);
+      await plantCart(page, instantCart(1));
+      await page.goto("/checkout");
+      expect(await toPaymentStep(page)).toBe("payment");
+      await page.getByRole("checkbox", { name: /cancellation policy/ }).check();
+      await payButton(page).click();
+      await page.getByLabel("6-digit code").fill("123456");
+      const opening = page.getByText("Re-checking availability with the operator before charging you.");
+      await expect(opening).toBeVisible();
+      await expect.poll(() => page.evaluate(() => sessionStorage.getItem("outlyy.paymentHandoff"))).not.toBeNull();
+
+      // The cart still holds its line but the hand-off is spent: nothing is being opened any more.
+      await paidElsewhereThenRestore(page, false);
+      await expect(opening).toHaveCount(0);
+      await expect(page.getByRole("heading", { level: 1, name: "Review & pay" })).toBeVisible();
+
+      // The status page then emptied the paid cart and left the marker: the booking, not the stale cart.
+      await paidElsewhereThenRestore(page, true);
+      await expect(page.getByRole("heading", { level: 1, name: `Your booking ${PAID_REF} is confirmed` })).toBeVisible();
+      await expect(page.getByRole("heading", { level: 1, name: "Review & pay" })).toHaveCount(0);
+    });
+  });
+
   test.describe("320 px wide", () => {
     test.use(NARROW_320);
     test("three items on the payment step: no horizontal scroll", async ({ page }) => {

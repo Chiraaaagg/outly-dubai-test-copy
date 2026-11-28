@@ -17,6 +17,7 @@ import {
   widgetConfigured,
 } from "@/lib/msg91-widget";
 import { serverErrorCode } from "@/lib/server-error";
+import { entersPrivatePage } from "@/lib/private-navigation";
 import { cn } from "@/lib/utils";
 
 /**
@@ -160,8 +161,12 @@ export function PhoneCodeForm({ next, onDisabled }: { next: string; onDisabled: 
       } else {
         await verifyOtp({ challengeId: challenge.challengeId, code: value });
       }
-      router.replace(next);
-      router.refresh();
+      // A private customer page (a booking or voucher) is entered with a full page load (PRV-4).
+      if (entersPrivatePage(next)) window.location.assign(next);
+      else {
+        router.replace(next);
+        router.refresh();
+      }
     } catch (err) {
       const serverCode = serverErrorCode(err);
       if (serverCode === "NOT_FOUND" || serverCode === "UNAUTHORIZED") {

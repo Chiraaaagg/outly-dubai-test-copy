@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Alert } from "@/components/ui/primitives";
 import { SignInError, startEmailCode, verifyEmailCode } from "@/lib/api";
 import { EMAIL_CODE_LENGTH, EMAIL_CODE_TTL_SECONDS, EMAIL_MAX_LENGTH, EMAIL_RESEND_AFTER_SECONDS, maskEmail, normaliseEmail, type SignInReason } from "@/lib/customer-auth-options";
+import { entersPrivatePage } from "@/lib/private-navigation";
 import { cn } from "@/lib/utils";
 import { TurnstileWidget, type TurnstileHandle } from "./turnstile-widget";
 import { CODE_TIMED_OUT_MESSAGE, codeStepMessage, cookieBlockedMessage, emailStepMessage, EXPIRED_IN_A_ROW_MEANS_NO_COOKIE, minutes } from "./email-code-messages";
@@ -168,8 +169,12 @@ export function EmailCodeForm({
     setCodeError(null);
     try {
       await verifyEmailCode({ email: sentTo, code: value });
-      router.replace(next);
-      router.refresh();
+      // A private customer page (a booking or voucher) is entered with a full page load (PRV-4).
+      if (entersPrivatePage(next)) window.location.assign(next);
+      else {
+        router.replace(next);
+        router.refresh();
+      }
     } catch (err) {
       const reason = err instanceof SignInError ? err.reason : "UNAVAILABLE";
       if (reason === "NOT_CONFIGURED") {

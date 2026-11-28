@@ -122,8 +122,8 @@ export function OrderRow({ order, placement, status }: { order: CustomerOrderLik
         </div>
 
         <div className="flex shrink-0 flex-col gap-2">
+          {/* A full page load into the private route (PRV-4): see `PrivateButtonLink`. */}
           {status && (
-            {/* A full page load into the private route (PRV-4): see `PrivateButtonLink`. */}
             <PrivateButtonLink href={`/booking/${encodeURIComponent(order.reference)}`} size="md">
               View booking<span className="sr-only"> {order.reference}</span>
             </PrivateButtonLink>

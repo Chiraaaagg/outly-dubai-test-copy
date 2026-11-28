@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import { EmptyCartView, type PaidBookingPhase } from "@/components/commerce/paid-booking-notice";
 import { EmptyState } from "@/components/ui/primitives";
 import { resolvePaidBooking, type NoticeStatus, type PaidBookingNotice } from "@/lib/paid-booking";
+import { entersPrivatePage } from "@/lib/private-navigation";
 
 /**
  * The empty /checkout and /cart after a paid booking (production fix,
@@ -170,6 +171,29 @@ describe("the pages use it", () => {
     expect(read("src/components/commerce/paid-booking-notice.tsx")).toContain("<PrivateButtonLink href={notice.href}>View booking</PrivateButtonLink>");
     const button = read("src/components/ui/button.tsx");
     expect(button).toMatch(/export function PrivateButtonLink[\s\S]*?<a \{\.\.\.rest\} href=\{href\}/);
+  });
+
+  it("client-side moves into private pages become full page loads (review 116b N2)", () => {
+    for (const href of ["/booking/OUT-123455", "/booking/OUT-123455?result=success", "/voucher/OUT-123455", "/manage-booking", "/t/abc#x"]) expect(entersPrivatePage(href), href).toBe(true);
+    for (const href of ["/account", "/account/bookings", "/bookings", "/tours", "/checkout", "/"]) expect(entersPrivatePage(href), href).toBe(false);
+    const recovery = read("src/components/commerce/order-status/recovery-form.tsx");
+    expect(recovery).toContain("else window.location.assign(`/booking/${encodeURIComponent(result.reference)}`);");
+    expect(recovery).not.toMatch(/router\.(push|replace)\(/);
+    for (const f of ["src/components/auth/email-code-form.tsx", "src/components/auth/phone-code-form.tsx"]) {
+      expect(read(f), f).toMatch(/if \(entersPrivatePage\(next\)\) window\.location\.assign\(next\);\s*else \{\s*router\.replace\(next\);/);
+    }
+  });
+
+  it("a late answer moves focus to the notice only when focus was in the usual empty state (review 116b N4)", () => {
+    const src = read("src/components/commerce/paid-booking-notice.tsx");
+    expect(src).toContain("focusNotice: Boolean(notice && box && active && box.contains(active))");
+    expect(src).toMatch(/if \(!result\?\.focusNotice\) return;[\s\S]{0,200}heading\.setAttribute\("tabindex", "-1"\);\s*heading\.focus\(\);/);
+  });
+
+  it("no JSX comment sits where an expression is expected (review 116b N1)", () => {
+    for (const f of ["src/app/account/_components/order-row.tsx", "src/app/checkout/page.tsx", "src/app/cart/page.tsx", "src/components/commerce/paid-booking-notice.tsx"]) {
+      expect(read(f), f).not.toMatch(/(&&|\?|:)\s*\(\s*\{\/\*/);
+    }
   });
 
   it("the notice sends no analytics (PRV-4)", () => {

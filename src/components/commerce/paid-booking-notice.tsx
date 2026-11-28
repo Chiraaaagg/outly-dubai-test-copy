@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode, type Ref } from "react";
 import { CheckCircle2, Clock, Info } from "lucide-react";
 import { ButtonLink, PrivateButtonLink } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/primitives";
@@ -24,9 +24,11 @@ import { readPaidMarker, startPaidBookingCheck, type PaidBookingKind, type PaidB
  * Google tag configured on this measured page never sees the reference.
  *
  * Accessibility: the title is a heading, at the same level as the page's own
- * empty state; focus is never moved. When a check runs, one polite status line
- * says what is happening, then what is shown: the booking, or the usual empty
- * state's title. No analytics here (PRV-4).
+ * empty state. Focus is left alone, except when a late answer replaces the
+ * usual empty state while focus is inside it (review 116b N4): focus then
+ * moves to the new heading instead of falling to the page. When a check runs,
+ * one polite status line says what is happening, then what is shown: the
+ * booking, or the usual empty state's title. No analytics here (PRV-4).
  */
 
 type HeadingLevel = "h1" | "h2" | "h3";
@@ -66,6 +68,8 @@ export function EmptyCartView({
   fallbackMessage,
   skeleton,
   headingAs,
+  fallbackRef,
+  noticeRef,
 }: {
   phase: PaidBookingPhase;
   notice: PaidBookingNotice | null;
@@ -74,6 +78,9 @@ export function EmptyCartView({
   fallbackMessage: string;
   skeleton: ReactNode;
   headingAs?: HeadingLevel;
+  /** The boxes around the usual empty state and the notice, for the late-answer focus rule. */
+  fallbackRef?: Ref<HTMLDivElement>;
+  noticeRef?: Ref<HTMLDivElement>;
 }) {
   const shown = phase === "notice" && notice ? notice : null;
   const message = phase === "checking" ? "Checking your recent booking." : shown ? shown.title : fallbackMessage;
@@ -84,7 +91,15 @@ export function EmptyCartView({
           {message}
         </p>
       )}
-      {phase === "checking" ? skeleton : shown ? <PaidBookingEmptyState notice={shown} headingAs={headingAs} /> : fallback}
+      {phase === "checking" ? (
+        skeleton
+      ) : shown ? (
+        <div ref={noticeRef} data-testid="paid-booking-notice">
+          <PaidBookingEmptyState notice={shown} headingAs={headingAs} />
+        </div>
+      ) : (
+        <div ref={fallbackRef}>{fallback}</div>
+      )}
     </>
   );
 }
@@ -104,12 +119,30 @@ export function EmptyCartOrPaidBooking({
   // Read once: this component mounts only on the client, once the cart has loaded and is empty. The pages key it
   // by the provider's `restored`, so a back-forward cache restore mounts it again and reads the marker afresh.
   const [marker] = useState(() => readPaidMarker());
-  const [result, setResult] = useState<{ notice: PaidBookingNotice | null } | null>(null);
+  const [result, setResult] = useState<{ notice: PaidBookingNotice | null; focusNotice: boolean } | null>(null);
+  const fallbackRef = useRef<HTMLDivElement>(null);
+  const noticeRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!marker) return;
-    return startPaidBookingCheck(marker, { fetchStatus: fetchOrderStatus, onResult: setResult });
+    return startPaidBookingCheck(marker, {
+      fetchStatus: fetchOrderStatus,
+      onResult: ({ notice }) => {
+        // A late answer replacing the usual empty state while focus is in it (N4): focus follows to the new heading.
+        const box = fallbackRef.current;
+        const active = document.activeElement;
+        setResult({ notice, focusNotice: Boolean(notice && box && active && box.contains(active)) });
+      },
+    });
   }, [marker]);
+
+  useEffect(() => {
+    if (!result?.focusNotice) return;
+    const heading = noticeRef.current?.querySelector<HTMLElement>("h1, h2, h3");
+    if (!heading) return;
+    heading.setAttribute("tabindex", "-1");
+    heading.focus();
+  }, [result]);
 
   const phase: PaidBookingPhase = !marker ? "none" : !result ? "checking" : result.notice ? "notice" : "fallback";
   return (
@@ -120,6 +153,8 @@ export function EmptyCartOrPaidBooking({
       fallbackMessage={fallbackMessage}
       skeleton={skeleton}
       headingAs={headingAs}
+      fallbackRef={fallbackRef}
+      noticeRef={noticeRef}
     />
   );
 }

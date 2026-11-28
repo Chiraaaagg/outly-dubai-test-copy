@@ -1,6 +1,5 @@
 "use client";
 
-import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { Search, ShieldCheck } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -71,7 +70,6 @@ export interface RecoveryUnlock {
 }
 
 export function RecoveryForm({ unlock, channels: given }: { unlock?: RecoveryUnlock; channels?: readonly RecoveryChannel[] } = {}) {
-  const router = useRouter();
   const channels = offeredChannels(given);
   const [input, setInput] = useState<RecoveryInput>({
     reference: unlock?.reference ?? "",
@@ -312,7 +310,8 @@ export function RecoveryForm({ unlock, channels: given }: { unlock?: RecoveryUnl
             const result = await verifyRecovery({ challengeId: c.id, code });
             if (!result.ok) return "failed";
             if (unlock) unlock.onRecovered(result.reference);
-            else router.push(`/booking/${encodeURIComponent(result.reference)}`);
+            // A full page load (PRV-4): /manage-booking is often reached by a client-side move from a measured page.
+            else window.location.assign(`/booking/${encodeURIComponent(result.reference)}`);
             return "ok";
           }}
           onResend={send}

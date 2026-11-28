@@ -91,8 +91,13 @@ test.describe("empty /checkout and /cart after a paid booking", () => {
     });
     await page.goto("/checkout");
     await expect(page.getByRole("heading", { level: 1, name: "Nothing to check out yet" })).toBeVisible({ timeout: 10_500 });
-    await expect(page.getByRole("heading", { level: 1, name: `Your booking ${REF} is confirmed` })).toBeVisible({ timeout: 10_000 });
+    // A keyboard user is on the usual empty state's link when the late answer replaces it (review 116b N4).
+    await page.getByRole("link", { name: "Browse experiences" }).focus();
+    const notice = page.getByRole("heading", { level: 1, name: `Your booking ${REF} is confirmed` });
+    await expect(notice).toBeVisible({ timeout: 10_000 });
     await expect(page.getByText("Nothing to check out yet")).toHaveCount(0);
+    // Focus follows to the new heading instead of falling to the page.
+    await expect(notice).toBeFocused();
   });
 
   test("no marker: the usual empty state, and no status request", async ({ page }) => {
