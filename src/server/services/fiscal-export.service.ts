@@ -45,7 +45,7 @@ const MAX_DOCUMENTS = 20_000;
 export type ExportSend = (msg: EmailSend, opts: EmailSendOptions) => Promise<EmailOutcome>;
 
 export interface ExportRunResult {
-  skipped?: "off" | "start_at_missing" | "before_start" | "allowlist" | "not_due" | "no_time";
+  skipped?: "off" | "switch_off" | "start_at_missing" | "before_start" | "allowlist" | "not_due" | "no_time";
   /** Set when a period was attempted. */
   period?: string;
   status?: "sent" | "failed" | "unknown";
@@ -104,6 +104,8 @@ export async function runMonthlyExport(now: Date, opts: { e?: Env; send?: Export
   const e = opts.e ?? readEnv();
   const recipient = e.FISCAL_ACCOUNTANT_EMAIL;
   if (!recipient) return { skipped: "off" };
+  // Review 109e S6: no export row is created and nothing is sent while the fiscal documents are switched off.
+  if (!e.FISCAL_DOCUMENTS_ENABLED) return { skipped: "switch_off" };
   const startAt = e.FISCAL_DOCUMENTS_START_AT;
   if (!startAt) return { skipped: "start_at_missing" };
   const periods = closedPeriods(startAt, now);
@@ -124,7 +126,9 @@ export async function runMonthlyExport(now: Date, opts: { e?: Env; send?: Export
   }
 
   // R3: every closed month since the start that has not been sent: the oldest one that is due, one per run.
-  for (const period of periods) {
+  // A row only for a closed month that has none yet (S6 housekeeping: no write per month on every run).
+  const missing = (await prisma.fiscalExport.findMany({ where: { environment, period: { in: periods } }, select: { period: true } })).map((r) => r.period);
+  for (const period of periods.filter((p) => !missing.includes(p))) {
     await prisma.$executeRaw`
       INSERT INTO fiscal_exports (id, period, environment, status, attempts, generation, created_at, updated_at)
       VALUES (${uuidv7()}::uuid, ${period}, ${environment}, 'pending', 0, 1, ${now}, ${now})
@@ -205,7 +209,7 @@ export async function requeueExport(period: string, now: Date, e: Env = readEnv(
   const environment = e.isProduction ? "production" : "test";
   const [row] = await prisma.$queryRaw<{ period: string; generation: number }[]>`
     UPDATE fiscal_exports SET status = 'pending', attempts = 0, generation = generation + 1, error_code = NULL,
-      locked_until = NULL, next_attempt_at = NULL, updated_at = ${now}
+      locked_until = NULL, next_attempt_at = NULL, sent_at = NULL, provider_id = NULL, updated_at = ${now}
     WHERE environment = ${environment} AND period = ${period} AND (locked_until IS NULL OR locked_until < ${now})
     RETURNING period, generation`;
   if (!row) return null;

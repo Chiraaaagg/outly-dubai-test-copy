@@ -959,8 +959,8 @@ export const REFUND_GAP_ALERT_AFTER_MS = 15 * 60_000;
 
 /** Open attention rows raised in the window, for the ops alert sweep (codes and ids only). A refund gap only once it has lasted. */
 export async function fiscalAttentionOpen(since: Date, now: Date, limit: number): Promise<{ id: string; entityKind: string; entityId: string; orderId: string | null; reason: string; raisedAt: Date; reference: string | null }[]> {
-  // Review 109d R7: a missing CBUAE rate opens a row per INR capture (each held invoice keeps its own row), but staff
-  // are alerted once per Dubai day overall: only the first such row raised that day is an incident.
+  // Review 109d R7 / 109e S3: a missing CBUAE rate opens a row per INR capture (each held invoice keeps its own row),
+  // but staff are alerted at most once per Dubai day: the day's first row is the one incident of the day.
   const rows = await prisma.$queryRaw<{ id: string; entity_kind: string; entity_id: string; order_id: string | null; reason: string; raised_at: Date; reference: string | null }[]>`
     SELECT * FROM (
       SELECT a.id, a.entity_kind, a.entity_id, a.order_id, a.reason, a.raised_at, o.reference
@@ -968,14 +968,21 @@ export async function fiscalAttentionOpen(since: Date, now: Date, limit: number)
       WHERE a.resolved_at IS NULL AND a.raised_at >= ${since} AND a.raised_at <= ${now} AND a.reason <> 'fx_rate_missing'
         AND (a.reason <> 'refund_without_refund_row' OR a.raised_at <= ${new Date(now.getTime() - REFUND_GAP_ALERT_AFTER_MS)})
       UNION ALL
-      (SELECT DISTINCT ON ((a.raised_at AT TIME ZONE 'Asia/Dubai')::date) a.id, a.entity_kind, a.entity_id, a.order_id, a.reason, a.raised_at, o.reference
-      FROM fiscal_attention a LEFT JOIN orders o ON o.id = a.order_id
-      WHERE a.reason = 'fx_rate_missing' AND a.resolved_at IS NULL AND a.raised_at >= ${since} AND a.raised_at <= ${now}
-        AND NOT EXISTS (
+      -- Review 109e S3: the alert is keyed on the Dubai day. The day's FIRST row, whatever its state, stands for the
+      -- day (a stable entity, so the ops alert dedupes it), and is reported while any row of that day is unresolved.
+      SELECT f.id, f.entity_kind, f.entity_id, f.order_id, f.reason, f.raised_at, o.reference
+      FROM (
+        SELECT DISTINCT ON ((a.raised_at AT TIME ZONE 'Asia/Dubai')::date) a.id, a.entity_kind, a.entity_id, a.order_id, a.reason, a.raised_at
+        FROM fiscal_attention a
+        WHERE a.reason = 'fx_rate_missing' AND a.raised_at >= ${new Date(since.getTime() - 86_400_000)} AND a.raised_at <= ${now}
+        ORDER BY (a.raised_at AT TIME ZONE 'Asia/Dubai')::date, a.raised_at ASC, a.id ASC
+      ) f
+      LEFT JOIN orders o ON o.id = f.order_id
+      WHERE f.raised_at >= ${since}
+        AND EXISTS (
           SELECT 1 FROM fiscal_attention b
-          WHERE b.reason = 'fx_rate_missing' AND b.id <> a.id
-            AND (b.raised_at AT TIME ZONE 'Asia/Dubai')::date = (a.raised_at AT TIME ZONE 'Asia/Dubai')::date AND b.raised_at < ${since})
-      ORDER BY (a.raised_at AT TIME ZONE 'Asia/Dubai')::date, a.raised_at ASC)
+          WHERE b.reason = 'fx_rate_missing' AND b.resolved_at IS NULL
+            AND (b.raised_at AT TIME ZONE 'Asia/Dubai')::date = (f.raised_at AT TIME ZONE 'Asia/Dubai')::date)
     ) x
     ORDER BY x.raised_at DESC LIMIT ${limit}`;
   return rows.map((r) => ({ id: r.id, entityKind: r.entity_kind, entityId: r.entity_id, orderId: r.order_id, reason: r.reason, raisedAt: r.raised_at, reference: r.reference }));

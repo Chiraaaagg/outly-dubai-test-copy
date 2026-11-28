@@ -1,3 +1,4 @@
+import type { LineRestoreReason } from "./pricing";
 import type { Activity, CartItem } from "./types";
 
 /**
@@ -48,6 +49,71 @@ export function retimeHrefFor(
   if (!activity || (activity.timeSlots.length < 2 && !dateOnlyStart)) return null;
   const q = new URLSearchParams({ date: item.date, retime: item.id });
   return `/activities/${encodeURIComponent(item.slug)}?${q.toString()}#book`;
+}
+
+/**
+ * Refusals the guests can fix on the activity page (guest picker fix, D1): a
+ * guest type the option has no unit for (`unknown_unit`), or a number its
+ * units do not take (`unit_rule_failed`).
+ */
+export const GUEST_REASONS: readonly string[] = ["unknown_unit", "unit_rule_failed"];
+
+/**
+ * The "Change guests" link for a refused quote, or null when no single line
+ * can be fixed by its guests: no line refused for its guests, or more than
+ * one. Other lines refused for other reasons do not hide the link (re-review
+ * 111b N5): the guest wording then always comes with the way to act on it.
+ * Like "Choose another time" it restores the cart line on its activity page
+ * (`retime`, the line id), marked `change=guests`: the widget keeps the
+ * line's time, drops the guests its option cannot book, says so and moves
+ * focus to the guests. Continuing replaces the line.
+ */
+export function guestsHrefFor(refused: readonly { index: number; reason: string }[], cart: readonly CartItem[]): string | null {
+  const indexes = new Set(refused.filter((l) => GUEST_REASONS.includes(l.reason)).map((l) => l.index));
+  if (indexes.size !== 1) return null;
+  const item = cart[[...indexes][0]];
+  if (!item || item.kind !== "activity" || !parseRetimeId(item.id)) return null;
+  const q = new URLSearchParams({ date: item.date, retime: item.id, change: "guests" });
+  return `/activities/${encodeURIComponent(item.slug)}?${q.toString()}#book`;
+}
+
+/** The "Change guests" link checkout shows: only under the guest wording (`guest_types`, `guest_numbers`; re-review 111c L2). */
+export function guestsLinkShown(reason: string | null, href: string | null): string | null {
+  return href && (reason === "guest_types" || reason === "guest_numbers") ? href : null;
+}
+
+/**
+ * Whether the booking widget must have a start time chosen before it adds
+ * the line, and the restored line's own time to keep (re-review 111b N1).
+ * Times on screen (listed or loading, or more than one stored time) always
+ * need a usable choice, so a restored line whose time was since removed is
+ * never given the first time unseen. A line
+ * sent back for its time needs a new one unless a date-only answer gives
+ * the start. A line sent back for its guests never does: its time was not
+ * refused, and a listing with no stored times (an entry ticket, a date-only
+ * offer whose start read is busy or failed) shows no time control to choose
+ * from. Its time is kept for the same date when the page has no stored
+ * times, so the line keeps its id and is replaced, not added again.
+ */
+export function restoreTimeGate(input: {
+  chosenTime: string | undefined;
+  timesOnScreen: boolean;
+  storedTimes: readonly string[];
+  date: string;
+  dateOnlyAnswered: boolean;
+  restore: { reason: LineRestoreReason; date: string; time: string } | null;
+}): { mustChoose: boolean; keptTime: string | undefined } {
+  const { chosenTime, timesOnScreen, storedTimes, date, dateOnlyAnswered, restore } = input;
+  // Stored times count when the widget shows them to choose from, which it does for more than one (re-review 111c L1);
+  // a single stored time has no control, and is the time used.
+  const mustChoose = !chosenTime && (timesOnScreen || storedTimes.length > 1 || (restore?.reason === "time" && !dateOnlyAnswered));
+  const keptTime = restore?.reason === "guests" && restore.date === date && storedTimes.length === 0 && !timesOnScreen ? restore.time : undefined;
+  return { mustChoose, keptTime };
+}
+
+/** Why a restored line was sent back (`change` in the activity page URL); anything but "guests" is the start time. */
+export function parseRestoreReason(raw: string | null | undefined): LineRestoreReason {
+  return raw === "guests" ? "guests" : "time";
 }
 
 /**

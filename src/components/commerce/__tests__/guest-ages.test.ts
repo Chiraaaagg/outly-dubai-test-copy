@@ -50,8 +50,11 @@ describe("guest picker ages", () => {
     const html = picker();
     const text = visible(html);
     for (const hint of ["Age 12+", "Age 3–11", "Under 3 · usually free", "Age 60+ · reduced rate on many activities"]) expect(text).toContain(hint);
-    // Passing the default variant's ages renders the same markup.
-    expect(picker({ ages: guestRowAges({ units: [unit("adult", { ageMin: null, ageMax: null }), unit("child", { ageMin: null, ageMax: null })] }) })).toBe(html);
+    // Passing the default variant's ages renders the same markup. Guest picker fix: typed units open a row only with a
+    // unit of its own, so the default variant here carries all three (adult and child alone would close the infant row).
+    const none = { ageMin: null, ageMax: null };
+    expect(picker({ ages: guestRowAges({ units: [unit("adult", none), unit("child", none), unit("infant", none)] }) })).toBe(html);
+    expect(picker({ ages: guestRowAges({}) })).toBe(html);
     expect(picker({ ages: guestRowAges(undefined) })).toBe(html);
   });
 
@@ -77,10 +80,14 @@ describe("guest picker ages", () => {
     expect(text).toContain("Age 3–7");
     expect(text).toContain("Under 3 · not available on this option");
     expect(html).toContain('<span class="sr-only">Ages 3 to 7</span>');
-    // The infant row's increase is disabled; the others are not.
+    // The infant row's increase is unavailable but stays focusable (review 111 D5); the others are open.
     const infantIncrease = html.match(/<button[^>]*aria-label="Increase Infants"[^>]*>/)![0];
-    expect(infantIncrease).toContain(' disabled=""');
-    expect(html.match(/<button[^>]*aria-label="Increase Children"[^>]*>/)![0]).not.toContain(' disabled=""');
+    expect(infantIncrease).toContain('aria-disabled="true"');
+    expect(infantIncrease).not.toContain(' disabled=""');
+    const childIncrease = html.match(/<button[^>]*aria-label="Increase Children"[^>]*>/)![0];
+    expect(childIncrease).not.toContain(' disabled=""');
+    // The attribute, not the word: the class holds Tailwind's `aria-disabled:` variants.
+    expect(childIncrease).not.toContain('aria-disabled="true"');
   });
 
   it("an option with an infant band under 2 shows children from 2", () => {
@@ -90,6 +97,69 @@ describe("guest picker ages", () => {
     expect(text).toContain("Age 2–11");
     expect(text).toContain("Under 2 · usually free");
     expect(text).toContain("Age 12+");
+  });
+});
+
+describe("an option with only an adult unit (guest picker fix)", () => {
+  const ages = guestRowAges({ units: [unit("adult", { ageMin: 12, ageMax: null })] });
+
+  it("keeps the page's hints, closes the child and infant rows and says why, also in words", () => {
+    const html = picker({ ages });
+    const text = visible(html);
+    expect(text).toContain("Age 12+");
+    expect(text).toContain("Age 3–11 · not available on this option");
+    expect(text).toContain("Under 3 · not available on this option");
+    const group = html.match(/<div role="group" aria-label="Guests" aria-describedby="([^"]+)"/)!;
+    expect(html).toContain(`<p id="${group[1]}" class="sr-only">Children: Ages 3 to 11, not available on this option. Infants: Under 3, not available on this option.</p>`);
+    // D5: each closed row's Increase is focusable, announced unavailable, and read with its row's "not available" hint.
+    for (const row of ["Children", "Infants"]) {
+      const increase = html.match(new RegExp(`<button[^>]*aria-label="Increase ${row}"[^>]*>`))![0];
+      expect(increase).toContain('aria-disabled="true"');
+      expect(increase).not.toContain(' disabled=""');
+      const hintId = increase.match(/aria-describedby="([^"]+)"/)![1];
+      expect(html).toMatch(new RegExp(`<p id="${hintId}"[^>]*>.*?not available on this option</span></p>`));
+    }
+    // Decrease stays natively disabled at 0, as on any row.
+    expect(html.match(/<button[^>]*aria-label="Decrease Children"[^>]*>/)![0]).toContain(' disabled=""');
+    expect(html.match(/<button[^>]*aria-label="Increase Adults"[^>]*>/)![0]).not.toContain(' disabled=""');
+  });
+});
+
+describe("review 111 follow-ups: instant only (D2), unit limits (D3), focus (D1, D6)", () => {
+  const adultOnly = { units: [unit("adult", { ageMin: 12, ageMax: null })] };
+
+  it("an inquiry listing's adult-only option renders the page's rows exactly as before", () => {
+    expect(picker({ ages: guestRowAges(adultOnly, "inquiry") })).toBe(picker());
+  });
+
+  it("a row at its unit's limit cannot be increased; below it, it can", () => {
+    const at = picker({ value: { adult: 4, child: 0, infant: 0, senior: 0 }, limits: { adult: 4 } });
+    expect(at.match(/<button[^>]*aria-label="Increase Adults"[^>]*>/)![0]).toContain(' disabled=""');
+    const below = picker({ value: { adult: 3, child: 0, infant: 0, senior: 0 }, limits: { adult: 4 } });
+    expect(below.match(/<button[^>]*aria-label="Increase Adults"[^>]*>/)![0]).not.toContain(' disabled=""');
+    // Over the limit (after a switch), the count can still be lowered.
+    const over = picker({ value: { adult: 6, child: 0, infant: 0, senior: 0 }, limits: { adult: 4 } });
+    expect(over.match(/<button[^>]*aria-label="Decrease Adults"[^>]*>/)![0]).not.toContain(' disabled=""');
+  });
+
+  it("the guest group takes programmatic focus only when the caller asks for it, with the product's focus style", () => {
+    // No outline-none: the global :focus-visible treatment shows where focus landed (re-review 111b N3).
+    expect(renderToStaticMarkup(h(GuestSelector, { value: PAX, onChange: noop, focusable: true, focusRef: { current: null } }))).toContain(
+      '<div role="group" aria-label="Guests" tabindex="-1" class="space-y-1">',
+    );
+    expect(picker()).not.toContain("tabindex");
+  });
+
+  it("the notice describes the group, before the closed rows, so focus on the group reads it (re-review 111b N2)", () => {
+    const html = picker({ notice: "This option takes up to 4 adults online. Lower the number to continue.", ages: guestRowAges(adultOnly) });
+    const ids = html.match(/<div role="group" aria-label="Guests" aria-describedby="([^"]+)"/)![1].split(" ");
+    expect(ids).toHaveLength(2);
+    expect(html).toContain(`<p id="${ids[0]}" class="mb-2`);
+    expect(html).toMatch(new RegExp(`<p id="${ids[0]}"[^>]*>This option takes up to 4 adults online`));
+    expect(html).toContain(`<p id="${ids[1]}" class="sr-only">Children:`);
+    // No notice text: only the closed rows; nothing at all: no description.
+    expect(picker({ notice: null, ages: guestRowAges(adultOnly) }).match(/aria-describedby="([^"]+)"/)![1].split(" ")).toHaveLength(1);
+    expect(picker({ notice: null })).toContain('<div role="group" aria-label="Guests" class="space-y-1">');
   });
 });
 
@@ -118,8 +188,9 @@ describe("option switch notice and closed rows (review 102 N4-02, N4-06)", () =>
     const html = picker({ ages: guestRowAges(noInfants) });
     const group = html.match(/<div role="group" aria-label="Guests" aria-describedby="([^"]+)"/)!;
     expect(html).toContain(`<p id="${group[1]}" class="sr-only">Infants: Under 3, not available on this option.</p>`);
-    // Every stepper is still a native button; the closed row adds no focusable element.
+    // Every stepper is still a native button; the closed row's Increase is focusable and marked unavailable (review 111 D5).
     expect(html.match(/<button/g)).toHaveLength(8);
+    expect(html.match(/aria-disabled="true"/g)).toHaveLength(1);
     // Without closed rows the group has no description.
     expect(picker()).toContain('<div role="group" aria-label="Guests" class="space-y-1">');
   });
@@ -140,6 +211,14 @@ describe("page price lines", () => {
     expect(block(bands)).toContain("Child (2–9):");
     expect(block(bands)).toContain("Infant (under 2): Free");
     expect(block(null)).toContain("Child (age by option):");
+  });
+
+  it("no child line when no option books children (guest picker fix)", () => {
+    const html = visible(renderToStaticMarkup(h(PriceBlock, { band, childrenSold: false, infantsSold: false })));
+    expect(html).not.toContain("Child");
+    expect(html).not.toContain("Infant");
+    expect(renderToStaticMarkup(h(PriceBlock, { band, childrenSold: false, infantsSold: false }))).not.toContain("<ul");
+    expect(visible(renderToStaticMarkup(h(PriceBlock, { band, childrenSold: false })))).toContain("Infant (under 3): Free");
   });
 
   it("no infant line when no option books infants (review 102 N4-05)", () => {

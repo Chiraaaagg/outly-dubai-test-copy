@@ -45,6 +45,8 @@ const INVALID_CATEGORY = "zz_not_a_category";
 const EXPORT_PERIODS = ["2027-01", "2027-02"];
 /** C-P1: the CBUAE rate setting of the fixture capture date (NOW is 14 Feb 2027 in Dubai). */
 const RATE_KEY = "fiscal.cbuae_aed_per_inr.2027-02-14";
+/** S2: a second date, entered with a confirmed jump. */
+const JUMP_RATE_KEY = "fiscal.cbuae_aed_per_inr.2027-02-12";
 
 type Prisma = typeof import("../../lib/db").prisma;
 let prisma: Prisma;
@@ -237,7 +239,7 @@ async function cleanupRun(): Promise<void> {
       await tx.$executeRaw`DELETE FROM fiscal_attention WHERE order_id = ANY(${orderIds}::uuid[])`;
       await tx.$executeRaw`DELETE FROM fiscal_attention WHERE entity_kind = 'fiscal_export' AND entity_id IN (SELECT id FROM fiscal_exports WHERE environment = 'test' AND period = ANY(${EXPORT_PERIODS}::text[]))`;
       await tx.$executeRaw`DELETE FROM fiscal_exports WHERE environment = 'test' AND period = ANY(${EXPORT_PERIODS}::text[])`;
-      await tx.$executeRaw`DELETE FROM settings WHERE key = ${RATE_KEY}`;
+      await tx.$executeRaw`DELETE FROM settings WHERE key = ANY(${[RATE_KEY, JUMP_RATE_KEY]}::text[])`;
       await tx.$executeRaw`DELETE FROM generated_documents WHERE order_id = ANY(${orderIds}::uuid[])`;
       await tx.$executeRaw`DELETE FROM fiscal_document_parties WHERE fiscal_document_id IN (SELECT id FROM fiscal_documents WHERE order_id = ANY(${orderIds}::uuid[]))`;
       // 2. The append-only rows only, with user triggers off.
@@ -1193,7 +1195,7 @@ describe("Group C documents (disposable database)", () => {
   it("C-P1: an INR-paid order is invoiced in AED at the staff-entered CBUAE rate of its capture date; credits net to zero; a used rate cannot change", async () => {
     const { createFiscalStaffService } = await import("../fiscal-staff.service");
     const staff = createFiscalStaffService({ stepUp: async () => null, env: () => envWith({}) });
-    await prisma.setting.deleteMany({ where: { key: RATE_KEY } });
+    await prisma.setting.deleteMany({ where: { key: { in: [RATE_KEY, JUMP_RATE_KEY] } } });
     const o = await paidOrder({ currency: "INR", grosses: [40000n, 2000n] });
     expect(await fiscal.issueForLedgerEntry(o.ledgerId, deps())).toEqual({ kind: "blocked", reason: "fx_rate_missing" });
     const o2 = await paidOrder({ currency: "INR", grosses: [10000n] });
@@ -1225,6 +1227,12 @@ describe("Group C documents (disposable database)", () => {
     const c2 = await prisma.fiscalDocument.findUniqueOrThrow({ where: { ledgerEntryId: r2.ledgerId } });
     expect([c1.grossMinor, c1.vatMinor, c2.grossMinor, c2.vatMinor]).toEqual([870n, 41n, 870n, 42n]);
     expect(c1.currency).toBe("AED");
+    // Review 109e S3: o's row is resolved now; the day still has exactly one incident (keyed on the day's first row).
+    expect((await fiscalIncidents(new Date(NOW.getTime() - 1000), new Date(NOW.getTime() + 1000))).filter((i) => i.reason === "fx_rate_missing")).toHaveLength(1);
+    // Review 109e S2: a rate more than 5 % from the last entered one needs a confirmation.
+    await expect(staff.recordCbuaeRate(staffActor(), { date: "2027-02-12", aedPerInr: "0.0480", totpCode: "000000" }, NOW)).rejects.toMatchObject({ code: "CONFLICT", details: { reason: "rate_jump_unconfirmed", previous: "0.04350000" } });
+    expect(await prisma.setting.count({ where: { key: JUMP_RATE_KEY } })).toBe(0);
+    expect(await staff.recordCbuaeRate(staffActor(), { date: "2027-02-12", aedPerInr: "0.0480", totpCode: "000000", confirmJump: true }, NOW)).toMatchObject({ aedPerInr: "0.04800000" });
     // The rate is now part of documents: it cannot be changed.
     await expect(staff.recordCbuaeRate(staffActor(), { date: "2027-02-14", aedPerInr: "0.0436", totpCode: "000000" }, NOW)).rejects.toMatchObject({ code: "CONFLICT", details: { reason: "rate_in_use" } });
     // A refused code: nothing written.
@@ -1312,7 +1320,7 @@ describe("Group C documents (disposable database)", () => {
     const { createFiscalStaffService } = await import("../fiscal-staff.service");
     const o = await paidOrder({ grosses: [5000n] });
     const inv = (await fiscal.issueForLedgerEntry(o.ledgerId, deps())) as { displayNumber: string };
-    const e = envWith({ FISCAL_ACCOUNTANT_EMAIL: "accountant@example.com", recipientAllowlist: ["@example.com"] });
+    const e = envWith({ FISCAL_DOCUMENTS_ENABLED: true, FISCAL_ACCOUNTANT_EMAIL: "accountant@example.com", recipientAllowlist: ["@example.com"] });
     const mails: { msg: EmailSend; opts: EmailSendOptions }[] = [];
     const ok = async (msg: EmailSend, opts: EmailSendOptions): Promise<EmailOutcome> => {
       mails.push({ msg, opts });
@@ -1321,6 +1329,9 @@ describe("Group C documents (disposable database)", () => {
     // Off without an address; nothing before the start's month has closed.
     expect(await exporter.runMonthlyExport(new Date("2027-03-01T06:00:00Z"), { e: envWith({ FISCAL_ACCOUNTANT_EMAIL: null }), send: ok })).toEqual({ skipped: "off" });
     expect(await exporter.runMonthlyExport(new Date("2027-01-01T06:00:00Z"), { e, send: ok })).toEqual({ skipped: "before_start" });
+    // Review 109e S6: nothing is created or sent while the fiscal switch is off.
+    expect(await exporter.runMonthlyExport(new Date("2027-03-01T06:00:00Z"), { e: { ...e, FISCAL_DOCUMENTS_ENABLED: false }, send: ok })).toEqual({ skipped: "switch_off" });
+    expect(await prisma.fiscalExport.count({ where: { environment: "test", period: { in: EXPORT_PERIODS } } })).toBe(0);
     expect(exporter.closedPeriods(START_AT, new Date("2027-03-01T06:00:00Z"))).toEqual(["2027-01", "2027-02"]);
 
     // 1 Feb 2027: January is refused by the provider: a staff alert, a retry after the back-off, the alert closed on success.
@@ -1347,7 +1358,9 @@ describe("Group C documents (disposable database)", () => {
     expect(mails[0].msg.to).toBe("accountant@example.com");
     const att = mails[0].msg.attachments ?? [];
     expect(att.map((a) => [a.filename, a.contentType])).toEqual([["OUTLYY-fiscal-documents-2027-02-TEST.csv", "text/csv"]]);
-    const csv = new TextDecoder().decode(att[0].content);
+    // Review 109e S1: the attachment starts with the UTF-8 byte order mark (a default TextDecoder would strip it).
+    expect([...att[0].content.subarray(0, 3)]).toEqual([0xef, 0xbb, 0xbf]);
+    const csv = new TextDecoder("utf-8", { ignoreBOM: true }).decode(att[0].content);
     expect(csv.charCodeAt(0)).toBe(0xfeff);
     expect(csv).toContain(`${inv.displayNumber},Tax invoice (simplified),2027-02-14,2027-02-14,${o.reference},,,,Specimen Activity 1,standard,47.62,2.38,50.00,AED`);
     // R4: no consumer name is exported.

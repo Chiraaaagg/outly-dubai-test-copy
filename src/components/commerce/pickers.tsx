@@ -239,7 +239,10 @@ export function GuestSelector({
   max = 20,
   rows,
   ages = PAGE_ROW_AGES,
+  limits,
   notice,
+  focusable = false,
+  focusRef,
   className,
 }: {
   value: PaxCount;
@@ -252,6 +255,15 @@ export function GuestSelector({
    * own. A row the option cannot book shows why and cannot be increased.
    */
   ages?: Record<PaxAgeType, GuestRowAge>;
+  /** The most guests per row the selected option takes (`guestRowLimits`, guest picker fix D3); a row at its limit cannot be increased. */
+  limits?: Partial<Record<PaxAgeType, number>>;
+  /**
+   * True: the guest group can take focus (programmatic only, `tabIndex` -1), so the caller can move focus to it (D1,
+   * D6). It then shows the product's one focus treatment (`:focus-visible`, globals.css; re-review 111b N3).
+   */
+  focusable?: boolean;
+  /** The guest group element, for the caller to focus from an effect or handler; never read during render. */
+  focusRef?: React.Ref<HTMLDivElement>;
   /**
    * What changed for the guests already set when the option changed (`guestAgesNotice`, review 102 N4-02).
    * Given (even null), a polite live region stays mounted above the rows, so the text is announced when it arrives.
@@ -265,6 +277,9 @@ export function GuestSelector({
   // A closed row has no control to focus, so its reason is the group's description, read on entering the steppers (N4-06).
   const closed = shown.filter((row) => !ages[row.key].allowed);
   const closedId = `${uid}-closed`;
+  const noticeId = `${uid}-notice`;
+  // The notice and the closed rows describe the group, so focus moved onto it reads why (re-review 111b N2).
+  const describedBy = [notice ? noticeId : null, closed.length ? closedId : null].filter(Boolean).join(" ") || undefined;
 
   const set = (key: keyof PaxCount, next: number) => {
     const updated = { ...value, [key]: next };
@@ -276,10 +291,17 @@ export function GuestSelector({
   };
 
   return (
-    <div role="group" aria-label="Guests" aria-describedby={closed.length ? closedId : undefined} className={cn("space-y-1", className)}>
+    <div
+      ref={focusRef}
+      role="group"
+      aria-label="Guests"
+      aria-describedby={describedBy}
+      tabIndex={focusable ? -1 : undefined}
+      className={cn("space-y-1", className)}
+    >
       {notice !== undefined && (
         <div role="status" aria-live="polite">
-          {notice ? <p className="mb-2 rounded-[var(--radius-control)] bg-sun-50 p-3 text-xs font-semibold leading-relaxed text-sun-800">{notice}</p> : null}
+          {notice ? <p id={noticeId} className="mb-2 rounded-[var(--radius-control)] bg-sun-50 p-3 text-xs font-semibold leading-relaxed text-sun-800">{notice}</p> : null}
         </div>
       )}
       {closed.length > 0 && (
@@ -290,6 +312,7 @@ export function GuestSelector({
       {shown.map((row) => {
         const age = ages[row.key];
         const hintId = `${uid}-${row.key}-age`;
+        const limit = limits?.[row.key];
         return (
           <div key={row.key} className="flex items-center justify-between gap-4 py-2.5">
             <div className="min-w-0">
@@ -312,10 +335,12 @@ export function GuestSelector({
               <span className="w-8 text-center font-display text-lg font-bold tnum" aria-live="polite">
                 {value[row.key]}
               </span>
+              {/* A closed row's Increase stays focusable and says why (D5): its description is the row's hint. */}
               <Stepper
                 label={`Increase ${row.label}`}
                 describedBy={hintId}
-                disabled={total >= max || !age.allowed}
+                disabled={age.allowed && (total >= max || (limit !== undefined && value[row.key] >= limit))}
+                unavailable={!age.allowed}
                 onClick={() => set(row.key, value[row.key] + 1)}
               >
                 <Plus className="h-4 w-4" />
@@ -340,12 +365,15 @@ function Stepper({
   children,
   onClick,
   disabled,
+  unavailable,
   label,
   describedBy,
 }: {
   children: React.ReactNode;
   onClick: () => void;
   disabled?: boolean;
+  /** Not available on this option: focusable, announced as unavailable (`aria-disabled`), and does nothing. */
+  unavailable?: boolean;
   label: string;
   /** The row's age hint, read after the button's name. */
   describedBy?: string;
@@ -353,11 +381,12 @@ function Stepper({
   return (
     <button
       type="button"
-      onClick={onClick}
+      onClick={unavailable ? undefined : onClick}
       disabled={disabled}
+      aria-disabled={unavailable || undefined}
       aria-label={label}
       aria-describedby={describedBy}
-      className="flex h-11 w-11 items-center justify-center rounded-full border border-ink-300 text-ink-800 transition-colors hover:border-ink-900 disabled:cursor-not-allowed disabled:opacity-40"
+      className="flex h-11 w-11 items-center justify-center rounded-full border border-ink-300 text-ink-800 transition-colors hover:border-ink-900 disabled:cursor-not-allowed disabled:opacity-40 aria-disabled:cursor-not-allowed aria-disabled:opacity-40 aria-disabled:hover:border-ink-300"
     >
       {children}
     </button>

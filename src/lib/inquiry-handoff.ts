@@ -10,7 +10,7 @@
  * inquiry form (`hotelForInquiry`, src/lib/pickup-selection.ts), never the URL.
  */
 
-export type InquiryReason = "mixed" | "over_limit" | "cutoff" | "time_slot" | "sold_out" | "pickup" | "ticket_validity" | "ages" | "unavailable" | "external_hold";
+export type InquiryReason = "mixed" | "over_limit" | "cutoff" | "time_slot" | "sold_out" | "pickup" | "ticket_validity" | "ages" | "guest_types" | "guest_numbers" | "unavailable" | "external_hold";
 
 const TEXT: Record<InquiryReason, string> = {
   mixed: "Some activities in your trip are confirmed by our team before you pay, so the whole trip goes to them in one message.",
@@ -22,6 +22,12 @@ const TEXT: Record<InquiryReason, string> = {
   ticket_validity: "The tickets on sale now can't be used on the date you picked. Pick an earlier visit date, or our team finds tickets for your date.",
   // Doc 30 N4 (review 102 N4-01): the option's child or infant ages changed after the guests were chosen. Wording pending owner review (K10).
   ages: "The ages this activity counts as children or infants have changed since you chose your guests. Check your guest numbers on the activity page, or our team confirms them with you before you pay.",
+  // Guest picker fix (28 Nov 2026): a line asks for a guest type (child, infant) the option has no unit for (`unknown_unit`).
+  guest_types:
+    "This option takes only some guest types online, such as adults. Change your guests on the activity page, or our team books everyone with you before you pay.",
+  // Guest picker fix (D3): a line's guest numbers are outside what the option's units take (`unit_rule_failed`).
+  guest_numbers:
+    "The number of guests you chose isn't one this option takes online. Change your guests on the activity page, or our team books everyone with you before you pay.",
   unavailable: "This trip can't be booked online as it is, so our team confirms it with the operator before you pay.",
   // Doc 29 Batch 6 (owner decision d): from the status page, after an external hold too short to book online was released.
   external_hold: "The operator couldn't hold your place long enough to book it online, so our team books it with them for you before you pay.",
@@ -40,6 +46,8 @@ export function inquiryReasonForQuote(reasons: readonly string[]): InquiryReason
   if (reasons.some((r) => r === "pickup_unavailable")) return "pickup";
   if (reasons.some((r) => r === "ticket_validity_ended")) return "ticket_validity";
   if (reasons.some((r) => r === "ages_changed")) return "ages";
+  if (reasons.some((r) => r === "unknown_unit")) return "guest_types";
+  if (reasons.some((r) => r === "unit_rule_failed")) return "guest_numbers";
   if (reasons.some((r) => r === "past_cutoff" || r === "same_day_inquiry_only" || r === "closed")) return "cutoff";
   // The time is not one the operator's live availability lists. Not a cut-off: calling it one sent customers
   // looking for a later date when the date was fine.

@@ -3,9 +3,9 @@ import { prisma, TX_OPTIONS } from "../lib/db";
 import { env as readEnv, type Env } from "../lib/env";
 import { audit } from "../lib/audit";
 import { requirePermission, type Actor } from "../lib/actor";
-import { Errors } from "../lib/errors";
+import { AppError, Errors } from "../lib/errors";
 import { settingsRepo } from "../repositories/settings.repo";
-import { CBUAE_RATE_SETTING_PREFIX, CBUAE_RATE_SOURCE, cbuaeRateFrom, parseAedPerInr } from "../domain/fiscal-fx";
+import { CBUAE_RATE_SETTING_PREFIX, CBUAE_RATE_SOURCE, cbuaeRateFrom, parseAedPerInr, RATE_JUMP_CONFIRM_BPS, rateMoveBps } from "../domain/fiscal-fx";
 import { isRealSellerText, isRealTrn } from "../documents/generated/fiscal/seller";
 import { dubaiIsoDate } from "../documents/generated/fiscal/snapshot";
 import { reissueAsFullTaxInvoice, sellerFromEnv, type ReissueOutcome, type ReissueRefusal } from "./fiscal-document.service";
@@ -84,14 +84,18 @@ export function createFiscalStaffService(deps: { stepUp: StepUp; env?: () => Env
       return out;
     },
 
-    async recordCbuaeRate(actor: Actor, input: { date?: string; aedPerInr?: string; totpCode?: string }, now: Date = new Date()): Promise<{ date: string; aedPerInr: string; replaced: string | null }> {
+    async recordCbuaeRate(
+      actor: Actor,
+      input: { date?: string; aedPerInr?: string; totpCode?: string; confirmJump?: boolean },
+      now: Date = new Date(),
+    ): Promise<{ date: string; aedPerInr: string; replaced: string | null }> {
       requirePermission(actor, "payments.reconcile");
       const date = (input.date ?? "").trim();
       const rate = parseAedPerInr(input.aedPerInr);
       const fields: Record<string, string> = {};
       if (!isRealDate(date)) fields.date = "Use the date as YYYY-MM-DD";
       else if (date > dubaiIsoDate(now)) fields.date = "A rate cannot be entered for a future date";
-      if (!rate) fields.aedPerInr = "AED per 1 INR, for example 0.04350 (between 0.0400 and 0.0470)";
+      if (!rate) fields.aedPerInr = "AED per 1 INR, for example 0.04350 (between 0.0300 and 0.0600)";
       if (Object.keys(fields).length || !rate) throw Errors.validation(fields);
       const key = `${CBUAE_RATE_SETTING_PREFIX}${date}`;
       await requireStepUp(actor, input.totpCode, "fiscal.cbuae_rate_refused", { type: "setting", id: key });
@@ -105,16 +109,33 @@ export function createFiscalStaffService(deps: { stepUp: StepUp; env?: () => Env
           // A rate a document was converted at is part of that document's record: never changed afterwards.
           const [used] = await tx.$queryRaw<{ used: boolean }[]>`
             SELECT EXISTS (SELECT 1 FROM fiscal_documents f, jsonb_array_elements(f.lines) l WHERE l->'source'->>'rateDate' = ${date}) AS used`;
-          if (used?.used) return { refused: true as const, prior };
+          if (used?.used) return { refused: "rate_in_use" as const, prior };
+        }
+        // Review 109e S2: a move of more than 5 % from the last rate entered for another date needs a confirmation.
+        const last = await tx.setting.findFirst({ where: { key: { startsWith: CBUAE_RATE_SETTING_PREFIX, not: key } }, orderBy: { updatedAt: "desc" }, select: { key: true, value: true } });
+        const lastRate = last ? cbuaeRateFrom(last.key.slice(CBUAE_RATE_SETTING_PREFIX.length), last.value) : null;
+        if (lastRate && !input.confirmJump && rateMoveBps(lastRate.aedPerInr, rate) > RATE_JUMP_CONFIRM_BPS) {
+          return { refused: "rate_jump_unconfirmed" as const, prior, lastRate };
         }
         const value = { aedPerInr: rate, source: CBUAE_RATE_SOURCE, recordedBy: actor.id ?? null, recordedAt: now.toISOString() };
         // `updated_by` is left empty: the actor is in the value and the audit row (no foreign key to satisfy).
         await tx.setting.upsert({ where: { key }, create: { key, value }, update: { value } });
-        return { refused: false as const, prior };
+        return { refused: null, prior };
       }, TX_OPTIONS);
-      if (written.refused) {
+      if (written.refused === "rate_in_use") {
         await audit(actor, "fiscal.cbuae_rate_refused", { type: "setting", id: key }, { after: { refused: "rate_in_use", date } });
         throw Errors.conflict("A document was already converted at this date's rate; it cannot be changed", { reason: "rate_in_use" });
+      }
+      if (written.refused === "rate_jump_unconfirmed") {
+        const previous = "lastRate" in written ? written.lastRate?.aedPerInr ?? null : null;
+        await audit(actor, "fiscal.cbuae_rate_refused", { type: "setting", id: key }, { after: { refused: "rate_jump_unconfirmed", date, previous, aedPerInr: rate } });
+        throw new AppError({
+          status: 409,
+          code: "CONFLICT",
+          message: `This rate is more than 5% from the last one entered (${previous ?? "?"})`,
+          recovery: "Check the Central Bank figure, then tick the confirmation and save again.",
+          details: { reason: "rate_jump_unconfirmed", previous, fields: { confirmJump: "Tick to confirm a move of more than 5%" } },
+        });
       }
       const prior = written.prior;
       settingsRepo.invalidate(key);

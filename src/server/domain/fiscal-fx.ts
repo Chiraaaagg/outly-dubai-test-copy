@@ -26,11 +26,24 @@ export const CBUAE_RATE_SETTING_PREFIX = "fiscal.cbuae_aed_per_inr.";
 export const CBUAE_RATE_SOURCE = "CBUAE";
 
 /**
- * Plausible AED per INR: 0.0400 to 0.0470 (INR per AED about 21.3 to 25.0; review 109d R7). A typo is refused before
- * any document can be converted at it (a rate once used is never changed).
+ * Plausible AED per INR: 0.0300 to 0.0600 (INR per AED about 16.7 to 33.3; review 109e S2), wide enough that a real
+ * market move never blocks entry. A typo by a factor of ten is still refused; a move of more than
+ * `RATE_JUMP_CONFIRM_BPS` from the last entered rate needs an explicit confirmation (`fiscal-staff.service.ts`).
  */
-const RATE_MIN_UNITS_PER_1E8 = 4_000_000n; // 0.0400
-const RATE_MAX_UNITS_PER_1E8 = 4_700_000n; // 0.0470
+const RATE_MIN_UNITS_PER_1E8 = 3_000_000n; // 0.0300
+const RATE_MAX_UNITS_PER_1E8 = 6_000_000n; // 0.0600
+
+/** A rate more than 5 % from the last entered one needs the staff member to confirm it (S2). */
+export const RATE_JUMP_CONFIRM_BPS = 500n;
+
+/** The move between two rates, in basis points of `from` (absolute). */
+export function rateMoveBps(from: string, to: string): bigint {
+  const a = BigInt((parseAedPerInr(from) ?? "0.00000000").slice(2));
+  const b = BigInt((parseAedPerInr(to) ?? "0.00000000").slice(2));
+  if (a === 0n) return 0n;
+  const d = b > a ? b - a : a - b;
+  return (d * 10_000n) / a;
+}
 
 const RATE_TEXT = /^0\.(\d{2,8})$/;
 

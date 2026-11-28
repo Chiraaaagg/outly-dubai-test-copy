@@ -71,12 +71,23 @@ export function FiscalForms({ rates, reissues, exports }: { rates: RateRow[]; re
           <FormField label="Date (Dubai)" htmlFor="rate-date" hint="YYYY-MM-DD" error={rateFields.date} required>
             <input id="rate-date" name="date" type="date" required aria-invalid={!!rateFields.date} aria-describedby={rateFields.date ? "rate-date-error" : "rate-date-hint"} className={INPUT_CLASS} />
           </FormField>
-          <FormField label="AED per 1 INR" htmlFor="rate-value" hint="For example 0.04350 (0.0400 to 0.0470)" error={rateFields.aedPerInr} required>
+          <FormField label="AED per 1 INR" htmlFor="rate-value" hint="For example 0.04350 (0.0300 to 0.0600)" error={rateFields.aedPerInr} required>
             <input id="rate-value" name="aedPerInr" inputMode="decimal" required aria-invalid={!!rateFields.aedPerInr} aria-describedby={rateFields.aedPerInr ? "rate-value-error" : "rate-value-hint"} className={INPUT_CLASS} />
           </FormField>
           <FormField label="Authenticator code" htmlFor="rate-totp" hint="6 digits" error={rateFields.totpCode} required>
             <input id="rate-totp" name="totpCode" inputMode="numeric" autoComplete="one-time-code" pattern="\d{6}" maxLength={6} required aria-invalid={!!rateFields.totpCode} aria-describedby={rateFields.totpCode ? "rate-totp-error" : "rate-totp-hint"} className={INPUT_CLASS} />
           </FormField>
+          <div className="sm:col-span-3">
+            <label htmlFor="rate-confirm" className="flex items-start gap-2 text-sm text-ink-800">
+              <input id="rate-confirm" name="confirmJump" type="checkbox" className="mt-1 h-4 w-4" aria-describedby={rateFields.confirmJump ? "rate-confirm-error" : undefined} />
+              <span>I checked the Central Bank figure: confirm a rate more than 5% from the last one entered.</span>
+            </label>
+            {rateFields.confirmJump && (
+              <p id="rate-confirm-error" className="mt-1 text-xs font-semibold text-[var(--color-danger)]" role="alert">
+                {rateFields.confirmJump}
+              </p>
+            )}
+          </div>
           <div className="flex justify-end sm:col-span-3">
             <Button type="submit" variant="secondary" loading={ratePending} loadingLabel="Saving…">
               Save rate

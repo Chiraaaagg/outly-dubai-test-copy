@@ -1,4 +1,4 @@
-import type { PaxCount, Variant } from "./types";
+import type { FulfilmentMode, PaxCount, Variant } from "./types";
 
 /**
  * Age bands per pax type (doc 30 N4, owner decision D22, 25 Nov 2026).
@@ -130,18 +130,28 @@ const SENIOR: GuestRowAge = { hint: "Age 60+ · reduced rate on many activities"
 /**
  * The guest picker's age wording for a variant. With the page's own bands
  * the hints are exactly the page's ("Age 12+", "Age 3–11", "Under 3 ·
- * usually free"). With own bands they follow the variant, and a child or
- * infant row the variant has no typed unit for reads "not available on this
- * option" and cannot be increased: the quote would refuse it (unknown unit).
- * Rows of a variant with the page's bands are never closed here, so a
- * listing without offer ages keeps every row it had.
+ * usually free"); with own bands they follow the variant.
+ *
+ * On an instant listing (`mode`, the page's effective fulfilment mode), a
+ * variant with typed units books a child or infant row only when it has a
+ * per-person unit of that id, whatever its bands: any other row reads "not
+ * available on this option" and cannot be increased, as the quote would
+ * refuse it (`unknown_unit`). Before this, a variant with the page's bands
+ * kept every row open, so an adult-only option took children and infants
+ * the quote then refused (guest picker fix, 28 Nov 2026). A variant without
+ * typed units keeps every row, the way the Seniors row is decided
+ * (`offersSeniorPrice`).
+ *
+ * An inquiry listing keeps its rows as before (owner decision D2): only a
+ * variant with its own bands closes a row it has no unit for (doc 30 N4).
+ * No server quote prices an inquiry, and the team books every guest.
  */
-export function guestRowAges(variant: Pick<Variant, "units"> | undefined): Record<PaxAgeType, GuestRowAge> {
+export function guestRowAges(variant: Pick<Variant, "units"> | undefined, mode: FulfilmentMode = "instant"): Record<PaxAgeType, GuestRowAge> {
   const bands = variantPaxAges(variant) ?? PAGE_PAX_AGES;
-  const own = hasOwnAges(bands);
   const units = variant?.units ?? [];
-  // The same units `variantPaxAges` reads: per person only (review 102 N4-07).
-  const sells = (id: PaxAgeType) => !own || units.length === 0 || units.some((u) => u.per === "person" && u.unitId === id);
+  const unitsDecide = units.length > 0 && (mode === "instant" || hasOwnAges(bands));
+  // The same units `variantPaxAges` reads: per person only (review 102 N4-07); a per-booking unit never opens a row.
+  const sells = (id: PaxAgeType) => !unitsDecide || units.some((u) => u.per === "person" && u.unitId === id);
   const adultMin = bands.adult.min as number;
   const child = bands.child as { min: number; max: number };
   const infantUnder = (bands.infant.max as number) + 1;
@@ -170,16 +180,82 @@ export function priceLineAges(bands: PaxAgeBands | null): { child: string; infan
   return { child: `Child (${bands.child.min}–${bands.child.max})`, infant: `Infant (under ${(bands.infant.max as number) + 1})` };
 }
 
+/** The listing facts the page-level price lines read: its options and its effective fulfilment mode. */
+type ListingGuests = { variants: Pick<Variant, "units">[]; fulfilmentMode: FulfilmentMode };
+
 /**
  * Whether any option of the listing can book infants (review 102 N4-05):
- * false only when every option has its own ages and no infant row (the
- * picker closes it on each). The page then shows no "Infant … Free" line.
+ * false only when the picker closes the infant row on every option. The
+ * page then shows no "Infant … Free" line.
  */
-export function listingSellsInfants(activity: { variants: Pick<Variant, "units">[] }): boolean {
-  return activity.variants.length === 0 || activity.variants.some((v) => guestRowAges(v).infant.allowed);
+export function listingSellsInfants(activity: ListingGuests): boolean {
+  return activity.variants.length === 0 || activity.variants.some((v) => guestRowAges(v, activity.fulfilmentMode).infant.allowed);
 }
 
+/**
+ * The same for children (guest picker fix): false only when an instant
+ * listing has no option with a child row; the page then shows no child
+ * price line. An inquiry listing always keeps it (owner decision D2).
+ */
+export function listingSellsChildren(activity: ListingGuests): boolean {
+  if (activity.fulfilmentMode !== "instant") return true;
+  return activity.variants.length === 0 || activity.variants.some((v) => guestRowAges(v, activity.fulfilmentMode).child.allowed);
+}
+
+/**
+ * The most guests of each type an instant option takes (guest picker fix,
+ * D3): the `maxQty` of its per-person unit for that row, which the quote
+ * enforces (`unit_rule_failed`). No entry for a row without one, and none
+ * at all on an inquiry listing or an option without typed units.
+ */
+export function guestRowLimits(variant: Pick<Variant, "units"> | undefined, mode: FulfilmentMode = "instant"): Partial<Record<PaxAgeType, number>> {
+  if (mode !== "instant") return {};
+  const out: Partial<Record<PaxAgeType, number>> = {};
+  for (const u of variant?.units ?? []) if (u.per === "person" && Object.hasOwn(ROW_WORDS, u.unitId)) out[u.unitId as PaxAgeType] = u.maxQty;
+  return out;
+}
+
+/**
+ * The fewest guests of each type an instant option takes (re-review 111b
+ * N4): the `minQty` of its per-person unit for that row, when above 0. The
+ * quote refuses fewer, even none (`unit_rule_failed`); the importer writes
+ * 0, so this is rare. Same scope as `guestRowLimits`.
+ */
+export function guestRowMinimums(variant: Pick<Variant, "units"> | undefined, mode: FulfilmentMode = "instant"): Partial<Record<PaxAgeType, number>> {
+  if (mode !== "instant") return {};
+  const out: Partial<Record<PaxAgeType, number>> = {};
+  for (const u of variant?.units ?? []) if (u.per === "person" && Object.hasOwn(ROW_WORDS, u.unitId) && u.minQty > 0) out[u.unitId as PaxAgeType] = u.minQty;
+  return out;
+}
+
+const ROW_WORDS: Record<PaxAgeType, [string, string]> = { adult: ["adult", "adults"], child: ["child", "children"], infant: ["infant", "infants"], senior: ["senior", "seniors"] };
+
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+
+/**
+ * What the guest is told while a row holds more guests than the option
+ * takes (`guestRowLimits`), or fewer than it needs (`guestRowMinimums`);
+ * null when every row is within them.
+ */
+export function guestLimitNotice(
+  pax: PaxCount,
+  limits: Partial<Record<PaxAgeType, number>>,
+  minimums: Partial<Record<PaxAgeType, number>> = {},
+): string | null {
+  const parts: string[] = [];
+  let under = false;
+  for (const t of Object.keys(ROW_WORDS) as PaxAgeType[]) {
+    const max = limits[t];
+    const min = minimums[t];
+    if (max !== undefined && pax[t] > max) parts.push(`This option takes up to ${plural(max, ...ROW_WORDS[t])} online.`);
+    else if (min !== undefined && pax[t] < min) {
+      under = true;
+      parts.push(`This option takes at least ${plural(min, ...ROW_WORDS[t])} online.`);
+    }
+  }
+  if (parts.length === 0) return null;
+  return `${parts.join(" ")} ${under ? "Change the number to continue." : "Lower the number to continue."}`;
+}
 
 /**
  * What the guest is told when they switch option and the ages behind a
@@ -188,10 +264,15 @@ const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one :
  * differently. Null when nothing they set is affected. The booking widget
  * shows it above the guest rows in a polite live region.
  */
-export function guestAgesNotice(before: Pick<Variant, "units"> | undefined, after: Pick<Variant, "units"> | undefined, pax: PaxCount): string | null {
+export function guestAgesNotice(
+  before: Pick<Variant, "units"> | undefined,
+  after: Pick<Variant, "units"> | undefined,
+  pax: PaxCount,
+  mode: FulfilmentMode = "instant",
+): string | null {
   const was = variantPaxAges(before) ?? PAGE_PAX_AGES;
   const now = variantPaxAges(after) ?? PAGE_PAX_AGES;
-  const rows = guestRowAges(after);
+  const rows = guestRowAges(after, mode);
   const parts: string[] = [];
   const dropped = (n: number, one: string, many: string) =>
     parts.push(`This option doesn't take ${many}, so ${plural(n, one, many)} ${n === 1 ? "was" : "were"} removed from your guests.`);

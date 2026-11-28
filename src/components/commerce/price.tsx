@@ -79,10 +79,13 @@ export function PriceBlock({
   showTaxLine = true,
   compact,
   ages = PAGE_PAX_AGES,
+  childrenSold = true,
   infantsSold = true,
   className,
 }: {
   band: PriceBand;
+  /** False when no option of the listing can book children (`listingSellsChildren`, guest picker fix): no child line then. */
+  childrenSold?: boolean;
   /** False when no option of the listing can book infants (`listingSellsInfants`, review 102 N4-05): no infant line then. */
   infantsSold?: boolean;
   /** Child and infant ages for the price lines (`listingPaxAges`, doc 30 N4); null when the options differ. Default: the page's own. */
@@ -117,9 +120,9 @@ export function PriceBlock({
         </p>
       )}
 
-      {!compact && (band.child || band.senior || (infantsSold && band.infant)) && (
+      {!compact && ((childrenSold && band.child) || band.senior || (infantsSold && band.infant)) && (
         <ul className="mt-2 flex flex-wrap gap-x-3.5 gap-y-1 text-xs text-ink-600">
-          {band.child && (
+          {childrenSold && band.child && (
             <li>
               {ageLabel.child}: <Amount money={band.child} className="font-bold" />
             </li>

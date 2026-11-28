@@ -29,7 +29,7 @@ export async function resendExportAction(_prev: ResendExportActionResult | null,
 export async function recordCbuaeRateAction(_prev: CbuaeRateActionResult | null, fd: FormData): Promise<CbuaeRateActionResult> {
   return runAction(async () => {
     const { actor } = await authService.requireCookies("payments.reconcile");
-    const out = await fiscalStaffService.recordCbuaeRate(actor, { date: form.str(fd, "date"), aedPerInr: form.str(fd, "aedPerInr"), totpCode: form.str(fd, "totpCode") });
+    const out = await fiscalStaffService.recordCbuaeRate(actor, { date: form.str(fd, "date"), aedPerInr: form.str(fd, "aedPerInr"), totpCode: form.str(fd, "totpCode"), confirmJump: form.bool(fd, "confirmJump") });
     revalidatePath("/admin/fiscal");
     return out;
   });

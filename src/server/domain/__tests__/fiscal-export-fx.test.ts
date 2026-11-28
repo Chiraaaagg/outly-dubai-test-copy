@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { csvText, dubaiPeriodOf, exportCsv, periodBounds, periodLabel, plainAmount, previousPeriod, EXPORT_COLUMNS, UTF8_BOM } from "../fiscal-export-csv";
-import { cbuaeRateFrom, inrToAedMinor, parseAedPerInr } from "../fiscal-fx";
+import { cbuaeRateFrom, inrToAedMinor, parseAedPerInr, RATE_JUMP_CONFIRM_BPS, rateMoveBps } from "../fiscal-fx";
 
 /**
  * Group C pre-launch round 2: the accountant's monthly CSV (owner decision
@@ -81,10 +81,16 @@ describe("INR to AED at the CBUAE rate (C-P1)", () => {
   it("accepts only a plausible AED-per-INR rate, normalised to 8 places", () => {
     expect(parseAedPerInr("0.0435")).toBe("0.04350000");
     expect(parseAedPerInr(" 0.04351234 ")).toBe("0.04351234");
-    // Review 109d R7: the plausible band is 0.0400 to 0.0470.
-    expect(parseAedPerInr("0.04")).toBe("0.04000000");
-    expect(parseAedPerInr("0.047")).toBe("0.04700000");
-    for (const bad of ["", "0.4350", "0.004", "0.0399", "0.04701", "0.02", "0.08", "23.0", "0.04350000001", "abc", null, undefined]) expect(parseAedPerInr(bad), String(bad)).toBeNull();
+    // Review 109e S2: the plausible band is 0.0300 to 0.0600, so a real market move never blocks entry.
+    expect(parseAedPerInr("0.03")).toBe("0.03000000");
+    expect(parseAedPerInr("0.06")).toBe("0.06000000");
+    expect(parseAedPerInr("0.0399")).toBe("0.03990000");
+    for (const bad of ["", "0.4350", "0.004", "0.0299", "0.06001", "0.02", "0.08", "23.0", "0.04350000001", "abc", null, undefined]) expect(parseAedPerInr(bad), String(bad)).toBeNull();
+    // A move of more than 5 % needs a confirmation (basis points of the earlier rate).
+    expect(rateMoveBps("0.0435", "0.0436")).toBe(22n);
+    expect(rateMoveBps("0.0435", "0.0460")).toBe(574n);
+    expect(rateMoveBps("0.0460", "0.0435")).toBe(543n);
+    expect(RATE_JUMP_CONFIRM_BPS).toBe(500n);
   });
 
   it("converts paise to fils half up, sign kept", () => {
@@ -95,7 +101,7 @@ describe("INR to AED at the CBUAE rate (C-P1)", () => {
     expect(inrToAedMinor(12n, "0.04350000")).toBe(1n);
     expect(inrToAedMinor(-100000n, "0.04350000")).toBe(-4350n);
     expect(() => inrToAedMinor(1n, "1.5")).toThrow(RangeError);
-    expect(() => inrToAedMinor(1n, "0.05")).toThrow(RangeError);
+    expect(() => inrToAedMinor(1n, "0.07")).toThrow(RangeError);
   });
 
   it("reads a stored rate only when its source is CBUAE", () => {

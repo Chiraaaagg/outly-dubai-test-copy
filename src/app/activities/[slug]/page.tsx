@@ -17,10 +17,10 @@ import { toCard } from "@/lib/catalog/card";
 import { ComboCard } from "@/components/commerce/cards";
 import { BookingWidget, StickyBookingBar } from "@/components/commerce/booking-widget";
 import { TicketTerms } from "@/components/commerce/ticket-terms";
-import { parseRetimeId } from "@/lib/start-time-retry";
+import { parseRestoreReason, parseRetimeId } from "@/lib/start-time-retry";
 import { Gallery } from "@/components/commerce/gallery";
 import { PriceBlock } from "@/components/commerce/price";
-import { listingPaxAges, listingSellsInfants } from "@/lib/pax-ages";
+import { listingPaxAges, listingSellsChildren, listingSellsInfants } from "@/lib/pax-ages";
 import { IndicativePriceNote } from "@/components/commerce/inquiry-ui";
 import { SisterBrandReviews } from "@/components/commerce/sister-reviews";
 import { TrustSummary } from "@/components/commerce/trust";
@@ -95,10 +95,10 @@ export default async function ActivityPage({
   searchParams,
 }: {
   params: Promise<{ slug: string }>;
-  searchParams: Promise<{ date?: string; retime?: string }>;
+  searchParams: Promise<{ date?: string; retime?: string; change?: string }>;
 }) {
   const { slug } = await params;
-  const { date, retime } = await searchParams;
+  const { date, retime, change } = await searchParams;
   const cached = await getActivityBySlug(slug);
   if (!cached) {
     // Doc 30 §3.9 (D12): a retired listing's slug goes to its replacement (permanent) or its category page.
@@ -225,7 +225,7 @@ export default async function ActivityPage({
 
           {/* Mobile price + booking entry */}
           <div className="mt-6 lg:hidden">
-            <PriceBlock band={activity.price} ages={listingPaxAges(activity)} infantsSold={listingSellsInfants(activity)} size="xl" />
+            <PriceBlock band={activity.price} ages={listingPaxAges(activity)} childrenSold={listingSellsChildren(activity)} infantsSold={listingSellsInfants(activity)} size="xl" />
             {activity.fulfilmentMode !== "instant" && <IndicativePriceNote className="mt-2" />}
           </div>
 
@@ -459,9 +459,9 @@ export default async function ActivityPage({
         {/* ---------------------------------------------------------- SIDEBAR */}
         <aside className="lg:sticky lg:top-28" id="book">
           <div className="hidden lg:block">
-            <PriceBlock band={activity.price} ages={listingPaxAges(activity)} infantsSold={listingSellsInfants(activity)} size="xl" className="mb-4" />
+            <PriceBlock band={activity.price} ages={listingPaxAges(activity)} childrenSold={listingSellsChildren(activity)} infantsSold={listingSellsInfants(activity)} size="xl" className="mb-4" />
           </div>
-          <BookingWidget activity={activity} initialDate={date} retimeItemId={parseRetimeId(retime) ?? undefined} />
+          <BookingWidget activity={activity} initialDate={date} retimeItemId={parseRetimeId(retime) ?? undefined} restoreReason={parseRestoreReason(change)} />
           <Card className="mt-4 p-5">
             <h2 className="mb-3 text-[0.95rem]">Why book this with OUTLYY</h2>
             <TrustSummary />
