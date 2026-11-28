@@ -103,7 +103,8 @@ export { isEntryKind as isGeneratedEntryKind };
 /** The valid combined invoice file of an order's capture, for the payment email attachment hook (O8). */
 export async function invoiceFileForPayment(paymentId: string, e: Env = env()): Promise<{ generatedDocumentId: string; displayNumber: string } | null> {
   if (!e.FISCAL_DOCUMENTS_ENABLED) return null;
-  const doc = await prisma.fiscalDocument.findFirst({ where: { paymentId, docType: "tax_invoice" }, select: { displayNumber: true, files: { where: { status: "valid" }, select: { id: true }, take: 1 } } });
+  // The invoice in force: a full tax invoice reissued by staff (C-P2) is issued later than the simplified one it replaces.
+  const doc = await prisma.fiscalDocument.findFirst({ where: { paymentId, docType: "tax_invoice" }, orderBy: { issuedAt: "desc" }, select: { displayNumber: true, files: { where: { status: "valid" }, select: { id: true }, take: 1 } } });
   const file = doc?.files[0];
   return file ? { generatedDocumentId: file.id, displayNumber: doc.displayNumber } : null;
 }

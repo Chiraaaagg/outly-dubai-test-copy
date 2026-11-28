@@ -27,9 +27,11 @@
  *  - every product is standard 5 % by default (A6). Pure point-to-point
  *    transport tickets (monorail, metro, bus, abra) are exempt: set
  *    `products.vat_category = 'exempt'`, or list the slug in
- *    `EXEMPT_TRANSPORT_SLUGS`. A product with no stored category whose name
- *    looks like such a ticket is held for review (`resolveVatCategory`), so a
- *    transport ticket is never invoiced at 5 % by accident.
+ *    `EXEMPT_TRANSPORT_SLUGS`. A product with no stored category whose slug or
+ *    title names any means of transport (bus, ferry, train, transfer, tram,
+ *    abra, metro, monorail, …) is held for staff (`resolveVatCategory`,
+ *    `vat_category_review`), whatever else the name says: staff then store
+ *    `standard` or `exempt` (review 109c N4).
  *
  * Pure: no env, no I/O. Amounts are bigint minor units, never floats.
  */
@@ -67,14 +69,16 @@ export const DEFAULT_VAT_CATEGORY: VatCategory = "standard";
  */
 export const EXEMPT_TRANSPORT_SLUGS: readonly string[] = [];
 
-const TRANSPORT_WORDS = /\b(monorail|metro|tram|abra|water ?bus|water ?taxi|bus ticket|bus pass|nol card)\b/;
-/** Pleasure and sightseeing trips are not local passenger transport (Executive Regulation Art. 45): they stay at 5 %. */
-const LEISURE_WORDS = /\b(tour|tours|cruise|dinner|safari|sightseeing|hop ?on|hop ?off|city|sunset|yacht|dhow|experience|walking|heritage|souk|show|park|museum|combo)\b/;
+/**
+ * Any means of transport (review 109c N4). No leisure word cancels a match: "hop-on hop-off bus tour" or "Aquaventure
+ * with monorail" are held too, and staff decide (sightseeing trips stay at 5 %, Executive Regulation Art. 45).
+ */
+const TRANSPORT_WORDS = /\b(monorail|metro|tram|trams|abra|abras|bus|buses|coach|ferry|ferries|train|trains|transfer|transfers|shuttle|water ?bus|water ?taxi|nol)\b/;
 
-/** Does this product's slug or title read like a pure point-to-point transport ticket (A6)? A heuristic for review only. */
+/** Does this product's slug or title name a means of transport (A6)? Then a missing category is held for staff. */
 export function looksLikePointToPointTransport(p: { slug: string; title?: string | null }): boolean {
   const text = `${p.slug.replace(/[-_]+/g, " ")} ${p.title ?? ""}`.toLowerCase();
-  return TRANSPORT_WORDS.test(text) && !LEISURE_WORDS.test(text);
+  return TRANSPORT_WORDS.test(text);
 }
 
 export type VatCategoryResolution =
@@ -187,13 +191,23 @@ export function creditForRefund(line: VatSplit, alreadyCredited: VatSplit, refun
   const leftGross = line.grossMinor - alreadyCredited.grossMinor;
   if (refundMinor > leftGross) throw new RangeError("creditForRefund: refund exceeds what is left of the invoiced line");
   if (refundMinor === leftGross) {
-    return { netMinor: line.netMinor - alreadyCredited.netMinor, vatMinor: line.vatMinor - alreadyCredited.vatMinor, grossMinor: leftGross };
+    return nonNegative({ netMinor: line.netMinor - alreadyCredited.netMinor, vatMinor: line.vatMinor - alreadyCredited.vatMinor, grossMinor: leftGross });
   }
   const s = splitInclusive(refundMinor, category);
   // Never credit more VAT than is left on the line (possible only through rounding on many small refunds).
   const leftVat = line.vatMinor - alreadyCredited.vatMinor;
-  if (s.vatMinor > leftVat) return { netMinor: refundMinor - leftVat, vatMinor: leftVat, grossMinor: refundMinor };
-  return s;
+  const out = s.vatMinor > leftVat ? { netMinor: refundMinor - leftVat, vatMinor: leftVat, grossMinor: refundMinor } : s;
+  return nonNegative(out);
+}
+
+/**
+ * Review 109c N8: with a discount line the item's VAT can sit a fil above what its paid amount would carry, so a
+ * last tiny remainder could come out with a negative net. Refused (the issuer turns it into `credit_exceeds_invoice`
+ * for staff) rather than written as a credit note the database check would refuse on every tick.
+ */
+function nonNegative(c: VatSplit): VatSplit {
+  if (c.netMinor < 0n || c.vatMinor < 0n || c.grossMinor <= 0n) throw new RangeError("creditForRefund: the credit would carry a negative amount");
+  return c;
 }
 
 /** "1,234.50" for minor units of a two-decimal currency. Pure, locale-independent. */

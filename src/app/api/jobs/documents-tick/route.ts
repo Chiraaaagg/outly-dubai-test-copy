@@ -5,7 +5,8 @@ import { handle, json, requireCron } from "@/server/lib/http";
 import { scheduledBookingJobsOff } from "@/server/jobs/schedule-switch";
 import { documentService } from "@/server/services/document.service";
 import { issueDue, reconcileRefunds } from "@/server/services/fiscal-document.service";
-import { drawPendingFiscal, generatePendingEntries } from "@/server/services/generated-document.service";
+import { drawPendingFiscal, generatePendingEntries, sweepErasedObjects } from "@/server/services/generated-document.service";
+import { runMonthlyExport } from "@/server/services/fiscal-export.service";
 import { EMAIL_SEND_UNIT_MS, notificationService } from "@/server/services/notification.service";
 import { keyRewrapService, REWRAP_BUDGET_PER_TICK } from "@/server/services/key-rewrap.service";
 import { TRAVELDESK_SUPPLIER_CODE } from "@/server/services/supplier-booking.service";
@@ -48,6 +49,8 @@ const RECONCILE_UNIT_MS = 5_000;
 const FISCAL_FILES_PER_RUN = 25;
 /** Group C: branded entry files per run (locate, build and verify: about a second each). */
 const ENTRY_FILES_PER_RUN = 3;
+/** Group C (review 109c N2): objects of erased files whose delete failed, retried per run. */
+const ERASED_OBJECTS_PER_RUN = 10;
 
 /**
  * /api/jobs/documents-tick — the supplier document step (doc 22 §23 B4; F12,
@@ -124,6 +127,9 @@ async function run() {
   const paymentReceived = await notificationService.sweepPaymentReceived(new Date(), PAYMENT_EMAILS_PER_RUN, {}, { startBy: emailStartBy() });
   const invoiceEmails = await notificationService.sweepInvoiceIssued(new Date(), INVOICE_EMAILS_PER_RUN, {}, { startBy: emailStartBy() });
   const refundReconciliation = Date.now() + RECONCILE_UNIT_MS <= deadline ? await reconcileRefunds(new Date()) : { skipped: "no_time" as const };
+  // C-P4: the monthly CSV for the accountant (once per month, from the 1st, Dubai), then N2's delete retries.
+  const accountantExport = await runMonthlyExport(new Date(), { deadline }).catch(() => ({ skipped: "error" as const }));
+  const erasedObjects = await sweepErasedObjects({ store, max: ERASED_OBJECTS_PER_RUN, deadline });
   const entryFiles = await generatePendingEntries({ store, now: new Date(), max: ENTRY_FILES_PER_RUN, deadline });
   return json({
     ok: true,
@@ -136,6 +142,8 @@ async function run() {
     fiscal,
     fiscalFiles,
     refundReconciliation,
+    accountantExport,
+    erasedObjects,
     entryFiles,
     ranAt: new Date().toISOString(),
   });

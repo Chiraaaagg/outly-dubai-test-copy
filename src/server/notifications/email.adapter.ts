@@ -32,12 +32,13 @@ export interface EmailSend {
   /** Plain-text part — always present so text-only clients and previews work. */
   text: string;
   /**
-   * Group C (owner answer O8): files sent with the message. Only the payment
-   * email uses it, and only for the combined "Tax invoice / Receipt" while
-   * FISCAL_DOCUMENTS_ENABLED is on. The same row always carries the same
-   * bytes, so a retry under the same idempotency key is identical.
+   * Group C (owner answer O8): files sent with the message. The payment and
+   * invoice emails attach the combined "Tax Invoice / Receipt" PDF while
+   * FISCAL_DOCUMENTS_ENABLED is on; the monthly accountant export (C-P4)
+   * attaches its CSV. The same row always carries the same bytes, so a retry
+   * under the same idempotency key is identical.
    */
-  attachments?: { filename: string; content: Uint8Array; contentType: "application/pdf" }[];
+  attachments?: { filename: string; content: Uint8Array; contentType: "application/pdf" | "text/csv" }[];
 }
 
 export interface EmailSendOptions {

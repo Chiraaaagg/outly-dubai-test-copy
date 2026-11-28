@@ -606,7 +606,7 @@ export async function fiscalIncidents(since: Date, now: Date, limit = COLLECT_LI
   const rows = await fiscalAttentionOpen(since, now, limit);
   return rows.map((r) => ({
     kind: "fiscal_attention" as const,
-    entityKind: r.entityKind === "payment" ? ("payment" as const) : ("ledger_entry" as const),
+    entityKind: r.entityKind === "payment" ? ("payment" as const) : r.entityKind === "fiscal_export" ? ("fiscal_export" as const) : ("ledger_entry" as const),
     entityId: r.entityId,
     reason: r.reason,
     raisedAt: r.raisedAt,

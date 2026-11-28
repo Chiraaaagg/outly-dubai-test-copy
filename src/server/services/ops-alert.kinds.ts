@@ -24,6 +24,8 @@ export const OPS_ENTITY_KINDS = [
   /** Group C: needs migration 20261130160000 (ops_alerts_entity_kind_check). */
   "payment",
   "ledger_entry",
+  /** Group C pre-launch round 2 (owner decision C-P4): needs migration 20261202120000. */
+  "fiscal_export",
 ] as const;
 
 export type OpsEntityKind = (typeof OPS_ENTITY_KINDS)[number];

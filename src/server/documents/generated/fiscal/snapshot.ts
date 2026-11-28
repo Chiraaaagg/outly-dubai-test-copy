@@ -53,6 +53,32 @@ export interface FiscalLine {
   note?: string | null;
   /** "discount" for an item's discount line (A5); absent or "item" for the item itself. */
   lineKind?: "item" | "discount";
+  /**
+   * C-P1: an INR-paid line. The line's AED amounts were converted from `grossMinor` INR at the CBUAE rate of
+   * `rateDate`. Kept for audit only: never printed (no INR figure, no rate note on the document).
+   */
+  source?: FiscalLineSource;
+}
+
+export interface FiscalLineSource {
+  currency: "INR";
+  /** The line's amount in INR minor units (signed like the line). */
+  grossMinor: string;
+  /** AED per 1 INR, 8 places. */
+  aedPerInr: string;
+  /** YYYY-MM-DD, the Dubai date of the rate (the capture date). */
+  rateDate: string;
+  rateSource: "CBUAE";
+}
+
+/** The buyer block, read from the mutable party row at draw time. */
+export interface FiscalParty {
+  buyerName: string | null;
+  /** The buyer was erased (A13; or the order was erased before the invoice, review 109c N6): a neutral line. */
+  erased?: boolean;
+  /** Full tax invoice only (C-P2). */
+  buyerTrn?: string | null;
+  buyerAddress?: string | null;
 }
 
 export interface FiscalTotals {
@@ -85,7 +111,16 @@ export interface FiscalSnapshot {
   vatRule: string;
   vatRuleConfirmed: boolean;
   templateVersion: number;
+  /** C-P1: the conversion of an INR-paid order, for audit only (never printed). Absent or null for AED. */
+  fx?: { from: "INR"; aedPerInr: string; rateDate: string; source: "CBUAE" } | null;
+  /** C-P2: "full" for a full tax invoice issued to a VAT-registered buyer on request; absent means simplified. */
+  invoiceType?: "simplified" | "full";
+  /** C-P2: the reissue a document belongs to. */
+  reissue?: { kind: "cancel"; replacementNumber: string } | { kind: "full"; replacesNumber: string; cancelledBy: string } | null;
 }
+
+/** The neutral buyer line of an erased buyer (review 109c N6): never the erasure marker, never the old name. */
+export const ERASED_BUYER_LABEL = "Private customer";
 
 /** Plain phrases for `refunds.reason`; raw reason codes and supplier text are never printed (doc 93 §5.3). */
 export function refundReasonLabel(reason: string): string {
@@ -143,8 +178,10 @@ function zeroRateWord(label: string): string {
   return label === "0%" ? "Zero-rated" : label;
 }
 
-export function fiscalView(s: FiscalSnapshot, party: { buyerName: string | null } | null): FiscalView {
+export function fiscalView(s: FiscalSnapshot, party: FiscalParty | null): FiscalView {
   const invoice = s.docType === "tax_invoice";
+  const full = invoice && s.invoiceType === "full";
+  const cancel = !invoice && s.reissue?.kind === "cancel" ? s.reissue : null;
   const bands: string[] = [];
   if (s.environment === "test") bands.push(invoice ? "TEST — not a tax invoice, not a receipt" : "TEST — not a tax credit note");
   if (!s.vatRuleConfirmed) bands.push("VAT rules UNCONFIRMED — owner-approved, accountant sign-off pending");
@@ -159,8 +196,17 @@ export function fiscalView(s: FiscalSnapshot, party: { buyerName: string | null 
   if (s.seller.licence) seller.push(["Licence", s.seller.licence]);
 
   const booking: [string, string][] = [["Booking reference", s.orderReference]];
-  if (party?.buyerName) booking.push(["Customer", party.buyerName]);
+  if (full) {
+    // C-P2: the recipient's name, address and TRN, as the full tax invoice requires.
+    booking.push(["Customer", party?.erased ? ERASED_BUYER_LABEL : party?.buyerName ?? "[Customer legal name]"]);
+    if (!party?.erased) {
+      booking.push(["Customer address", party?.buyerAddress ?? "[Customer address]"]);
+      booking.push(["Customer TRN", party?.buyerTrn ?? "[Customer TRN]"]);
+    }
+  } else if (party?.erased) booking.push(["Customer", ERASED_BUYER_LABEL]);
+  else if (party?.buyerName) booking.push(["Customer", party.buyerName]);
   if (invoice) booking.push(["Date of supply", dubaiDateLabel(s.supplyDate)]);
+  if (invoice && s.reissue?.kind === "full") booking.push(["Replaces", `Simplified tax invoice ${s.reissue.replacesNumber}, cancelled by credit note ${s.reissue.cancelledBy}`]);
   if (!invoice && s.refersTo) booking.push(["Credit against", `${s.refersTo.displayNumber} dated ${dubaiDateLabel(s.refersTo.issuedAt)}`]);
   if (!invoice && s.refundReasonLabel) booking.push(["Reason", s.refundReasonLabel]);
 
@@ -202,12 +248,14 @@ export function fiscalView(s: FiscalSnapshot, party: { buyerName: string | null 
         s.lines.some((l) => l.rateBasisPoints > 0) ? "All amounts in UAE dirhams (AED). Prices include VAT where it is charged." : "All amounts in UAE dirhams (AED). No VAT is charged on this document.",
         "This document confirms payment. It is not your entry ticket.",
       ]
-    : [`Refunded to the original ${s.paymentMethodLabel.toLowerCase()} on ${dubaiDateLabel(s.moneyAt)}.`, "Banks usually show a refund within 5 to 10 working days.", "All amounts in UAE dirhams (AED)."];
+    : cancel
+      ? [`Cancels simplified tax invoice ${s.refersTo?.displayNumber ?? ""}, reissued as full tax invoice ${cancel.replacementNumber}.`, "No money was refunded.", "All amounts in UAE dirhams (AED)."]
+      : [`Refunded to the original ${s.paymentMethodLabel.toLowerCase()} on ${dubaiDateLabel(s.moneyAt)}.`, "Banks usually show a refund within 5 to 10 working days.", "All amounts in UAE dirhams (AED)."];
   if (s.seller.supportEmail || s.seller.phone) notes.push(`Questions: ${[s.seller.supportEmail, s.seller.phone].filter(Boolean).join(" · ")}`);
 
-  // A3: one PDF headed "Tax Invoice / Receipt", marked PAID, with the payment line. A2: this is the simplified tax
-  // invoice; a full tax invoice (a VAT-registered buyer's TRN printed) is not built yet (staff on request, O3).
-  const title = invoice ? "Tax Invoice / Receipt" : "Tax Credit Note";
+  // A3: one PDF headed "Tax Invoice / Receipt", marked PAID, with the payment line (the simplified tax invoice, A2).
+  // C-P2: a full tax invoice, reissued by staff for a VAT-registered buyer, is headed "Tax Invoice".
+  const title = full ? "Tax Invoice" : invoice ? "Tax Invoice / Receipt" : "Tax Credit Note";
   return {
     title,
     bands,

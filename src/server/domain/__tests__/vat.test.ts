@@ -56,9 +56,27 @@ describe("VAT helpers (owner-approved, accountant sign-off pending)", () => {
     expect(resolveVatCategory({ vatCategory: "standard", slug: "palm-monorail-ticket", title: "Palm Monorail ticket" })).toEqual({ kind: "ok", category: "standard", source: "stored" });
     expect(resolveVatCategory({ vatCategory: null, slug: "palm-monorail-ticket", title: "Palm Monorail ticket" })).toEqual({ kind: "review" });
     expect(resolveVatCategory({ vatCategory: "vat5", slug: "x", title: "X" })).toEqual({ kind: "invalid" });
-    for (const t of ["Palm Monorail single ride", "Dubai Metro day pass", "Creek abra", "Dubai Tram ticket", "Intercity bus ticket"]) expect(looksLikePointToPointTransport({ slug: "x", title: t }), t).toBe(true);
-    // Pleasure and sightseeing trips stay at 5 % (dinner cruises, tours, hop-on hop-off buses).
-    for (const t of ["Dhow Cruise Marina Dinner", "Old Dubai souk walking tour with abra crossing", "Hop-on hop-off bus tour", "Abra sunset cruise", "Atlantis Aquaventure"]) expect(looksLikePointToPointTransport({ slug: "x", title: t }), t).toBe(false);
+    // Review 109c N4: any means of transport holds a product with no stored category, whatever else the name says.
+    for (const t of [
+      "Palm Monorail single ride",
+      "Dubai Metro day pass",
+      "Creek abra",
+      "Dubai Tram ticket",
+      "Intercity bus ticket",
+      "Dubai City Bus ticket",
+      "Palm Monorail ticket, Aquaventure park station",
+      "Metro day pass - City Centre",
+      "Hop-on hop-off bus tour",
+      "Old Dubai souk walking tour with abra crossing",
+      "Desert safari with hotel transfer",
+      "Musandam ferry",
+      "Etihad Rail train ticket",
+    ])
+      expect(looksLikePointToPointTransport({ slug: "x", title: t }), t).toBe(true);
+    expect(resolveVatCategory({ vatCategory: null, slug: "hop-on-hop-off-bus", title: "Hop-on hop-off bus tour" })).toEqual({ kind: "review" });
+    for (const t of ["Dhow Cruise Marina Dinner", "Atlantis Aquaventure", "Evening Desert Safari", "Burj Khalifa 124-125", "Private yacht charter at sunset"]) expect(looksLikePointToPointTransport({ slug: "x", title: t }), t).toBe(false);
+    // "Intercity" or "busy" are not the word "city" or "bus".
+    expect(looksLikePointToPointTransport({ slug: "busy-morning-walk", title: "Busy morning walk" })).toBe(false);
   });
 
   it("splits a VAT-inclusive standard line as 5/105, half up", () => {
@@ -121,6 +139,13 @@ describe("VAT helpers (owner-approved, accountant sign-off pending)", () => {
       credited = { netMinor: credited.netMinor + c.netMinor, vatMinor: credited.vatMinor + c.vatMinor, grossMinor: credited.grossMinor + c.grossMinor };
     }
     expect(credited).toEqual(line);
+  });
+
+  it("review 109c N8: a credit that would carry a negative net is refused, never written", () => {
+    // VAT left 2 fils on 1 fil of gross: the exact remainder would be net -1.
+    const line = { netMinor: 100n, vatMinor: 6n, grossMinor: 106n };
+    const credited = { netMinor: 99n, vatMinor: 4n, grossMinor: 103n };
+    expect(() => creditForRefund(line, { ...credited, grossMinor: 105n, netMinor: 101n }, 1n, "standard")).toThrow(RangeError);
   });
 
   it("refuses a refund beyond what is left of the line, and a non-positive refund", () => {

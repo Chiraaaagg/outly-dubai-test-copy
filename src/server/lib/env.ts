@@ -50,9 +50,21 @@ const strictBool = (name: string) =>
 /** `FISCAL_DOCUMENTS_START_AT`: a full ISO 8601 time with a zone, else null (fail closed, A12). */
 export function parseFiscalStartAt(v: string | undefined): Date | null {
   const t = v?.trim();
-  if (!t || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2})$/.test(t)) return null;
+  const m = t ? /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,3})?)?(?:Z|([+-])(\d{2}):(\d{2}))$/.exec(t) : null;
+  if (!t || !m) return null;
+  // Review 109c N10: an impossible date or time ("2027-02-30", "25:00") is refused, never rolled over.
+  const [y, mo, d, h, mi, se, , oh, om] = [m[1], m[2], m[3], m[4], m[5], m[6] ?? "0", m[7], m[8] ?? "0", m[9] ?? "0"].map((x) => Number(x));
+  const day = new Date(Date.UTC(y, mo - 1, d));
+  if (day.getUTCFullYear() !== y || day.getUTCMonth() !== mo - 1 || day.getUTCDate() !== d) return null;
+  if (h > 23 || mi > 59 || se > 59 || oh > 14 || om > 59) return null;
   const ms = Date.parse(t);
   return Number.isFinite(ms) ? new Date(ms) : null;
+}
+
+/** `FISCAL_ACCOUNTANT_EMAIL`: one plain address, else null (the monthly export is off, C-P4). */
+export function parseAccountantEmail(v: string | undefined): string | null {
+  const t = v?.trim().toLowerCase();
+  return t && t.length <= 254 && /^[^\s@,;<>"]+@[^\s@,;<>"]+\.[a-z]{2,}$/.test(t) ? t : null;
 }
 
 /** Tri-state flag: unset/empty ⇒ `undefined` (no override), otherwise a boolean. */
@@ -297,6 +309,15 @@ const schema = z.object({
     .string()
     .optional()
     .transform((v) => parseFiscalStartAt(v)),
+  /**
+   * Group C, owner decision C-P4: the accountant's address for the monthly
+   * CSV of the fiscal documents, sent on the 1st (Dubai) for the previous
+   * month. Empty or not an address: the export is off.
+   */
+  FISCAL_ACCOUNTANT_EMAIL: z
+    .string()
+    .optional()
+    .transform((v) => parseAccountantEmail(v)),
   /** Stable key of the issuing legal entity for the fiscal series (doc 93 §1.4). */
   FISCAL_LEGAL_ENTITY: z
     .string()
@@ -581,6 +602,8 @@ export function assertBootEnv(): string[] {
   for (const p of stripeConfigProblems(e)) problems.push(`Stripe refused: ${p}`);
   // Group C, A12: the fiscal switch never issues without its go-live start.
   if (e.FISCAL_DOCUMENTS_ENABLED && !e.FISCAL_DOCUMENTS_START_AT) problems.push("FISCAL_DOCUMENTS_ENABLED is on but FISCAL_DOCUMENTS_START_AT is unset or not an ISO time with a zone — no invoice is issued");
+  // Review 109c N7: a value that does not parse is reported even with the switch off (the reconciliation needs it).
+  else if (!e.FISCAL_DOCUMENTS_START_AT && (process.env.FISCAL_DOCUMENTS_START_AT ?? "").trim()) problems.push("FISCAL_DOCUMENTS_START_AT is set but is not a valid ISO time with a zone — the refund reconciliation stays idle");
   if (e.CRM_SYNC_ENABLED) {
     for (const p of crmConfigProblems(e)) problems.push(`CRM sync on but unusable: ${p}`);
     const crm = crmConfigFrom(e);

@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState, type ReactNode } from "react";
-import { BarChart3, ClipboardList, FolderTree, GitMerge, Inbox, LayoutDashboard, ListTree, LogOut, Menu, Package, ScrollText, Settings, Upload, Users, X } from "lucide-react";
+import { BarChart3, ClipboardList, FolderTree, GitMerge, Inbox, LayoutDashboard, ListTree, LogOut, Menu, Package, Receipt, ScrollText, Settings, Upload, Users, X } from "lucide-react";
 import { Logo } from "@/components/layout/logo";
 import { cn } from "@/lib/utils";
 
@@ -40,6 +40,7 @@ interface NavItem {
 const NAV: NavItem[] = [
   { href: "/admin/inquiries", label: "Inquiries", icon: Inbox },
   { href: "/admin/bookings", label: "Bookings", icon: ClipboardList, permission: "orders.view_all" },
+  { href: "/admin/fiscal", label: "Fiscal", icon: Receipt, permission: "payments.reconcile" },
   { href: "/admin", label: "Dashboard", icon: LayoutDashboard, exact: true },
   { href: "/admin/users", label: "Users", icon: Users, permission: "users.manage" },
   { href: "/admin/settings", label: "Settings", icon: Settings, permission: "settings.edit" },

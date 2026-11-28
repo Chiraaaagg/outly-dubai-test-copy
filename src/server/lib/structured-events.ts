@@ -112,6 +112,9 @@ export const STRUCTURED_EVENTS = {
   "fiscal.issue_failed": ["ledgerEntryId", "reason"],
   "fiscal.sweep_failed": ["stage", "reason"],
   "fiscal.refund_reconciliation": ["mismatched"],
+  // Group C pre-launch round 2 (review 109c N1, owner decision C-P4).
+  "fiscal.before_start_uninvoiced": ["count"],
+  "fiscal.export_failed": ["period", "reason"],
   // Files OUTLYY draws itself (keys under "document.", the first segment has no underscore).
   "document.generated_failed": ["generatedDocumentId", "sourceDocumentId", "reason"],
   "document.generated_sweep_failed": ["stage", "reason"],

@@ -1,5 +1,5 @@
 import { PlainWriter } from "../layout/plain";
-import { fiscalView, type FiscalSnapshot, type FiscalView } from "./snapshot";
+import { fiscalView, type FiscalParty, type FiscalSnapshot, type FiscalView } from "./snapshot";
 
 /**
  * Fiscal document renderer: a snapshot in, PDF bytes out (doc 93 §4, §5.1,
@@ -54,7 +54,7 @@ export const plainFiscalLayout: FiscalLayout = {
 
 export async function renderFiscalPdf(
   snapshot: FiscalSnapshot,
-  party: { buyerName: string | null } | null,
+  party: FiscalParty | null,
   layout: FiscalLayout = plainFiscalLayout,
   /** Specimens only: bands printed first on every page ("SPECIMEN — not valid for entry"). */
   extraBands: readonly string[] = [],

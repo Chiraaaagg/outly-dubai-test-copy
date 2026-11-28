@@ -131,6 +131,39 @@ describe("fiscal PDF (plain layout, switch-off backbone)", () => {
     expect(text).toContain("Exempt");
   });
 
+  it("review 109c N6: an erased buyer prints a neutral line, never a marker or the old name", () => {
+    const v = fiscalView(snapshot(), { buyerName: null, erased: true });
+    expect(v.booking).toContainEqual(["Customer", "Private customer"]);
+    expect(JSON.stringify(v)).not.toMatch(/deleted-/);
+  });
+
+  it("C-P2: a full tax invoice is headed Tax Invoice and prints the buyer's name, address and TRN; its cancelling credit note says no money was refunded", async () => {
+    const trn = ["1", "0".repeat(13), "7"].join("");
+    const full = snapshot({ displayNumber: "TEST-INV-000124", invoiceType: "full", reissue: { kind: "full", replacesNumber: "TEST-INV-000123", cancelledBy: "TEST-CN-000009" } });
+    const v = fiscalView(full, { buyerName: "Specimen Trading LLC", buyerTrn: trn, buyerAddress: "Specimen Tower, Dubai" });
+    expect(v.title).toBe("Tax Invoice");
+    expect(v.booking).toEqual(expect.arrayContaining([["Customer", "Specimen Trading LLC"], ["Customer address", "Specimen Tower, Dubai"], ["Customer TRN", trn]]));
+    expect(v.booking).toContainEqual(["Replaces", "Simplified tax invoice TEST-INV-000123, cancelled by credit note TEST-CN-000009"]);
+    const [text] = await pdfText((await renderFiscalPdf(full, { buyerName: "Specimen Trading LLC", buyerTrn: trn, buyerAddress: "Specimen Tower, Dubai" })).bytes);
+    for (const t of ["Tax Invoice", "Specimen Trading LLC", trn, "Date of supply", "PAID"]) expect(text, t).toContain(t);
+    const cancel = fiscalView(
+      snapshot({ docType: "tax_credit_note", displayNumber: "TEST-CN-000009", refersTo: { displayNumber: "TEST-INV-000123", issuedAt: "2027-02-14T10:05:00.000Z" }, refundReasonLabel: "Reissued as a full tax invoice", reissue: { kind: "cancel", replacementNumber: "TEST-INV-000124" } }),
+      { buyerName: "Asha Specimen" },
+    );
+    expect(cancel.notes[0]).toBe("Cancels simplified tax invoice TEST-INV-000123, reissued as full tax invoice TEST-INV-000124.");
+    expect(cancel.notes).toContain("No money was refunded.");
+    expect(cancel.notes.join(" ")).not.toMatch(/Refunded to/);
+  });
+
+  it("C-P1: an INR-paid line keeps its INR source for audit, but nothing INR is printed", async () => {
+    const src = { currency: "INR" as const, grossMinor: "919540", aedPerInr: "0.04350000", rateDate: "2027-02-14", rateSource: "CBUAE" as const };
+    const snap = snapshot({ lines: [line("a", 40000n, { source: src })], fx: { from: "INR", aedPerInr: "0.04350000", rateDate: "2027-02-14", source: "CBUAE" } });
+    expect(isFiscalSnapshot(snap)).toBe(true);
+    const text = (await pdfText((await renderFiscalPdf(snap, null)).bytes)).join("\n");
+    expect(text).not.toMatch(/INR|9,195|0\.0435|CBUAE/);
+    expect(text).toContain("AED 400.00");
+  });
+
   it("replaces characters the standard font cannot draw, and counts them for staff", async () => {
     expect(toWinAnsi("Asha Specimen")).toEqual({ text: "Asha Specimen", replaced: 0 });
     expect(toWinAnsi("आशा 😀")).toEqual({ text: "??? ?", replaced: 4 });

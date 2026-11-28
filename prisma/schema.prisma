@@ -2856,8 +2856,13 @@ model FiscalDocument {
   paymentId       String               @map("payment_id") @db.Uuid
   /// Credit notes only: the refund they document.
   refundId        String?              @map("refund_id") @db.Uuid
-  /// The customer_money ledger entry (capture or refund) this documents. Unique: one document per entry.
-  ledgerEntryId   String               @unique(map: "fiscal_documents_ledger_entry_key") @map("ledger_entry_id") @db.Uuid
+  /// The customer_money ledger entry (capture or refund) this documents. Unique: one document per entry. Null only
+  /// for a reissue (C-P2: the cancelling credit note and the full tax invoice document no money movement).
+  ledgerEntryId   String?              @unique(map: "fiscal_documents_ledger_entry_key") @map("ledger_entry_id") @db.Uuid
+  /// money | reissue_cancel | reissue_full (migration 20261202120000, owner decision C-P2).
+  issueReason     String               @default("money") @map("issue_reason")
+  /// A full tax invoice (`reissue_full`): the simplified invoice it replaces.
+  replacesId      String?              @map("replaces_id") @db.Uuid
   /// Credit notes only: the invoice they correct.
   refersToId      String?              @map("refers_to_id") @db.Uuid
   issuedAt        DateTime             @map("issued_at") @db.Timestamptz(6)
@@ -2877,6 +2882,8 @@ model FiscalDocument {
   series          FiscalSeries         @relation(fields: [seriesId], references: [id], onDelete: Restrict)
   refersTo        FiscalDocument?      @relation("FiscalCredit", fields: [refersToId], references: [id], onDelete: Restrict)
   credits         FiscalDocument[]     @relation("FiscalCredit")
+  replaces        FiscalDocument?      @relation("FiscalReissue", fields: [replacesId], references: [id], onDelete: Restrict)
+  replacedBy      FiscalDocument[]     @relation("FiscalReissue")
   party           FiscalDocumentParty?
   files           GeneratedDocument[]
 
@@ -2941,7 +2948,7 @@ model GeneratedDocument {
 /// reason); detection only, nothing is issued from here. `detail` holds codes and counts. Migration 20261130160000.
 model FiscalAttention {
   id         String    @id @db.Uuid
-  /// payment | ledger_entry
+  /// payment | ledger_entry | fiscal_export
   entityKind String    @map("entity_kind")
   entityId   String    @map("entity_id") @db.Uuid
   orderId    String?   @map("order_id") @db.Uuid
@@ -2953,4 +2960,28 @@ model FiscalAttention {
   createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
 
   @@map("fiscal_attention")
+}
+
+/// Group C (owner decision C-P4): one monthly CSV export of the fiscal documents to the accountant per environment
+/// and period (YYYY-MM, Dubai calendar). The row makes the email go once; a failure is a staff alert.
+model FiscalExport {
+  id            String    @id @db.Uuid
+  period        String
+  /// production | test
+  environment   String
+  /// pending | sent | failed | unknown
+  status        String    @default("pending")
+  attempts      Int       @default(0)
+  documentCount Int?      @map("document_count")
+  lineCount     Int?      @map("line_count")
+  providerId    String?   @map("provider_id")
+  errorCode     String?   @map("error_code")
+  lockedUntil   DateTime? @map("locked_until") @db.Timestamptz(6)
+  nextAttemptAt DateTime? @map("next_attempt_at") @db.Timestamptz(6)
+  sentAt        DateTime? @map("sent_at") @db.Timestamptz(6)
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([environment, period], map: "fiscal_exports_period_key")
+  @@map("fiscal_exports")
 }

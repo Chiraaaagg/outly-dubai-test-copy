@@ -41,6 +41,10 @@ const PLACEHOLDER_CIPHERTEXT = ["v2", "ticket_codes", "zz", "AAAA", "BBBB", "CCC
 const MAIL_DOMAIN = "@example.invalid";
 /** A stored VAT category that is not one of VAT_CATEGORIES: the line is refused (`vat_category_missing`). */
 const INVALID_CATEGORY = "zz_not_a_category";
+/** C-P4: the export periods this suite sends (its fixture documents are issued on NOW, February 2027). */
+const EXPORT_PERIODS = ["2027-01", "2027-02"];
+/** C-P1: the CBUAE rate setting of the fixture capture date (NOW is 14 Feb 2027 in Dubai). */
+const RATE_KEY = "fiscal.cbuae_aed_per_inr.2027-02-14";
 
 type Prisma = typeof import("../../lib/db").prisma;
 let prisma: Prisma;
@@ -142,14 +146,15 @@ async function paidOrder(opts: { grosses?: bigint[]; discounts?: bigint[]; envir
 }
 
 /** A settled refund on one item, with its ledger entry (as refunds.ts settle writes it). */
-async function settledRefund(o: Awaited<ReturnType<typeof paidOrder>>, itemIndex: number, amount: bigint, over: { outlyFunded?: boolean } = {}) {
+async function settledRefund(o: Awaited<ReturnType<typeof paidOrder>>, itemIndex: number, amount: bigint, over: { outlyFunded?: boolean; currency?: "AED" | "INR" } = {}) {
+  const currency = over.currency ?? "AED";
   const id = uuidv7();
   const providerRefundId = `re_zc_${RUN}_${++n}`;
-  await prisma.refund.create({ data: { id, paymentId: o.paymentId, orderItemId: o.items[itemIndex], provider: "stripe", providerRefundId, idempotencyKey: `zc-${RUN}-${n}`, amountMinor: amount, currency: "AED", status: "succeeded", reason: "customer_cancel_request", outlyFunded: over.outlyFunded ?? false } });
+  await prisma.refund.create({ data: { id, paymentId: o.paymentId, orderItemId: o.items[itemIndex], provider: "stripe", providerRefundId, idempotencyKey: `zc-${RUN}-${n}`, amountMinor: amount, currency, status: "succeeded", reason: "customer_cancel_request", outlyFunded: over.outlyFunded ?? false } });
   const p = await prisma.payment.findUniqueOrThrow({ where: { id: o.paymentId } });
   await prisma.payment.update({ where: { id: o.paymentId }, data: { refundedMinor: p.refundedMinor + amount, status: "partially_refunded" } });
   const ledgerId = uuidv7();
-  await prisma.ledgerEntry.create({ data: { id: ledgerId, book: "customer_money", orderId: o.orderId, paymentId: o.paymentId, currency: "AED", amountMinor: -amount, kind: "refund", evidenceRef: `refund:test:stripe:${providerRefundId}`, occurredAt: new Date(NOW.getTime() + 3600_000) } });
+  await prisma.ledgerEntry.create({ data: { id: ledgerId, book: "customer_money", orderId: o.orderId, paymentId: o.paymentId, currency, amountMinor: -amount, kind: "refund", evidenceRef: `refund:test:stripe:${providerRefundId}`, occurredAt: new Date(NOW.getTime() + 3600_000) } });
   return { refundId: id, ledgerId };
 }
 
@@ -226,6 +231,9 @@ async function cleanupRun(): Promise<void> {
       // 1. Children of the append-only rows, foreign keys on.
       await tx.$executeRaw`DELETE FROM notifications WHERE order_id = ANY(${orderIds}::uuid[])`;
       await tx.$executeRaw`DELETE FROM fiscal_attention WHERE order_id = ANY(${orderIds}::uuid[])`;
+      await tx.$executeRaw`DELETE FROM fiscal_attention WHERE entity_kind = 'fiscal_export' AND entity_id IN (SELECT id FROM fiscal_exports WHERE environment = 'test' AND period = ANY(${EXPORT_PERIODS}::text[]))`;
+      await tx.$executeRaw`DELETE FROM fiscal_exports WHERE environment = 'test' AND period = ANY(${EXPORT_PERIODS}::text[])`;
+      await tx.$executeRaw`DELETE FROM settings WHERE key = ${RATE_KEY}`;
       await tx.$executeRaw`DELETE FROM generated_documents WHERE order_id = ANY(${orderIds}::uuid[])`;
       await tx.$executeRaw`DELETE FROM fiscal_document_parties WHERE fiscal_document_id IN (SELECT id FROM fiscal_documents WHERE order_id = ANY(${orderIds}::uuid[]))`;
       // 2. The append-only rows only, with user triggers off.
@@ -393,8 +401,9 @@ describe("Group C documents (disposable database)", () => {
     expect(await prisma.fiscalAttention.count({ where: { entityId: noCat.ledgerId, resolvedAt: null } })).toBe(1);
     const mismatch = await paidOrder({ grosses: [40000n, 2000n], captured: 30000n });
     expect(await fiscal.issueForLedgerEntry(mismatch.ledgerId, deps())).toEqual({ kind: "blocked", reason: "amount_mismatch" });
+    // C-P1: an INR capture with no CBUAE rate for its date is held for staff, never converted at a guess.
     const inr = await paidOrder({ currency: "INR" });
-    expect(await fiscal.issueForLedgerEntry(inr.ledgerId, deps())).toEqual({ kind: "blocked", reason: "currency_not_supported" });
+    expect(await fiscal.issueForLedgerEntry(inr.ledgerId, deps())).toEqual({ kind: "blocked", reason: "fx_rate_missing" });
     const incidents = await (await import("../ops-alert.service")).fiscalIncidents(new Date(NOW.getTime() - 1000), new Date(NOW.getTime() + 1000));
     const mine = incidents.filter((i) => i.entityId === noCat.ledgerId);
     expect(mine).toHaveLength(1);
@@ -1170,4 +1179,213 @@ describe("Group C documents (disposable database)", () => {
     expect(await prisma.$transaction((tx) => erasure.eraseGeneratedForOrders(tx, [o.orderId], NOW))).toMatchObject({ fiscalParties: 0, generatedDocuments: 0, storageObjects: [] });
     expect(erasure.scrubEntrySnapshot({ leadGuest: null, where: "Specimen Station" })).toBeNull();
   }, 60_000);
+  /* -------------------------------------------------------------- pre-launch round 2 (review 109c, owner C-P1 to C-P4) */
+
+  const staffActor = (): import("../../lib/actor").Actor => ({ type: "admin", id: uuidv7(), roles: ["finance"], permissions: new Set(["payments.reconcile"]) });
+  const fixtureTrn = () => ["1", "0".repeat(13), "7"].join("");
+
+  it("C-P1: an INR-paid order is invoiced in AED at the staff-entered CBUAE rate of its capture date; credits net to zero; a used rate cannot change", async () => {
+    const { createFiscalStaffService } = await import("../fiscal-staff.service");
+    const staff = createFiscalStaffService({ stepUp: async () => null, env: () => envWith({}) });
+    await prisma.setting.deleteMany({ where: { key: RATE_KEY } });
+    const o = await paidOrder({ currency: "INR", grosses: [40000n, 2000n] });
+    expect(await fiscal.issueForLedgerEntry(o.ledgerId, deps())).toEqual({ kind: "blocked", reason: "fx_rate_missing" });
+    // Staff enter the rate (validated, step-up, audited); a future date and an implausible rate are refused.
+    await expect(staff.recordCbuaeRate(staffActor(), { date: "2027-02-15", aedPerInr: "0.0435", totpCode: "000000" }, NOW)).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
+    await expect(staff.recordCbuaeRate(staffActor(), { date: "2027-02-14", aedPerInr: "4.35", totpCode: "000000" }, NOW)).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
+    expect(await staff.recordCbuaeRate(staffActor(), { date: "2027-02-14", aedPerInr: "0.0435", totpCode: "000000" }, NOW)).toEqual({ date: "2027-02-14", aedPerInr: "0.04350000", replaced: null });
+    expect((await fiscal.issueForLedgerEntry(o.ledgerId, deps())).kind).toBe("issued");
+    const doc = await prisma.fiscalDocument.findUniqueOrThrow({ where: { ledgerEntryId: o.ledgerId }, include: { files: true } });
+    // INR 400.00 → AED 17.40 (VAT 0.83), INR 20.00 → AED 0.87 (VAT 0.04). Every amount in AED.
+    expect(doc).toMatchObject({ currency: "AED", grossMinor: 1827n, vatMinor: 87n, netMinor: 1740n });
+    const lines = doc.lines as unknown as import("../../documents/generated/fiscal/snapshot").FiscalLine[];
+    expect(lines.map((l) => [l.grossMinor, l.source?.grossMinor, l.source?.aedPerInr, l.source?.rateDate, l.source?.rateSource])).toEqual([
+      ["1740", "40000", "0.04350000", "2027-02-14", "CBUAE"],
+      ["87", "2000", "0.04350000", "2027-02-14", "CBUAE"],
+    ]);
+    expect((doc.files[0].snapshot as { fx?: unknown }).fx).toEqual({ from: "INR", aedPerInr: "0.04350000", rateDate: "2027-02-14", source: "CBUAE" });
+    // Two INR refunds of item 1 at the invoice's own rate: the second takes the exact AED remainder.
+    const r1 = await settledRefund(o, 0, 20000n, { currency: "INR" });
+    const r2 = await settledRefund(o, 0, 20000n, { currency: "INR" });
+    expect((await fiscal.issueForLedgerEntry(r1.ledgerId, deps())).kind).toBe("issued");
+    expect((await fiscal.issueForLedgerEntry(r2.ledgerId, deps())).kind).toBe("issued");
+    const c1 = await prisma.fiscalDocument.findUniqueOrThrow({ where: { ledgerEntryId: r1.ledgerId } });
+    const c2 = await prisma.fiscalDocument.findUniqueOrThrow({ where: { ledgerEntryId: r2.ledgerId } });
+    expect([c1.grossMinor, c1.vatMinor, c2.grossMinor, c2.vatMinor]).toEqual([870n, 41n, 870n, 42n]);
+    expect(c1.currency).toBe("AED");
+    // The rate is now part of documents: it cannot be changed.
+    await expect(staff.recordCbuaeRate(staffActor(), { date: "2027-02-14", aedPerInr: "0.0436", totpCode: "000000" }, NOW)).rejects.toMatchObject({ code: "CONFLICT", details: { reason: "rate_in_use" } });
+    // A refused code: nothing written.
+    const refusing = createFiscalStaffService({ stepUp: async () => "invalid_code", env: () => envWith({}) });
+    await expect(refusing.recordCbuaeRate(staffActor(), { date: "2027-02-13", aedPerInr: "0.0435", totpCode: "000000" }, NOW)).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
+    expect(await prisma.setting.count({ where: { key: "fiscal.cbuae_aed_per_inr.2027-02-13" } })).toBe(0);
+  });
+
+  it("C-P2: staff reissue a simplified invoice as a full tax invoice: a cancelling credit note and a new invoice under the next numbers, the buyer's TRN printed", async () => {
+    const store = new MemoryDocumentStore();
+    storeMod.setDocumentStoreForTests(store);
+    const { createFiscalStaffService } = await import("../fiscal-staff.service");
+    const { pdfText } = await import("../../documents/generated/__tests__/pdf-text");
+    const on = envWith({ FISCAL_DOCUMENTS_ENABLED: true });
+    const staff = createFiscalStaffService({ stepUp: async () => null, env: () => on });
+    const o = await paidOrder({ grosses: [40000n, 2000n] });
+    const inv = (await fiscal.issueForLedgerEntry(o.ledgerId, deps())) as { id: string; displayNumber: string };
+    const trn = fixtureTrn();
+    const input = { displayNumber: inv.displayNumber, legalName: "Specimen Trading LLC", trn, address: "Specimen Tower 1, Business Bay, Dubai", totpCode: "000000" };
+    // Validation, step-up and the switch come first.
+    await expect(staff.reissueFullTaxInvoice(staffActor(), { ...input, trn: "123" }, NOW)).rejects.toMatchObject({ code: "VALIDATION_FAILED", details: { fields: { trn: expect.any(String) } } });
+    await expect(createFiscalStaffService({ stepUp: async () => "invalid_code", env: () => on }).reissueFullTaxInvoice(staffActor(), input, NOW)).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
+    await expect(createFiscalStaffService({ stepUp: async () => null, env: () => envWith({}) }).reissueFullTaxInvoice(staffActor(), input, NOW)).rejects.toMatchObject({ code: "CONFLICT", details: { reason: "switch_off" } });
+    const noPermission = { ...staffActor(), permissions: new Set<string>() };
+    await expect(staff.reissueFullTaxInvoice(noPermission, input, NOW)).rejects.toMatchObject({ code: "FORBIDDEN" });
+
+    const invSeries = await prisma.fiscalSeries.findFirstOrThrow({ where: { legalEntity: ENTITY, docType: "tax_invoice" } });
+    const cnSeries = await prisma.fiscalSeries.findFirstOrThrow({ where: { legalEntity: ENTITY, docType: "tax_credit_note" } });
+    const out = await staff.reissueFullTaxInvoice(staffActor(), input, NOW);
+    expect(out.cancelled.displayNumber).toBe(inv.displayNumber);
+    expect(out.invoice.displayNumber).toBe(fiscal.displayNumberOf(PREFIX, invSeries.nextNumber, 6));
+    expect(out.creditNote.displayNumber).toBe(fiscal.displayNumberOf(CN_PREFIX, cnSeries.nextNumber, 6));
+    const original = await prisma.fiscalDocument.findUniqueOrThrow({ where: { id: inv.id } });
+    const cn = await prisma.fiscalDocument.findUniqueOrThrow({ where: { id: out.creditNote.id }, include: { party: true } });
+    const full = await prisma.fiscalDocument.findUniqueOrThrow({ where: { id: out.invoice.id }, include: { party: true } });
+    expect(cn).toMatchObject({ docType: "tax_credit_note", issueReason: "reissue_cancel", refersToId: inv.id, refundId: null, ledgerEntryId: null, grossMinor: original.grossMinor, vatMinor: original.vatMinor });
+    expect(full).toMatchObject({ docType: "tax_invoice", issueReason: "reissue_full", replacesId: inv.id, ledgerEntryId: null, grossMinor: original.grossMinor, vatMinor: original.vatMinor, supplyDate: original.supplyDate });
+    expect(JSON.stringify(full.lines)).toBe(JSON.stringify(original.lines));
+    expect(full.party).toMatchObject({ buyerName: "Specimen Trading LLC", buyerTrn: trn, buyerAddress: "Specimen Tower 1, Business Bay, Dubai", buyerEmail: null });
+    // Audit names fields and numbers only.
+    const auditRow = await prisma.auditLog.findFirstOrThrow({ where: { action: "fiscal.reissued_full", entityId: inv.displayNumber }, orderBy: { createdAt: "desc" } });
+    expect(JSON.stringify(auditRow.after)).not.toContain(trn);
+    // Both files drawn: the full invoice carries the TRN, the credit note says no money was refunded.
+    expect(await generated.drawPendingFiscal({ store, now: NOW, max: 5, e: on, fiscalDocumentIds: [cn.id, full.id] })).toMatchObject({ drawn: 2 });
+    const textOf = async (id: string) => {
+      const f = await prisma.generatedDocument.findFirstOrThrow({ where: { fiscalDocumentId: id, status: "valid" } });
+      return (await pdfText((await store.get(f.storageKey!, { maxBytes: 10 * 1024 * 1024 }))!)).join("\n");
+    };
+    const fullText = await textOf(full.id);
+    for (const t of ["Tax Invoice", full.displayNumber, "Specimen Trading LLC", trn, "Customer address", inv.displayNumber]) expect(fullText, t).toContain(t);
+    expect(fullText).not.toContain("Tax Invoice / Receipt");
+    expect(await textOf(cn.id)).toContain("No money was refunded.");
+    // Once only; a later refund is credited against the full invoice.
+    await expect(staff.reissueFullTaxInvoice(staffActor(), input, NOW)).rejects.toMatchObject({ code: "CONFLICT", details: { reason: "already_reissued" } });
+    const again = await fiscal.reissueAsFullTaxInvoice(inv.displayNumber, { legalName: "Specimen Trading LLC", trn, address: "Specimen Tower 1, Dubai" }, deps());
+    expect(again).toEqual({ kind: "refused", reason: "already_reissued" });
+    expect(await fiscal.reissueAsFullTaxInvoice(full.displayNumber, { legalName: "Specimen Trading LLC", trn, address: "Specimen Tower 1, Dubai" }, deps())).toEqual({ kind: "refused", reason: "not_simplified" });
+    const refund = await settledRefund(o, 1, 2000n);
+    expect((await fiscal.issueForLedgerEntry(refund.ledgerId, deps())).kind).toBe("issued");
+    expect((await prisma.fiscalDocument.findUniqueOrThrow({ where: { ledgerEntryId: refund.ledgerId } })).refersToId).toBe(full.id);
+    // An invoice with a refund is not reissued automatically.
+    const o2 = await paidOrder({ grosses: [5000n] });
+    const inv2 = (await fiscal.issueForLedgerEntry(o2.ledgerId, deps())) as { displayNumber: string };
+    await settledRefund(o2, 0, 1000n);
+    expect(await fiscal.reissueAsFullTaxInvoice(inv2.displayNumber, { legalName: "Specimen Trading LLC", trn, address: "Specimen Tower 1, Dubai" }, deps())).toEqual({ kind: "refused", reason: "refunds_exist" });
+  }, 60_000);
+
+  it("C-P4: the monthly CSV goes once to the accountant with the month's documents; a failed send alerts staff and is retried", async () => {
+    await prisma.$executeRaw`DELETE FROM fiscal_attention WHERE entity_kind = 'fiscal_export' AND entity_id IN (SELECT id FROM fiscal_exports WHERE environment = 'test' AND period = ANY(${EXPORT_PERIODS}::text[]))`;
+    await prisma.fiscalExport.deleteMany({ where: { environment: "test", period: { in: EXPORT_PERIODS } } });
+    const exporter = await import("../fiscal-export.service");
+    const o = await paidOrder({ grosses: [5000n] });
+    const inv = (await fiscal.issueForLedgerEntry(o.ledgerId, deps())) as { displayNumber: string };
+    const e = envWith({ FISCAL_ACCOUNTANT_EMAIL: "accountant@example.com", recipientAllowlist: ["@example.com"] });
+    const mails: { msg: EmailSend; opts: EmailSendOptions }[] = [];
+    const ok = async (msg: EmailSend, opts: EmailSendOptions): Promise<EmailOutcome> => {
+      mails.push({ msg, opts });
+      return { kind: "sent", providerId: `fake-${opts.idempotencyKey}` };
+    };
+    // Off without an address; not before the start.
+    expect(await exporter.runMonthlyExport(new Date("2027-03-01T06:00:00Z"), { e: envWith({ FISCAL_ACCOUNTANT_EMAIL: null }), send: ok })).toEqual({ skipped: "off" });
+    expect(await exporter.runMonthlyExport(new Date("2027-01-01T06:00:00Z"), { e, send: ok })).toMatchObject({ skipped: "before_start", period: "2026-12" });
+    // 1 March 2027, Dubai: February goes.
+    const first = await exporter.runMonthlyExport(new Date("2027-03-01T06:00:00Z"), { e, send: ok });
+    expect(first).toMatchObject({ period: "2027-02", status: "sent" });
+    expect(mails).toHaveLength(1);
+    expect(mails[0].msg.to).toBe("accountant@example.com");
+    const att = mails[0].msg.attachments ?? [];
+    expect(att.map((a) => [a.filename, a.contentType])).toEqual([["OUTLYY-fiscal-documents-2027-02-TEST.csv", "text/csv"]]);
+    const csv = new TextDecoder().decode(att[0].content);
+    expect(csv.split("\r\n")[0]).toBe("Document number,Type,Issue date,Date of supply,Order reference,Buyer name,Line description,VAT category,Net,VAT,Gross,Currency");
+    expect(csv).toContain(`${inv.displayNumber},Tax invoice (simplified),2027-02-14,2027-02-14,${o.reference},zz-c-${RUN} Asha Specimen,Specimen Activity 1,standard,47.62,2.38,50.00,AED`);
+    // Once per month: later runs send nothing.
+    expect(await exporter.runMonthlyExport(new Date("2027-03-01T08:00:00Z"), { e, send: ok })).toMatchObject({ skipped: "not_due", period: "2027-02" });
+    expect(mails).toHaveLength(1);
+    expect(await prisma.fiscalExport.findFirstOrThrow({ where: { environment: "test", period: "2027-02" } })).toMatchObject({ status: "sent", attempts: 1 });
+    // A refused send (January): a staff alert, a retry after the back-off, the alert closed on success.
+    const refuse = async (): Promise<EmailOutcome> => ({ kind: "failed", retryable: true, httpStatus: 429, reason: "rate_limited" });
+    expect(await exporter.runMonthlyExport(new Date("2027-02-01T06:00:00Z"), { e, send: refuse })).toMatchObject({ period: "2027-01", status: "failed" });
+    const row = await prisma.fiscalExport.findFirstOrThrow({ where: { environment: "test", period: "2027-01" } });
+    expect(row).toMatchObject({ status: "failed", errorCode: "retryable:rate_limited" });
+    expect(await prisma.fiscalAttention.count({ where: { entityKind: "fiscal_export", entityId: row.id, resolvedAt: null, reason: "export_failed" } })).toBe(1);
+    const { fiscalIncidents } = await import("../ops-alert.service");
+    expect((await fiscalIncidents(new Date("2027-02-01T05:00:00Z"), new Date("2027-02-01T07:00:00Z"))).find((i) => i.entityId === row.id)).toMatchObject({ entityKind: "fiscal_export", reason: "export_failed" });
+    expect(await exporter.runMonthlyExport(new Date("2027-02-01T06:10:00Z"), { e, send: ok })).toMatchObject({ skipped: "not_due" });
+    expect(await exporter.runMonthlyExport(new Date("2027-02-01T07:00:00Z"), { e, send: ok })).toMatchObject({ period: "2027-01", status: "sent" });
+    expect(await prisma.fiscalAttention.count({ where: { entityKind: "fiscal_export", entityId: row.id, resolvedAt: null } })).toBe(0);
+  }, 60_000);
+
+  it("review 109c N2, N3: erased files' objects are deleted by a retrying sweep; a file being drawn when the erasure commits never ends valid with the name", async () => {
+    const erasure = await import("../../repositories/generated-document-erasure");
+    const on = envWith({ FISCAL_DOCUMENTS_ENABLED: true });
+    // N2: the delete after the erasure fails; the sweep deletes the object later; a repeat erasure collects it again.
+    const store = new MemoryDocumentStore();
+    storeMod.setDocumentStoreForTests(store);
+    const o = await paidOrder({ grosses: [5000n] });
+    const fid = ((await fiscal.issueForLedgerEntry(o.ledgerId, deps())) as { id: string }).id;
+    await generated.drawPendingFiscal({ store, now: NOW, max: 5, e: on, fiscalDocumentIds: [fid] });
+    const first = await prisma.generatedDocument.findFirstOrThrow({ where: { fiscalDocumentId: fid, status: "valid" } });
+    const out = await prisma.$transaction((tx) => erasure.eraseGeneratedForOrders(tx, [o.orderId], NOW));
+    expect(out.storageObjects.map((x) => x.storageKey)).toContain(first.storageKey);
+    // (The delete is never attempted here: as if storage were down after the commit.)
+    const again = await prisma.$transaction((tx) => erasure.eraseGeneratedForOrders(tx, [o.orderId], NOW));
+    expect(again.fiscalParties).toBe(0);
+    expect(again.storageObjects.map((x) => x.storageKey)).toContain(first.storageKey);
+    expect(await prisma.generatedDocument.findUniqueOrThrow({ where: { id: first.id } })).toMatchObject({ status: "superseded", reasonCode: "erased" });
+    // The sweep sees every erased row with an object in the shared database: run until this one is gone.
+    for (let i = 0; i < 20 && (await store.get(first.storageKey!, { maxBytes: 10 * 1024 * 1024 })); i++) await generated.sweepErasedObjects({ store, max: 50 });
+    expect(await store.get(first.storageKey!, { maxBytes: 10 * 1024 * 1024 })).toBeNull();
+    expect((await prisma.generatedDocument.findUniqueOrThrow({ where: { id: first.id } })).storageKey).toBeNull();
+
+    // N3: the erasure commits while the file is being stored (inside the put): the row never turns valid, the object goes.
+    const o3 = await paidOrder({ grosses: [5000n] });
+    const fid3 = ((await fiscal.issueForLedgerEntry(o3.ledgerId, deps())) as { id: string }).id;
+    let putKey: string | null = null;
+    class ErasingStore extends MemoryDocumentStore {
+      override async put(key: string, bytes: Uint8Array, contentType: string): Promise<void> {
+        putKey = key;
+        await prisma.$transaction((tx) => erasure.eraseGeneratedForOrders(tx, [o3.orderId], NOW));
+        return super.put(key, bytes, contentType);
+      }
+    }
+    const racing = new ErasingStore();
+    expect(await generated.drawPendingFiscal({ store: racing, now: NOW, max: 5, e: on, fiscalDocumentIds: [fid3] })).toMatchObject({ drawn: 0 });
+    expect(putKey).not.toBeNull();
+    expect(await racing.get(putKey!, { maxBytes: 10 * 1024 * 1024 })).toBeNull();
+    expect(await prisma.generatedDocument.count({ where: { fiscalDocumentId: fid3, status: "valid" } })).toBe(0);
+    // The re-queued copy is drawn without the name.
+    const { pdfText } = await import("../../documents/generated/__tests__/pdf-text");
+    expect(await generated.drawPendingFiscal({ store, now: NOW, max: 5, e: on, fiscalDocumentIds: [fid3] })).toMatchObject({ drawn: 1 });
+    const redrawn = await prisma.generatedDocument.findFirstOrThrow({ where: { fiscalDocumentId: fid3, status: "valid" } });
+    expect((await pdfText((await store.get(redrawn.storageKey!, { maxBytes: 10 * 1024 * 1024 }))!)).join("\n")).not.toContain("Asha Specimen");
+  }, 60_000);
+
+  it("review 109c N6: an order erased before its invoice gets a neutral buyer line; N1: production captures before the start are counted", async () => {
+    const store = new MemoryDocumentStore();
+    storeMod.setDocumentStoreForTests(store);
+    const { pdfText } = await import("../../documents/generated/__tests__/pdf-text");
+    const o = await paidOrder({ grosses: [5000n] });
+    await prisma.order.update({ where: { id: o.orderId }, data: { leadName: "[deleted-0123456789ab]", leadEmail: null } });
+    const fid = ((await fiscal.issueForLedgerEntry(o.ledgerId, deps())) as { id: string }).id;
+    const party = await prisma.fiscalDocumentParty.findUniqueOrThrow({ where: { fiscalDocumentId: fid } });
+    expect(party).toMatchObject({ buyerName: null, buyerEmail: null });
+    expect(party.erasedAt).not.toBeNull();
+    await generated.drawPendingFiscal({ store, now: NOW, max: 5, e: envWith({ FISCAL_DOCUMENTS_ENABLED: true }), fiscalDocumentIds: [fid] });
+    const f = await prisma.generatedDocument.findFirstOrThrow({ where: { fiscalDocumentId: fid, status: "valid" } });
+    const text = (await pdfText((await store.get(f.storageKey!, { maxBytes: 10 * 1024 * 1024 }))!)).join("\n");
+    expect(text).toContain("Private customer");
+    expect(text).not.toContain("deleted-");
+    // N1: a production capture before the start is counted (shared database: compared before and after).
+    const later = new Date(NOW.getTime() + 3600_000);
+    const before = await fiscal.countCapturesBeforeStart(later);
+    await paidOrder({ environment: "production", grosses: [5000n] });
+    expect(await fiscal.countCapturesBeforeStart(later)).toBe(before + 1);
+  });
 });

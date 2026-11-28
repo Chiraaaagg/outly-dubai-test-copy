@@ -17,6 +17,7 @@ import { DOCUMENT_LIMITS } from "./document.service";
 import { paxLabel } from "./order-status.service";
 import { siteConfig } from "@/lib/site-config";
 import { FISCAL_KINDS } from "./generated-document.read";
+import { forgetGeneratedStorageKey } from "../repositories/generated-document-erasure";
 
 /**
  * Files OUTLYY draws itself (doc 93 §2, §4.4): the PDF of each fiscal
@@ -61,13 +62,61 @@ async function claim(row: Pick<GeneratedDocument, "id" | "attempts">, now: Date,
   return n.count === 1;
 }
 
-async function storeValid(row: Pick<GeneratedDocument, "id">, bytes: Uint8Array, store: DocumentStore, now: Date): Promise<void> {
+/**
+ * Stores a drawn fiscal file (review 109c N3). The key is recorded on the pending row BEFORE the put, and the row
+ * turns valid only if it is still pending with that key. An erasure that commits while the file is being drawn
+ * supersedes the pending row (row lock), so: either the key is recorded first, and the erasure then collects it for
+ * deletion; or the recording finds no pending row and nothing is stored; and a file stored after the erasure never
+ * turns valid: its object is deleted at once. An object left by a killed attempt (key on the pending row) is deleted
+ * before a new one is made. Answers whether the row is now valid.
+ */
+async function storeValid(row: Pick<GeneratedDocument, "id" | "storageKey">, bytes: Uint8Array, store: DocumentStore, now: Date): Promise<boolean> {
+  if (row.storageKey) await store.delete(row.storageKey).catch(() => {});
   const key = newKey();
+  const recorded = await prisma.generatedDocument.updateMany({ where: { id: row.id, status: "pending" }, data: { storageKey: key } });
+  if (recorded.count !== 1) return false;
   await store.put(key, bytes, "application/pdf");
-  await prisma.generatedDocument.updateMany({
-    where: { id: row.id, status: "pending" },
-    data: { status: "valid", storageKey: key, contentType: "application/pdf", byteSize: bytes.byteLength, sha256: sha256Of(bytes), validatedAt: now, lockedUntil: null, reasonCode: null, nextAttemptAt: null },
+  const n = await prisma.generatedDocument.updateMany({
+    where: { id: row.id, status: "pending", storageKey: key },
+    data: { status: "valid", contentType: "application/pdf", byteSize: bytes.byteLength, sha256: sha256Of(bytes), validatedAt: now, lockedUntil: null, reasonCode: null, nextAttemptAt: null },
   });
+  if (n.count === 1) return true;
+  // Superseded meanwhile (an erasure): the object must not outlive it.
+  try {
+    await store.delete(key);
+    await forgetGeneratedStorageKey(row.id, key);
+  } catch {
+    emitEvent("document.generated_store_error", { generatedDocumentId: row.id, operation: "delete" }, "error");
+  }
+  return false;
+}
+
+/**
+ * Review 109c N2: objects of files superseded by an erasure (`reason_code = 'erased'`) that are still in the store,
+ * because the delete after the erasure failed or never ran, are deleted here, a few per run, until none is left.
+ * Never throws.
+ */
+export async function sweepErasedObjects(opts: { store: DocumentStore | null; max: number; deadline?: number }): Promise<{ deleted: number; failed: number }> {
+  const out = { deleted: 0, failed: 0 };
+  if (!opts.store) return out;
+  try {
+    const rows = await prisma.generatedDocument.findMany({ where: { reasonCode: "erased", status: { in: ["superseded", "failed"] }, storageKey: { not: null } }, select: { id: true, storageKey: true }, orderBy: { updatedAt: "asc" }, take: opts.max });
+    for (const r of rows) {
+      if (opts.deadline !== undefined && Date.now() + 2_000 > opts.deadline) break;
+      if (!r.storageKey) continue;
+      try {
+        await opts.store.delete(r.storageKey);
+        await forgetGeneratedStorageKey(r.id, r.storageKey);
+        out.deleted++;
+      } catch {
+        out.failed++;
+        emitEvent("document.generated_store_error", { generatedDocumentId: r.id, operation: "delete" }, "error");
+      }
+    }
+  } catch {
+    emitEvent("document.generated_sweep_failed", { stage: "erased_objects", reason: "query_failed" }, "error");
+  }
+  return out;
 }
 
 /**
@@ -107,10 +156,12 @@ async function failExhausted(row: Pick<GeneratedDocument, "id" | "attempts">, no
 async function raiseFiscalFileAttention(generatedDocumentId: string, reason: string, now: Date): Promise<void> {
   const g = await prisma.generatedDocument.findUnique({ where: { id: generatedDocumentId }, select: { fiscalDocumentId: true, orderId: true } });
   if (!g?.fiscalDocumentId) return;
-  const doc = await prisma.fiscalDocument.findUnique({ where: { id: g.fiscalDocumentId }, select: { ledgerEntryId: true } });
+  const doc = await prisma.fiscalDocument.findUnique({ where: { id: g.fiscalDocumentId }, select: { ledgerEntryId: true, paymentId: true } });
   if (!doc) return;
   const { raiseAttention } = await import("./fiscal-document.service");
-  await raiseAttention(prisma, { entityKind: "ledger_entry", entityId: doc.ledgerEntryId, orderId: g.orderId, reason: "fiscal_file_failed", detail: { stage: "draw", code: reason.slice(0, 64) } }, now);
+  // A reissued document (C-P2) has no ledger entry: the row goes on its payment.
+  const entity = doc.ledgerEntryId ? { entityKind: "ledger_entry" as const, entityId: doc.ledgerEntryId } : { entityKind: "payment" as const, entityId: doc.paymentId };
+  await raiseAttention(prisma, { ...entity, orderId: g.orderId, reason: "fiscal_file_failed", detail: { stage: "draw", code: reason.slice(0, 64) } }, now);
 }
 
 /**
@@ -130,10 +181,11 @@ export async function requeueFailedFiscalFile(fiscalDocumentId: string, now: Dat
     return true;
   });
   if (queued) {
-    const doc = await prisma.fiscalDocument.findUnique({ where: { id: fiscalDocumentId }, select: { ledgerEntryId: true } });
+    const doc = await prisma.fiscalDocument.findUnique({ where: { id: fiscalDocumentId }, select: { ledgerEntryId: true, paymentId: true } });
     if (doc) {
       const { resolveAttention } = await import("./fiscal-document.service");
-      await resolveAttention(prisma, "ledger_entry", doc.ledgerEntryId, now, ["fiscal_file_failed"]);
+      if (doc.ledgerEntryId) await resolveAttention(prisma, "ledger_entry", doc.ledgerEntryId, now, ["fiscal_file_failed"]);
+      else await resolveAttention(prisma, "payment", doc.paymentId, now, ["fiscal_file_failed"]);
     }
   }
   return queued;
@@ -151,7 +203,9 @@ export async function drawFiscal(row: Pick<GeneratedDocument, "fiscalDocumentId"
   if (doc.displayNumber !== snap.displayNumber || doc.grossMinor.toString() !== snap.totals.grossMinor || doc.docType !== snap.docType || JSON.stringify(doc.lines) !== JSON.stringify(snap.lines)) {
     return { ok: false, reason: "snapshot_mismatch" };
   }
-  const out = await renderFiscalPdf(snap, doc.party ? { buyerName: doc.party.erasedAt ? null : doc.party.buyerName } : null);
+  const p = doc.party;
+  // A13 / review 109c N6: an erased buyer prints the neutral line; a full tax invoice (C-P2) prints the buyer's TRN and address.
+  const out = await renderFiscalPdf(snap, p ? (p.erasedAt ? { buyerName: null, erased: true } : { buyerName: p.buyerName, buyerTrn: p.buyerTrn, buyerAddress: p.buyerAddress }) : null);
   const verdict = validatePdf(out.bytes, { maxBytes: DOCUMENT_LIMITS.maxPdfBytes });
   if (!verdict.ok) return { ok: false, reason: `validator_${verdict.reason}` };
   if (out.replacedChars > 0) emitEvent("document.generated_replaced_chars", { fiscalDocumentId: doc.id, count: out.replacedChars }, "warn");
@@ -196,8 +250,7 @@ export async function drawPendingFiscal(opts: { store: DocumentStore | null; now
           (await retryOrFail(row, drawn.reason, opts.now)) === "failed" ? summary.failed++ : summary.retried++;
           continue;
         }
-        await storeValid(row, drawn.bytes, opts.store, opts.now);
-        summary.drawn++;
+        if (await storeValid(row, drawn.bytes, opts.store, opts.now)) summary.drawn++;
       } catch {
         (await retryOrFail(row, "draw_error", opts.now)) === "failed" ? summary.failed++ : summary.retried++;
       }

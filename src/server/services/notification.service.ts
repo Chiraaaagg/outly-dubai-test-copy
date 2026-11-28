@@ -163,6 +163,13 @@ const INVOICE_ISSUED: InvoiceNotificationEvent = "INVOICE_ISSUED";
 export const INVOICE_ISSUED_WINDOW_MS = 7 * 24 * 3600_000;
 /** Order states in which the money is still held for the booking: the payment email is sent only in these (finding 9). */
 const PAYMENT_EMAIL_ORDER_STATES = ["paid", "supplier_pending", "confirmed", "partially_confirmed", "completed"] as const;
+/**
+ * Review 109c N9: every character `String.prototype.trim()` removes (ECMAScript WhiteSpace and LineTerminator), passed
+ * to `btrim` as a parameter so the database trims exactly what the send-time `trim()` does.
+ */
+const JS_TRIM_CHARS = [0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20, 0xa0, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff]
+  .map((c) => String.fromCharCode(c))
+  .join("");
 /** Time one payment or invoice email send may take (the email provider's timeout plus the writes). */
 export const EMAIL_SEND_UNIT_MS = 12_000;
 
@@ -1150,7 +1157,7 @@ export const notificationService = {
           -- Same trim as the send (re-review E2): an order with no usable lead email writes no row, so it must not be
           -- selected again every tick and hold a place.
           AND EXISTS (SELECT 1 FROM orders o WHERE o.id = l.order_id
-            AND NULLIF(btrim(o.lead_email, chr(32) || chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(160) || chr(65279)), '') IS NOT NULL)
+            AND NULLIF(btrim(o.lead_email, ${JS_TRIM_CHARS}), '') IS NOT NULL)
           ${only}
         ORDER BY l.order_id, l.occurred_at ASC
         LIMIT ${max}`;
@@ -1199,12 +1206,14 @@ export const notificationService = {
         JOIN orders o ON o.id = f.order_id
         JOIN payments p ON p.id = f.payment_id
         JOIN ledger_entries l ON l.id = f.ledger_entry_id
-        WHERE f.doc_type = 'tax_invoice' AND l.occurred_at >= ${since} AND l.occurred_at <= ${now}
+        WHERE f.doc_type = 'tax_invoice' AND f.issue_reason = 'money' AND l.occurred_at >= ${since} AND l.occurred_at <= ${now}
+          -- C-P2: a simplified invoice staff reissued as a full tax invoice is not mailed; staff send the full one.
+          AND NOT EXISTS (SELECT 1 FROM fiscal_documents rf WHERE rf.replaces_id = f.id)
           -- Re-review D2: the skip conditions are part of the selection, so skipped orders never hold the run's places.
           -- Same test as paymentEmailStillRight (kept at send time): a lead email, a paid order, nothing refunded or refunding.
-          -- Re-review E2: trims the same whitespace as the JS trim() used at send time (space, tab, LF, VT, FF, CR, NBSP, BOM),
+          -- Re-review E2 / review 109c N9: trims exactly the whitespace of the JS trim() used at send time (JS_TRIM_CHARS),
           -- so a whitespace-only address is never selected and then skipped while holding a place.
-          AND NULLIF(btrim(o.lead_email, chr(32) || chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(160) || chr(65279)), '') IS NOT NULL
+          AND NULLIF(btrim(o.lead_email, ${JS_TRIM_CHARS}), '') IS NOT NULL
           AND o.status::text IN (${Prisma.join([...PAYMENT_EMAIL_ORDER_STATES])})
           AND p.order_id = f.order_id AND p.captured_minor > 0 AND p.refunded_minor = 0
           AND NOT EXISTS (SELECT 1 FROM refunds r WHERE r.payment_id = f.payment_id AND r.status <> 'failed')
