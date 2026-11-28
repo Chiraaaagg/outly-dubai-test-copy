@@ -12,7 +12,8 @@ import { CollapsiblePromo } from "@/components/checkout/collapsible-promo";
 import { COUNTRIES, PhoneInput, type Country } from "@/components/checkout/phone-input";
 import { writeOrderHint } from "@/components/commerce/order-status/order-hint";
 import { EmptyCartOrPaidBooking } from "@/components/commerce/paid-booking-notice";
-import { Button, ButtonLink } from "@/components/ui/button";
+import { clearPaidMarker } from "@/lib/paid-booking";
+import { Button, ButtonLink, PrivateButtonLink } from "@/components/ui/button";
 import { Alert, Card, EmptyState } from "@/components/ui/primitives";
 import { Stepper, StepperIndicator, StepperItem, StepperSeparator, StepperTitle, StepperTrigger } from "@/components/ui/stepper";
 import {
@@ -254,7 +255,7 @@ function chargeText(m: Money, currency: "INR" | "AED"): string {
 
 export default function CheckoutPage() {
   const router = useRouter();
-  const { cart, cartTotalINR, cartTotalAED, currency, clearCart, hydrated, toast, updateCartItem } = useApp();
+  const { cart, cartTotalINR, cartTotalAED, currency, clearCart, hydrated, restored, toast, updateCartItem } = useApp();
 
   const [step, setStep] = useState<Step>(1);
   // The details typed in this tab come back (CO-06): after Stripe, a reload, or the inquiry form and back.
@@ -432,17 +433,23 @@ export default function CheckoutPage() {
     }
   };
 
+  // On load, and again after each back-forward cache restore (`restored`): the provider has read the cart from
+  // storage again by then, so the check sees the cart as it is now, not as it was when the page was left.
   useEffect(() => {
     if (!hydrated) return;
     void checkHandoff();
-    // A page restored from the back-forward cache keeps its old "opening the payment page" state.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hydrated, restored]);
+
+  // A page restored from the back-forward cache keeps its old "opening the payment page" state. With no hand-off
+  // left (the status page spent it), nothing is being opened any more.
+  useEffect(() => {
     const onShow = (e: PageTransitionEvent) => {
-      if (e.persisted) void checkHandoff();
+      if (e.persisted && !readPaymentHandoff()) setPayment((p) => (p === "processing" ? "idle" : p));
     };
     window.addEventListener("pageshow", onShow);
     return () => window.removeEventListener("pageshow", onShow);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hydrated]);
+  }, []);
 
   const returnToPayment = async () => {
     const handoff = readPaymentHandoff();
@@ -720,6 +727,7 @@ export default function CheckoutPage() {
       }
       // The reference, so the return page knows which order to ask the server about; the hand-off, so
       // "Return to payment" can repeat this same call if the customer comes back without paying (CO-06).
+      clearPaidMarker();
       writeOrderHint(r.orderReference);
       writePaymentHandoff({ reference: r.orderReference, cartKey: cartFingerprint(cart), quoteId: q.quoteId, verificationId, method, traveller: sent });
       window.location.assign(payPage);
@@ -795,10 +803,13 @@ export default function CheckoutPage() {
     return (
       <div className="container-page py-10 pb-20">
         <EmptyCartOrPaidBooking
+          key={restored}
           headingAs="h1"
+          fallbackMessage="Nothing to check out yet"
           skeleton={<div className="skeleton h-96 w-full rounded-[var(--radius-tile)]" />}
           fallback={
             <EmptyState
+              headingAs="h1"
               illustration="cart"
               title="Nothing to check out yet"
               body="Your trip is empty. Add an experience and it'll appear here, or if you started a booking on WhatsApp, we can pick it up from there."
@@ -988,9 +999,9 @@ export default function CheckoutPage() {
                   <p className="font-bold">This trip already has a booking, {leftPayment.reference}.</p>
                   <p className="mt-1 leading-relaxed">Check where it stands before you pay again.</p>
                   <div className="mt-3 flex flex-wrap gap-2">
-                    <ButtonLink href={`/booking/${encodeURIComponent(leftPayment.reference)}`} size="sm">
+                    <PrivateButtonLink href={`/booking/${encodeURIComponent(leftPayment.reference)}`} size="sm">
                       View my booking
-                    </ButtonLink>
+                    </PrivateButtonLink>
                   </div>
                 </>
               ) : (
@@ -1030,9 +1041,9 @@ export default function CheckoutPage() {
                         Start again
                       </Button>
                     )}
-                    <ButtonLink href={`/booking/${encodeURIComponent(leftPayment.reference)}`} size="sm" variant="outline">
+                    <PrivateButtonLink href={`/booking/${encodeURIComponent(leftPayment.reference)}`} size="sm" variant="outline">
                       View booking status
-                    </ButtonLink>
+                    </PrivateButtonLink>
                   </div>
                 </>
               )}

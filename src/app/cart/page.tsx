@@ -43,7 +43,7 @@ import { cancellationPolicyBeforeQuote, formatDateKey, formatDateLong, formatDur
  * server quote re-checks everything again before any payment.
  */
 export default function CartPage() {
-  const { cart, removeFromCart, updateCartItem, cartTotalINR, cartTotalAED, currency, hydrated } = useApp();
+  const { cart, removeFromCart, updateCartItem, cartTotalINR, cartTotalAED, currency, hydrated, restored } = useApp();
   const { activities } = useCatalog();
   // The checkout's own rule (mixed carts and over-cap carts go to inquiry); no build-type gate (CO-03, doc 22 §32.34).
   const inquiry = cartGoesToInquiry(cart);
@@ -148,10 +148,13 @@ export default function CartPage() {
       {cart.length === 0 ? (
         // The same paid-booking notice as the empty /checkout (src/lib/paid-booking.ts); otherwise the usual state.
         <EmptyCartOrPaidBooking
+          key={restored}
           headingAs="h2"
+          fallbackMessage="Your trip is empty"
           skeleton={<div className="skeleton h-64 w-full rounded-[var(--radius-tile)]" />}
           fallback={
             <EmptyState
+              headingAs="h2"
               illustration="cart"
               icon={<Sparkles className="h-6 w-6" />}
               title="Your trip is empty"

@@ -16,9 +16,12 @@ import { isValidReference, normaliseReference } from "@/lib/reference";
  * `checkout-draft.ts`). It is never put in a URL or an analytics event, and
  * it is never evidence: an empty cart page that finds it asks the status API
  * about that order (`fetchOrderStatus`, which answers only what this browser
- * may see) and shows the booking only when the server says the payment
- * arrived. Otherwise, or when the request fails, the page shows its usual
- * empty state. The marker lasts 24 hours; blocked or full storage is ignored.
+ * may see) and points to the booking in the server's words: "paid" only when
+ * the server's payment step is done (`paidBookingNotice`). An order this
+ * browser may not see, an unpaid one, or a failed request leaves the page's
+ * usual empty state. The marker lasts 24 hours, goes as soon as something is
+ * added to the cart or a new payment starts, and blocked or full storage is
+ * ignored.
  */
 
 export const PAID_MARKER_KEY = "outlyy.recentlyPaid";
@@ -101,39 +104,79 @@ export function readPaidMarker(now: number = Date.now(), storage: MarkerStorage 
  * ------------------------------------------------------------------------ */
 
 /**
- * The states in which an empty cart page may say the trip was paid: the
- * states in which the status page empties the cart (`CART_PAID_STATES`), and
- * `completed`. Never `awaiting_payment` or `payment_failed`, and not once the
- * payment was released, refunded or cancelled, or our team is looking.
+ * How the notice reads, by the server's state:
+ *  - `confirmed`: the operator confirmed the booking (tickets ready or still coming);
+ *  - `completed`: the service date has passed ("has taken place", as the server says);
+ *  - `partial`: some items are booked and the rest are not (refunded, released, cancelled or failed);
+ *  - `confirming`: the payment or the booking is still on its way;
+ *  - `recent`: the order has moved on (released, refunded, cancelled, or our team is looking). It claims
+ *    nothing about the payment: it only points to the booking (review 116 D5; owner wording open).
+ * `awaiting_payment`, `payment_failed` and any state not listed show the usual empty state.
  */
-export const PAID_BOOKING_STATES: readonly string[] = [...CART_PAID_STATES, "completed"];
+export type PaidBookingKind = "confirmed" | "completed" | "partial" | "confirming" | "recent";
 
-/** Of those, the states in which the operator has confirmed the booking (tickets ready or still coming). */
-export const CONFIRMED_BOOKING_STATES: readonly string[] = ["confirmed_ticket_pending", "confirmed", "paid_confirmed_by_team", "completed"];
+const KIND_BY_STATE: Readonly<Record<string, PaidBookingKind>> = {
+  confirmed_ticket_pending: "confirmed",
+  confirmed: "confirmed",
+  paid_confirmed_by_team: "confirmed",
+  completed: "completed",
+  partially_fulfilled: "partial",
+  payment_processing: "confirming",
+  booking_processing: "confirming",
+  payment_released: "recent",
+  refund_processing: "recent",
+  refunded: "recent",
+  cancellation_processing: "recent",
+  cancelled: "recent",
+  needs_attention: "recent",
+};
+
+/** The states in which the empty cart page points to the booking at all. */
+export const NOTICE_STATES: readonly string[] = Object.keys(KIND_BY_STATE);
+
+/** The states whose notice may say the trip was paid (only when the server's payment step is also done). */
+export const PAID_BOOKING_STATES: readonly string[] = [...CART_PAID_STATES, "completed"];
 
 export interface PaidBookingNotice {
   reference: string;
-  confirmed: boolean;
+  kind: PaidBookingKind;
   title: string;
   body: string;
   href: string;
 }
 
+/** Said only when the server's payment step is `done`. */
 export const PAID_BOOKING_BODY = "You've already paid for this trip, so your cart is empty.";
+/** A booking whose payment step is not (yet) done: claims no payment. */
+export const CONFIRMING_BODY = "We're still confirming your payment and booking.";
+export const HAS_BOOKING_BODY = "This trip already has a booking, so your cart is empty.";
+export const PARTIAL_BODY = "Some of this trip is booked and some isn't, so your cart is empty. Your booking page shows what happens next.";
+export const RECENT_BODY = "Your cart is empty. Your booking page shows where this booking stands.";
+
+/** The part of the status projection the notice reads. */
+export interface NoticeStatus {
+  reference: string;
+  state: string;
+  steps?: { payment?: { status?: string } | null } | null;
+}
 
 /** What an empty cart page shows for the order the server returned, or null for its usual empty state. */
-export function paidBookingNotice(expectedReference: string, status: { reference: string; state: string } | null): PaidBookingNotice | null {
-  if (!status || !PAID_BOOKING_STATES.includes(status.state)) return null;
+export function paidBookingNotice(expectedReference: string, status: NoticeStatus | null): PaidBookingNotice | null {
+  if (!status) return null;
+  const kind = Object.prototype.hasOwnProperty.call(KIND_BY_STATE, status.state) ? KIND_BY_STATE[status.state] : undefined;
+  if (!kind) return null;
   const reference = cleanRef(status.reference);
   if (!reference || reference !== cleanRef(expectedReference)) return null;
-  const confirmed = CONFIRMED_BOOKING_STATES.includes(status.state);
-  return {
-    reference,
-    confirmed,
-    title: confirmed ? `Your booking ${reference} is confirmed` : `We're confirming your booking ${reference}`,
-    body: PAID_BOOKING_BODY,
-    href: `/booking/${encodeURIComponent(reference)}`,
+  // Review 116 D1: "paid" only when the server's own payment step says so.
+  const paid = PAID_BOOKING_STATES.includes(status.state) && status.steps?.payment?.status === "done";
+  const words: Record<PaidBookingKind, { title: string; body: string }> = {
+    confirmed: { title: `Your booking ${reference} is confirmed`, body: paid ? PAID_BOOKING_BODY : HAS_BOOKING_BODY },
+    completed: { title: `Your booking ${reference} has taken place`, body: paid ? PAID_BOOKING_BODY : HAS_BOOKING_BODY },
+    partial: { title: `Part of your booking ${reference} is confirmed`, body: PARTIAL_BODY },
+    confirming: { title: `We're confirming your booking ${reference}`, body: paid ? PAID_BOOKING_BODY : CONFIRMING_BODY },
+    recent: { title: `You have a recent booking, ${reference}`, body: RECENT_BODY },
   };
+  return { reference, kind, ...words[kind], href: `/booking/${encodeURIComponent(reference)}` };
 }
 
 /**
@@ -143,7 +186,7 @@ export function paidBookingNotice(expectedReference: string, status: { reference
  */
 export async function resolvePaidBooking(
   marker: PaidMarker | null,
-  fetchStatus: (reference: string) => Promise<{ reference: string; state: string } | null>,
+  fetchStatus: (reference: string) => Promise<NoticeStatus | null>,
   storage: MarkerStorage | null = browserStorage(),
 ): Promise<PaidBookingNotice | null> {
   if (!marker) return null;
@@ -157,4 +200,46 @@ export async function resolvePaidBooking(
   } catch {
     return null;
   }
+}
+
+/** After this long without an answer the page shows its usual empty state. */
+export const CHECK_TIMEOUT_MS = 8_000;
+
+/**
+ * Runs one check for the empty cart page and reports what to show
+ * (`onResult`), at most twice:
+ *  - the server's answer, if it comes within `timeoutMs`;
+ *  - otherwise `{ notice: null }` at `timeoutMs` (the usual empty state), and
+ *    then the notice if a good answer still arrives (review 116 D9). A late
+ *    failure changes nothing, and nothing ever replaces a notice.
+ * The returned function cancels it (the page unmounted): nothing is reported after that.
+ */
+export function startPaidBookingCheck(
+  marker: PaidMarker,
+  opts: {
+    fetchStatus: (reference: string) => Promise<NoticeStatus | null>;
+    onResult: (result: { notice: PaidBookingNotice | null }) => void;
+    timeoutMs?: number;
+    storage?: MarkerStorage | null;
+  },
+): () => void {
+  let cancelled = false;
+  let answered = false;
+  let fellBack = false;
+  const timer = setTimeout(() => {
+    if (cancelled || answered) return;
+    fellBack = true;
+    opts.onResult({ notice: null });
+  }, opts.timeoutMs ?? CHECK_TIMEOUT_MS);
+  void resolvePaidBooking(marker, opts.fetchStatus, opts.storage === undefined ? browserStorage() : opts.storage).then((notice) => {
+    if (cancelled || answered) return;
+    answered = true;
+    clearTimeout(timer);
+    if (fellBack && !notice) return;
+    opts.onResult({ notice });
+  });
+  return () => {
+    cancelled = true;
+    clearTimeout(timer);
+  };
 }

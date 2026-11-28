@@ -1,5 +1,5 @@
 import { Badge } from "@/components/ui/badge";
-import { ButtonLink } from "@/components/ui/button";
+import { PrivateButtonLink } from "@/components/ui/button";
 import { Card } from "@/components/ui/primitives";
 import { WhatsAppButton } from "@/components/commerce/whatsapp";
 import { StatePill } from "@/components/commerce/order-status/state-pill";
@@ -123,9 +123,10 @@ export function OrderRow({ order, placement, status }: { order: CustomerOrderLik
 
         <div className="flex shrink-0 flex-col gap-2">
           {status && (
-            <ButtonLink href={`/booking/${encodeURIComponent(order.reference)}`} size="md" prefetch={false}>
+            {/* A full page load into the private route (PRV-4): see `PrivateButtonLink`. */}
+            <PrivateButtonLink href={`/booking/${encodeURIComponent(order.reference)}`} size="md">
               View booking<span className="sr-only"> {order.reference}</span>
-            </ButtonLink>
+            </PrivateButtonLink>
           )}
           <WhatsAppButton
             size="md"

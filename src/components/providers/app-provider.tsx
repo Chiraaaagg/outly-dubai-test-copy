@@ -20,6 +20,7 @@ import {
 } from "@/lib/currency";
 import type { CartItem } from "@/lib/types";
 import { PRICE_LOCK_MINUTES } from "@/lib/pricing";
+import { clearPaidMarker } from "@/lib/paid-booking";
 
 /**
  * Client-side application state: currency, cart (trip builder), wishlist,
@@ -48,6 +49,12 @@ export interface Toast {
 
 interface AppState {
   hydrated: boolean;
+  /**
+   * How many times the browser restored this document from its back-forward
+   * cache. On each restore the cart is read from storage again; pages re-check
+   * what they derived from storage when this changes.
+   */
+  restored: number;
 
   /** What the visitor sees. Storage stays INR+AED; USD is derived for display only. */
   currency: DisplayCurrency;
@@ -117,6 +124,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [lockStartedAt, setLockStartedAt] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
+  const [restored, setRestored] = useState(0);
 
   // Hydrate once on the client. Rendering identical markup on the server and
   // the first client pass avoids a hydration mismatch on cart/wishlist counts.
@@ -140,6 +148,20 @@ export function AppProvider({ children }: { children: ReactNode }) {
     if (!fromCookie) writeCurrencyCookie(active);
     applyCurrencyAttribute(active);
     setHydrated(true);
+  }, []);
+
+  // Back-forward cache: Back restores the page as it was, with the cart as it was in memory. The status page may
+  // have emptied the paid cart since (CO-19), so read it again, and let pages re-check (`restored`).
+  useEffect(() => {
+    const onShow = (e: PageTransitionEvent) => {
+      if (!e.persisted) return;
+      const stored = read<CartItem[]>(KEYS.cart, []);
+      setCart((prev) => (JSON.stringify(prev) === JSON.stringify(stored) ? prev : stored));
+      setLockStartedAt(read<number | null>(KEYS.lock, null));
+      setRestored((n) => n + 1);
+    };
+    window.addEventListener("pageshow", onShow);
+    return () => window.removeEventListener("pageshow", onShow);
   }, []);
 
   // First-party analytics identity + attribution cookies (outlyy_sid / outlyy_aid /
@@ -184,6 +206,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const addToCart = useCallback(
     (item: CartItem) => {
+      // A new cart: an empty cart page no longer points to the booking paid before (src/lib/paid-booking.ts).
+      clearPaidMarker();
       setCart((prev) => {
         const next = prev.some((i) => i.id === item.id)
           ? prev.map((i) => (i.id === item.id ? item : i))
@@ -290,6 +314,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const value: AppState = {
     hydrated,
+    restored,
     currency,
     setCurrency,
     inUAE,

@@ -104,6 +104,33 @@ export function ButtonLink({
   );
 }
 
+/**
+ * `ButtonLink`'s look on a plain `<a>`, for a link from a measured page into a
+ * private customer page that carries a reference (`/booking/<reference>`).
+ *
+ * The move is a full document load on purpose (PRV-4, review 116 D4). The
+ * Google tag is configured once per document, and only off the private paths
+ * (`googleTagBootstrap`). After a client-side move it would still be configured,
+ * and GA4's history-based page view would send `page_location` with the booking
+ * reference. A new document on `/booking/...` never configures it. A plain
+ * anchor also never prefetches the private route.
+ */
+export function PrivateButtonLink({
+  variant,
+  size,
+  block,
+  className,
+  children,
+  href,
+  ...rest
+}: Omit<CommonProps, "loading" | "loadingLabel"> & Omit<ComponentProps<"a">, "href" | "className" | "children"> & { href: string }) {
+  return (
+    <a {...rest} href={href} className={classes({ variant, size, block, className, children })}>
+      {children}
+    </a>
+  );
+}
+
 export function Spinner({ className }: { className?: string }) {
   return (
     <svg
