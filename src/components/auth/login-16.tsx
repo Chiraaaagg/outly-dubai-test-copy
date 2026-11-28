@@ -30,11 +30,53 @@
  *     OUTLYY ink/paper/sun; `rounded-xl` onto `--radius-control`; 48px
  *     controls (touch target and 16px text so iOS does not zoom); hover only
  *     where hover exists; press feedback on `:active`; no tap flash.
+ *
+ * Google first, email collapsed (owner, 28 Nov 2026: customers pick Google
+ * instead of typing an email, which saves the Resend free cap of sign-in
+ * codes):
+ *   - when Google works (and the browser is not an in-app web view, where
+ *     Google refuses to sign in), the Google button is the first and
+ *     dominant action, full width and 48px, with one short reason under it
+ *     (`providersNote`);
+ *   - the email-code form sits behind a small text button, "Use email
+ *     instead" (`AltMethodToggle`: a real `<button>` with `aria-expanded` and
+ *     `aria-controls`), which opens the same form in place and moves focus to
+ *     its email field; no new motion. Without Google the form shows open, as
+ *     before: the only way to sign in is never hidden;
+ *   - Google's own sign-in branding instead of OUTLYY's: the light theme
+ *     (#FFFFFF fill, #747775 border, #1F1F1F label, the standard four-colour
+ *     "G", "Continue with Google"), which sits on the white paper and cream
+ *     shell with AA contrast; it is never filled with sun. The page, the text
+ *     and the toggle keep OUTLYY ink, paper and sun;
+ *   - a `notice` slot above the providers, so a Google notice ("cancelled",
+ *     "failed") reads before the button it is about, and never sits between
+ *     the toggle and the form it opens.
  */
 import type { ReactNode } from "react";
+import { ChevronDown } from "lucide-react";
 import { cn } from "@/lib/utils";
 
-export function Login16({ title, intro, providers, children, footer, className }: { title: string; intro: ReactNode; providers?: ReactNode; children?: ReactNode; footer?: ReactNode; className?: string }) {
+export function Login16({
+  title,
+  intro,
+  notice,
+  providers,
+  providersNote,
+  children,
+  footer,
+  className,
+}: {
+  title: string;
+  intro: ReactNode;
+  /** A status line above the providers (for example the Google callback's notice). */
+  notice?: ReactNode;
+  providers?: ReactNode;
+  /** One short line under the provider button(s), then anything that belongs with them (the email toggle). */
+  providersNote?: ReactNode;
+  children?: ReactNode;
+  footer?: ReactNode;
+  className?: string;
+}) {
   return (
     <section aria-labelledby="login-title" className={cn("w-full", className)}>
       <div className="flex flex-col gap-2">
@@ -43,10 +85,38 @@ export function Login16({ title, intro, providers, children, footer, className }
         </h1>
         <div className="max-w-[60ch] text-[0.95rem] leading-relaxed text-ink-700">{intro}</div>
       </div>
-      {providers && <div className="mt-6 flex flex-col gap-3">{providers}</div>}
+      {notice && <div className="mt-6">{notice}</div>}
+      {providers && (
+        <div className="mt-6 flex flex-col gap-3">
+          {providers}
+          {providersNote}
+        </div>
+      )}
       {children && <div className="mt-6">{children}</div>}
       {footer && <div className="mt-5">{footer}</div>}
     </section>
+  );
+}
+
+/**
+ * "Use email instead": a small text button that shows or hides another way
+ * to sign in, placed right after the provider button(s) so the keyboard
+ * order is Google, this button, then the form it opens. `controls` is the id
+ * of the panel it opens; the state is announced through `aria-expanded`. The
+ * chevron turns with the state, without a transition.
+ */
+export function AltMethodToggle({ expanded, controls, onToggle, children }: { expanded: boolean; controls: string; onToggle: () => void; children: ReactNode }) {
+  return (
+    <button
+      type="button"
+      aria-expanded={expanded}
+      aria-controls={controls}
+      onClick={onToggle}
+      className="inline-flex min-h-11 select-none items-center gap-1 self-start text-base font-bold text-sun-700 underline underline-offset-2 [-webkit-tap-highlight-color:transparent] hover:text-ink-900"
+    >
+      {children}
+      <ChevronDown className={cn("h-4 w-4 shrink-0", expanded && "rotate-180")} aria-hidden="true" />
+    </button>
   );
 }
 
@@ -65,13 +135,18 @@ function GoogleMark() {
 /**
  * "Continue with Google": a top-level navigation to our own start route
  * (owner Q-B1: Google's screen then names this site). A plain `<a>`, never a
- * prefetching link: the route sets a cookie and redirects.
+ * prefetching link: the route sets a cookie and redirects. `pilot` carries
+ * `?pilot=1` on during the owner-only pilot (CUSTOMER_AUTH_PILOT_EMAILS).
+ *
+ * Google's sign-in branding, light theme: #FFFFFF fill, 1px #747775 border,
+ * #1F1F1F label (15.9:1 on white), the standard "G"; a light grey state
+ * layer on hover and press, never an OUTLYY colour. Full width, 48px.
  */
-export function GoogleButton({ next }: { next: string }) {
+export function GoogleButton({ next, pilot = false }: { next: string; pilot?: boolean }) {
   return (
     <a
-      href={`/api/auth/google/start?next=${encodeURIComponent(next)}`}
-      className="inline-flex min-h-12 w-full select-none items-center justify-center gap-2.5 rounded-[var(--radius-control)] border border-ink-300 bg-white px-4 text-base font-semibold text-ink-900 transition-[background-color,transform] duration-150 [-webkit-tap-highlight-color:transparent] active:translate-y-px active:bg-shell hover:border-ink-500 hover:bg-shell"
+      href={`/api/auth/google/start?next=${encodeURIComponent(next)}${pilot ? "&pilot=1" : ""}`}
+      className="inline-flex min-h-12 w-full select-none items-center justify-center gap-3 rounded-[var(--radius-control)] border border-[#747775] bg-[#ffffff] px-4 text-base font-semibold text-[#1f1f1f] transition-[background-color,transform] duration-150 [-webkit-tap-highlight-color:transparent] active:translate-y-px active:bg-[#e8e8e8] hover:bg-[#f2f2f2] motion-reduce:transition-none motion-reduce:active:translate-y-0"
     >
       <GoogleMark />
       Continue with Google

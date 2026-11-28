@@ -920,10 +920,24 @@ async function queueAccountLinkNotice(input: { linkId: string; orderId: string; 
   }
 }
 
-/** Step 2 of the attach notice: the send of a queued row, deferred until after the response. Never throws. */
+/**
+ * Step 2 of the attach notice: the send of a queued row, deferred until after the response. Never throws.
+ *
+ * The sends of one sign-in run one after another, so a later row's claim, taken when it was queued, may lapse
+ * before its turn (re-review 103c D4). The claim is renewed first, on condition that the row still carries the
+ * claim this request took: if the outbox sweep has claimed the row meanwhile, it is the sweep's to send, and this
+ * row is skipped without an attempt.
+ */
 async function sendQueuedAccountLinkNotice(queued: QueuedAccountLinkNotice): Promise<DispatchResult | null> {
   try {
-    return await attemptAndRecord(queued.row, new Date(), queued.claimUntil);
+    const now = new Date();
+    const claimUntil = new Date(now.getTime() + SEND_LOCK_MS);
+    const renewed = await prisma.notification.updateMany({ where: { id: queued.row.id, status: "queued", lockedUntil: queued.claimUntil }, data: { lockedUntil: claimUntil } });
+    if (renewed.count !== 1) {
+      emitEvent("notification.claim_skipped", { notificationId: queued.row.id, event: queued.row.event, reason: "claim_lost" });
+      return resultOf(queued.row.id, "queued");
+    }
+    return await attemptAndRecord({ ...queued.row, lockedUntil: claimUntil }, now, claimUntil);
   } catch {
     emitEvent("notification.failed", { event: ACCOUNT_LINK_NOTICE_EVENT, channel: "email", reason: "dispatch_failed" }, "error");
     return null;

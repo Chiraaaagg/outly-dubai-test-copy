@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decideVerifiedEmail, confirmedPhone, emailStartLimits, signInCodeDailyBudget, signupClaimFor, selectAttachable, ATTACH_CAP, ATTACH_SCAN_LIMIT, EMAIL_START_LIMITS, EMAIL_VERIFY_LIMITS, type AttachCandidate } from "../../services/customer-identity.service";
+import { decideVerifiedEmail, confirmedPhone, emailStartLimits, otpSentNothing, signInCodeDailyBudget, signupClaimFor, selectAttachable, ATTACH_CAP, ATTACH_SCAN_LIMIT, EMAIL_START_LIMITS, EMAIL_VERIFY_LIMITS, type AttachCandidate } from "../../services/customer-identity.service";
 import { accountIncidents, noticeGaveUpAt, volumeCrossings } from "../../services/account-alerts";
 import { budgetWindowStart, signInBudgetCrossings } from "../signin-code-budget";
 import { codeStepMessage, cookieBlockedMessage, CODE_TIMED_OUT_MESSAGE, emailStepMessage, waitWords } from "@/components/auth/email-code-messages";
@@ -8,9 +8,9 @@ import { MAX_ATTEMPTS, RETRY_WINDOW_MS } from "../../services/notification.servi
 import { inquiryNeedsVerification } from "../../services/inquiry.service";
 import { supabaseUrlProblem } from "../../lib/env";
 import { notMeLink, renderAccountLinkNotice, renderSignInCode } from "../../notifications/auth-templates";
-import { maskEmail, normaliseEmail, parseLoginNotice, hasAnySignInOption } from "@/lib/customer-auth-options";
+import { loginDescription, maskEmail, normaliseEmail, parseLoginNotice, hasAnySignInOption } from "@/lib/customer-auth-options";
 import { buildCsp, edgePolicy } from "@/proxy";
-import type { SupabaseUser } from "../supabase-auth.client";
+import { SupabaseAuthError, type SupabaseUser } from "../supabase-auth.client";
 
 const user = (over: Partial<SupabaseUser> = {}): SupabaseUser => ({ id: "u", email: "jo@example.com", emailConfirmedAt: "2026-11-27T00:00:00Z", phone: null, phoneConfirmedAt: null, identities: [], ...over });
 
@@ -265,13 +265,14 @@ describe("attach cap counts the orders that pass the per-order checks (review 10
     const own = order(1, { lead: "signer@example.com", verified: "signer@example.com", session: null });
     expect(selectAttachable([own], ctx).chosen[0]).toMatchObject({ rule: "verified_email", recipient: "signer@example.com" });
     const many = Array.from({ length: ATTACH_CAP + 1 }, (_, i) => order(i, { lead: `b${i}@example.com`, verified: `b${i}@example.com` }));
-    expect(selectAttachable(many, ctx)).toEqual({ chosen: [], capped: true });
+    expect(selectAttachable(many, ctx)).toEqual({ chosen: [], capped: true, cappedBy: "attached" });
     expect(selectAttachable(many.slice(0, ATTACH_CAP), ctx).chosen).toHaveLength(ATTACH_CAP);
   });
 
   it("more candidates than the scan limit is itself unusual volume: none attached", () => {
     const loose = Array.from({ length: ATTACH_SCAN_LIMIT + 1 }, (_, i) => order(i, { lead: `x${i}@example.com`, verified: "nobody@example.com" }));
-    expect(selectAttachable(loose, ctx)).toEqual({ chosen: [], capped: true });
+    // The audit row then says which limit fired (re-review 103c D8).
+    expect(selectAttachable(loose, ctx)).toEqual({ chosen: [], capped: true, cappedBy: "scanned" });
   });
 
   it("another session, or no browser link at all, never attaches by rule (b)", () => {
@@ -293,5 +294,87 @@ describe("account alerts survive a failing part (re-review 103b N3)", () => {
     } as unknown as Parameters<typeof accountIncidents>[3];
     const out = await accountIncidents(new Date("2031-03-04T00:00:00Z"), new Date("2031-03-04T12:00:00Z"), 100, fake);
     expect(out.map((i) => [i.kind, i.entityId])).toEqual([["account_attach_capped", "0190f7a2-0000-7000-8000-0000000000cc"]]);
+  });
+});
+
+describe("which failed /otp gives the site-wide code charges back (re-review 103c D3)", () => {
+  const e = (kind: ConstructorParameters<typeof SupabaseAuthError>[0], status: number | null, code: string | null, timedOut = false) => new SupabaseAuthError(kind, status, code, timedOut);
+
+  it("refused before the hook, or the hook reported a failed send: given back", () => {
+    expect(otpSentNothing(e("rate_limited", 429, "over_email_send_rate_limit"))).toBe(true);
+    expect(otpSentNothing(e("invalid_request", 400, "email_address_invalid"))).toBe(true);
+    expect(otpSentNothing(e("rejected", 422, "signup_disabled"))).toBe(true);
+    expect(otpSentNothing(e("not_configured", null, null))).toBe(true);
+    // Our hooks refused (a 4xx, or a hook error code that is not a timeout).
+    expect(otpSentNothing(e("delivery_failed", 403, "hook_rejected"))).toBe(true);
+    expect(otpSentNothing(e("delivery_failed", 500, "hook_payload_over_size_limit"))).toBe(true);
+    expect(otpSentNothing(e("delivery_failed", 422, null))).toBe(true);
+  });
+
+  it("a hook timeout, any other 5xx, a transport error or our own timeout: the charge stays", () => {
+    expect(otpSentNothing(e("delivery_failed", 500, "hook_timeout"))).toBe(false);
+    expect(otpSentNothing(e("delivery_failed", 504, "hook_timeout_after_retry"))).toBe(false);
+    expect(otpSentNothing(e("delivery_failed", 500, "unexpected_failure"))).toBe(false);
+    expect(otpSentNothing(e("delivery_failed", 502, null))).toBe(false);
+    expect(otpSentNothing(e("unavailable", null, null))).toBe(false);
+    expect(otpSentNothing(e("unavailable", null, null, true))).toBe(false);
+    expect(otpSentNothing(new Error("boom"))).toBe(false);
+  });
+});
+
+describe("/login description names only the options the page shows", () => {
+  it("Google and the email code only when on; neutral words otherwise; no promise when nothing is on (review 109 N9)", () => {
+    expect(loginDescription({ google: true, emailCode: true, phone: false })).toBe("Sign in to see your OUTLYY bookings: Google or a one-time code by email. No password needed.");
+    expect(loginDescription({ google: true, emailCode: false, phone: false })).not.toMatch(/email/i);
+    expect(loginDescription({ google: false, emailCode: true, phone: false })).not.toMatch(/google/i);
+    const phoneOnly = loginDescription({ google: false, emailCode: false, phone: true });
+    expect(phoneOnly).not.toMatch(/google|email/i);
+    expect(phoneOnly).toMatch(/one-time code/);
+    const none = loginDescription({ google: false, emailCode: false, phone: false });
+    expect(none).not.toMatch(/google|email|code|sign in/i);
+  });
+});
+
+describe("notice alerts page by (created_at, id), never OFFSET, and only over recent links (re-review 103c D5)", () => {
+  it("the second page starts after the last row of the first; every query is bounded on attached_at", async () => {
+    const now = new Date("2031-03-04T12:00:00Z");
+    const since = new Date("2031-03-04T11:00:00Z");
+    const at = new Date("2031-03-04T11:30:00Z");
+    const row = (n: number) => ({
+      id: `0190f7a2-0000-7000-8000-${String(n).padStart(12, "0")}`,
+      status: "failed",
+      provider_error: "definite:invalid_recipient",
+      suppressed_reason: null,
+      attempt: 1,
+      created_at: at,
+      created_key: "2031-03-04 11:30:00.000123+00",
+      failed_at: at,
+      attention_required_at: null,
+      link_id: `0190f7a2-0000-7000-9000-${String(n).padStart(12, "0")}`,
+      order_id: `0190f7a2-0000-7000-a000-${String(n).padStart(12, "0")}`,
+      reference: `OUT-${200000 + n}`,
+    });
+    const calls: { text: string; values: unknown[] }[] = [];
+    const pages = [Array.from({ length: 500 }, (_, i) => row(i)), [row(500)]];
+    const fake = {
+      orderAccountLink: { findMany: async () => [] },
+      auditLog: { findMany: async () => [] },
+      $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        calls.push({ text: strings.join("?"), values });
+        return pages[calls.length - 1] ?? [];
+      },
+    } as unknown as Parameters<typeof accountIncidents>[3];
+    const out = await accountIncidents(since, now, 100, fake);
+    expect(out.filter((i) => i.kind === "account_attach_notice_failed")).toHaveLength(501);
+    expect(calls).toHaveLength(2);
+    for (const c of calls) {
+      expect(c.text).not.toMatch(/OFFSET/i);
+      expect(c.text).toMatch(/l\.attached_at > \?/);
+    }
+    const fragment = (c: { values: unknown[] }) => c.values.find((v): v is { sql: string; values: unknown[] } => typeof v === "object" && v !== null && "sql" in v && "values" in v);
+    expect(fragment(calls[0])?.sql ?? "").toBe("");
+    const second = fragment(calls[1]);
+    expect(second?.sql).toMatch(/\(n\.created_at, n\.id\) > \(\?::timestamptz, \?::uuid\)/);
+    expect(second?.values).toEqual(["2031-03-04 11:30:00.000123+00", row(499).id]);
   });
 });

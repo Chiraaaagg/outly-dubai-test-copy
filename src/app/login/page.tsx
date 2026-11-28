@@ -1,10 +1,13 @@
-import { headers } from "next/headers";
+import type { Metadata } from "next";
+import { cookies, headers } from "next/headers";
 import { Breadcrumbs } from "@/components/ui/primitives";
 import { Scene } from "@/components/ui/scene";
 import { customerAuthService } from "@/server/services/customer-auth.service";
 import { env } from "@/server/lib/env";
-import { parseLoginNotice } from "@/lib/customer-auth-options";
+import { loginDescription, parseLoginNotice, type CustomerAuthOptions } from "@/lib/customer-auth-options";
+import { PILOT_PARAM, pilotShownOptions } from "@/server/auth/pilot";
 import { safeNext } from "@/lib/safe-next";
+import { decodeEmailStartCookie, emailStartCookieName } from "@/server/lib/email-start-cookie";
 import type { EmailFormPreview } from "@/components/auth/email-code-form";
 import { LoginClient } from "./login-client";
 
@@ -21,9 +24,30 @@ import { LoginClient } from "./login-client";
  * Development only: `?preview=<state>` opens a designed state of the email
  * form directly (code sent, wrong code, too many tries, closed account, long
  * address) for review and screenshots. Ignored outside APP_ENV=development.
+ *
+ * Owner-only pilot (CUSTOMER_AUTH_PILOT_EMAILS set): the email and Google
+ * options show only with `?pilot=1`; the phone option is unchanged. The
+ * description says only what the page offers (`loginDescription`).
+ *
+ * Google first, email collapsed (login-client.tsx): a live, signed email
+ * start cookie in this browser means an email sign-in is under way, so the
+ * collapsed email form opens by itself (`emailInProgress`).
  */
 
 export const dynamic = "force-dynamic";
+
+type SearchParams = Promise<Record<string, string | string[] | undefined>>;
+
+/** The options this request shows: the deployment's, less email and Google during the pilot without `?pilot=1`. */
+function shownOptions(sp: Record<string, string | string[] | undefined>): { options: CustomerAuthOptions; pilot: boolean } {
+  const raw = sp[PILOT_PARAM];
+  return pilotShownOptions(customerAuthService.options(), typeof raw === "string" ? raw : null);
+}
+
+export async function generateMetadata({ searchParams }: { searchParams: SearchParams }): Promise<Metadata> {
+  const { options } = shownOptions(await searchParams);
+  return { title: "Sign in", description: loginDescription(options), robots: { index: false, follow: true } };
+}
 
 const IN_APP = /\b(FBAN|FBAV|FB_IAB|Instagram|Line\/|WhatsApp|Snapchat|TikTok|musical_ly|LinkedInApp|GSA\/)|; wv\)/i;
 
@@ -40,7 +64,7 @@ const PREVIEWS: Record<string, EmailFormPreview> = {
   closed: { step: "code", email: "jo@example.com", codeError: "ACCOUNT_CLOSED" },
 };
 
-export default async function LoginPage({ searchParams }: { searchParams: Promise<Record<string, string | string[] | undefined>> }) {
+export default async function LoginPage({ searchParams }: { searchParams: SearchParams }) {
   const sp = await searchParams;
   const one = (k: string) => (typeof sp[k] === "string" ? (sp[k] as string) : null);
   const ua = (await headers()).get("user-agent") ?? "";
@@ -48,7 +72,9 @@ export default async function LoginPage({ searchParams }: { searchParams: Promis
   const dev = e.APP_ENV === "development" && process.env.NODE_ENV !== "production";
   const previewKey = dev ? one("preview") : null;
   const preview = previewKey ? PREVIEWS[previewKey] : undefined;
-  let options = customerAuthService.options();
+  const shown = shownOptions(sp);
+  const emailInProgress = decodeEmailStartCookie((await cookies()).get(emailStartCookieName())?.value || undefined) !== null;
+  let options = shown.options;
   if (dev && one("options")) {
     // Development only: `?options=email,google` or `?options=none` to see each combination.
     const want = new Set((one("options") ?? "").split(","));
@@ -64,7 +90,7 @@ export default async function LoginPage({ searchParams }: { searchParams: Promis
         <div className="min-w-0">
           <Breadcrumbs items={[{ label: "Dubai", href: "/" }, { label: "Sign in" }]} className="mb-3" />
           <div className="max-w-md">
-            <LoginClient options={options} next={safeNext(one("next"))} notice={parseLoginNotice(one("e"))} inAppBrowser={IN_APP.test(ua)} preview={preview} />
+            <LoginClient options={options} next={safeNext(one("next"))} notice={parseLoginNotice(one("e"))} inAppBrowser={IN_APP.test(ua)} preview={preview} pilot={shown.pilot} emailInProgress={emailInProgress} />
           </div>
         </div>
       </div>

@@ -59,6 +59,11 @@ export interface FakeSupabase {
    * creation and `/otp` answers 403 `hook_rejected`-style, as assumed for the hosted service (to confirm at staging).
    */
   onBeforeUserCreated: ((body: string, headers: Record<string, string>) => Promise<number>) | null;
+  /**
+   * What `/otp` answers when the Before User Created hook refuses. Default 403 `hook_rejected`; review 109 N2:
+   * hosted Supabase may answer a plain 500 `unexpected_failure` instead (to record at live step 7).
+   */
+  beforeUserCreatedRefusal: { status: number; body: unknown };
   sendEmailHookSecret: string;
   beforeUserCreatedHookSecret: string;
   close: () => Promise<void>;
@@ -114,6 +119,7 @@ export async function startFakeSupabase(opts: { sendEmailHookSecret?: string; be
     foreignKey: foreign.privateKey,
     onSendEmail: null,
     onBeforeUserCreated: null,
+    beforeUserCreatedRefusal: { status: 403, body: { code: 403, error_code: "hook_rejected", msg: "Sign-up is not available this way." } },
     sendEmailHookSecret,
     beforeUserCreatedHookSecret,
     close: () => new Promise<void>((r) => server.close(() => r())),
@@ -165,7 +171,7 @@ export async function startFakeSupabase(opts: { sendEmailHookSecret?: string; be
         const ts = String(Math.floor(Date.now() / 1000));
         const key = hookSecretKey(beforeUserCreatedHookSecret)!;
         const status = await fake.onBeforeUserCreated(hookBody, { "webhook-id": id, "webhook-timestamp": ts, "webhook-signature": `v1,${signHookPayload(key, id, ts, hookBody)}` });
-        if (status < 200 || status >= 300) return send(res, 403, { code: 403, error_code: "hook_rejected", msg: "Sign-up is not available this way." });
+        if (status < 200 || status >= 300) return send(res, fake.beforeUserCreatedRefusal.status, fake.beforeUserCreatedRefusal.body);
       }
       const user = userFor(email, "email", { email, email_verified: false, sub: "" });
       const code = String(randomInt(0, 1_000_000)).padStart(6, "0");
