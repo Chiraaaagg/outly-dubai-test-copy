@@ -57,7 +57,7 @@ import {
 import { fetchOrderStatus } from "@/lib/api/order-status";
 import { resumePayment } from "@/lib/resume-payment";
 import { inquiryHref, inquiryReasonForQuote, inquiryReasonText, type InquiryReason } from "@/lib/inquiry-handoff";
-import { guestsHrefFor, retimeHrefFor, reviewTime } from "@/lib/start-time-retry";
+import { guestsHrefFor, guestsLinkShown, retimeHrefFor, reviewTime } from "@/lib/start-time-retry";
 import { PickupHotelFields, usePickupHotelLists } from "@/components/checkout/pickup-hotel-fields";
 import {
   CART_HOTEL_FIELD,
@@ -327,6 +327,9 @@ export default function CheckoutPage() {
   const [retimeHref, setRetimeHref] = useState<string | null>(null);
   /** Guest picker fix (D1): when only a line's guests were refused, the way back to change them (`guestsHrefFor`). */
   const [guestsHref, setGuestsHref] = useState<string | null>(null);
+  // Re-review 111c L2: the link only under wording about the guests; a reason that ranks above them (pickup, ticket
+  // validity, changed ages) is about another line, and changing the guests alone would be refused again.
+  const showGuestsLink = guestsLinkShown(inquiryReason, guestsHref);
   // Back from Stripe (CO-06): the order this tab handed over for this cart. `moved_on`: it has a payment or has ended.
   const [leftPayment, setLeftPayment] = useState<{ reference: string; state: LeftPaymentState | "moved_on" } | null>(null);
   const leftPaymentRef = useRef<HTMLDivElement>(null);
@@ -1040,12 +1043,12 @@ export default function CheckoutPage() {
                       Choose another time
                     </ButtonLink>
                   )}
-                  {guestsHref && (
-                    <ButtonLink href={guestsHref} size="sm">
+                  {showGuestsLink && (
+                    <ButtonLink href={showGuestsLink} size="sm">
                       Change guests
                     </ButtonLink>
                   )}
-                  <ButtonLink href={inquiryHref(inquiryReason)} size="sm" variant={retimeHref || guestsHref ? "outline" : undefined}>
+                  <ButtonLink href={inquiryHref(inquiryReason)} size="sm" variant={retimeHref || showGuestsLink ? "outline" : undefined}>
                     Send it to our team
                   </ButtonLink>
                   {/* The operator refused the hotel (doc 29 §3.5 Pickup): back to the hotel choice, focus on it. */}

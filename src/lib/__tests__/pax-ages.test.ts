@@ -24,7 +24,7 @@ import {
   type PaxAgeBands,
 } from "../pax-ages";
 import { computeBreakdown, guestOptionSwitch, PAGE_PAX_AGES as PRICING_PAGE_PAX_AGES, restoreLineGuests, toCartItem } from "../pricing";
-import { guestsHrefFor, parseRestoreReason, restoreTimeGate } from "../start-time-retry";
+import { guestsHrefFor, guestsLinkShown, parseRestoreReason, restoreTimeGate } from "../start-time-retry";
 import { quoteLinesFor } from "../api";
 import { inquiryHref, inquiryReasonForQuote, inquiryReasonText, parseInquiryReason } from "../inquiry-handoff";
 import type { Activity, CartItem, Variant } from "../types";
@@ -807,6 +807,25 @@ describe("re-review 111b follow-ups", () => {
       expect(gate({ storedTimes: ["10:00", "14:00"], restore: { reason: "guests", date, time: "10:00" } }).keptTime).toBeUndefined();
       // No line restored: unchanged from before (no time on screen, nothing to choose).
       expect(gate({ restore: null })).toEqual({ mustChoose: false, keptTime: undefined });
+    });
+
+    it("stored times shown to choose from need a choice when the restored line's time is gone (re-review 111c L1)", () => {
+      const gone = { reason: "guests" as const, date, time: "09:00" };
+      expect(gate({ storedTimes: ["10:00", "14:00"], restore: gone })).toEqual({ mustChoose: true, keptTime: undefined });
+      expect(gate({ storedTimes: ["10:00", "14:00"], restore: gone, chosenTime: "14:00" }).mustChoose).toBe(false);
+      expect(gate({ storedTimes: ["10:00", "14:00"], restore: { reason: "time", date, time: "09:00" } }).mustChoose).toBe(true);
+      // One stored time has no control on the page: it is the time used, never a dead end.
+      expect(gate({ storedTimes: ["10:00"], restore: gone })).toEqual({ mustChoose: false, keptTime: undefined });
+      // The no-times ticket N1 fixed is unchanged.
+      expect(gate({ storedTimes: [] }).mustChoose).toBe(false);
+    });
+
+    it("checkout shows Change guests only under the guest wording (re-review 111c L2)", () => {
+      const href = "/activities/x?date=2026-12-01&retime=x-2026-12-01-Flexible-std&change=guests#book";
+      expect(guestsLinkShown("guest_types", href)).toBe(href);
+      expect(guestsLinkShown("guest_numbers", href)).toBe(href);
+      for (const reason of ["pickup", "ticket_validity", "ages", "sold_out", "unavailable", null]) expect(guestsLinkShown(reason, href)).toBeNull();
+      expect(guestsLinkShown("guest_types", null)).toBeNull();
     });
   });
 

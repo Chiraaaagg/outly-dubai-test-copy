@@ -77,10 +77,17 @@ export function guestsHrefFor(refused: readonly { index: number; reason: string 
   return `/activities/${encodeURIComponent(item.slug)}?${q.toString()}#book`;
 }
 
+/** The "Change guests" link checkout shows: only under the guest wording (`guest_types`, `guest_numbers`; re-review 111c L2). */
+export function guestsLinkShown(reason: string | null, href: string | null): string | null {
+  return href && (reason === "guest_types" || reason === "guest_numbers") ? href : null;
+}
+
 /**
  * Whether the booking widget must have a start time chosen before it adds
  * the line, and the restored line's own time to keep (re-review 111b N1).
- * Times on screen (listed, or loading) always need a usable choice. A line
+ * Times on screen (listed or loading, or more than one stored time) always
+ * need a usable choice, so a restored line whose time was since removed is
+ * never given the first time unseen. A line
  * sent back for its time needs a new one unless a date-only answer gives
  * the start. A line sent back for its guests never does: its time was not
  * refused, and a listing with no stored times (an entry ticket, a date-only
@@ -97,7 +104,9 @@ export function restoreTimeGate(input: {
   restore: { reason: LineRestoreReason; date: string; time: string } | null;
 }): { mustChoose: boolean; keptTime: string | undefined } {
   const { chosenTime, timesOnScreen, storedTimes, date, dateOnlyAnswered, restore } = input;
-  const mustChoose = !chosenTime && (timesOnScreen || (restore?.reason === "time" && !dateOnlyAnswered));
+  // Stored times count when the widget shows them to choose from, which it does for more than one (re-review 111c L1);
+  // a single stored time has no control, and is the time used.
+  const mustChoose = !chosenTime && (timesOnScreen || storedTimes.length > 1 || (restore?.reason === "time" && !dateOnlyAnswered));
   const keptTime = restore?.reason === "guests" && restore.date === date && storedTimes.length === 0 && !timesOnScreen ? restore.time : undefined;
   return { mustChoose, keptTime };
 }

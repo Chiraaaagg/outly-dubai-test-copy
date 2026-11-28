@@ -556,6 +556,7 @@ export function BookingWidget({
             ages={guestAges}
             limits={guestLimits}
             notice={guestNotice}
+            focusable
             focusRef={guestsRef}
           />
         </div>

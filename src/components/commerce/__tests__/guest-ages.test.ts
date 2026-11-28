@@ -86,7 +86,8 @@ describe("guest picker ages", () => {
     expect(infantIncrease).not.toContain(' disabled=""');
     const childIncrease = html.match(/<button[^>]*aria-label="Increase Children"[^>]*>/)![0];
     expect(childIncrease).not.toContain(' disabled=""');
-    expect(childIncrease).not.toContain("aria-disabled");
+    // The attribute, not the word: the class holds Tailwind's `aria-disabled:` variants.
+    expect(childIncrease).not.toContain('aria-disabled="true"');
   });
 
   it("an option with an infant band under 2 shows children from 2", () => {
@@ -143,7 +144,7 @@ describe("review 111 follow-ups: instant only (D2), unit limits (D3), focus (D1,
 
   it("the guest group takes programmatic focus only when the caller asks for it, with the product's focus style", () => {
     // No outline-none: the global :focus-visible treatment shows where focus landed (re-review 111b N3).
-    expect(renderToStaticMarkup(h(GuestSelector, { value: PAX, onChange: noop, focusRef: { current: null } }))).toContain(
+    expect(renderToStaticMarkup(h(GuestSelector, { value: PAX, onChange: noop, focusable: true, focusRef: { current: null } }))).toContain(
       '<div role="group" aria-label="Guests" tabindex="-1" class="space-y-1">',
     );
     expect(picker()).not.toContain("tabindex");

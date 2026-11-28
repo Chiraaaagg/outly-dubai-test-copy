@@ -241,6 +241,7 @@ export function GuestSelector({
   ages = PAGE_ROW_AGES,
   limits,
   notice,
+  focusable = false,
   focusRef,
   className,
 }: {
@@ -257,9 +258,11 @@ export function GuestSelector({
   /** The most guests per row the selected option takes (`guestRowLimits`, guest picker fix D3); a row at its limit cannot be increased. */
   limits?: Partial<Record<PaxAgeType, number>>;
   /**
-   * Given, the guest group can take focus (programmatic only), so the caller can move focus to it (D1, D6). It then
-   * shows the product's one focus treatment (`:focus-visible`, globals.css; re-review 111b N3).
+   * True: the guest group can take focus (programmatic only, `tabIndex` -1), so the caller can move focus to it (D1,
+   * D6). It then shows the product's one focus treatment (`:focus-visible`, globals.css; re-review 111b N3).
    */
+  focusable?: boolean;
+  /** The guest group element, for the caller to focus from an effect or handler; never read during render. */
   focusRef?: React.Ref<HTMLDivElement>;
   /**
    * What changed for the guests already set when the option changed (`guestAgesNotice`, review 102 N4-02).
@@ -293,7 +296,7 @@ export function GuestSelector({
       role="group"
       aria-label="Guests"
       aria-describedby={describedBy}
-      tabIndex={focusRef ? -1 : undefined}
+      tabIndex={focusable ? -1 : undefined}
       className={cn("space-y-1", className)}
     >
       {notice !== undefined && (
