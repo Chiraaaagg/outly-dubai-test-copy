@@ -1,0 +1,81 @@
+{
+  "_comment": "Sanitised contract fixture for capability class live.date_only_no_slot_metadata.pickup_required.internal.per_person (doc 29 Batch 7). Shape of a TravelDesk GET /tours/{id} answer with one LiveBook offer that lists no time slot (timeSlots empty), internal route, hotel pickup (not direct reporting), per-person price, no cancellation policy. Ids, names and every price are synthetic; no supplier rate, code or text.",
+  "id": 9702,
+  "name": "Synthetic date-only tour 9702",
+  "languageId": 1,
+  "language": "English",
+  "isExternal": false,
+  "cancellationPolicy": [],
+  "categories": [
+    {
+      "id": 3,
+      "name": null,
+      "url": null,
+      "heroImageId": null,
+      "heroImage": null
+    }
+  ],
+  "notesToAgent": null,
+  "videoUrl": null,
+  "termsAndConditions": "Synthetic terms.",
+  "salesDescription": "Synthetic description.",
+  "faqList": [],
+  "itineraries": [],
+  "photos": [],
+  "offers": [
+    {
+      "id": 97021,
+      "name": "Synthetic date-only offer, sharing transfers",
+      "code": "SYNTH-DATE-97021",
+      "daysOffered": 0,
+      "numberOfHours": 3,
+      "minNumOfPeople": 1,
+      "maxNumOfPeople": 10,
+      "minNumberOfAdult": null,
+      "maxNumberOfAdult": null,
+      "minNumberOfChild": null,
+      "maxNumberOfChild": null,
+      "minNumberOfInfant": null,
+      "maxNumberOfInfant": null,
+      "minimumAdvancedPayment": 0,
+      "privateType": 0,
+      "childrenAllowed": true,
+      "childAge": 12,
+      "infantsAllowed": false,
+      "infantAge": 3,
+      "pricingPeriods": [
+        {
+          "id": 970211,
+          "widgetPricing": null,
+          "dateStart": "2026-01-01T00:00:00",
+          "dateEnd": "2027-12-31T00:00:00",
+          "offerId": 97021,
+          "currency": "AED",
+          "recPricePerAdult": 390.0,
+          "recPricePerChild": 225.0,
+          "recPricePerTrip": 0,
+          "pricePerAdult": 260,
+          "pricePerChild": 150,
+          "pricePerTrip": 0,
+          "pricePerAdultUsd": 70.85,
+          "pricePerChildUsd": 40.87,
+          "pricePerTripUsd": 0,
+          "discountPercent": null,
+          "hasDiscount": false,
+          "isBookable": true,
+          "supplierCurrencyCode": null,
+          "conversionRate": 3.67,
+          "vat": 5
+        }
+      ],
+      "isDirectReporting": false,
+      "isAppendTransactionFeeB2b": false,
+      "isDirectCollection": false,
+      "description": null,
+      "timeSlots": [],
+      "bookingType": 1,
+      "isExternal": false,
+      "tripUnit": ""
+    }
+  ]
+}
