@@ -256,7 +256,10 @@ export function GuestSelector({
   ages?: Record<PaxAgeType, GuestRowAge>;
   /** The most guests per row the selected option takes (`guestRowLimits`, guest picker fix D3); a row at its limit cannot be increased. */
   limits?: Partial<Record<PaxAgeType, number>>;
-  /** Given, the guest group can take focus (programmatic only), so the caller can move focus to it (D1, D6). */
+  /**
+   * Given, the guest group can take focus (programmatic only), so the caller can move focus to it (D1, D6). It then
+   * shows the product's one focus treatment (`:focus-visible`, globals.css; re-review 111b N3).
+   */
   focusRef?: React.Ref<HTMLDivElement>;
   /**
    * What changed for the guests already set when the option changed (`guestAgesNotice`, review 102 N4-02).
@@ -271,6 +274,9 @@ export function GuestSelector({
   // A closed row has no control to focus, so its reason is the group's description, read on entering the steppers (N4-06).
   const closed = shown.filter((row) => !ages[row.key].allowed);
   const closedId = `${uid}-closed`;
+  const noticeId = `${uid}-notice`;
+  // The notice and the closed rows describe the group, so focus moved onto it reads why (re-review 111b N2).
+  const describedBy = [notice ? noticeId : null, closed.length ? closedId : null].filter(Boolean).join(" ") || undefined;
 
   const set = (key: keyof PaxCount, next: number) => {
     const updated = { ...value, [key]: next };
@@ -286,13 +292,13 @@ export function GuestSelector({
       ref={focusRef}
       role="group"
       aria-label="Guests"
-      aria-describedby={closed.length ? closedId : undefined}
+      aria-describedby={describedBy}
       tabIndex={focusRef ? -1 : undefined}
-      className={cn("space-y-1", focusRef && "outline-none", className)}
+      className={cn("space-y-1", className)}
     >
       {notice !== undefined && (
         <div role="status" aria-live="polite">
-          {notice ? <p className="mb-2 rounded-[var(--radius-control)] bg-sun-50 p-3 text-xs font-semibold leading-relaxed text-sun-800">{notice}</p> : null}
+          {notice ? <p id={noticeId} className="mb-2 rounded-[var(--radius-control)] bg-sun-50 p-3 text-xs font-semibold leading-relaxed text-sun-800">{notice}</p> : null}
         </div>
       )}
       {closed.length > 0 && (

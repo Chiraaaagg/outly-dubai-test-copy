@@ -13,9 +13,9 @@ import { ConfirmFirstNote, IndicativePriceNote, ResponsePromise } from "./inquir
 import { track } from "@/lib/analytics";
 import { ctaFor } from "@/lib/cta";
 import { computeBreakdown, guestOptionSwitch, guestRowsFor, restoreLineGuests, toCartItem, variantById, type LineRestoreReason } from "@/lib/pricing";
-import { guestLimitNotice, guestRowAges, guestRowLimits, paxForAges } from "@/lib/pax-ages";
+import { guestLimitNotice, guestRowAges, guestRowLimits, guestRowMinimums, paxForAges } from "@/lib/pax-ages";
 import { fetchStartTimes, type StartTimesAnswer } from "@/lib/api/start-times";
-import { dateOnlyStartView } from "@/lib/start-time-retry";
+import { dateOnlyStartView, restoreTimeGate } from "@/lib/start-time-retry";
 import { startMark } from "@/lib/perf-mark";
 import { useAbortableRead } from "@/lib/use-abortable-read";
 import type { Activity, PaxCount } from "@/lib/types";
@@ -137,6 +137,7 @@ export function BookingWidget({
   // listing its typed units decide which rows it books and how many (guest picker fix; inquiry keeps its rows, D2).
   const guestAges = guestRowAges(variantById(activity, variantId), activity.fulfilmentMode);
   const guestLimits = guestRowLimits(variantById(activity, variantId), activity.fulfilmentMode);
+  const guestMinimums = guestRowMinimums(variantById(activity, variantId), activity.fulfilmentMode);
   // Review 102 N4-02, N4-06: switching option says when the ages behind a count already set change, or a row closes;
   // a closed row's count is dropped from the party itself, so switching back never brings it back unseen.
   const sw = guestOptionSwitch(activity, agesVariant, variantId, pax);
@@ -146,8 +147,8 @@ export function BookingWidget({
     if (sw.pax !== pax) setPax(sw.pax);
   }
   const shownPax: PaxCount = paxForAges(guestRows.includes("senior") || pax.senior === 0 ? pax : { ...pax, senior: 0 }, guestAges);
-  // D3: more guests of a type than the option's unit takes (after an option switch or a restored line); the quote would refuse it.
-  const limitNotice = guestLimitNotice(shownPax, guestLimits);
+  // D3: more (or, re-review 111b N4, fewer) guests of a type than the option's unit takes; the quote would refuse it.
+  const limitNotice = guestLimitNotice(shownPax, guestLimits, guestMinimums);
   const guestNotice = [ageNotice, limitNotice].filter(Boolean).join(" ") || null;
 
   // Listed start times for the date (Batch 2). Inquiry products never ask: their times are preferences.
@@ -236,13 +237,22 @@ export function BookingWidget({
       setFocusTimes(true);
       return;
     }
-    // A date-only date with one start needs no choice, even for a line sent back for a new time.
-    if (!chosenTime && (pickerTimes || pickerLoading || (retimeItem && !dateOnlyAnswer))) {
+    // A date-only date with one start needs no choice, even for a line sent back for a new time; a line sent back for its
+    // guests keeps its time and never waits on one (re-review 111b N1: a listing with no times would dead-end here).
+    const timeGate = restoreTimeGate({
+      chosenTime,
+      timesOnScreen: !!pickerTimes || pickerLoading,
+      storedTimes: activity.timeSlots,
+      date,
+      dateOnlyAnswered: !!dateOnlyAnswer,
+      restore: retimeItem ? { reason: restoreReason, date: retimeItem.date, time: retimeItem.time } : null,
+    });
+    if (timeGate.mustChoose) {
       setTimeNotice("Choose a start time first.");
       setFocusTimes(true);
       return;
     }
-    // More guests of a type than the option takes: the notice says so above the rows; lower the number first.
+    // A guest count the option does not take: the notice says so above the rows; change the number first.
     if (limitNotice) {
       setFocusGuests(true);
       return;
@@ -250,7 +260,7 @@ export function BookingWidget({
     setSubmitting(true);
     const item = toCartItem(activity, {
       date,
-      time: chosenTime ?? dateOnlyStart ?? activity.timeSlots[0] ?? "Flexible",
+      time: chosenTime ?? dateOnlyStart ?? timeGate.keptTime ?? activity.timeSlots[0] ?? "Flexible",
       pax: shownPax,
       variantId,
       addOnIds,

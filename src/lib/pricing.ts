@@ -1,7 +1,7 @@
 import type { Activity, AddOn, CartItem, Currency, Money, PaxCount, Variant } from "./types";
 import { ZERO, addMoney, scaleMoney } from "./utils";
 import { MAX_INSTANT_ITEMS_PER_ORDER } from "@/server/quotes/contracts";
-import { guestAgesNotice, guestRowAges, paxForAges, quoteLineAges } from "./pax-ages";
+import { guestAgesNotice, guestLimitNotice, guestRowAges, guestRowLimits, guestRowMinimums, paxForAges, quoteLineAges } from "./pax-ages";
 
 /** The fields pricing reads — a full `Activity` or the card projection both satisfy it. */
 export type PricedActivity = Pick<Activity, "slug" | "title" | "images" | "price" | "variants" | "addOns" | "quoteOnly" | "confirmation" | "fulfilmentMode" | "freeCancellationHours" | "durationMinutes"> &
@@ -74,23 +74,38 @@ export type LineRestoreReason = "time" | "guests";
 
 /**
  * The guest picker's step when the booking widget restores a cart line sent
- * back from checkout (guest picker fix, D1, D6). The line's guests with
- * every row its option cannot book dropped, what the guest is told about
- * the dropped ones (null when none), and where focus goes: the guests when
- * they were sent back for their guests or a notice is shown, else the start
- * times. A line restored on its own option is not an option switch, so no
- * band wording (re-review R1).
+ * back from checkout (guest picker fix, D1, D6; re-review 111b N4). The
+ * line's guests with every row its option cannot book dropped, Seniors
+ * included where the option has no senior price (owner decision 5), and
+ * every such change said in words. A line sent back for its guests with
+ * nothing dropped and every count within the option's limits gets a short
+ * prompt, so it never lands with nothing said; counts outside the limits are
+ * said by the widget's live notice (`guestLimitNotice`). Focus goes to the
+ * guests when they were sent back for their guests or a notice is shown,
+ * else to the start times. A line restored on its own option is not an
+ * option switch, so no band wording (re-review R1).
  */
 export function restoreLineGuests(
-  activity: Pick<PricedActivity, "variants" | "fulfilmentMode">,
+  activity: Pick<PricedActivity, "variants" | "fulfilmentMode" | "price">,
   item: Pick<CartItem, "pax" | "variantId">,
   reason: LineRestoreReason,
   currentVariantId?: string,
 ): { pax: PaxCount; notice: string | null; focus: "guests" | "times" } {
   const variant = variantById(activity, item.variantId ?? currentVariantId);
   const mode = activity.fulfilmentMode;
-  const notice = guestAgesNotice(variant, variant, item.pax, mode);
-  return { pax: paxForAges(item.pax, guestRowAges(variant, mode)), notice, focus: reason === "guests" || notice ? "guests" : "times" };
+  let pax = paxForAges(item.pax, guestRowAges(variant, mode));
+  const parts: string[] = [];
+  const dropped = guestAgesNotice(variant, variant, item.pax, mode);
+  if (dropped) parts.push(dropped);
+  if (pax.senior > 0 && !offersSeniorPrice(activity, variant)) {
+    parts.push(`This option has no senior rate, so ${pax.senior === 1 ? "1 senior was" : `${pax.senior} seniors were`} removed from your guests.`);
+    pax = { ...pax, senior: 0 };
+  }
+  if (reason === "guests" && parts.length === 0 && !guestLimitNotice(pax, guestRowLimits(variant, mode), guestRowMinimums(variant, mode))) {
+    parts.push("Check your guest numbers for this option.");
+  }
+  const notice = parts.length ? parts.join(" ") : null;
+  return { pax, notice, focus: reason === "guests" || notice ? "guests" : "times" };
 }
 
 /** The guest rows the picker can show, in display order. */

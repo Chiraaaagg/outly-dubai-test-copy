@@ -141,11 +141,24 @@ describe("review 111 follow-ups: instant only (D2), unit limits (D3), focus (D1,
     expect(over.match(/<button[^>]*aria-label="Decrease Adults"[^>]*>/)![0]).not.toContain(' disabled=""');
   });
 
-  it("the guest group takes programmatic focus only when the caller asks for it", () => {
+  it("the guest group takes programmatic focus only when the caller asks for it, with the product's focus style", () => {
+    // No outline-none: the global :focus-visible treatment shows where focus landed (re-review 111b N3).
     expect(renderToStaticMarkup(h(GuestSelector, { value: PAX, onChange: noop, focusRef: { current: null } }))).toContain(
-      '<div role="group" aria-label="Guests" tabindex="-1" class="space-y-1 outline-none">',
+      '<div role="group" aria-label="Guests" tabindex="-1" class="space-y-1">',
     );
     expect(picker()).not.toContain("tabindex");
+  });
+
+  it("the notice describes the group, before the closed rows, so focus on the group reads it (re-review 111b N2)", () => {
+    const html = picker({ notice: "This option takes up to 4 adults online. Lower the number to continue.", ages: guestRowAges(adultOnly) });
+    const ids = html.match(/<div role="group" aria-label="Guests" aria-describedby="([^"]+)"/)![1].split(" ");
+    expect(ids).toHaveLength(2);
+    expect(html).toContain(`<p id="${ids[0]}" class="mb-2`);
+    expect(html).toMatch(new RegExp(`<p id="${ids[0]}"[^>]*>This option takes up to 4 adults online`));
+    expect(html).toContain(`<p id="${ids[1]}" class="sr-only">Children:`);
+    // No notice text: only the closed rows; nothing at all: no description.
+    expect(picker({ notice: null, ages: guestRowAges(adultOnly) }).match(/aria-describedby="([^"]+)"/)![1].split(" ")).toHaveLength(1);
+    expect(picker({ notice: null })).toContain('<div role="group" aria-label="Guests" class="space-y-1">');
   });
 });
 

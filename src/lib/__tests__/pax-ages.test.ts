@@ -6,6 +6,7 @@ import {
   guestLimitNotice,
   guestRowAges,
   guestRowLimits,
+  guestRowMinimums,
   hasOwnAges,
   listingPaxAges,
   listingSellsChildren,
@@ -23,7 +24,7 @@ import {
   type PaxAgeBands,
 } from "../pax-ages";
 import { computeBreakdown, guestOptionSwitch, PAGE_PAX_AGES as PRICING_PAGE_PAX_AGES, restoreLineGuests, toCartItem } from "../pricing";
-import { guestsHrefFor, parseRestoreReason } from "../start-time-retry";
+import { guestsHrefFor, parseRestoreReason, restoreTimeGate } from "../start-time-retry";
 import { quoteLinesFor } from "../api";
 import { inquiryHref, inquiryReasonForQuote, inquiryReasonText, parseInquiryReason } from "../inquiry-handoff";
 import type { Activity, CartItem, Variant } from "../types";
@@ -688,9 +689,14 @@ describe("follow-ups to the guest picker fix (review 111)", () => {
       expect(guestsHrefFor([{ index: 1, reason: "unit_rule_failed" }], [other, line])).toContain("/activities/global-village?");
     });
 
-    it("no link when changing the guests cannot fix the quote", () => {
+    it("another line refused for another reason still gets the guest line its link (re-review 111b N5)", () => {
+      expect(guestsHrefFor([{ index: 0, reason: "unknown_unit" }, { index: 1, reason: "sold_out" }], [line, other])).toContain("/activities/global-village?");
+      expect(guestsHrefFor([{ index: 0, reason: "pickup_unavailable" }, { index: 1, reason: "unit_rule_failed" }], [other, line])).toContain("/activities/global-village?");
+    });
+
+    it("no link when no single line can be fixed by its guests", () => {
       expect(guestsHrefFor([], [line])).toBeNull();
-      expect(guestsHrefFor([{ index: 0, reason: "unknown_unit" }, { index: 0, reason: "sold_out" }], [line])).toBeNull();
+      expect(guestsHrefFor([{ index: 0, reason: "sold_out" }], [line])).toBeNull();
       expect(guestsHrefFor([{ index: 0, reason: "unknown_unit" }, { index: 1, reason: "unknown_unit" }], [line, other])).toBeNull();
       expect(guestsHrefFor([{ index: 0, reason: "unknown_unit" }], [{ ...line, id: "not a line id" }])).toBeNull();
       expect(guestsHrefFor([{ index: 0, reason: "unknown_unit" }], [{ ...line, kind: "combo" } as CartItem])).toBeNull();
@@ -703,7 +709,7 @@ describe("follow-ups to the guest picker fix (review 111)", () => {
     describe("the widget's restore step (restoreLineGuests)", () => {
       const ao = { id: "td-597", name: "Entry", delta: { inr: 0, aed: 0 }, ...adultOnly } as unknown as Variant;
       const plain = { id: "std", name: "std", delta: { inr: 0, aed: 0 }, ...page } as unknown as Variant;
-      const instant = { variants: [plain, ao], fulfilmentMode: "instant" as const };
+      const instant = { variants: [plain, ao], fulfilmentMode: "instant" as const, price: { adult: { inr: 700, aed: 29 } } };
       const saved = { pax: p(4, 1, 2), variantId: "td-597" };
       const dropped = "This option doesn't take children, so 1 child was removed from your guests. This option doesn't take infants, so 2 infants were removed from your guests.";
 
@@ -716,7 +722,8 @@ describe("follow-ups to the guest picker fix (review 111)", () => {
       it("nothing to drop: no notice; focus on the guests only when sent back for them", () => {
         const fine = { pax: p(4, 0, 0), variantId: "td-597" };
         expect(restoreLineGuests(instant, fine, "time")).toEqual({ pax: p(4, 0, 0), notice: null, focus: "times" });
-        expect(restoreLineGuests(instant, fine, "guests")).toEqual({ pax: p(4, 0, 0), notice: null, focus: "guests" });
+        // Sent back for its guests with nothing to drop: a short prompt, never nothing said (re-review 111b N4).
+        expect(restoreLineGuests(instant, fine, "guests")).toEqual({ pax: p(4, 0, 0), notice: "Check your guest numbers for this option.", focus: "guests" });
         // A page-band option with every unit: as before the fix (re-review R1), nothing announced.
         expect(restoreLineGuests(instant, { pax: p(2, 1, 1), variantId: "std" }, "time")).toEqual({ pax: p(2, 1, 1), notice: null, focus: "times" });
       });
@@ -725,6 +732,114 @@ describe("follow-ups to the guest picker fix (review 111)", () => {
         expect(restoreLineGuests(instant, { pax: p(4, 1, 2), variantId: undefined }, "time", "td-597").pax).toEqual(p(4, 0, 0));
         expect(restoreLineGuests({ ...instant, fulfilmentMode: "inquiry" }, saved, "time")).toEqual({ pax: p(4, 1, 2), notice: null, focus: "times" });
       });
+    });
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * Re-review 111b: the guests restore on a listing with no start times (N1),
+ * every guest change said (N4)
+ * ------------------------------------------------------------------------ */
+
+describe("re-review 111b follow-ups", () => {
+  const p = (adult: number, child: number, infant: number, senior = 0) => ({ adult, child, infant, senior });
+  const adultOnly = { units: [unit("adult", 12, null, { price: { inr: 700, aed: 29 } })] };
+
+  describe("N1: a guests restore never waits on a start time the page cannot show", () => {
+    // The Global Village shape: an instant entry ticket, no stored times, one adult-only option.
+    const ticket = {
+      slug: "zz-synthetic-entry",
+      title: "Synthetic entry",
+      images: ["/img/x.jpg"],
+      productId: "0190a000-0000-7000-8000-000000000003",
+      price: { adult: { inr: 700, aed: 29 } },
+      variants: [{ id: "td-597", name: "Entry", delta: { inr: 0, aed: 0 }, ...adultOnly }],
+      addOns: [],
+      quoteOnly: false,
+      confirmation: "instant",
+      fulfilmentMode: "instant",
+      freeCancellationHours: 0,
+      durationMinutes: 240,
+      pickupIncluded: false,
+      timeSlots: [],
+    } as unknown as Activity;
+    const date = "2026-12-01";
+    const gate = (over: Partial<Parameters<typeof restoreTimeGate>[0]> = {}) =>
+      restoreTimeGate({
+        chosenTime: undefined,
+        timesOnScreen: false,
+        storedTimes: [],
+        date,
+        dateOnlyAnswered: false,
+        restore: { reason: "guests", date, time: "Flexible" },
+        ...over,
+      });
+
+    it("timeSlots []: no time to choose, the line's time kept, and the continued line replaces the old one", () => {
+      expect(gate()).toEqual({ mustChoose: false, keptTime: "Flexible" });
+      // A saved line from before the fix: 4 adults, 1 child, 2 infants (its pax as stored, not re-filtered).
+      const saved = { ...toCartItem(ticket, { date, time: "Flexible", pax: p(4, 0, 0), variantId: "td-597" }), pax: p(4, 1, 2) };
+      const restored = restoreLineGuests(ticket, saved, "guests");
+      expect(restored.pax).toEqual(p(4, 0, 0));
+      expect(restored.focus).toBe("guests");
+      const next = toCartItem(ticket, { date, time: gate().keptTime ?? "Flexible", pax: restored.pax, variantId: "td-597" });
+      expect(next.id).toBe(saved.id);
+      expect(next.pax).toEqual(p(4, 0, 0));
+    });
+
+    it("a date-only start whose read is busy or failed: no time to choose, the line's start kept for its date", () => {
+      const restore = { reason: "guests" as const, date, time: "16:00" };
+      expect(gate({ restore })).toEqual({ mustChoose: false, keptTime: "16:00" });
+      // Another date: nothing kept (that date's start is the offer's), and still nothing to choose.
+      expect(gate({ restore, date: "2026-12-02" })).toEqual({ mustChoose: false, keptTime: undefined });
+      // Answered: the answer's start is used before the kept one (the widget's order), and nothing to choose.
+      expect(gate({ restore, dateOnlyAnswered: true }).mustChoose).toBe(false);
+    });
+
+    it("a line sent back for its time still needs a new one, as before", () => {
+      expect(gate({ restore: { reason: "time", date, time: "Flexible" } })).toEqual({ mustChoose: true, keptTime: undefined });
+      expect(gate({ restore: { reason: "time", date, time: "16:00" }, dateOnlyAnswered: true }).mustChoose).toBe(false);
+    });
+
+    it("times on screen always need a usable choice; stored times keep no line time of their own", () => {
+      expect(gate({ timesOnScreen: true }).mustChoose).toBe(true);
+      expect(gate({ timesOnScreen: true, chosenTime: "10:00" }).mustChoose).toBe(false);
+      expect(gate({ storedTimes: ["10:00", "14:00"], restore: { reason: "guests", date, time: "10:00" } }).keptTime).toBeUndefined();
+      // No line restored: unchanged from before (no time on screen, nothing to choose).
+      expect(gate({ restore: null })).toEqual({ mustChoose: false, keptTime: undefined });
+    });
+  });
+
+  describe("N4: every guest change a restore makes is said", () => {
+    const ao = { id: "ao", name: "Entry", delta: { inr: 0, aed: 0 }, ...adultOnly } as unknown as Variant;
+    const withSenior = { id: "ws", name: "With seniors", delta: { inr: 0, aed: 0 }, units: [unit("adult", null, null), unit("senior", null, null)] } as unknown as Variant;
+    const activity = { variants: [ao, withSenior], fulfilmentMode: "instant" as const, price: { adult: { inr: 700, aed: 29 } } };
+
+    it("a senior on an option with no senior rate is removed and said", () => {
+      expect(restoreLineGuests(activity, { pax: p(2, 0, 0, 1), variantId: "ao" }, "time")).toEqual({
+        pax: p(2, 0, 0, 0),
+        notice: "This option has no senior rate, so 1 senior was removed from your guests.",
+        focus: "guests",
+      });
+      expect(restoreLineGuests(activity, { pax: p(2, 1, 0, 2), variantId: "ao" }, "guests").notice).toBe(
+        "This option doesn't take children, so 1 child was removed from your guests. This option has no senior rate, so 2 seniors were removed from your guests.",
+      );
+      // An option with a senior unit keeps them.
+      expect(restoreLineGuests(activity, { pax: p(2, 0, 0, 1), variantId: "ws" }, "time")).toEqual({ pax: p(2, 0, 0, 1), notice: null, focus: "times" });
+    });
+
+    it("an unmet unit minimum is said by the live notice, so the restore adds no prompt of its own", () => {
+      const min2 = { id: "m2", name: "Min 2", delta: { inr: 0, aed: 0 }, units: [unit("adult", null, null, { minQty: 2 })] } as unknown as Variant;
+      expect(guestRowMinimums(min2)).toEqual({ adult: 2 });
+      expect(guestRowMinimums(min2, "inquiry")).toEqual({});
+      expect(guestRowMinimums(ao)).toEqual({});
+      expect(guestLimitNotice(p(1, 0, 0), guestRowLimits(min2), guestRowMinimums(min2))).toBe("This option takes at least 2 adults online. Change the number to continue.");
+      expect(guestLimitNotice(p(2, 0, 0), guestRowLimits(min2), guestRowMinimums(min2))).toBeNull();
+      expect(restoreLineGuests({ ...activity, variants: [min2] }, { pax: p(1, 0, 0), variantId: "m2" }, "guests")).toEqual({ pax: p(1, 0, 0), notice: null, focus: "guests" });
+      // Over one limit and under another: both said; the number may need to go either way.
+      expect(guestLimitNotice(p(12, 0, 0), { adult: 10 }, { child: 1 })).toBe(
+        "This option takes up to 10 adults online. This option takes at least 1 child online. Change the number to continue.",
+      );
     });
   });
 });

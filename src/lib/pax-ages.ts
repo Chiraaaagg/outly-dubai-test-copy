@@ -215,15 +215,46 @@ export function guestRowLimits(variant: Pick<Variant, "units"> | undefined, mode
   return out;
 }
 
+/**
+ * The fewest guests of each type an instant option takes (re-review 111b
+ * N4): the `minQty` of its per-person unit for that row, when above 0. The
+ * quote refuses fewer, even none (`unit_rule_failed`); the importer writes
+ * 0, so this is rare. Same scope as `guestRowLimits`.
+ */
+export function guestRowMinimums(variant: Pick<Variant, "units"> | undefined, mode: FulfilmentMode = "instant"): Partial<Record<PaxAgeType, number>> {
+  if (mode !== "instant") return {};
+  const out: Partial<Record<PaxAgeType, number>> = {};
+  for (const u of variant?.units ?? []) if (u.per === "person" && Object.hasOwn(ROW_WORDS, u.unitId) && u.minQty > 0) out[u.unitId as PaxAgeType] = u.minQty;
+  return out;
+}
+
 const ROW_WORDS: Record<PaxAgeType, [string, string]> = { adult: ["adult", "adults"], child: ["child", "children"], infant: ["infant", "infants"], senior: ["senior", "seniors"] };
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
-/** What the guest is told while a row holds more guests than the option takes (`guestRowLimits`); null when none does. */
-export function guestLimitNotice(pax: PaxCount, limits: Partial<Record<PaxAgeType, number>>): string | null {
-  const over = (Object.keys(ROW_WORDS) as PaxAgeType[]).filter((t) => limits[t] !== undefined && pax[t] > (limits[t] as number));
-  if (over.length === 0) return null;
-  return `${over.map((t) => `This option takes up to ${plural(limits[t] as number, ...ROW_WORDS[t])} online.`).join(" ")} Lower the number to continue.`;
+/**
+ * What the guest is told while a row holds more guests than the option
+ * takes (`guestRowLimits`), or fewer than it needs (`guestRowMinimums`);
+ * null when every row is within them.
+ */
+export function guestLimitNotice(
+  pax: PaxCount,
+  limits: Partial<Record<PaxAgeType, number>>,
+  minimums: Partial<Record<PaxAgeType, number>> = {},
+): string | null {
+  const parts: string[] = [];
+  let under = false;
+  for (const t of Object.keys(ROW_WORDS) as PaxAgeType[]) {
+    const max = limits[t];
+    const min = minimums[t];
+    if (max !== undefined && pax[t] > max) parts.push(`This option takes up to ${plural(max, ...ROW_WORDS[t])} online.`);
+    else if (min !== undefined && pax[t] < min) {
+      under = true;
+      parts.push(`This option takes at least ${plural(min, ...ROW_WORDS[t])} online.`);
+    }
+  }
+  if (parts.length === 0) return null;
+  return `${parts.join(" ")} ${under ? "Change the number to continue." : "Lower the number to continue."}`;
 }
 
 /**
