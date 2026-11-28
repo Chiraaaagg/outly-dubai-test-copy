@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { headers } from "next/headers";
+import { cookies, headers } from "next/headers";
 import { Breadcrumbs } from "@/components/ui/primitives";
 import { Scene } from "@/components/ui/scene";
 import { customerAuthService } from "@/server/services/customer-auth.service";
@@ -7,6 +7,7 @@ import { env } from "@/server/lib/env";
 import { loginDescription, parseLoginNotice, type CustomerAuthOptions } from "@/lib/customer-auth-options";
 import { PILOT_PARAM, pilotShownOptions } from "@/server/auth/pilot";
 import { safeNext } from "@/lib/safe-next";
+import { decodeEmailStartCookie, emailStartCookieName } from "@/server/lib/email-start-cookie";
 import type { EmailFormPreview } from "@/components/auth/email-code-form";
 import { LoginClient } from "./login-client";
 
@@ -27,6 +28,10 @@ import { LoginClient } from "./login-client";
  * Owner-only pilot (CUSTOMER_AUTH_PILOT_EMAILS set): the email and Google
  * options show only with `?pilot=1`; the phone option is unchanged. The
  * description says only what the page offers (`loginDescription`).
+ *
+ * Google first, email collapsed (login-client.tsx): a live, signed email
+ * start cookie in this browser means an email sign-in is under way, so the
+ * collapsed email form opens by itself (`emailInProgress`).
  */
 
 export const dynamic = "force-dynamic";
@@ -68,6 +73,7 @@ export default async function LoginPage({ searchParams }: { searchParams: Search
   const previewKey = dev ? one("preview") : null;
   const preview = previewKey ? PREVIEWS[previewKey] : undefined;
   const shown = shownOptions(sp);
+  const emailInProgress = decodeEmailStartCookie((await cookies()).get(emailStartCookieName())?.value || undefined) !== null;
   let options = shown.options;
   if (dev && one("options")) {
     // Development only: `?options=email,google` or `?options=none` to see each combination.
@@ -84,7 +90,7 @@ export default async function LoginPage({ searchParams }: { searchParams: Search
         <div className="min-w-0">
           <Breadcrumbs items={[{ label: "Dubai", href: "/" }, { label: "Sign in" }]} className="mb-3" />
           <div className="max-w-md">
-            <LoginClient options={options} next={safeNext(one("next"))} notice={parseLoginNotice(one("e"))} inAppBrowser={IN_APP.test(ua)} preview={preview} pilot={shown.pilot} />
+            <LoginClient options={options} next={safeNext(one("next"))} notice={parseLoginNotice(one("e"))} inAppBrowser={IN_APP.test(ua)} preview={preview} pilot={shown.pilot} emailInProgress={emailInProgress} />
           </div>
         </div>
       </div>
