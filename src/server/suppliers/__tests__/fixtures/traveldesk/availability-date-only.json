@@ -1,0 +1,726 @@
+{
+  "_comment": "Sanitised contract fixtures for GET /availability/byoffer on a date-only offer (doc 29 Batch 7), one list per case, all for 2026-12-31. The shapes follow what a read-only census of three date-only offers returned on 22 November 2026 (one row per date, timeSlotId 0, startTime 0, endTime 0 or 1439; unpriced dates with left 0, isBookable false and currency null; one offer with left 99999) plus the documented case of several rows sharing one timeSlotId, and the review 92 cases (a real start on a one-row date, a sentinel row before a counted one, rows at one start with different prices, a per-trip part, a zero child price). Ids, seat counts and every price are synthetic; no supplier rate or text.",
+  "singleWholeDay": [
+    {
+      "availability": {
+        "id": 1,
+        "date": "2026-12-31T00:00:00",
+        "startTime": 0,
+        "endTime": 1439,
+        "timeSlotId": 0,
+        "left": 40
+      },
+      "price": {
+        "offerId": 97011,
+        "currency": "AED",
+        "recPricePerAdult": 300.0,
+        "recPricePerChild": 180.0,
+        "recPricePerTrip": 0,
+        "pricePerAdult": 200,
+        "pricePerChild": 120,
+        "pricePerTrip": 0,
+        "pricePerAdultUsd": 54.5,
+        "pricePerChildUsd": 32.7,
+        "pricePerTripUsd": 0,
+        "discountPercent": null,
+        "hasDiscount": false,
+        "isBookable": true,
+        "supplierCurrencyCode": null,
+        "conversionRate": 3.67,
+        "vat": 5,
+        "date": "2026-12-31T00:00:00"
+      }
+    }
+  ],
+  "singleZeroEnd": [
+    {
+      "availability": {
+        "id": 1,
+        "date": "2026-12-31T00:00:00",
+        "startTime": 0,
+        "endTime": 0,
+        "timeSlotId": 0,
+        "left": 40
+      },
+      "price": {
+        "offerId": 97011,
+        "currency": "AED",
+        "recPricePerAdult": 300.0,
+        "recPricePerChild": 180.0,
+        "recPricePerTrip": 0,
+        "pricePerAdult": 200,
+        "pricePerChild": 120,
+        "pricePerTrip": 0,
+        "pricePerAdultUsd": 54.5,
+        "pricePerChildUsd": 32.7,
+        "pricePerTripUsd": 0,
+        "discountPercent": null,
+        "hasDiscount": false,
+        "isBookable": true,
+        "supplierCurrencyCode": null,
+        "conversionRate": 3.67,
+        "vat": 5,
+        "date": "2026-12-31T00:00:00"
+      }
+    }
+  ],
+  "severalStarts": [
+    {
+      "availability": {
+        "id": 1,
+        "date": "2026-12-31T00:00:00",
+        "startTime": 1080,
+        "endTime": 1260,
+        "timeSlotId": 7,
+        "left": 30
+      },
+      "price": {
+        "offerId": 97011,
+        "currency": "AED",
+        "recPricePerAdult": 300.0,
+        "recPricePerChild": 180.0,
+        "recPricePerTrip": 0,
+        "pricePerAdult": 200,
+        "pricePerChild": 120,
+        "pricePerTrip": 0,
+        "pricePerAdultUsd": 54.5,
+        "pricePerChildUsd": 32.7,
+        "pricePerTripUsd": 0,
+        "discountPercent": null,
+        "hasDiscount": false,
+        "isBookable": true,
+        "supplierCurrencyCode": null,
+        "conversionRate": 3.67,
+        "vat": 5,
+        "date": "2026-12-31T00:00:00"
+      }
+    },
+    {
+      "availability": {
+        "id": 2,
+        "date": "2026-12-31T00:00:00",
+        "startTime": 1200,
+        "endTime": 1380,
+        "timeSlotId": 8,
+        "left": 3
+      },
+      "price": {
+        "offerId": 97011,
+        "currency": "AED",
+        "recPricePerAdult": 300.0,
+        "recPricePerChild": 180.0,
+        "recPricePerTrip": 0,
+        "pricePerAdult": 200,
+        "pricePerChild": 120,
+        "pricePerTrip": 0,
+        "pricePerAdultUsd": 54.5,
+        "pricePerChildUsd": 32.7,
+        "pricePerTripUsd": 0,
+        "discountPercent": null,
+        "hasDiscount": false,
+        "isBookable": true,
+        "supplierCurrencyCode": null,
+        "conversionRate": 3.67,
+        "vat": 5,
+        "date": "2026-12-31T00:00:00"
+      }
+    }
+  ],
+  "sharedSlotId": [
+    {
+      "availability": {
+        "id": 1,
+        "date": "2026-12-31T00:00:00",
+        "startTime": 0,
+        "endTime": 1439,
+        "timeSlotId": 0,
+        "left": 2
+      },
+      "price": {
+        "offerId": 97011,
+        "currency": "AED",
+        "recPricePerAdult": 300.0,
+        "recPricePerChild": 180.0,
+        "recPricePerTrip": 0,
+        "pricePerAdult": 200,
+        "pricePerChild": 120,
+        "pricePerTrip": 0,
+        "pricePerAdultUsd": 54.5,
+        "pricePerChildUsd": 32.7,
+        "pricePerTripUsd": 0,
+        "discountPercent": null,
+        "hasDiscount": false,
+        "isBookable": true,
+        "supplierCurrencyCode": null,
+        "conversionRate": 3.67,
+        "vat": 5,
+        "date": "2026-12-31T00:00:00"
+      }
+    },
+    {
+      "availability": {
+        "id": 2,
+        "date": "2026-12-31T00:00:00",
+        "startTime": 0,
+        "endTime": 1439,
+        "timeSlotId": 0,
+        "left": 12
+      },
+      "price": {
+        "offerId": 97011,
+        "currency": "AED",
+        "recPricePerAdult": 300.0,
+        "recPricePerChild": 180.0,
+        "recPricePerTrip": 0,
+        "pricePerAdult": 200,
+        "pricePerChild": 120,
+        "pricePerTrip": 0,
+        "pricePerAdultUsd": 54.5,
+        "pricePerChildUsd": 32.7,
+        "pricePerTripUsd": 0,
+        "discountPercent": null,
+        "hasDiscount": false,
+        "isBookable": true,
+        "supplierCurrencyCode": null,
+        "conversionRate": 3.67,
+        "vat": 5,
+        "date": "2026-12-31T00:00:00"
+      }
+    }
+  ],
+  "unpriced": [
+    {
+      "availability": {
+        "id": 1,
+        "date": "2026-12-31T00:00:00",
+        "startTime": 0,
+        "endTime": 1439,
+        "timeSlotId": 0,
+        "left": 0
+      },
+      "price": {
+        "offerId": 97011,
+        "currency": null,
+        "recPricePerAdult": null,
+        "recPricePerChild": null,
+        "recPricePerTrip": null,
+        "pricePerAdult": 0,
+        "pricePerChild": 0,
+        "pricePerTrip": 0,
+        "pricePerAdultUsd": 0,
+        "pricePerChildUsd": 0,
+        "pricePerTripUsd": 0,
+        "discountPercent": null,
+        "hasDiscount": false,
+        "isBookable": false,
+        "supplierCurrencyCode": null,
+        "conversionRate": null,
+        "vat": null,
+        "date": "2026-12-31T00:00:00"
+      }
+    }
+  ],
+  "zeroPrice": [
+    {
+      "availability": {
+        "id": 1,
+        "date": "2026-12-31T00:00:00",
+        "startTime": 0,
+        "endTime": 1439,
+        "timeSlotId": 0,
+        "left": 40
+      },
+      "price": {
+        "offerId": 97011,
+        "currency": "AED",
+        "recPricePerAdult": 0.0,
+        "recPricePerChild": 0.0,
+        "recPricePerTrip": 0,
+        "pricePerAdult": 0,
+        "pricePerChild": 0,
+        "pricePerTrip": 0,
+        "pricePerAdultUsd": 0,
+        "pricePerChildUsd": 0,
+        "pricePerTripUsd": 0,
+        "discountPercent": null,
+        "hasDiscount": false,
+        "isBookable": true,
+        "supplierCurrencyCode": null,
+        "conversionRate": 3.67,
+        "vat": 5,
+        "date": "2026-12-31T00:00:00"
+      }
+    }
+  ],
+  "capacitySentinel": [
+    {
+      "availability": {
+        "id": 1,
+        "date": "2026-12-31T00:00:00",
+        "startTime": 0,
+        "endTime": 1439,
+        "timeSlotId": 0,
+        "left": 99999
+      },
+      "price": {
+        "offerId": 97011,
+        "currency": "AED",
+        "recPricePerAdult": 300.0,
+        "recPricePerChild": 180.0,
+        "recPricePerTrip": 0,
+        "pricePerAdult": 200,
+        "pricePerChild": 120,
+        "pricePerTrip": 0,
+        "pricePerAdultUsd": 54.5,
+        "pricePerChildUsd": 32.7,
+        "pricePerTripUsd": 0,
+        "discountPercent": null,
+        "hasDiscount": false,
+        "isBookable": true,
+        "supplierCurrencyCode": null,
+        "conversionRate": 3.67,
+        "vat": 5,
+        "date": "2026-12-31T00:00:00"
+      }
+    }
+  ],
+  "conflictingSlotIds": [
+    {
+      "availability": {
+        "id": 1,
+        "date": "2026-12-31T00:00:00",
+        "startTime": 0,
+        "endTime": 1439,
+        "timeSlotId": 0,
+        "left": 20
+      },
+      "price": {
+        "offerId": 97011,
+        "currency": "AED",
+        "recPricePerAdult": 300.0,
+        "recPricePerChild": 180.0,
+        "recPricePerTrip": 0,
+        "pricePerAdult": 200,
+        "pricePerChild": 120,
+        "pricePerTrip": 0,
+        "pricePerAdultUsd": 54.5,
+        "pricePerChildUsd": 32.7,
+        "pricePerTripUsd": 0,
+        "discountPercent": null,
+        "hasDiscount": false,
+        "isBookable": true,
+        "supplierCurrencyCode": null,
+        "conversionRate": 3.67,
+        "vat": 5,
+        "date": "2026-12-31T00:00:00"
+      }
+    },
+    {
+      "availability": {
+        "id": 2,
+        "date": "2026-12-31T00:00:00",
+        "startTime": 0,
+        "endTime": 1439,
+        "timeSlotId": 5,
+        "left": 20
+      },
+      "price": {
+        "offerId": 97011,
+        "currency": "AED",
+        "recPricePerAdult": 300.0,
+        "recPricePerChild": 180.0,
+        "recPricePerTrip": 0,
+        "pricePerAdult": 200,
+        "pricePerChild": 120,
+        "pricePerTrip": 0,
+        "pricePerAdultUsd": 54.5,
+        "pricePerChildUsd": 32.7,
+        "pricePerTripUsd": 0,
+        "discountPercent": null,
+        "hasDiscount": false,
+        "isBookable": true,
+        "supplierCurrencyCode": null,
+        "conversionRate": 3.67,
+        "vat": 5,
+        "date": "2026-12-31T00:00:00"
+      }
+    }
+  ],
+  "conflictingEnds": [
+    {
+      "availability": {
+        "id": 1,
+        "date": "2026-12-31T00:00:00",
+        "startTime": 0,
+        "endTime": 1439,
+        "timeSlotId": 0,
+        "left": 20
+      },
+      "price": {
+        "offerId": 97011,
+        "currency": "AED",
+        "recPricePerAdult": 300.0,
+        "recPricePerChild": 180.0,
+        "recPricePerTrip": 0,
+        "pricePerAdult": 200,
+        "pricePerChild": 120,
+        "pricePerTrip": 0,
+        "pricePerAdultUsd": 54.5,
+        "pricePerChildUsd": 32.7,
+        "pricePerTripUsd": 0,
+        "discountPercent": null,
+        "hasDiscount": false,
+        "isBookable": true,
+        "supplierCurrencyCode": null,
+        "conversionRate": 3.67,
+        "vat": 5,
+        "date": "2026-12-31T00:00:00"
+      }
+    },
+    {
+      "availability": {
+        "id": 2,
+        "date": "2026-12-31T00:00:00",
+        "startTime": 0,
+        "endTime": 0,
+        "timeSlotId": 0,
+        "left": 20
+      },
+      "price": {
+        "offerId": 97011,
+        "currency": "AED",
+        "recPricePerAdult": 300.0,
+        "recPricePerChild": 180.0,
+        "recPricePerTrip": 0,
+        "pricePerAdult": 200,
+        "pricePerChild": 120,
+        "pricePerTrip": 0,
+        "pricePerAdultUsd": 54.5,
+        "pricePerChildUsd": 32.7,
+        "pricePerTripUsd": 0,
+        "discountPercent": null,
+        "hasDiscount": false,
+        "isBookable": true,
+        "supplierCurrencyCode": null,
+        "conversionRate": 3.67,
+        "vat": 5,
+        "date": "2026-12-31T00:00:00"
+      }
+    }
+  ],
+  "endBeforeStart": [
+    {
+      "availability": {
+        "id": 1,
+        "date": "2026-12-31T00:00:00",
+        "startTime": 1200,
+        "endTime": 60,
+        "timeSlotId": 0,
+        "left": 20
+      },
+      "price": {
+        "offerId": 97011,
+        "currency": "AED",
+        "recPricePerAdult": 300.0,
+        "recPricePerChild": 180.0,
+        "recPricePerTrip": 0,
+        "pricePerAdult": 200,
+        "pricePerChild": 120,
+        "pricePerTrip": 0,
+        "pricePerAdultUsd": 54.5,
+        "pricePerChildUsd": 32.7,
+        "pricePerTripUsd": 0,
+        "discountPercent": null,
+        "hasDiscount": false,
+        "isBookable": true,
+        "supplierCurrencyCode": null,
+        "conversionRate": 3.67,
+        "vat": 5,
+        "date": "2026-12-31T00:00:00"
+      }
+    }
+  ],
+  "none": [],
+  "singleRealStart": [
+    {
+      "availability": {
+        "id": 1,
+        "date": "2026-12-31T00:00:00",
+        "startTime": 900,
+        "endTime": 1080,
+        "timeSlotId": 4,
+        "left": 40
+      },
+      "price": {
+        "offerId": 97011,
+        "currency": "AED",
+        "recPricePerAdult": 300.0,
+        "recPricePerChild": 180.0,
+        "recPricePerTrip": 0,
+        "pricePerAdult": 200,
+        "pricePerChild": 120,
+        "pricePerTrip": 0,
+        "pricePerAdultUsd": 54.5,
+        "pricePerChildUsd": 32.7,
+        "pricePerTripUsd": 0,
+        "discountPercent": null,
+        "hasDiscount": false,
+        "isBookable": true,
+        "supplierCurrencyCode": null,
+        "conversionRate": 3.67,
+        "vat": 5,
+        "date": "2026-12-31T00:00:00"
+      }
+    }
+  ],
+  "sentinelThenCounted": [
+    {
+      "availability": {
+        "id": 1,
+        "date": "2026-12-31T00:00:00",
+        "startTime": 0,
+        "endTime": 1439,
+        "timeSlotId": 0,
+        "left": 99999
+      },
+      "price": {
+        "offerId": 97011,
+        "currency": "AED",
+        "recPricePerAdult": 300.0,
+        "recPricePerChild": 180.0,
+        "recPricePerTrip": 0,
+        "pricePerAdult": 200,
+        "pricePerChild": 120,
+        "pricePerTrip": 0,
+        "pricePerAdultUsd": 54.5,
+        "pricePerChildUsd": 32.7,
+        "pricePerTripUsd": 0,
+        "discountPercent": null,
+        "hasDiscount": false,
+        "isBookable": true,
+        "supplierCurrencyCode": null,
+        "conversionRate": 3.67,
+        "vat": 5,
+        "date": "2026-12-31T00:00:00"
+      }
+    },
+    {
+      "availability": {
+        "id": 2,
+        "date": "2026-12-31T00:00:00",
+        "startTime": 0,
+        "endTime": 1439,
+        "timeSlotId": 0,
+        "left": 12
+      },
+      "price": {
+        "offerId": 97011,
+        "currency": "AED",
+        "recPricePerAdult": 300.0,
+        "recPricePerChild": 180.0,
+        "recPricePerTrip": 0,
+        "pricePerAdult": 200,
+        "pricePerChild": 120,
+        "pricePerTrip": 0,
+        "pricePerAdultUsd": 54.5,
+        "pricePerChildUsd": 32.7,
+        "pricePerTripUsd": 0,
+        "discountPercent": null,
+        "hasDiscount": false,
+        "isBookable": true,
+        "supplierCurrencyCode": null,
+        "conversionRate": 3.67,
+        "vat": 5,
+        "date": "2026-12-31T00:00:00"
+      }
+    }
+  ],
+  "notBookableThenOpen": [
+    {
+      "availability": {
+        "id": 1,
+        "date": "2026-12-31T00:00:00",
+        "startTime": 0,
+        "endTime": 1439,
+        "timeSlotId": 0,
+        "left": 30
+      },
+      "price": {
+        "offerId": 97011,
+        "currency": "AED",
+        "recPricePerAdult": 300.0,
+        "recPricePerChild": 180.0,
+        "recPricePerTrip": 0,
+        "pricePerAdult": 200,
+        "pricePerChild": 120,
+        "pricePerTrip": 0,
+        "pricePerAdultUsd": 54.5,
+        "pricePerChildUsd": 32.7,
+        "pricePerTripUsd": 0,
+        "discountPercent": null,
+        "hasDiscount": false,
+        "isBookable": false,
+        "supplierCurrencyCode": null,
+        "conversionRate": 3.67,
+        "vat": 5,
+        "date": "2026-12-31T00:00:00"
+      }
+    },
+    {
+      "availability": {
+        "id": 2,
+        "date": "2026-12-31T00:00:00",
+        "startTime": 0,
+        "endTime": 1439,
+        "timeSlotId": 0,
+        "left": 12
+      },
+      "price": {
+        "offerId": 97011,
+        "currency": "AED",
+        "recPricePerAdult": 300.0,
+        "recPricePerChild": 180.0,
+        "recPricePerTrip": 0,
+        "pricePerAdult": 200,
+        "pricePerChild": 120,
+        "pricePerTrip": 0,
+        "pricePerAdultUsd": 54.5,
+        "pricePerChildUsd": 32.7,
+        "pricePerTripUsd": 0,
+        "discountPercent": null,
+        "hasDiscount": false,
+        "isBookable": true,
+        "supplierCurrencyCode": null,
+        "conversionRate": 3.67,
+        "vat": 5,
+        "date": "2026-12-31T00:00:00"
+      }
+    }
+  ],
+  "differentPrices": [
+    {
+      "availability": {
+        "id": 1,
+        "date": "2026-12-31T00:00:00",
+        "startTime": 0,
+        "endTime": 1439,
+        "timeSlotId": 0,
+        "left": 20
+      },
+      "price": {
+        "offerId": 97011,
+        "currency": "AED",
+        "recPricePerAdult": 300.0,
+        "recPricePerChild": 180.0,
+        "recPricePerTrip": 0,
+        "pricePerAdult": 200,
+        "pricePerChild": 120,
+        "pricePerTrip": 0,
+        "pricePerAdultUsd": 54.5,
+        "pricePerChildUsd": 32.7,
+        "pricePerTripUsd": 0,
+        "discountPercent": null,
+        "hasDiscount": false,
+        "isBookable": true,
+        "supplierCurrencyCode": null,
+        "conversionRate": 3.67,
+        "vat": 5,
+        "date": "2026-12-31T00:00:00"
+      }
+    },
+    {
+      "availability": {
+        "id": 2,
+        "date": "2026-12-31T00:00:00",
+        "startTime": 0,
+        "endTime": 1439,
+        "timeSlotId": 0,
+        "left": 20
+      },
+      "price": {
+        "offerId": 97011,
+        "currency": "AED",
+        "recPricePerAdult": 300.0,
+        "recPricePerChild": 180.0,
+        "recPricePerTrip": 0,
+        "pricePerAdult": 210,
+        "pricePerChild": 120,
+        "pricePerTrip": 0,
+        "pricePerAdultUsd": 57.2,
+        "pricePerChildUsd": 32.7,
+        "pricePerTripUsd": 0,
+        "discountPercent": null,
+        "hasDiscount": false,
+        "isBookable": true,
+        "supplierCurrencyCode": null,
+        "conversionRate": 3.67,
+        "vat": 5,
+        "date": "2026-12-31T00:00:00"
+      }
+    }
+  ],
+  "mixedTripPrice": [
+    {
+      "availability": {
+        "id": 1,
+        "date": "2026-12-31T00:00:00",
+        "startTime": 0,
+        "endTime": 1439,
+        "timeSlotId": 0,
+        "left": 20
+      },
+      "price": {
+        "offerId": 97011,
+        "currency": "AED",
+        "recPricePerAdult": 300.0,
+        "recPricePerChild": 180.0,
+        "recPricePerTrip": 0,
+        "pricePerAdult": 200,
+        "pricePerChild": 120,
+        "pricePerTrip": 50,
+        "pricePerAdultUsd": 54.5,
+        "pricePerChildUsd": 32.7,
+        "pricePerTripUsd": 13.62,
+        "discountPercent": null,
+        "hasDiscount": false,
+        "isBookable": true,
+        "supplierCurrencyCode": null,
+        "conversionRate": 3.67,
+        "vat": 5,
+        "date": "2026-12-31T00:00:00"
+      }
+    }
+  ],
+  "freeChild": [
+    {
+      "availability": {
+        "id": 1,
+        "date": "2026-12-31T00:00:00",
+        "startTime": 0,
+        "endTime": 1439,
+        "timeSlotId": 0,
+        "left": 20
+      },
+      "price": {
+        "offerId": 97011,
+        "currency": "AED",
+        "recPricePerAdult": 300.0,
+        "recPricePerChild": 180.0,
+        "recPricePerTrip": 0,
+        "pricePerAdult": 200,
+        "pricePerChild": 0,
+        "pricePerTrip": 0,
+        "pricePerAdultUsd": 54.5,
+        "pricePerChildUsd": 0,
+        "pricePerTripUsd": 0,
+        "discountPercent": null,
+        "hasDiscount": false,
+        "isBookable": true,
+        "supplierCurrencyCode": null,
+        "conversionRate": 3.67,
+        "vat": 5,
+        "date": "2026-12-31T00:00:00"
+      }
+    }
+  ]
+}
