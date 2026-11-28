@@ -2972,6 +2972,8 @@ model FiscalExport {
   /// pending | sent | failed | unknown
   status        String    @default("pending")
   attempts      Int       @default(0)
+  /// The send's generation: one provider idempotency key per period and generation; staff "send again" adds one.
+  generation    Int       @default(1)
   documentCount Int?      @map("document_count")
   lineCount     Int?      @map("line_count")
   providerId    String?   @map("provider_id")

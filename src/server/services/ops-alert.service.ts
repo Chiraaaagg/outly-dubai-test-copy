@@ -15,7 +15,7 @@ import { crmReturnIncidents } from "../crm/crm.return.alerts";
 import { ownerAlertIncidents } from "./owner-alert";
 import { bulkDisarmIncidents } from "./bulk-guard";
 import type { OpsEntityKind } from "./ops-alert.kinds";
-import { accountIncidents, emailVolumeIncidents, signInCodeBudgetIncidents } from "./account-alerts";
+import { accountIncidents, emailVolumeIncidents, signInCodeBudgetIncidents, signupClaimIncidents } from "./account-alerts";
 import { duplicateScanIncidents } from "../payments/duplicate-scan";
 
 /**
@@ -163,6 +163,8 @@ export type OpsIncidentKind =
   | "email_volume_high"
   /** Group B (re-review 103b N1): today's sign-in code budget reached 80 % or is spent (account-alerts.ts). */
   | "signin_code_budget"
+  /** Group B (re-review 103c D1): Supabase gave our Before User Created hook no signup claim, so new email sign-ins are refused (account-alerts.ts). */
+  | "signup_claim_missing"
   /** Review 102c D5: the payments tick's duplicate-payment scan came back full (payments/duplicate-scan.ts). */
   | "duplicate_scan_full"
   /** Review 102c D5: duplicates of a provider with no configured gateway are held (payments/duplicate-scan.ts). */
@@ -216,6 +218,7 @@ export const OPS_INCIDENT_TITLES: Record<OpsIncidentKind, string> = {
   supabase_user_delete_due: "Erased account: delete its Supabase Auth user by hand",
   email_volume_high: "Email volume near the Resend plan cap",
   signin_code_budget: "Email sign-in codes: today's budget is nearly or fully spent (Google sign-in still works)",
+  signup_claim_missing: "New email sign-ins refused: Supabase did not pass the signup claim to our hook (Google and returning customers still work)",
   duplicate_scan_full: "Duplicate payments waiting: automatic refunds may be held up",
   duplicate_no_gateway: "Duplicate payments held: no payment gateway for their provider account",
 };
@@ -308,7 +311,7 @@ export function bookingReason(b: { state: string; errorCode: string | null; atte
 export const EXTERNAL_REFUND_ALERT_AFTER_MS = 3 * 3_600_000;
 
 /** A Group B alert read failed: no incident from it, and a log line instead of silence (re-review 103b N3). */
-function groupBReadFailed(part: "account" | "volume" | "signin_budget"): OpsIncident[] {
+function groupBReadFailed(part: "account" | "volume" | "signin_budget" | "signup_claim"): OpsIncident[] {
   emitEvent("customer.identity_alerts_failed", { part }, "error");
   return [];
 }
@@ -529,6 +532,8 @@ export async function collectOpsIncidents(since: Date, now: Date, limit = COLLEC
   out.push(...(await accountIncidents(since, now, limit).catch(() => groupBReadFailed("account"))));
   out.push(...(await emailVolumeIncidents(now).catch(() => groupBReadFailed("volume"))));
   out.push(...(await signInCodeBudgetIncidents(now).catch(() => groupBReadFailed("signin_budget"))));
+  // Re-review 103c D1: entity kind `email_volume`, so no constraint change.
+  out.push(...(await signupClaimIncidents(now).catch(() => groupBReadFailed("signup_claim"))));
   // Review 102c D5: entity kind `payment_saga`, so no constraint change.
   out.push(...(await duplicateScanIncidents(since, now)));
   return out;

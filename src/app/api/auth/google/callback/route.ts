@@ -4,6 +4,7 @@ import { guestSessionService } from "@/server/services/guest-session.service";
 import { clientIp, handle, userAgent } from "@/server/lib/http";
 import { setCustomerCookies, ticketAccessFromRequest } from "@/server/lib/customer-session";
 import { clearOAuthCookie, decodeOAuthCookie, oauthCookieFromRequest } from "@/server/lib/oauth-cookie";
+import { pilotActive } from "@/server/auth/pilot";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -28,7 +29,9 @@ export const GET = handle(async (req: NextRequest) => {
     guestSessionId: guest?.guestSessionId ?? null,
     accessCookie: ticketAccessFromRequest(req),
   });
-  const target = result.ok ? result.next : `/login?e=${result.notice}`;
+  // Owner-only pilot (review 109 N5): a failed round trip returns to /login with `pilot=1`, so the page still shows
+  // the options the owner was using. `pilot=1` is not a secret; the gates are the list checks.
+  const target = result.ok ? result.next : `/login?e=${result.notice}${pilotActive() ? "&pilot=1" : ""}`;
   const res = NextResponse.redirect(new URL(target, req.url), 303);
   res.headers.set("cache-control", "no-store");
   res.headers.set("referrer-policy", "no-referrer");

@@ -150,6 +150,29 @@ const schema = z.object({
    * last 10 minutes. Only "true" turns it on; default off everywhere.
    */
   CUSTOMER_PHONE_LINK_ENABLED: strictBool("CUSTOMER_PHONE_LINK_ENABLED"),
+  /**
+   * Safety valve for the signup claim (re-review 103c D1). Off: the Before
+   * User Created hook lets an email user be created only when Supabase hands
+   * it the signup claim our start route sent in `/otp` `data`. On: the claim
+   * is not compared, but the hook still needs a live, unexpired intent of ours
+   * for that address created in the last 2 minutes (a Turnstile-gated start)
+   * and still spends that intent's single creation, so a direct `/signup`
+   * with no start of ours stays refused. Turn on only if Supabase is found not
+   * to pass the claim (staff alert `signup_claim_missing`). Only "true" turns
+   * it on; default off everywhere.
+   */
+  CUSTOMER_SIGNUP_CLAIM_RELAXED: strictBool("CUSTOMER_SIGNUP_CLAIM_RELAXED"),
+  /**
+   * Owner-only pilot (owner decision, production proof). Comma-separated
+   * email addresses; empty (the default) means no pilot. When set: the email
+   * code start route sends codes only to these addresses (any other address
+   * gets the same answer as a sent code, and nothing is sent), Google sign-in
+   * starts only from `/login?pilot=1` and its callback refuses any Google
+   * email not in the list before an account is created or linked, and /login
+   * shows the email and Google options only with `?pilot=1`. Compared trimmed
+   * and lower-cased.
+   */
+  CUSTOMER_AUTH_PILOT_EMAILS: csv,
   /** `https://<project>.supabase.co`: the Auth base URL and the JWT issuer host. Server only. */
   SUPABASE_URL: optionalStr,
   /** The project's publishable key (public by design), sent as `apikey` on Auth calls. Server only all the same. */
@@ -306,6 +329,19 @@ const schema = z.object({
    * nothing is issued (fail closed) and the boot check says so.
    */
   FISCAL_DOCUMENTS_START_AT: z
+    .string()
+    .optional()
+    .transform((v) => parseFiscalStartAt(v)),
+  /**
+   * Group C, owner decision R5 (28 Nov 2026): the moment invoice emails may
+   * start, an ISO time with a zone; set it to the moment
+   * FISCAL_DOCUMENTS_ENABLED is switched on. Only captures booked at or after
+   * it get the invoice by email (the follow-up invoice email, 7-day rule, and
+   * the attachment on the payment email); the backlog numbered at switch-on is
+   * download-only, never emailed. Unset or invalid: no invoice is emailed at
+   * all (fail closed).
+   */
+  FISCAL_EMAIL_FROM_AT: z
     .string()
     .optional()
     .transform((v) => parseFiscalStartAt(v)),
@@ -602,6 +638,7 @@ export function assertBootEnv(): string[] {
   for (const p of stripeConfigProblems(e)) problems.push(`Stripe refused: ${p}`);
   // Group C, A12: the fiscal switch never issues without its go-live start.
   if (e.FISCAL_DOCUMENTS_ENABLED && !e.FISCAL_DOCUMENTS_START_AT) problems.push("FISCAL_DOCUMENTS_ENABLED is on but FISCAL_DOCUMENTS_START_AT is unset or not an ISO time with a zone — no invoice is issued");
+  if (e.FISCAL_DOCUMENTS_ENABLED && !e.FISCAL_EMAIL_FROM_AT) problems.push("FISCAL_DOCUMENTS_ENABLED is on but FISCAL_EMAIL_FROM_AT is unset or invalid — no invoice is emailed (set it to the switch-on moment)");
   // Review 109c N7: a value that does not parse is reported even with the switch off (the reconciliation needs it).
   else if (!e.FISCAL_DOCUMENTS_START_AT && (process.env.FISCAL_DOCUMENTS_START_AT ?? "").trim()) problems.push("FISCAL_DOCUMENTS_START_AT is set but is not a valid ISO time with a zone — the refund reconciliation stays idle");
   if (e.CRM_SYNC_ENABLED) {

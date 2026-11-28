@@ -9,8 +9,10 @@ import { uuidv7 } from "../lib/ids";
  * erasure request erases (never a deferred order). Runs inside the erasure
  * transaction (`eraseSubjectRows`).
  *
- *  - `fiscal_document_parties`: buyer name, email, address and TRN blanked and
- *    `erased_at` set. The fiscal document itself (number, dates, lines, VAT,
+ *  - `fiscal_document_parties` of simplified invoices and credit notes: buyer
+ *    name, email, address and TRN blanked and `erased_at` set. A full tax
+ *    invoice reissued for a VAT-registered buyer (C-P2) is left alone: its
+ *    buyer is a company (review 109d R1). The fiscal document itself (number, dates, lines, VAT,
  *    totals) is append-only and keeps everything; it never held the buyer.
  *  - A drawn fiscal PDF printed the buyer name: its file row, and a row still
  *    being drawn, is superseded (`erased`) and a pending copy of the same
@@ -60,10 +62,12 @@ export async function eraseGeneratedForOrders(tx: Tx, orderIds: readonly string[
   if (!orderIds.length) return out;
   const ids = [...orderIds];
 
-  // Fiscal documents of these orders whose party still names someone.
+  // Fiscal documents of these orders whose party still names someone. Review 109d R1: a full tax invoice reissued for
+  // a VAT-registered buyer (C-P2) names a company (legal name, TRN, address), not the consumer: A13 covers simplified
+  // invoices only, so its party row and its file are left as they are.
   const named = await tx.$queryRaw<{ id: string }[]>`
     SELECT f.id FROM fiscal_documents f JOIN fiscal_document_parties p ON p.fiscal_document_id = f.id
-    WHERE f.order_id = ANY(${ids}::uuid[]) AND p.erased_at IS NULL`;
+    WHERE f.order_id = ANY(${ids}::uuid[]) AND p.erased_at IS NULL AND f.issue_reason <> 'reissue_full'`;
   const fiscalIds = named.map((r) => r.id);
   if (fiscalIds.length) {
     const parties = await tx.fiscalDocumentParty.updateMany({
@@ -92,7 +96,7 @@ export async function eraseGeneratedForOrders(tx: Tx, orderIds: readonly string[
   // repeat erasure collects again what an earlier delete missed. Marked `erased` so the documents job retries the
   // delete as well (`sweepErasedObjects`).
   const oldFiscal = await tx.generatedDocument.findMany({
-    where: { orderId: { in: ids }, kind: { in: ["tax_invoice", "tax_credit_note"] }, status: { in: ["superseded", "failed"] }, storageKey: { not: null } },
+    where: { orderId: { in: ids }, kind: { in: ["tax_invoice", "tax_credit_note"] }, status: { in: ["superseded", "failed"] }, storageKey: { not: null }, fiscalDocument: { issueReason: { not: "reissue_full" } } },
     select: { id: true, storageKey: true, reasonCode: true },
   });
   for (const r of oldFiscal) {

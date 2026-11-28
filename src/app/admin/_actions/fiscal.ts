@@ -14,7 +14,17 @@ import { form, runAction, type ActionResult } from "./result";
  */
 
 export type CbuaeRateActionResult = ActionResult<{ date: string; aedPerInr: string; replaced: string | null }>;
-export type ReissueActionResult = ActionResult<{ cancelled: string; creditNote: string; invoice: string }>;
+export type ReissueActionResult = ActionResult<{ cancelled: string; creditNote: string; invoice: string; creditNoteFileId: string; invoiceFileId: string }>;
+export type ResendExportActionResult = ActionResult<{ period: string; generation: number }>;
+
+export async function resendExportAction(_prev: ResendExportActionResult | null, fd: FormData): Promise<ResendExportActionResult> {
+  return runAction(async () => {
+    const { actor } = await authService.requireCookies("payments.reconcile");
+    const out = await fiscalStaffService.resendExport(actor, { period: form.str(fd, "period"), totpCode: form.str(fd, "totpCode") });
+    revalidatePath("/admin/fiscal");
+    return out;
+  });
+}
 
 export async function recordCbuaeRateAction(_prev: CbuaeRateActionResult | null, fd: FormData): Promise<CbuaeRateActionResult> {
   return runAction(async () => {
@@ -36,6 +46,6 @@ export async function reissueFullTaxInvoiceAction(_prev: ReissueActionResult | n
       totpCode: form.str(fd, "totpCode"),
     });
     revalidatePath("/admin/fiscal");
-    return { cancelled: out.cancelled.displayNumber, creditNote: out.creditNote.displayNumber, invoice: out.invoice.displayNumber };
+    return { cancelled: out.cancelled.displayNumber, creditNote: out.creditNote.displayNumber, invoice: out.invoice.displayNumber, creditNoteFileId: out.creditNote.fileId, invoiceFileId: out.invoice.fileId };
   });
 }

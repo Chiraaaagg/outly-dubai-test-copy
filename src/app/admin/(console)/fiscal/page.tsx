@@ -1,7 +1,7 @@
-import { listCbuaeRates } from "@/server/services/fiscal-staff.service";
+import { listCbuaeRates, listExports, listRecentReissues } from "@/server/services/fiscal-staff.service";
 import { requirePage } from "../../_lib/guard";
 import { PageHeader } from "../../_components/ui";
-import { FiscalForms, type RateRow } from "./fiscal-forms";
+import { FiscalForms } from "./fiscal-forms";
 
 /**
  * /admin/fiscal — staff actions on the fiscal documents (Group C, owner
@@ -14,11 +14,11 @@ export const dynamic = "force-dynamic";
 
 export default async function AdminFiscalPage() {
   const { actor } = await requirePage("payments.reconcile");
-  const rates: RateRow[] = await listCbuaeRates(actor);
+  const [rates, reissues, exports] = await Promise.all([listCbuaeRates(actor), listRecentReissues(actor), listExports(actor)]);
   return (
     <>
       <PageHeader title="Fiscal documents" sub="Exchange rates for INR-paid invoices and full tax invoices on request. Each action needs your authenticator code and is audited." />
-      <FiscalForms rates={rates} />
+      <FiscalForms rates={rates} reissues={reissues} exports={exports} />
     </>
   );
 }

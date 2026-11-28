@@ -220,7 +220,11 @@ class FailingReadStore extends MemoryDocumentStore {
 async function cleanupRun(): Promise<void> {
   assertDisposableDb();
   const { TX_OPTIONS } = await import("../../lib/db");
-  const orderIds = (await prisma.order.findMany({ where: { leadName: { startsWith: `zz-c-${RUN}` } }, select: { id: true } })).map((o) => o.id);
+  // By lead name AND by reference: a test erases a lead name (review 109c N6), and an order left behind would keep a
+  // guest this cleanup deletes (`order_has_buyer`).
+  const orderIds = (
+    await prisma.order.findMany({ where: { OR: [{ leadName: { startsWith: `zz-c-${RUN}` } }, { reference: { startsWith: `OUT-ZC${RUN.toUpperCase()}` } }] }, select: { id: true } })
+  ).map((o) => o.id);
   const guestIds = (await prisma.guest.findMany({ where: { fullName: { startsWith: `zz-c-${RUN}` } }, select: { id: true } })).map((g) => g.id);
   const entities = [ENTITY, `zz_d_${RUN}`];
   // D7: the supplier branch only when this run's supplier exists (an undefined id would match every booking).
@@ -276,6 +280,8 @@ describe("Group C documents (disposable database)", () => {
     process.env.PAYMENT_RECEIVED_EMAIL_ENABLED = "true";
     // A12: the reconciliation reads the go-live start from the environment.
     process.env.FISCAL_DOCUMENTS_START_AT = START_AT.toISOString();
+    // R5: invoice emails for captures from the switch-on moment (here the same as the start).
+    process.env.FISCAL_EMAIL_FROM_AT = START_AT.toISOString();
     delete process.env.RESEND_API_KEY;
     delete process.env.FISCAL_DOCUMENTS_ENABLED;
     delete process.env.BRANDED_ENTRY_PDF_ENABLED;
@@ -1190,6 +1196,12 @@ describe("Group C documents (disposable database)", () => {
     await prisma.setting.deleteMany({ where: { key: RATE_KEY } });
     const o = await paidOrder({ currency: "INR", grosses: [40000n, 2000n] });
     expect(await fiscal.issueForLedgerEntry(o.ledgerId, deps())).toEqual({ kind: "blocked", reason: "fx_rate_missing" });
+    const o2 = await paidOrder({ currency: "INR", grosses: [10000n] });
+    expect(await fiscal.issueForLedgerEntry(o2.ledgerId, deps())).toEqual({ kind: "blocked", reason: "fx_rate_missing" });
+    // R7: every held INR capture keeps its own row, but staff are alerted once for the day.
+    const { fiscalIncidents } = await import("../ops-alert.service");
+    expect((await fiscalIncidents(new Date(NOW.getTime() - 1000), new Date(NOW.getTime() + 1000))).filter((i) => i.reason === "fx_rate_missing")).toHaveLength(1);
+    expect(await prisma.fiscalAttention.count({ where: { entityId: { in: [o.ledgerId, o2.ledgerId] }, reason: "fx_rate_missing", resolvedAt: null } })).toBe(2);
     // Staff enter the rate (validated, step-up, audited); a future date and an implausible rate are refused.
     await expect(staff.recordCbuaeRate(staffActor(), { date: "2027-02-15", aedPerInr: "0.0435", totpCode: "000000" }, NOW)).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
     await expect(staff.recordCbuaeRate(staffActor(), { date: "2027-02-14", aedPerInr: "4.35", totpCode: "000000" }, NOW)).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
@@ -1273,6 +1285,19 @@ describe("Group C documents (disposable database)", () => {
     const refund = await settledRefund(o, 1, 2000n);
     expect((await fiscal.issueForLedgerEntry(refund.ledgerId, deps())).kind).toBe("issued");
     expect((await prisma.fiscalDocument.findUniqueOrThrow({ where: { ledgerEntryId: refund.ledgerId } })).refersToId).toBe(full.id);
+    // R8: the result names the new files; the admin listing shows the cancelled invoice with its replacement.
+    expect(out.invoice.fileId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(await prisma.generatedDocument.findUniqueOrThrow({ where: { id: out.invoice.fileId } })).toMatchObject({ fiscalDocumentId: full.id });
+    const { listRecentReissues } = await import("../fiscal-staff.service");
+    const listed = (await listRecentReissues(staffActor(), 200)).find((r) => r.invoice.displayNumber === full.displayNumber);
+    expect(listed).toMatchObject({ cancelled: { displayNumber: inv.displayNumber }, creditNote: { displayNumber: cn.displayNumber } });
+    expect(listed?.invoice.fileId).toBeTruthy();
+    // R1: erasing the order blanks the consumer on the simplified invoice and its credit note, never the company on the full one.
+    const erasure = await import("../../repositories/generated-document-erasure");
+    await prisma.$transaction((tx) => erasure.eraseGeneratedForOrders(tx, [o.orderId], NOW));
+    expect(await prisma.fiscalDocumentParty.findUniqueOrThrow({ where: { fiscalDocumentId: full.id } })).toMatchObject({ buyerName: "Specimen Trading LLC", buyerTrn: trn, erasedAt: null });
+    expect((await prisma.fiscalDocumentParty.findUniqueOrThrow({ where: { fiscalDocumentId: inv.id } })).erasedAt).not.toBeNull();
+    expect(await prisma.generatedDocument.count({ where: { fiscalDocumentId: full.id, status: "valid" } })).toBe(1);
     // An invoice with a refund is not reissued automatically.
     const o2 = await paidOrder({ grosses: [5000n] });
     const inv2 = (await fiscal.issueForLedgerEntry(o2.ledgerId, deps())) as { displayNumber: string };
@@ -1280,10 +1305,11 @@ describe("Group C documents (disposable database)", () => {
     expect(await fiscal.reissueAsFullTaxInvoice(inv2.displayNumber, { legalName: "Specimen Trading LLC", trn, address: "Specimen Tower 1, Dubai" }, deps())).toEqual({ kind: "refused", reason: "refunds_exist" });
   }, 60_000);
 
-  it("C-P4: the monthly CSV goes once to the accountant with the month's documents; a failed send alerts staff and is retried", async () => {
+  it("C-P4: every closed month goes once to the accountant, oldest first, no consumer name; a failure alerts staff and is retried; staff can send a month again; a send left in flight is never repeated", async () => {
     await prisma.$executeRaw`DELETE FROM fiscal_attention WHERE entity_kind = 'fiscal_export' AND entity_id IN (SELECT id FROM fiscal_exports WHERE environment = 'test' AND period = ANY(${EXPORT_PERIODS}::text[]))`;
     await prisma.fiscalExport.deleteMany({ where: { environment: "test", period: { in: EXPORT_PERIODS } } });
     const exporter = await import("../fiscal-export.service");
+    const { createFiscalStaffService } = await import("../fiscal-staff.service");
     const o = await paidOrder({ grosses: [5000n] });
     const inv = (await fiscal.issueForLedgerEntry(o.ledgerId, deps())) as { displayNumber: string };
     const e = envWith({ FISCAL_ACCOUNTANT_EMAIL: "accountant@example.com", recipientAllowlist: ["@example.com"] });
@@ -1292,34 +1318,59 @@ describe("Group C documents (disposable database)", () => {
       mails.push({ msg, opts });
       return { kind: "sent", providerId: `fake-${opts.idempotencyKey}` };
     };
-    // Off without an address; not before the start.
+    // Off without an address; nothing before the start's month has closed.
     expect(await exporter.runMonthlyExport(new Date("2027-03-01T06:00:00Z"), { e: envWith({ FISCAL_ACCOUNTANT_EMAIL: null }), send: ok })).toEqual({ skipped: "off" });
-    expect(await exporter.runMonthlyExport(new Date("2027-01-01T06:00:00Z"), { e, send: ok })).toMatchObject({ skipped: "before_start", period: "2026-12" });
-    // 1 March 2027, Dubai: February goes.
-    const first = await exporter.runMonthlyExport(new Date("2027-03-01T06:00:00Z"), { e, send: ok });
-    expect(first).toMatchObject({ period: "2027-02", status: "sent" });
+    expect(await exporter.runMonthlyExport(new Date("2027-01-01T06:00:00Z"), { e, send: ok })).toEqual({ skipped: "before_start" });
+    expect(exporter.closedPeriods(START_AT, new Date("2027-03-01T06:00:00Z"))).toEqual(["2027-01", "2027-02"]);
+
+    // 1 Feb 2027: January is refused by the provider: a staff alert, a retry after the back-off, the alert closed on success.
+    const refuse = async (_m: EmailSend, opts: EmailSendOptions): Promise<EmailOutcome> => {
+      mails.push({ msg: _m, opts });
+      return { kind: "failed", retryable: true, httpStatus: 429, reason: "rate_limited" };
+    };
+    expect(await exporter.runMonthlyExport(new Date("2027-02-01T06:00:00Z"), { e, send: refuse })).toMatchObject({ period: "2027-01", status: "failed" });
+    const jan = await prisma.fiscalExport.findFirstOrThrow({ where: { environment: "test", period: "2027-01" } });
+    expect(jan).toMatchObject({ status: "failed", errorCode: "retryable:rate_limited", generation: 1 });
+    expect(await prisma.fiscalAttention.count({ where: { entityKind: "fiscal_export", entityId: jan.id, resolvedAt: null, reason: "export_failed" } })).toBe(1);
+    const { fiscalIncidents } = await import("../ops-alert.service");
+    expect((await fiscalIncidents(new Date("2027-02-01T05:00:00Z"), new Date("2027-02-01T07:00:00Z"))).find((i) => i.entityId === jan.id)).toMatchObject({ entityKind: "fiscal_export", reason: "export_failed" });
+    expect(await exporter.runMonthlyExport(new Date("2027-02-01T06:10:00Z"), { e, send: ok })).toEqual({ skipped: "not_due" });
+    expect(await exporter.runMonthlyExport(new Date("2027-02-01T07:00:00Z"), { e, send: ok })).toMatchObject({ period: "2027-01", status: "sent" });
+    expect(await prisma.fiscalAttention.count({ where: { entityKind: "fiscal_export", entityId: jan.id, resolvedAt: null } })).toBe(0);
+    // R2: the same idempotency key for the retry of the same month.
+    expect(mails.map((m) => m.opts.idempotencyKey)).toEqual(["fiscal-export-test-2027-01-g1", "fiscal-export-test-2027-01-g1"]);
+
+    // 1 March 2027: January is sent, so February goes, once.
+    mails.length = 0;
+    expect(await exporter.runMonthlyExport(new Date("2027-03-01T06:00:00Z"), { e, send: ok })).toMatchObject({ period: "2027-02", status: "sent" });
     expect(mails).toHaveLength(1);
     expect(mails[0].msg.to).toBe("accountant@example.com");
     const att = mails[0].msg.attachments ?? [];
     expect(att.map((a) => [a.filename, a.contentType])).toEqual([["OUTLYY-fiscal-documents-2027-02-TEST.csv", "text/csv"]]);
     const csv = new TextDecoder().decode(att[0].content);
-    expect(csv.split("\r\n")[0]).toBe("Document number,Type,Issue date,Date of supply,Order reference,Buyer name,Line description,VAT category,Net,VAT,Gross,Currency");
-    expect(csv).toContain(`${inv.displayNumber},Tax invoice (simplified),2027-02-14,2027-02-14,${o.reference},zz-c-${RUN} Asha Specimen,Specimen Activity 1,standard,47.62,2.38,50.00,AED`);
-    // Once per month: later runs send nothing.
-    expect(await exporter.runMonthlyExport(new Date("2027-03-01T08:00:00Z"), { e, send: ok })).toMatchObject({ skipped: "not_due", period: "2027-02" });
+    expect(csv.charCodeAt(0)).toBe(0xfeff);
+    expect(csv).toContain(`${inv.displayNumber},Tax invoice (simplified),2027-02-14,2027-02-14,${o.reference},,,,Specimen Activity 1,standard,47.62,2.38,50.00,AED`);
+    // R4: no consumer name is exported.
+    expect(csv).not.toContain("Asha Specimen");
+    expect(await exporter.runMonthlyExport(new Date("2027-03-01T08:00:00Z"), { e, send: ok })).toEqual({ skipped: "not_due" });
     expect(mails).toHaveLength(1);
-    expect(await prisma.fiscalExport.findFirstOrThrow({ where: { environment: "test", period: "2027-02" } })).toMatchObject({ status: "sent", attempts: 1 });
-    // A refused send (January): a staff alert, a retry after the back-off, the alert closed on success.
-    const refuse = async (): Promise<EmailOutcome> => ({ kind: "failed", retryable: true, httpStatus: 429, reason: "rate_limited" });
-    expect(await exporter.runMonthlyExport(new Date("2027-02-01T06:00:00Z"), { e, send: refuse })).toMatchObject({ period: "2027-01", status: "failed" });
-    const row = await prisma.fiscalExport.findFirstOrThrow({ where: { environment: "test", period: "2027-01" } });
-    expect(row).toMatchObject({ status: "failed", errorCode: "retryable:rate_limited" });
-    expect(await prisma.fiscalAttention.count({ where: { entityKind: "fiscal_export", entityId: row.id, resolvedAt: null, reason: "export_failed" } })).toBe(1);
-    const { fiscalIncidents } = await import("../ops-alert.service");
-    expect((await fiscalIncidents(new Date("2027-02-01T05:00:00Z"), new Date("2027-02-01T07:00:00Z"))).find((i) => i.entityId === row.id)).toMatchObject({ entityKind: "fiscal_export", reason: "export_failed" });
-    expect(await exporter.runMonthlyExport(new Date("2027-02-01T06:10:00Z"), { e, send: ok })).toMatchObject({ skipped: "not_due" });
-    expect(await exporter.runMonthlyExport(new Date("2027-02-01T07:00:00Z"), { e, send: ok })).toMatchObject({ period: "2027-01", status: "sent" });
-    expect(await prisma.fiscalAttention.count({ where: { entityKind: "fiscal_export", entityId: row.id, resolvedAt: null } })).toBe(0);
+
+    // R3: staff send February again (step-up, audit): the next run sends it under the next generation's key.
+    const staff = createFiscalStaffService({ stepUp: async () => null, env: () => e });
+    await expect(staff.resendExport(staffActor(), { period: "2027-13", totpCode: "000000" }, new Date("2027-03-02T06:00:00Z"))).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
+    expect(await staff.resendExport(staffActor(), { period: "2027-02", totpCode: "000000" }, new Date("2027-03-02T06:00:00Z"))).toEqual({ period: "2027-02", generation: 2 });
+    expect(await exporter.runMonthlyExport(new Date("2027-03-02T06:05:00Z"), { e, send: ok })).toMatchObject({ period: "2027-02", status: "sent" });
+    expect(mails.map((m) => m.opts.idempotencyKey)).toEqual(["fiscal-export-test-2027-02-g1", "fiscal-export-test-2027-02-g2"]);
+
+    // R2: a send left in flight (the function died after claiming) becomes an unknown outcome for staff, never a second email.
+    await staff.resendExport(staffActor(), { period: "2027-02", totpCode: "000000" }, new Date("2027-03-03T06:00:00Z"));
+    await prisma.fiscalExport.updateMany({ where: { environment: "test", period: "2027-02" }, data: { status: "unknown", errorCode: "in_flight", lockedUntil: new Date("2027-03-03T06:01:00Z") } });
+    mails.length = 0;
+    expect(await exporter.runMonthlyExport(new Date("2027-03-03T06:10:00Z"), { e, send: ok })).toEqual({ skipped: "not_due" });
+    expect(mails).toHaveLength(0);
+    const feb = await prisma.fiscalExport.findFirstOrThrow({ where: { environment: "test", period: "2027-02" } });
+    expect(feb).toMatchObject({ status: "unknown", errorCode: "unknown:killed" });
+    expect(await prisma.fiscalAttention.count({ where: { entityKind: "fiscal_export", entityId: feb.id, resolvedAt: null, reason: "export_unknown" } })).toBe(1);
   }, 60_000);
 
   it("review 109c N2, N3: erased files' objects are deleted by a retrying sweep; a file being drawn when the erasure commits never ends valid with the name", async () => {

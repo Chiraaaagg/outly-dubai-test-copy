@@ -2,6 +2,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { customerIdentityService, reasonOf } from "@/server/services/customer-identity.service";
 import { handle } from "@/server/lib/http";
 import { setOAuthCookie } from "@/server/lib/oauth-cookie";
+import { PILOT_PARAM, pilotRequested } from "@/server/auth/pilot";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -15,7 +16,8 @@ export const dynamic = "force-dynamic";
  */
 export const GET = handle(async (req: NextRequest) => {
   try {
-    const { url, cookie } = customerIdentityService.googleStart({ next: req.nextUrl.searchParams.get("next") });
+    // Owner-only pilot (CUSTOMER_AUTH_PILOT_EMAILS): Google starts only from `/login?pilot=1` while the list is set.
+    const { url, cookie } = customerIdentityService.googleStart({ next: req.nextUrl.searchParams.get("next"), pilot: pilotRequested(req.nextUrl.searchParams.get(PILOT_PARAM)) });
     const res = NextResponse.redirect(url, 303);
     res.headers.set("cache-control", "no-store");
     res.headers.set("referrer-policy", "no-referrer");

@@ -7,9 +7,10 @@ import { env } from "../lib/env";
  * The /login widget produces a single-use token; the email-code start route
  * sends it here with our secret before any intent is written or any code is
  * requested. `success` must be true, the `action` must be exactly ours
- * (present and equal) and, in production, the `hostname` must be the
- * NEXT_PUBLIC_SITE_URL host exactly (an alias such as `www.` must redirect to
- * it before /login is reached). Anything else, including a
+ * (present and equal) and, in production, the `hostname` must be exactly
+ * the NEXT_PUBLIC_SITE_URL host or its `www.` twin (owner decision: the apex
+ * and `www.` both serve /login; `turnstileHostnames`), nothing else, not even
+ * another subdomain. Anything else, including a
  * Cloudflare outage, refuses the send (fail closed): Google sign-in stays
  * available on the same page.
  *
@@ -34,6 +35,17 @@ export function turnstileConfigured(): boolean {
 }
 
 export type TurnstileResult = "ok" | "missing" | "refused" | "unavailable";
+
+/**
+ * The hostnames a production token may name (pure, exported for tests): the
+ * NEXT_PUBLIC_SITE_URL host and its `www.` twin, or the apex when the site
+ * URL is the `www.` host. Compared exactly.
+ */
+export function turnstileHostnames(siteUrl: string): string[] {
+  const host = new URL(siteUrl).hostname;
+  const twin = host.startsWith("www.") ? host.slice("www.".length) : `www.${host}`;
+  return twin ? [host, twin] : [host];
+}
 
 export async function verifyTurnstile(token: unknown, remoteIp: string | undefined): Promise<TurnstileResult> {
   const e = env();
@@ -61,8 +73,7 @@ export async function verifyTurnstile(token: unknown, remoteIp: string | undefin
     // Exactly our action (review 103 finding 10): a token from a widget without it, or with another, is refused.
     if (data.action !== TURNSTILE_ACTION) return "refused";
     if (e.isProduction) {
-      const host = new URL(e.NEXT_PUBLIC_SITE_URL).hostname;
-      if (data.hostname !== host) return "refused";
+      if (typeof data.hostname !== "string" || !turnstileHostnames(e.NEXT_PUBLIC_SITE_URL).includes(data.hostname)) return "refused";
     }
     return "ok";
   } catch {

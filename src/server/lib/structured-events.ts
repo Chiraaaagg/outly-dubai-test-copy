@@ -53,6 +53,8 @@ export const STRUCTURED_EVENTS = {
   "notification.reconciled": ["notificationId", "outcome"],
   "notification.suppressed": ["notificationId", "event", "channel", "reason"],
   "notification.attention": ["notificationId", "event", "reason"],
+  // A deferred send whose row claim another worker already took (re-review 103c D4): skipped, nothing sent here.
+  "notification.claim_skipped": ["notificationId", "event", "reason"],
   // Privacy (PRV-3)
   "privacy.erasure_deferred": ["requestId", "obligations"],
   "privacy.erasure_completed": [
@@ -246,6 +248,12 @@ export const STRUCTURED_EVENTS = {
   "customer.identity_code_failed": ["reason", "httpStatus"],
   "customer.identity_code_sent": ["outcome", "provider"],
   "customer.identity_dispute": ["applied"],
+  // Re-review 103c D1: our own start's `/otp` was refused because Supabase gave our hook no signup claim (error level).
+  "customer.identity_signup_claim_missing": [],
+  // Re-review 103c D1: CUSTOMER_SIGNUP_CLAIM_RELAXED let a creation through without a matching claim (`claim_missing` or `claim_mismatch`).
+  "customer.identity_signup_claim_relaxed": ["reason"],
+  // Owner-only pilot (CUSTOMER_AUTH_PILOT_EMAILS): a start or a Google sign-in for an address outside the list. Method code only.
+  "customer.identity_pilot_refused": ["method"],
   // A Group B staff-alert read that failed (account-alerts.ts, ops-alert.service.ts; re-review 103b N3). A part code only.
   "customer.identity_alerts_failed": ["part"],
 } as const satisfies Record<string, readonly string[]>;

@@ -6,7 +6,7 @@ import { AppError, isAppError } from "../lib/errors";
 import { uuidv7 } from "../lib/ids";
 import { emitEvent } from "../lib/structured-events";
 import { encryptFor, hashIp, randomToken, sha256Hex } from "../lib/crypto";
-import { enforceRateLimit, rateLimit, rateLimitSpan, releaseRateLimit } from "../lib/rate-limit";
+import { enforceRateLimit, rateLimit, rateLimitSpan, readRateLimitSpan, releaseRateLimit, spanStartedSince } from "../lib/rate-limit";
 import { audit } from "../lib/audit";
 import { customerActor, type Actor } from "../lib/actor";
 import { safeNext } from "@/lib/safe-next";
@@ -27,6 +27,8 @@ import { isRecipientAllowed } from "../notifications/allowlist";
 import type { OAuthCookieValue } from "../lib/oauth-cookie";
 import { decodeEmailStartCookie, EMAIL_START_COOKIE_MAX_AGE_SECONDS, newEmailStartCookie, type EmailStartCookieValue } from "../lib/email-start-cookie";
 import { SIGNIN_CODE_BUDGET_BUCKET, SIGNIN_CODE_BUDGET_WINDOW_SECONDS, SIGNIN_CODE_HOURLY_BUCKET, signInCodeDailyBudget } from "../auth/signin-code-budget";
+import { CLAIM_MISSING_MARKER_START, CLAIM_MISSING_MARKER_TTL_MS, claimMissingMarkerKey, SIGNUP_CLAIM_MISSING_BUCKET, SIGNUP_CLAIM_MISSING_COUNT_LIMIT, SIGNUP_CLAIM_MISSING_WINDOW_SECONDS } from "../auth/signup-claim-alert";
+import { pilotActive, pilotAllowsEmail } from "../auth/pilot";
 import { defer } from "../lib/defer";
 import type { SendEmailHookPayload, BeforeUserCreatedPayload } from "../auth/auth-hook";
 import { SIGN_IN_EMAIL_ACTIONS } from "../auth/auth-hook";
@@ -227,6 +229,27 @@ async function releaseSiteCharges(charged: readonly EmailStartLimit[], chargedAt
   for (const l of charged) await releaseRateLimit({ key: l.key, windowSeconds: l.windowSeconds, chargedAt });
 }
 
+/**
+ * True only when a failed Supabase `/otp` shows that no code went out
+ * (re-review 103c D3; pure, exported for tests): Supabase refused before
+ * calling our hook (`rate_limited`, `invalid_request`, `rejected`, missing
+ * configuration, any other 4xx), or the hook reported a failed send (a
+ * `hook_*` error code other than a timeout). A hook timeout (`hook_timeout`,
+ * `hook_timeout_after_retry`), any other 5xx, a transport error and our own
+ * timeout are not proof: our hook may already have handed the code to Resend,
+ * so the site-wide charges stay.
+ */
+export function otpSentNothing(err: unknown): boolean {
+  if (!(err instanceof SupabaseAuthError)) return false;
+  if (err.kind === "not_configured") return true;
+  if (err.timedOut || err.httpStatus === null) return false;
+  const code = err.errorCode ?? "";
+  if (code.startsWith("hook_timeout")) return false;
+  if (err.kind === "rate_limited" || err.kind === "invalid_request" || err.kind === "rejected") return true;
+  if (code.startsWith("hook_")) return true;
+  return err.httpStatus >= 400 && err.httpStatus < 500;
+}
+
 function fromSupabase(err: unknown, op: "send" | "verify" | "token"): AppError {
   if (err instanceof SupabaseAuthError) {
     switch (err.kind) {
@@ -309,6 +332,12 @@ export async function checkoutGrantOrders(tx: Tx, accessCookie: string | undefin
 /** Candidates read per sign-in. More than this is itself unusual volume: none attach and staff are told. */
 export const ATTACH_SCAN_LIMIT = 200;
 
+/**
+ * Which limit stopped the attach (re-review 103c D8): `attached`, more than ATTACH_CAP orders passed the per-order
+ * checks; `scanned`, more than ATTACH_SCAN_LIMIT candidates were read.
+ */
+export type AttachCapCause = "attached" | "scanned";
+
 export interface AttachCandidate {
   id: string;
   reference: string;
@@ -332,8 +361,8 @@ export interface AttachChoice {
 export function selectAttachable(
   candidates: readonly AttachCandidate[],
   ctx: { verifiedEmail: string | null; guestSessionId: string | null; grantOrderIds: readonly string[] },
-): { chosen: AttachChoice[]; capped: boolean } {
-  if (candidates.length > ATTACH_SCAN_LIMIT) return { chosen: [], capped: true };
+): { chosen: AttachChoice[]; capped: false } | { chosen: AttachChoice[]; capped: true; cappedBy: AttachCapCause } {
+  if (candidates.length > ATTACH_SCAN_LIMIT) return { chosen: [], capped: true, cappedBy: "scanned" };
   const emailHash = ctx.verifiedEmail ? sha256Hex(ctx.verifiedEmail) : null;
   const chosen: AttachChoice[] = [];
   for (const o of candidates) {
@@ -349,7 +378,7 @@ export function selectAttachable(
     // The notice must reach a verified address: an order whose email was not the one proven is left alone.
     if ((quoteSession || grant) && lead && leadVerified) chosen.push({ order: o, rule: "guest_session", verificationId: leadVerified.id, recipient: lead });
   }
-  return chosen.length > ATTACH_CAP ? { chosen: [], capped: true } : { chosen, capped: false };
+  return chosen.length > ATTACH_CAP ? { chosen: [], capped: true, cappedBy: "attached" } : { chosen, capped: false };
 }
 
 /**
@@ -394,7 +423,9 @@ export async function attachGuestOrders(
     // once per customer per UTC day, not on every later sign-in (finding 12).
     const dayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
     const already = await tx.auditLog.count({ where: { entityType: "customer_attach_cap", entityId: customer.id, createdAt: { gte: dayStart } } });
-    if (!already) await audit(input.actor, "customer.order_attach_capped", { type: "customer_attach_cap", id: customer.id }, { after: { candidates: `>${ATTACH_CAP}` } }, tx);
+    // The audit row names the limit that fired (re-review 103c D8).
+    const candidatesOver = selection.cappedBy === "scanned" ? `>${ATTACH_SCAN_LIMIT}` : `>${ATTACH_CAP}`;
+    if (!already) await audit(input.actor, "customer.order_attach_capped", { type: "customer_attach_cap", id: customer.id }, { after: { candidates: candidatesOver, limit: selection.cappedBy } }, tx);
     emitEvent("customer.identity_attach_capped", { customerId: customer.id }, "warn");
     return { attached: [], capped: true };
   }
@@ -635,8 +666,27 @@ export const customerIdentityService = {
       throw err;
     }
 
-    const intentId = await customerIdentityRepo.createIntent({ channel: "email", contactHash, ipHash, now, ttlMs: INTENT_TTL_MS });
     const answer = { expiresInSeconds: EMAIL_CODE_TTL_SECONDS, resendAfterSeconds: EMAIL_RESEND_AFTER_SECONDS, startCookie: newEmailStartCookie(contactHash, now) };
+    if (!pilotAllowsEmail(email)) {
+      // Owner-only pilot (CUSTOMER_AUTH_PILOT_EMAILS): an address outside the list is refused silently, with the
+      // same answer as a sent code, so the answer says nothing about the list. No intent, no Supabase call; the
+      // per-address and per-IP charges stay as for any request, the site-wide ones are given back (nothing sent).
+      await releaseSiteCharges(charged, now);
+      // Review 109 N3: Supabase refuses a second code for one address within 60 seconds of the last one it sent.
+      // The same limit here, sliding from the last "sent" answer, so a second start inside 60 seconds answers 429
+      // alike for a listed and an outside address (the answer our real path gives for Supabase's 429). Fails closed.
+      // Accepted residual: an outside address answers without the Supabase and Resend round trip (timing).
+      const gapKey = `auth_email_start:pilot_gap:${contactHash.slice(0, 32)}`;
+      const recent = await spanStartedSince({ key: gapKey, since: new Date(now.getTime() - EMAIL_RESEND_AFTER_SECONDS * 1000) });
+      if (recent === "unavailable") throw signInError("UNAVAILABLE");
+      if (recent) throw signInError("RATE_LIMITED", EMAIL_RESEND_AFTER_SECONDS);
+      const mark = await rateLimitSpan({ key: gapKey, limit: 1, windowStart: now, expiresAt: new Date(now.getTime() + EMAIL_RESEND_AFTER_SECONDS * 1000), now });
+      if (mark.storeUnavailable) throw signInError("UNAVAILABLE");
+      emitEvent("customer.identity_pilot_refused", { method: "email_otp" }, "warn");
+      return answer;
+    }
+
+    const intentId = await customerIdentityRepo.createIntent({ channel: "email", contactHash, ipHash, now, ttlMs: INTENT_TTL_MS });
     try {
       // The signup claim lets our Before User Created hook tell this creation from a direct `/signup` (finding 7).
       await client.sendEmailOtp(email, { signupClaim: signupClaimFor(intentId) });
@@ -650,10 +700,21 @@ export const customerIdentityService = {
       }
       // Nothing will use this intent now: retire it so a direct call to Supabase cannot spend it (finding 9).
       await customerIdentityRepo.retireIntent(intentId, new Date()).catch(() => {});
-      // No code was sent: the site-wide hourly limit and daily budget are given back (re-review 103b N1). The
-      // per-address and per-IP charges stay, so failing requests still cannot be repeated without bound.
-      await releaseSiteCharges(charged, now);
+      // Re-review 103c D1: did our Before User Created hook refuse this very start for a missing signup claim? Then
+      // Supabase did not pass our `/otp` `data` on, and every new address is refused.
+      const claimMissing = (await readRateLimitSpan({ key: claimMissingMarkerKey(intentId), windowStart: CLAIM_MISSING_MARKER_START })) > 0;
+      // Only when no code went out are the site-wide hourly limit and daily budget given back (re-review 103b N1,
+      // 103c D3): Supabase's answer proves it (`otpSentNothing`), or our own hook refused this start's creation
+      // (review 109 N2: hosted Supabase may report a hook refusal as a plain 500, which the code alone cannot tell
+      // from a 5xx after a send; our marker can). A hook timeout or another 5xx may come after our hook sent the
+      // code: the charge stays. The per-address and per-IP charges always stay.
+      if (otpSentNothing(err) || claimMissing) await releaseSiteCharges(charged, now);
       emitEvent("customer.identity_email_start_failed", { reason: err instanceof SupabaseAuthError ? err.kind : "error" }, "warn");
+      // Tell staff, loudly (D1).
+      if (claimMissing) {
+        emitEvent("customer.identity_signup_claim_missing", {}, "error");
+        await rateLimit({ key: SIGNUP_CLAIM_MISSING_BUCKET, limit: SIGNUP_CLAIM_MISSING_COUNT_LIMIT, windowSeconds: SIGNUP_CLAIM_MISSING_WINDOW_SECONDS, now });
+      }
       throw fromSupabase(err, "send");
     }
     emitEvent("customer.identity_email_code_requested", {});
@@ -693,9 +754,14 @@ export const customerIdentityService = {
   },
 
   /** GET /api/auth/google/start: the redirect and the cookie value. */
-  googleStart(input: { next: string | null; now?: Date }): { url: string; cookie: OAuthCookieValue } {
+  googleStart(input: { next: string | null; now?: Date; pilot?: boolean }): { url: string; cookie: OAuthCookieValue } {
     const cfg = googleConfig();
     if (!googleEnabled() || !cfg) throw signInError("NOT_CONFIGURED");
+    // Owner-only pilot: Google starts only from `/login?pilot=1`; the real gate is the email check on the callback.
+    if (pilotActive() && !input.pilot) {
+      emitEvent("customer.identity_pilot_refused", { method: "google_start" }, "warn");
+      throw signInError("NOT_CONFIGURED");
+    }
     const flow = newGoogleFlow();
     const url = googleAuthorizeUrl({ clientId: cfg.clientId, redirectUri: googleRedirectUri(env().NEXT_PUBLIC_SITE_URL), flow });
     return { url, cookie: { ...flow, next: safeNext(input.next), issuedAt: (input.now ?? new Date()).getTime() } };
@@ -728,6 +794,12 @@ export const customerIdentityService = {
       const redirectUri = googleRedirectUri(env().NEXT_PUBLIC_SITE_URL);
       const idToken = await exchangeGoogleCode({ code, verifier: c.verifier, redirectUri, clientId: cfg.clientId, clientSecret: cfg.clientSecret });
       const google = await verifyGoogleIdToken(idToken, { clientId: cfg.clientId, rawNonce: c.nonce });
+      // Owner-only pilot: a Google email outside the list stops here, before Supabase or our tail can create or
+      // link anything.
+      if (!pilotAllowsEmail(google.email)) {
+        emitEvent("customer.identity_pilot_refused", { method: "google" }, "warn");
+        return { ok: false, notice: "not_configured" };
+      }
       const session = await client.signInWithGoogleIdToken(idToken, c.nonce);
       const outcome = await completeSignIn({ session, proof: { method: "google", email: google.email }, ip: input.ip, userAgent: input.userAgent, guestSessionId: input.guestSessionId, accessCookie: input.accessCookie });
       return { ok: true, next: c.next, outcome };
@@ -788,34 +860,67 @@ export const customerIdentityService = {
 
   /**
    * Before User Created hook (plan 92 §2.1): Supabase may create a user only
-   * for a Google sign-in, or for an email address with a live intent from our
-   * own start route whose signup claim the new user carries (re-review 103b,
-   * finding 7). Password sign-ups, phone users and junk calls to the public
-   * endpoints are refused at creation.
+   * for a Google sign-in, or for an email address with a recent intent from
+   * our own start route whose signup claim the new user carries (re-review
+   * 103b, finding 7). Password sign-ups, phone users and junk calls to the
+   * public endpoints are refused at creation.
+   *
+   * Re-review 103c: any unexpired intent of that address created in the last
+   * two minutes may match, not only the newest (D2: a second start must not
+   * refuse the creation of the first); a refusal says `claim_missing` (no
+   * claim at all, and the hook leaves a marker on each recent intent so our
+   * own start can raise the staff alert) or `claim_mismatch` (D1). With
+   * CUSTOMER_SIGNUP_CLAIM_RELAXED on, the claim is not compared, but a live
+   * (unconsumed) intent of ours from the last two minutes is still required
+   * and its single creation is still spent.
+   *
+   * During the owner-only pilot (CUSTOMER_AUTH_PILOT_EMAILS) any address
+   * outside the list is refused first, for every provider (review 109 N4).
    */
   async handleBeforeUserCreatedHook(payload: BeforeUserCreatedPayload): Promise<"allow" | "reject"> {
+    const provider = payload.provider ?? "none";
+    // Owner-only pilot (review 109 N4): while the list is set, Supabase creates no user for an address outside it,
+    // whatever the provider: Google through a direct `id_token` sign-in included, not only through our routes.
+    if (!pilotAllowsEmail(payload.email)) {
+      emitEvent("customer.identity_hook_refused", { hook: "before_user_created", reason: "pilot", provider }, "warn");
+      return "reject";
+    }
     if (payload.provider === "google" && payload.email) return "allow";
     if (payload.provider === "email" || (!payload.provider && payload.email)) {
       const email = normaliseEmail(payload.email);
-      const intentId = email ? await customerIdentityRepo.findLiveIntent("email", sha256Hex(email), new Date()) : null;
-      if (intentId) {
+      const now = new Date();
+      const recent = email ? await customerIdentityRepo.findRecentIntents("email", sha256Hex(email), now, new Date(now.getTime() - INTENT_TTL_MS)) : [];
+      if (recent.length) {
         // Only the creation our own start route asked for (re-review 103b, finding 7): its `/otp` carried the claim
-        // of this intent in `user_metadata`. A direct Supabase `/signup` racing our start for the same address does
-        // not have it and is refused, whoever arrives first.
-        if (!payload.signupClaim || !sameClaim(payload.signupClaim, signupClaimFor(intentId))) {
-          emitEvent("customer.identity_hook_refused", { hook: "before_user_created", reason: "no_claim", provider: payload.provider ?? "none" }, "warn");
-          return "reject";
+        // of one of these intents in `user_metadata`. A direct Supabase `/signup` racing our start for the same
+        // address does not have it and is refused, whoever arrives first.
+        const given = payload.signupClaim;
+        const matched = given ? recent.find((i) => sameClaim(given, signupClaimFor(i.id))) : undefined;
+        let intentId = matched?.id ?? null;
+        if (!intentId) {
+          const reason = given ? "claim_mismatch" : "claim_missing";
+          const live = env().CUSTOMER_SIGNUP_CLAIM_RELAXED ? recent.find((i) => !i.consumed) : undefined;
+          if (!live) {
+            if (reason === "claim_missing") {
+              // A marker per recent intent: if one of them is our own start's, that start reads it after its `/otp`
+              // fails and alerts staff (signup-claim-alert.ts). Best effort; it grants nothing.
+              for (const i of recent) await rateLimitSpan({ key: claimMissingMarkerKey(i.id), limit: SIGNUP_CLAIM_MISSING_COUNT_LIMIT, windowStart: CLAIM_MISSING_MARKER_START, expiresAt: new Date(now.getTime() + CLAIM_MISSING_MARKER_TTL_MS), now });
+            }
+            emitEvent("customer.identity_hook_refused", { hook: "before_user_created", reason, provider }, "warn");
+            return "reject";
+          }
+          emitEvent("customer.identity_signup_claim_relaxed", { reason }, "warn");
+          intentId = live.id;
         }
         // And once per intent: a replayed or repeated call is refused. The key is unique to the intent, so it is
         // one span that no window edge resets (re-review 103b), kept well past the intent's two minutes. Fails closed.
-        const now = new Date();
         const claim = await rateLimitSpan({ key: `auth_hook:before_create:${intentId}`, limit: 1, windowStart: new Date(0), expiresAt: new Date(now.getTime() + 3_600_000), now });
         if (claim.allowed) return "allow";
-        emitEvent("customer.identity_hook_refused", { hook: "before_user_created", reason: claim.storeUnavailable ? "store_unavailable" : "claimed", provider: payload.provider ?? "none" }, "warn");
+        emitEvent("customer.identity_hook_refused", { hook: "before_user_created", reason: claim.storeUnavailable ? "store_unavailable" : "claimed", provider }, "warn");
         return "reject";
       }
     }
-    emitEvent("customer.identity_hook_refused", { hook: "before_user_created", reason: "no_intent", provider: payload.provider ?? "none" }, "warn");
+    emitEvent("customer.identity_hook_refused", { hook: "before_user_created", reason: "no_intent", provider }, "warn");
     return "reject";
   },
 

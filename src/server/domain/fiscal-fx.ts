@@ -25,9 +25,12 @@ export const CBUAE_RATE_SETTING_PREFIX = "fiscal.cbuae_aed_per_inr.";
 /** The only source name a stored rate may carry. */
 export const CBUAE_RATE_SOURCE = "CBUAE";
 
-/** Plausible AED per INR (INR per AED between 12.5 and 50): a typo by a factor of ten is refused. */
-const RATE_MIN_UNITS_PER_1E8 = 2_000_000n; // 0.02
-const RATE_MAX_UNITS_PER_1E8 = 8_000_000n; // 0.08
+/**
+ * Plausible AED per INR: 0.0400 to 0.0470 (INR per AED about 21.3 to 25.0; review 109d R7). A typo is refused before
+ * any document can be converted at it (a rate once used is never changed).
+ */
+const RATE_MIN_UNITS_PER_1E8 = 4_000_000n; // 0.0400
+const RATE_MAX_UNITS_PER_1E8 = 4_700_000n; // 0.0470
 
 const RATE_TEXT = /^0\.(\d{2,8})$/;
 

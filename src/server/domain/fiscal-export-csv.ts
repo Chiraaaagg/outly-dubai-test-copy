@@ -4,10 +4,13 @@
  * the month (Dubai calendar).
  *
  * Columns: document number, type, issue date, date of supply, order
- * reference, buyer name (empty once erased, A13), line description, VAT
- * category, net, VAT, gross, currency (always AED, C-P1). Amounts are AED with
- * two decimals and no thousands separator; a credit note's amounts are
- * negative, so the column totals are the month's net figures.
+ * reference, refers to (a credit note's invoice), buyer legal name and buyer
+ * TRN (full tax invoices only: a company; no consumer name is ever exported,
+ * owner decision R4), line description, VAT category, net, VAT, gross,
+ * currency (always AED, C-P1). Amounts are AED with two decimals and no
+ * thousands separator; a credit note's amounts are negative, so the column
+ * totals are the month's net figures. The file starts with a UTF-8 byte order
+ * mark so spreadsheet programs read " · " and non-Latin text correctly.
  *
  * RFC 4180: comma separated, CRLF line ends, fields quoted when they hold a
  * comma, quote or line break. A text cell that a spreadsheet would read as a
@@ -16,13 +19,18 @@
  * Pure: no I/O, no env, no clock.
  */
 
+/** UTF-8 byte order mark: Excel reads the file as UTF-8 only with it (review 109d R4). */
+export const UTF8_BOM = "\uFEFF";
+
 export const EXPORT_COLUMNS = [
   "Document number",
   "Type",
   "Issue date",
   "Date of supply",
   "Order reference",
-  "Buyer name",
+  "Refers to",
+  "Buyer legal name",
+  "Buyer TRN",
   "Line description",
   "VAT category",
   "Net",
@@ -40,8 +48,11 @@ export interface ExportDocument {
   /** YYYY-MM-DD. */
   supplyDate: string;
   orderReference: string;
-  /** Null when erased or never known. */
-  buyerName: string | null;
+  /** A credit note: the invoice it credits. */
+  refersTo: string | null;
+  /** Full tax invoice only (C-P2): the VAT-registered buyer. Null for every consumer document (R4). */
+  buyerLegalName: string | null;
+  buyerTrn: string | null;
   lines: { description: string; variant: string | null; vatCategory: string; netMinor: string; vatMinor: string; grossMinor: string }[];
 }
 
@@ -77,7 +88,9 @@ export function exportCsv(documents: readonly ExportDocument[]): { csv: string; 
           d.issueDate,
           d.supplyDate,
           csvText(d.orderReference),
-          csvText(d.buyerName ?? ""),
+          csvText(d.refersTo ?? ""),
+          csvText(d.buyerLegalName ?? ""),
+          csvText(d.buyerTrn ?? ""),
           csvText([l.description, l.variant].filter(Boolean).join(" · ")),
           csvText(l.vatCategory),
           plainAmount(sign * BigInt(l.netMinor)),
@@ -88,7 +101,7 @@ export function exportCsv(documents: readonly ExportDocument[]): { csv: string; 
       );
     }
   }
-  return { csv: `${out.join("\r\n")}\r\n`, lineCount };
+  return { csv: `${UTF8_BOM}${out.join("\r\n")}\r\n`, lineCount };
 }
 
 /** "2026-11" for the Dubai calendar month of an instant. */

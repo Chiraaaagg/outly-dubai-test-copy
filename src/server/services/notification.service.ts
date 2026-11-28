@@ -277,6 +277,19 @@ function parseInvoiceRef(payload: unknown): InvoiceMessageRef | null {
  * is pending, running or done. An order the saga is refunding (supplier failed after capture) gets no "we have
  * received your payment" email.
  */
+/**
+ * Owner decision R5: an invoice goes by email (attached to the payment email, or as the follow-up invoice email) only
+ * for a capture booked at or after `FISCAL_EMAIL_FROM_AT`, the switch-on moment. Unset: never (fail closed). The
+ * invoices numbered at switch-on for the backlog of earlier captures are download-only.
+ */
+async function invoiceEmailAllowedFor(paymentId: string): Promise<boolean> {
+  const from = env().FISCAL_EMAIL_FROM_AT;
+  if (!from) return false;
+  const [row] = await prisma.$queryRaw<{ ok: boolean }[]>`
+    SELECT EXISTS (SELECT 1 FROM ledger_entries l WHERE l.payment_id = ${paymentId}::uuid AND l.book = 'customer_money' AND l.kind = 'capture' AND l.occurred_at >= ${from}) AS ok`;
+  return row?.ok === true;
+}
+
 async function paymentEmailStillRight(orderId: string, paymentId: string): Promise<boolean> {
   const [row] = await prisma.$queryRaw<{ ok: boolean }[]>`
     SELECT (
@@ -930,10 +943,24 @@ async function queueAccountLinkNotice(input: { linkId: string; orderId: string; 
   }
 }
 
-/** Step 2 of the attach notice: the send of a queued row, deferred until after the response. Never throws. */
+/**
+ * Step 2 of the attach notice: the send of a queued row, deferred until after the response. Never throws.
+ *
+ * The sends of one sign-in run one after another, so a later row's claim, taken when it was queued, may lapse
+ * before its turn (re-review 103c D4). The claim is renewed first, on condition that the row still carries the
+ * claim this request took: if the outbox sweep has claimed the row meanwhile, it is the sweep's to send, and this
+ * row is skipped without an attempt.
+ */
 async function sendQueuedAccountLinkNotice(queued: QueuedAccountLinkNotice): Promise<DispatchResult | null> {
   try {
-    return await attemptAndRecord(queued.row, new Date(), queued.claimUntil);
+    const now = new Date();
+    const claimUntil = new Date(now.getTime() + SEND_LOCK_MS);
+    const renewed = await prisma.notification.updateMany({ where: { id: queued.row.id, status: "queued", lockedUntil: queued.claimUntil }, data: { lockedUntil: claimUntil } });
+    if (renewed.count !== 1) {
+      emitEvent("notification.claim_skipped", { notificationId: queued.row.id, event: queued.row.event, reason: "claim_lost" });
+      return resultOf(queued.row.id, "queued");
+    }
+    return await attemptAndRecord({ ...queued.row, lockedUntil: claimUntil }, now, claimUntil);
   } catch {
     emitEvent("notification.failed", { event: ACCOUNT_LINK_NOTICE_EVENT, channel: "email", reason: "dispatch_failed" }, "error");
     return null;
@@ -1118,7 +1145,8 @@ export const notificationService = {
       if (!recipient) return null;
       if (!(await paymentEmailStillRight(input.orderId, input.paymentId))) return null;
       const { invoiceFileForPayment } = await import("./generated-document.read");
-      const invoice = await invoiceFileForPayment(input.paymentId).catch(() => null);
+      // Owner decision R5: the invoice rides on the payment email only for a capture at or after FISCAL_EMAIL_FROM_AT.
+      const invoice = (await invoiceEmailAllowedFor(input.paymentId)) ? await invoiceFileForPayment(input.paymentId).catch(() => null) : null;
       return await sendPaymentMessage({ ...input, recipient, attachGeneratedDocumentId: invoice?.generatedDocumentId ?? null }, now);
     } catch {
       emitEvent("notification.failed", { event: PAYMENT_RECEIVED, channel: "email", reason: "dispatch_error" }, "error");
@@ -1194,11 +1222,15 @@ export const notificationService = {
     const summary = { scanned: 0, sent: 0, failed: 0 };
     const e = env();
     if (!e.FISCAL_DOCUMENTS_ENABLED || !e.PAYMENT_RECEIVED_EMAIL_ENABLED) return { ...summary, skipped: "switch_off" };
+    // Owner decision R5: no invoice email without the switch-on moment (fail closed); none for a capture before it.
+    const emailFrom = e.FISCAL_EMAIL_FROM_AT;
+    if (!emailFrom) return { ...summary, skipped: "switch_off" };
     const only = scope.orderIds
       ? Prisma.sql`AND f.order_id IN (${Prisma.join(scope.orderIds.length ? scope.orderIds.map((id) => Prisma.sql`${id}::uuid`) : [Prisma.sql`NULL::uuid`])})`
       : Prisma.empty;
     try {
-      const since = new Date(now.getTime() - INVOICE_ISSUED_WINDOW_MS);
+      const windowStart = new Date(now.getTime() - INVOICE_ISSUED_WINDOW_MS);
+      const since = windowStart > emailFrom ? windowStart : emailFrom;
       const rows = await prisma.$queryRaw<{ order_id: string; payment_id: string; fiscal_document_id: string; generated_document_id: string; lead_email: string | null }[]>`
         SELECT f.order_id, f.payment_id, f.id AS fiscal_document_id, g.id AS generated_document_id, o.lead_email
         FROM fiscal_documents f

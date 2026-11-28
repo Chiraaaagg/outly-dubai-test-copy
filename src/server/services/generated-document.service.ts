@@ -87,6 +87,11 @@ async function storeValid(row: Pick<GeneratedDocument, "id" | "storageKey">, byt
     await forgetGeneratedStorageKey(row.id, key);
   } catch {
     emitEvent("document.generated_store_error", { generatedDocumentId: row.id, operation: "delete" }, "error");
+    // Review 109d R11: the erasure may already have forgotten the key; put it back on the row (marked `erased`), so
+    // the documents job's sweep retries the delete. Never over another key.
+    await prisma.generatedDocument
+      .updateMany({ where: { id: row.id, storageKey: null, status: { in: ["superseded", "failed"] } }, data: { storageKey: key, reasonCode: "erased" } })
+      .catch(() => {});
   }
   return false;
 }

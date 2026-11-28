@@ -1,4 +1,5 @@
 import "server-only";
+import { Prisma } from "@prisma/client";
 import { prisma, type Tx } from "../lib/db";
 import { env } from "../lib/env";
 import type { OpsIncident } from "./ops-alert.service";
@@ -6,6 +7,7 @@ import { MAX_ATTEMPTS, RETRY_WINDOW_MS } from "./notification.service";
 import { ACCOUNT_LINK_NOTICE_EVENT } from "../notifications/auth-templates";
 import { emitEvent } from "../lib/structured-events";
 import { budgetWindowStart, SIGNIN_CODE_BUDGET_BUCKET, signInBudgetCrossings, signInCodeDailyBudget } from "../auth/signin-code-budget";
+import { SIGNUP_CLAIM_MISSING_BUCKET, signupClaimWindowStart } from "../auth/signup-claim-alert";
 
 /**
  * Group B staff alerts, read from committed state by the ops sweep
@@ -42,6 +44,13 @@ import { budgetWindowStart, SIGNIN_CODE_BUDGET_BUCKET, signInBudgetCrossings, si
  *    (`signin_code_budget_spent`: email codes are refused until UTC midnight;
  *    Google still works). Entity `email_volume:signin_budget:<date>`, raised
  *    at the start of that UTC day, so each alerts once a day.
+ *  - `signup_claim_missing` (re-review 103c D1): today our own email start
+ *    route had a first-time sign-in refused because Supabase handed our
+ *    Before User Created hook no signup claim (signup-claim-alert.ts). Every
+ *    new email address is refused until that is fixed, or until
+ *    CUSTOMER_SIGNUP_CLAIM_RELAXED is turned on. Entity
+ *    `email_volume:signup_claim:<date>`, raised at the start of that UTC day,
+ *    so it alerts once a day.
  *
  * Each part reads on its own: a failing query loses only its own incidents,
  * never the others', and emits `customer.identity_alerts_failed`.
@@ -86,6 +95,8 @@ interface NoticeRow {
   suppressed_reason: string | null;
   attempt: number;
   created_at: Date;
+  /** `created_at` as Postgres text: the keyset cursor, exact to the microsecond (re-review 103c D5). */
+  created_key: string;
   failed_at: Date | null;
   attention_required_at: Date | null;
   link_id: string;
@@ -112,20 +123,28 @@ async function noticeIncidents(since: Date, now: Date, limit: number, db: Db): P
 
   // Only notices of links that are still attached, every page of them (re-review 103b N7): rows of detached links
   // cannot crowd out a new definite failure. A row can give up up to RETRY_WINDOW_MS after it was created.
+  // Bounded on the link side too (re-review 103c D5): the notice row is written right after the attach, so a link
+  // attached before the lookback has no notice row inside it. Keyset pages on (created_at, id), never OFFSET, so a
+  // row that changes between two pages cannot be skipped; the cursor's time is kept as Postgres text, exact to the
+  // microsecond.
   const lookback = new Date(since.getTime() - RETRY_WINDOW_MS - 3_600_000);
+  let after: { createdKey: string; id: string } | null = null;
   for (let page = 0; page < NOTICE_MAX_PAGES; page++) {
-    const rows = await db.$queryRaw<NoticeRow[]>`
+    const cursor: Prisma.Sql = after ? Prisma.sql`AND (n.created_at, n.id) > (${after.createdKey}::timestamptz, ${after.id}::uuid)` : Prisma.empty;
+    const rows: NoticeRow[] = await db.$queryRaw<NoticeRow[]>`
       SELECT n.id::text AS id, n.status::text AS status, n.provider_error, n.suppressed_reason, n.attempt,
-             n.created_at, n.failed_at, n.attention_required_at, l.id::text AS link_id, l.order_id::text AS order_id, o.reference
+             n.created_at, n.created_at::text AS created_key, n.failed_at, n.attention_required_at,
+             l.id::text AS link_id, l.order_id::text AS order_id, o.reference
       FROM order_account_links l
       JOIN notifications n ON n.id = l.notification_id
       JOIN orders o ON o.id = l.order_id
-      WHERE l.detached_at IS NULL AND n.event = ${ACCOUNT_LINK_NOTICE_EVENT} AND n.created_at > ${lookback}
+      WHERE l.detached_at IS NULL AND l.attached_at > ${lookback} AND n.event = ${ACCOUNT_LINK_NOTICE_EVENT} AND n.created_at > ${lookback}
         AND (n.status = 'failed'
           OR (n.status = 'unknown' AND n.attention_required_at IS NOT NULL)
           OR (n.status = 'suppressed' AND n.suppressed_reason IS DISTINCT FROM 'non_production_allowlist'))
+        ${cursor}
       ORDER BY n.created_at, n.id
-      LIMIT ${NOTICE_PAGE} OFFSET ${page * NOTICE_PAGE}`;
+      LIMIT ${NOTICE_PAGE}`;
     for (const r of rows) {
       const at = noticeGaveUpAt(
         { status: r.status, providerError: r.provider_error, suppressedReason: r.suppressed_reason, attempt: Number(r.attempt), createdAt: new Date(r.created_at), failedAt: r.failed_at ? new Date(r.failed_at) : null, attentionRequiredAt: r.attention_required_at ? new Date(r.attention_required_at) : null },
@@ -134,6 +153,8 @@ async function noticeIncidents(since: Date, now: Date, limit: number, db: Db): P
       if (inWindow(at)) out.push(incident({ id: r.link_id, orderId: r.order_id, reference: r.reference }, at, "attach_notice_failed"));
     }
     if (rows.length < NOTICE_PAGE) break;
+    const last = rows[rows.length - 1];
+    after = { createdKey: last.created_key, id: last.id };
   }
 
   // No outbox row at all: it could not be written in the sign-in request (the row is queued before the response).
@@ -153,7 +174,7 @@ async function noticeIncidents(since: Date, now: Date, limit: number, db: Db): P
 }
 
 /** One part of the account alerts, read on its own: a failure loses only that part and is logged (re-review 103b N3). */
-async function part(name: "disputed" | "audit" | "notices" | "volume" | "signin_budget", read: () => Promise<OpsIncident[]>): Promise<OpsIncident[]> {
+async function part(name: "disputed" | "audit" | "notices" | "volume" | "signin_budget" | "signup_claim", read: () => Promise<OpsIncident[]>): Promise<OpsIncident[]> {
   try {
     return await read();
   } catch {
@@ -297,5 +318,33 @@ export async function signInCodeBudgetIncidents(now: Date, db: Db = prisma): Pro
         adminPath: "/admin",
       }),
     );
+  });
+}
+
+/**
+ * `signup_claim_missing` for today (re-review 103c D1), read from the
+ * counter our email start route adds to when its own first-time sign-in was
+ * refused for a missing signup claim. Never throws: a read failure loses only
+ * this alert and is logged.
+ */
+export async function signupClaimIncidents(now: Date, db: Db = prisma): Promise<OpsIncident[]> {
+  return part("signup_claim", async () => {
+    const day = signupClaimWindowStart(now);
+    const row = await db.rateLimitBucket.findUnique({ where: { key_windowStart: { key: SIGNUP_CLAIM_MISSING_BUCKET, windowStart: day } }, select: { count: true } });
+    if (!row || !(row.count > 0)) return [];
+    return [
+      {
+        kind: "signup_claim_missing",
+        entityKind: "email_volume",
+        entityId: `signup_claim:${isoDay(day)}`,
+        reason: "signup_claim_missing",
+        raisedAt: day,
+        orderId: null,
+        orderReference: null,
+        bookingId: null,
+        supplierBookingRef: null,
+        adminPath: "/admin",
+      },
+    ];
   });
 }

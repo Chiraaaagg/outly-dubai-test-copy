@@ -21,6 +21,9 @@
 --          invoices only, plus one reissue and one cancellation per invoice.
 --   2. Monthly CSV export to the accountant (C-P4): `fiscal_exports`, one row
 --      per export period (YYYY-MM), so the email goes once per month.
+--      `generation` names the send in the provider idempotency key (one key
+--      per period; a staff "send again" moves to the next generation). Added
+--      in place before this migration was applied anywhere (review 109d R2).
 --   3. Staff alerts for a failed export: `fiscal_attention` and `ops_alerts`
 --      accept the entity kind 'fiscal_export'. The ops list is the full union
 --      of the previous definition (20261130160000) plus the new kind; it never
@@ -70,6 +73,7 @@ CREATE TABLE "fiscal_exports" (
   "environment"     TEXT           NOT NULL,
   "status"          TEXT           NOT NULL DEFAULT 'pending',
   "attempts"        INTEGER        NOT NULL DEFAULT 0,
+  "generation"      INTEGER        NOT NULL DEFAULT 1,
   "document_count"  INTEGER,
   "line_count"      INTEGER,
   "provider_id"     TEXT,
@@ -83,7 +87,7 @@ CREATE TABLE "fiscal_exports" (
   CONSTRAINT "fiscal_exports_period_check" CHECK ("period" ~ '^[0-9]{4}-(0[1-9]|1[0-2])$'),
   CONSTRAINT "fiscal_exports_environment_check" CHECK ("environment" IN ('production', 'test')),
   CONSTRAINT "fiscal_exports_status_check" CHECK ("status" IN ('pending', 'sent', 'failed', 'unknown')),
-  CONSTRAINT "fiscal_exports_attempts_check" CHECK ("attempts" >= 0),
+  CONSTRAINT "fiscal_exports_attempts_check" CHECK ("attempts" >= 0 AND "generation" >= 1),
   CONSTRAINT "fiscal_exports_error_check" CHECK ("error_code" IS NULL OR "error_code" ~ '^[a-z0-9_:]{1,64}$'),
   CONSTRAINT "fiscal_exports_sent_check" CHECK ("status" <> 'sent' OR "sent_at" IS NOT NULL)
 );

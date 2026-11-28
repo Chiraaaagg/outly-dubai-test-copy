@@ -90,10 +90,27 @@ export const customerIdentityRepo = {
     return id;
   },
 
-  /** The newest live, unconsumed intent's id, or null (Before User Created hook). Reads only. */
+  /** The newest live, unconsumed intent's id, or null. Reads only. */
   async findLiveIntent(channel: "email" | "phone", contactHash: string, now: Date, db: Db = prisma): Promise<string | null> {
     const row = await db.customerAuthIntent.findFirst({ where: { channel, contactHash, consumedAt: null, expiresAt: { gt: now } }, orderBy: { createdAt: "desc" }, select: { id: true } });
     return row?.id ?? null;
+  },
+
+  /**
+   * Every unexpired intent for this contact created after `since`, newest
+   * first, consumed or not (Before User Created hook; re-review 103c D2): a
+   * second start for the same address retires the first intent, but the
+   * creation Supabase makes for the first start's `/otp` may only reach the
+   * hook afterwards, and it still carries the first intent's claim. Reads only.
+   */
+  async findRecentIntents(channel: "email" | "phone", contactHash: string, now: Date, since: Date, db: Db = prisma): Promise<{ id: string; consumed: boolean }[]> {
+    const rows = await db.customerAuthIntent.findMany({
+      where: { channel, contactHash, createdAt: { gt: since }, expiresAt: { gt: now } },
+      orderBy: { createdAt: "desc" },
+      select: { id: true, consumedAt: true },
+      take: 10,
+    });
+    return rows.map((r) => ({ id: r.id, consumed: r.consumedAt !== null }));
   },
 
   /** Retires one intent that will not be used (Supabase `/otp` failed; review 103 finding 9). */

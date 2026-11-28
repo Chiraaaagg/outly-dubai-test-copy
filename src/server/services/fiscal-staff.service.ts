@@ -1,5 +1,5 @@
 import "server-only";
-import { prisma } from "../lib/db";
+import { prisma, TX_OPTIONS } from "../lib/db";
 import { env as readEnv, type Env } from "../lib/env";
 import { audit } from "../lib/audit";
 import { requirePermission, type Actor } from "../lib/actor";
@@ -10,6 +10,7 @@ import { isRealSellerText, isRealTrn } from "../documents/generated/fiscal/selle
 import { dubaiIsoDate } from "../documents/generated/fiscal/snapshot";
 import { reissueAsFullTaxInvoice, sellerFromEnv, type ReissueOutcome, type ReissueRefusal } from "./fiscal-document.service";
 import { verifyStepUp } from "./approval.service";
+import { requeueExport } from "./fiscal-export.service";
 
 /**
  * Staff actions on the fiscal documents (Group C, owner decisions C-P1, C-P2,
@@ -64,6 +65,25 @@ export function createFiscalStaffService(deps: { stepUp: StepUp; env?: () => Env
   }
 
   return {
+    /**
+     * Review 109d R3: staff send one month's CSV to the accountant again (a failure, an unknown outcome, a lost
+     * email). The documents job sends it on its next run under a new idempotency key.
+     */
+    async resendExport(actor: Actor, input: { period?: string; totpCode?: string }, now: Date = new Date()): Promise<{ period: string; generation: number }> {
+      requirePermission(actor, "payments.reconcile");
+      const period = (input.period ?? "").trim();
+      if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(period)) throw Errors.validation({ period: "The month as YYYY-MM" });
+      const entity = { type: "fiscal_export", id: period };
+      await requireStepUp(actor, input.totpCode, "fiscal.export_resend_refused", entity);
+      const out = await requeueExport(period, now, env());
+      if (!out) {
+        await audit(actor, "fiscal.export_resend_refused", entity, { after: { refused: "not_found_or_sending" } });
+        throw Errors.conflict("That month has not been exported yet, or it is being sent right now", { reason: "not_found_or_sending" });
+      }
+      await audit(actor, "fiscal.export_resend", entity, { after: { period, generation: out.generation } });
+      return out;
+    },
+
     async recordCbuaeRate(actor: Actor, input: { date?: string; aedPerInr?: string; totpCode?: string }, now: Date = new Date()): Promise<{ date: string; aedPerInr: string; replaced: string | null }> {
       requirePermission(actor, "payments.reconcile");
       const date = (input.date ?? "").trim();
@@ -71,24 +91,32 @@ export function createFiscalStaffService(deps: { stepUp: StepUp; env?: () => Env
       const fields: Record<string, string> = {};
       if (!isRealDate(date)) fields.date = "Use the date as YYYY-MM-DD";
       else if (date > dubaiIsoDate(now)) fields.date = "A rate cannot be entered for a future date";
-      if (!rate) fields.aedPerInr = "AED per 1 INR, for example 0.04350 (between 0.02 and 0.08)";
+      if (!rate) fields.aedPerInr = "AED per 1 INR, for example 0.04350 (between 0.0400 and 0.0470)";
       if (Object.keys(fields).length || !rate) throw Errors.validation(fields);
       const key = `${CBUAE_RATE_SETTING_PREFIX}${date}`;
       await requireStepUp(actor, input.totpCode, "fiscal.cbuae_rate_refused", { type: "setting", id: key });
-      const before = await prisma.setting.findUnique({ where: { key }, select: { value: true } });
-      const prior = before ? cbuaeRateFrom(date, before.value) : null;
-      if (prior && prior.aedPerInr !== rate) {
-        // A rate a document was converted at is part of that document's record: never changed afterwards.
-        const [used] = await prisma.$queryRaw<{ used: boolean }[]>`
-          SELECT EXISTS (SELECT 1 FROM fiscal_documents f, jsonb_array_elements(f.lines) l WHERE l->'source'->>'rateDate' = ${date}) AS used`;
-        if (used?.used) {
-          await audit(actor, "fiscal.cbuae_rate_refused", { type: "setting", id: key }, { after: { refused: "rate_in_use", date } });
-          throw Errors.conflict("A document was already converted at this date's rate; it cannot be changed", { reason: "rate_in_use" });
+      // Review 109d R7: the "in use" check and the write are one transaction. The rate row is locked FOR UPDATE first;
+      // an issuer reads it FOR SHARE inside its own transaction (`cbuaeRateFor`), so either the issuer's document is
+      // committed before the check below runs (and the change is refused), or the issuer waits and reads the new rate.
+      const written = await prisma.$transaction(async (tx) => {
+        const [locked] = await tx.$queryRaw<{ value: unknown }[]>`SELECT value FROM settings WHERE key = ${key} FOR UPDATE`;
+        const prior = locked ? cbuaeRateFrom(date, locked.value) : null;
+        if (prior && prior.aedPerInr !== rate) {
+          // A rate a document was converted at is part of that document's record: never changed afterwards.
+          const [used] = await tx.$queryRaw<{ used: boolean }[]>`
+            SELECT EXISTS (SELECT 1 FROM fiscal_documents f, jsonb_array_elements(f.lines) l WHERE l->'source'->>'rateDate' = ${date}) AS used`;
+          if (used?.used) return { refused: true as const, prior };
         }
+        const value = { aedPerInr: rate, source: CBUAE_RATE_SOURCE, recordedBy: actor.id ?? null, recordedAt: now.toISOString() };
+        // `updated_by` is left empty: the actor is in the value and the audit row (no foreign key to satisfy).
+        await tx.setting.upsert({ where: { key }, create: { key, value }, update: { value } });
+        return { refused: false as const, prior };
+      }, TX_OPTIONS);
+      if (written.refused) {
+        await audit(actor, "fiscal.cbuae_rate_refused", { type: "setting", id: key }, { after: { refused: "rate_in_use", date } });
+        throw Errors.conflict("A document was already converted at this date's rate; it cannot be changed", { reason: "rate_in_use" });
       }
-      const value = { aedPerInr: rate, source: CBUAE_RATE_SOURCE, recordedBy: actor.id ?? null, recordedAt: now.toISOString() };
-      // `updated_by` is left empty: the actor is in the value and the audit row (no foreign key to satisfy).
-      await prisma.setting.upsert({ where: { key }, create: { key, value }, update: { value } });
+      const prior = written.prior;
       settingsRepo.invalidate(key);
       await audit(actor, "fiscal.cbuae_rate_recorded", { type: "setting", id: key }, { before: prior ? { aedPerInr: prior.aedPerInr } : null, after: { aedPerInr: rate, source: CBUAE_RATE_SOURCE, date } });
       return { date, aedPerInr: rate, replaced: prior && prior.aedPerInr !== rate ? prior.aedPerInr : null };
@@ -128,6 +156,53 @@ export function createFiscalStaffService(deps: { stepUp: StepUp; env?: () => Env
 }
 
 export const fiscalStaffService = createFiscalStaffService({ stepUp: (actor, code) => verifyStepUp(actor, code) });
+
+export interface ReissueRow {
+  issuedAt: string;
+  /** The cancelled simplified invoice: still downloadable, shown as "Cancelled, replaced by …" (review 109d R8). */
+  cancelled: { displayNumber: string; fileId: string | null };
+  creditNote: { displayNumber: string; fileId: string | null };
+  invoice: { displayNumber: string; fileId: string | null };
+}
+
+/** The latest valid file of each fiscal document, or null while it is still being drawn. */
+async function validFileIds(ids: string[]): Promise<Map<string, string>> {
+  const files = ids.length ? await prisma.generatedDocument.findMany({ where: { fiscalDocumentId: { in: ids }, status: "valid" }, select: { id: true, fiscalDocumentId: true } }) : [];
+  return new Map(files.flatMap((f) => (f.fiscalDocumentId ? [[f.fiscalDocumentId, f.id] as [string, string]] : [])));
+}
+
+/** The latest reissues (C-P2) for the admin page, with links to their files (review 109d R8). */
+export async function listRecentReissues(actor: Actor, limit = 20): Promise<ReissueRow[]> {
+  requirePermission(actor, "payments.reconcile");
+  const full = await prisma.fiscalDocument.findMany({
+    where: { issueReason: "reissue_full" },
+    orderBy: { issuedAt: "desc" },
+    take: limit,
+    select: { id: true, displayNumber: true, issuedAt: true, replaces: { select: { id: true, displayNumber: true, credits: { where: { issueReason: "reissue_cancel" }, select: { id: true, displayNumber: true } } } } },
+  });
+  const ids = full.flatMap((f) => [f.id, ...(f.replaces ? [f.replaces.id, ...f.replaces.credits.map((c) => c.id)] : [])]);
+  const files = await validFileIds(ids);
+  return full.flatMap((f) => {
+    const cancelled = f.replaces;
+    const cn = cancelled?.credits[0];
+    if (!cancelled || !cn) return [];
+    return [
+      {
+        issuedAt: f.issuedAt.toISOString(),
+        cancelled: { displayNumber: cancelled.displayNumber, fileId: files.get(cancelled.id) ?? null },
+        creditNote: { displayNumber: cn.displayNumber, fileId: files.get(cn.id) ?? null },
+        invoice: { displayNumber: f.displayNumber, fileId: files.get(f.id) ?? null },
+      },
+    ];
+  });
+}
+
+/** The export rows of this environment, newest month first, for the admin page (R3). */
+export async function listExports(actor: Actor, e: Env = readEnv()): Promise<{ period: string; status: string; attempts: number; sentAt: string | null; errorCode: string | null }[]> {
+  requirePermission(actor, "payments.reconcile");
+  const rows = await prisma.fiscalExport.findMany({ where: { environment: e.isProduction ? "production" : "test" }, orderBy: { period: "desc" }, take: 24 });
+  return rows.map((r) => ({ period: r.period, status: r.status, attempts: r.attempts, sentAt: r.sentAt?.toISOString() ?? null, errorCode: r.errorCode }));
+}
 
 /** The latest CBUAE rates entered, newest date first, for the admin page (`payments.reconcile`). */
 export async function listCbuaeRates(actor: Actor, limit = 31): Promise<{ date: string; aedPerInr: string }[]> {

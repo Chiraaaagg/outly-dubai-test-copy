@@ -202,7 +202,9 @@ export function isErasureMarker(name: string | null | undefined): boolean {
 
 /** C-P1: the staff-entered CBUAE rate for a Dubai date, or null. Read without the settings cache (a fresh entry counts at once). */
 export async function cbuaeRateFor(db: Tx | typeof prisma, date: string): Promise<CbuaeRate | null> {
-  const row = await db.setting.findUnique({ where: { key: `${CBUAE_RATE_SETTING_PREFIX}${date}` }, select: { value: true } });
+  // FOR SHARE (review 109d R7): inside the issuing transaction the rate row cannot be changed until the document that
+  // uses it is committed; a staff correction (FOR UPDATE, then the "in use" check) waits and then sees the document.
+  const [row] = await db.$queryRaw<{ value: unknown }[]>`SELECT value FROM settings WHERE key = ${`${CBUAE_RATE_SETTING_PREFIX}${date}`} FOR SHARE`;
   return row ? cbuaeRateFrom(date, row.value) : null;
 }
 
@@ -352,7 +354,8 @@ async function draftCreditNote(db: Tx | typeof prisma, entry: { id: string; paym
     const leftAed = paidForItem.grossMinor - already.grossMinor;
     if (refund.amountMinor > leftInr) throw new Blocked("credit_exceeds_invoice");
     const converted = inrToAedMinor(refund.amountMinor, inrSource.aedPerInr);
-    refundAed = refund.amountMinor === leftInr ? leftAed : converted < leftAed ? converted : leftAed;
+    // Review 109d R9: a part-refund never takes the whole AED remainder; the refund that ends the INR amount does.
+    refundAed = refund.amountMinor === leftInr ? leftAed : converted < leftAed ? converted : leftAed - 1n;
     source = { source: { ...inrSource, grossMinor: s(refund.amountMinor) } };
   }
   let credit: VatSplit;
@@ -585,7 +588,13 @@ export type ReissueRefusal =
   | "series_format";
 
 export type ReissueOutcome =
-  | { kind: "reissued"; cancelled: { id: string; displayNumber: string }; creditNote: { id: string; displayNumber: string }; invoice: { id: string; displayNumber: string } }
+  | {
+      kind: "reissued";
+      cancelled: { id: string; displayNumber: string };
+      /** `fileId`: the generated file row (pending until the documents job draws it; then served by `/api/tickets/generated/<fileId>`). */
+      creditNote: { id: string; displayNumber: string; fileId: string };
+      invoice: { id: string; displayNumber: string; fileId: string };
+    }
   | { kind: "refused"; reason: ReissueRefusal };
 
 class ReissueRefused extends Error {
@@ -616,6 +625,8 @@ export async function reissueAsFullTaxInvoice(displayNumber: string, buyer: Full
   const snap = original.files[0]?.snapshot;
   if (!isFiscalSnapshot(snap) || snap.displayNumber !== original.displayNumber) return { kind: "refused", reason: "bad_snapshot" };
   if (snap.invoiceType === "full") return { kind: "refused", reason: "not_simplified" };
+  // A plain object type for the copies below (the predicate narrows a Prisma JSON value to an intersection).
+  const base = snap as FiscalSnapshot;
   const environment = original.environment as FiscalEnvironment;
   if (environment === "production") {
     if (!deps.productionAllowed) return { kind: "refused", reason: "environment_mismatch" };
@@ -648,7 +659,7 @@ export async function reissueAsFullTaxInvoice(displayNumber: string, buyer: Full
       const templateVersion = plainFiscalLayout.templateVersion;
 
       const cnId = uuidv7();
-      const cnLines: FiscalLine[] = snap.lines.map((l) => ({ ...l, note: REISSUE_CANCEL_NOTE }));
+      const cnLines: FiscalLine[] = base.lines.map((l) => ({ ...l, note: REISSUE_CANCEL_NOTE }));
       const cnSnapshot: FiscalSnapshot = {
         docType: "tax_credit_note",
         displayNumber: cnNumber,
@@ -656,18 +667,18 @@ export async function reissueAsFullTaxInvoice(displayNumber: string, buyer: Full
         issuedAt: deps.now.toISOString(),
         supplyDate: dubaiIsoDate(deps.now),
         currency: "AED",
-        orderReference: snap.orderReference,
+        orderReference: base.orderReference,
         seller: deps.seller,
         lines: cnLines,
-        totals: snap.totals,
+        totals: base.totals,
         moneyAt: deps.now.toISOString(),
-        paymentMethodLabel: snap.paymentMethodLabel,
+        paymentMethodLabel: base.paymentMethodLabel,
         refersTo: { displayNumber: original.displayNumber, issuedAt: original.issuedAt.toISOString() },
         refundReasonLabel: REISSUE_REASON_LABEL,
         vatRule: original.vatRule,
         vatRuleConfirmed,
         templateVersion,
-        ...(snap.fx ? { fx: snap.fx } : {}),
+        ...(base.fx ? { fx: base.fx } : {}),
         reissue: { kind: "cancel", replacementNumber: invNumber },
       };
       await tx.fiscalDocument.create({
@@ -703,7 +714,7 @@ export async function reissueAsFullTaxInvoice(displayNumber: string, buyer: Full
 
       const invId = uuidv7();
       const invSnapshot: FiscalSnapshot = {
-        ...snap,
+        ...base,
         displayNumber: invNumber,
         environment,
         issuedAt: deps.now.toISOString(),
@@ -736,19 +747,25 @@ export async function reissueAsFullTaxInvoice(displayNumber: string, buyer: Full
           vatMinor: original.vatMinor,
           grossMinor: original.grossMinor,
           seller: deps.seller as unknown as Prisma.InputJsonValue,
-          lines: snap.lines as unknown as Prisma.InputJsonValue,
+          lines: base.lines as unknown as Prisma.InputJsonValue,
           vatRule: original.vatRule,
           templateVersion,
         },
       });
       await tx.fiscalDocumentParty.create({ data: { fiscalDocumentId: invId, buyerName: buyer.legalName.slice(0, 200), buyerTrn: buyer.trn, buyerAddress: buyer.address.slice(0, 500), buyerEmail: null } });
+      const cnFileId = uuidv7();
+      const invFileId = uuidv7();
       await tx.generatedDocument.createMany({
         data: [
-          { id: uuidv7(), kind: "tax_credit_note", orderId: original.orderId, fiscalDocumentId: cnId, templateVersion, snapshot: cnSnapshot as unknown as Prisma.InputJsonValue, status: "pending" },
-          { id: uuidv7(), kind: "tax_invoice", orderId: original.orderId, fiscalDocumentId: invId, templateVersion, snapshot: invSnapshot as unknown as Prisma.InputJsonValue, status: "pending" },
+          { id: cnFileId, kind: "tax_credit_note", orderId: original.orderId, fiscalDocumentId: cnId, templateVersion, snapshot: cnSnapshot as unknown as Prisma.InputJsonValue, status: "pending" },
+          { id: invFileId, kind: "tax_invoice", orderId: original.orderId, fiscalDocumentId: invId, templateVersion, snapshot: invSnapshot as unknown as Prisma.InputJsonValue, status: "pending" },
         ],
       });
-      return { cancelled: { id: original.id, displayNumber: original.displayNumber }, creditNote: { id: cnId, displayNumber: cnNumber }, invoice: { id: invId, displayNumber: invNumber } };
+      return {
+        cancelled: { id: original.id, displayNumber: original.displayNumber },
+        creditNote: { id: cnId, displayNumber: cnNumber, fileId: cnFileId },
+        invoice: { id: invId, displayNumber: invNumber, fileId: invFileId },
+      };
     }, TX_OPTIONS);
     emitEvent("fiscal.issued", { fiscalDocumentId: out.creditNote.id, docType: "tax_credit_note" });
     emitEvent("fiscal.issued", { fiscalDocumentId: out.invoice.id, docType: "tax_invoice" });
@@ -773,6 +790,9 @@ export interface IssueDueSummary {
 /** How often the documents job counts the captures that fall before the start (review 109c N1). */
 export const BEFORE_START_COUNT_EVERY_MS = 60 * 60_000;
 let beforeStartCountedAt = 0;
+/** Review 109d R10: the last count logged and when; the same count is logged again at most once a day. */
+let beforeStartLogged: { count: number; at: number } | null = null;
+const BEFORE_START_RELOG_MS = 24 * 3600_000;
 
 /**
  * Review 109c N1 / owner decision C-P3: production captures booked before `FISCAL_DOCUMENTS_START_AT` (28 Nov 2026
@@ -855,7 +875,11 @@ export async function issueDue(opts: { now: Date; e?: Env; max?: number; scan?: 
     beforeStartCountedAt = Date.now();
     try {
       summary.beforeStartUninvoiced = await countCapturesBeforeStart(startAt);
-      if (summary.beforeStartUninvoiced > 0) emitEvent("fiscal.before_start_uninvoiced", { count: summary.beforeStartUninvoiced }, "warn");
+      const n = summary.beforeStartUninvoiced;
+      if (n > 0 && (!beforeStartLogged || beforeStartLogged.count !== n || Date.now() - beforeStartLogged.at >= BEFORE_START_RELOG_MS)) {
+        emitEvent("fiscal.before_start_uninvoiced", { count: n }, "warn");
+        beforeStartLogged = { count: n, at: Date.now() };
+      }
     } catch {
       emitEvent("fiscal.sweep_failed", { stage: "before_start_count", reason: "query_failed" }, "error");
     }
@@ -935,11 +959,24 @@ export const REFUND_GAP_ALERT_AFTER_MS = 15 * 60_000;
 
 /** Open attention rows raised in the window, for the ops alert sweep (codes and ids only). A refund gap only once it has lasted. */
 export async function fiscalAttentionOpen(since: Date, now: Date, limit: number): Promise<{ id: string; entityKind: string; entityId: string; orderId: string | null; reason: string; raisedAt: Date; reference: string | null }[]> {
+  // Review 109d R7: a missing CBUAE rate opens a row per INR capture (each held invoice keeps its own row), but staff
+  // are alerted once per Dubai day overall: only the first such row raised that day is an incident.
   const rows = await prisma.$queryRaw<{ id: string; entity_kind: string; entity_id: string; order_id: string | null; reason: string; raised_at: Date; reference: string | null }[]>`
-    SELECT a.id, a.entity_kind, a.entity_id, a.order_id, a.reason, a.raised_at, o.reference
-    FROM fiscal_attention a LEFT JOIN orders o ON o.id = a.order_id
-    WHERE a.resolved_at IS NULL AND a.raised_at >= ${since} AND a.raised_at <= ${now}
-      AND (a.reason <> 'refund_without_refund_row' OR a.raised_at <= ${new Date(now.getTime() - REFUND_GAP_ALERT_AFTER_MS)})
-    ORDER BY a.raised_at DESC LIMIT ${limit}`;
+    SELECT * FROM (
+      SELECT a.id, a.entity_kind, a.entity_id, a.order_id, a.reason, a.raised_at, o.reference
+      FROM fiscal_attention a LEFT JOIN orders o ON o.id = a.order_id
+      WHERE a.resolved_at IS NULL AND a.raised_at >= ${since} AND a.raised_at <= ${now} AND a.reason <> 'fx_rate_missing'
+        AND (a.reason <> 'refund_without_refund_row' OR a.raised_at <= ${new Date(now.getTime() - REFUND_GAP_ALERT_AFTER_MS)})
+      UNION ALL
+      (SELECT DISTINCT ON ((a.raised_at AT TIME ZONE 'Asia/Dubai')::date) a.id, a.entity_kind, a.entity_id, a.order_id, a.reason, a.raised_at, o.reference
+      FROM fiscal_attention a LEFT JOIN orders o ON o.id = a.order_id
+      WHERE a.reason = 'fx_rate_missing' AND a.resolved_at IS NULL AND a.raised_at >= ${since} AND a.raised_at <= ${now}
+        AND NOT EXISTS (
+          SELECT 1 FROM fiscal_attention b
+          WHERE b.reason = 'fx_rate_missing' AND b.id <> a.id
+            AND (b.raised_at AT TIME ZONE 'Asia/Dubai')::date = (a.raised_at AT TIME ZONE 'Asia/Dubai')::date AND b.raised_at < ${since})
+      ORDER BY (a.raised_at AT TIME ZONE 'Asia/Dubai')::date, a.raised_at ASC)
+    ) x
+    ORDER BY x.raised_at DESC LIMIT ${limit}`;
   return rows.map((r) => ({ id: r.id, entityKind: r.entity_kind, entityId: r.entity_id, orderId: r.order_id, reason: r.reason, raisedAt: r.raised_at, reference: r.reference }));
 }

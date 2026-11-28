@@ -133,6 +133,9 @@ export function EmailCodeForm({
       setCodeError(null);
       setLocked(false);
       submittedCode.current = null;
+      // A new code starts a new count (re-review 103c D7): one honest "can't be used here" before it never adds up
+      // with a later one to "this browser is blocking cookies".
+      expiredInARow.current = 0;
       setResendIn(r.resendAfterSeconds || EMAIL_RESEND_AFTER_SECONDS);
       setExpiresAt(Date.now() + (r.expiresInSeconds || EMAIL_CODE_TTL_SECONDS) * 1000);
       setStep("code");

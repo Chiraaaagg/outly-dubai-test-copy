@@ -25,6 +25,22 @@ export function hasAnySignInOption(o: CustomerAuthOptions): boolean {
   return o.emailCode || o.google || o.phone;
 }
 
+/**
+ * The /login page description, from the options the page shows: Google and
+ * the email code are named only when they are on (pure, exported for tests).
+ * Otherwise neutral words that fit the phone code form, and with no method
+ * at all words that promise none.
+ */
+export function loginDescription(o: Pick<CustomerAuthOptions, "emailCode" | "google" | "phone">): string {
+  const lead = "Sign in to see your OUTLYY bookings";
+  if (o.google && o.emailCode) return `${lead}: Google or a one-time code by email. No password needed.`;
+  if (o.google) return `${lead}: continue with Google. No password needed.`;
+  if (o.emailCode) return `${lead} with a one-time code by email. No password needed.`;
+  if (o.phone) return `${lead} with a one-time code. No password needed.`;
+  // No method on (review 109 N9): promise none; the page points at the booking and inquiry finders.
+  return "See your OUTLYY bookings in one place, or find a booking by its reference.";
+}
+
 /** Closed reasons a sign-in route answers with (`error.details.reason`). */
 export const SIGN_IN_REASONS = [
   "EMAIL_INVALID",
